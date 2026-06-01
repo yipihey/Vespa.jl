@@ -1,0 +1,7 @@
+name = "MeshInterface"
+uuid = "1a2b3c4d-0001-4000-8000-000000000001"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"

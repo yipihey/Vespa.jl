@@ -1,0 +1,18 @@
+name = "EnzoViz"
+uuid = "1a2b3c4d-0004-4000-8000-000000000004"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[deps]
+EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+
+[sources]
+EnzoNG = {path = "../.."}
+MeshInterface = {path = "../MeshInterface"}
+
+[compat]
+julia = "1.10"

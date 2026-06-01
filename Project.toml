@@ -1,0 +1,33 @@
+name = "EnzoNG"
+uuid = "1a2b3c4d-0000-4000-8000-000000000000"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[deps]
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+# The active (root) project is the only place Julia honors [sources], and every
+# [sources] key must also appear in [deps] or [extras]. HGBackend pulls in
+# HierarchicalGrids (path-dev'd) which transitively needs R3D (an unregistered
+# git package), so both must be sourced and declared here even though EnzoNG
+# itself never imports them — they reach the test env through HGBackend.
+[sources]
+MeshInterface = {path = "lib/MeshInterface"}
+RefMesh = {path = "lib/RefMesh"}
+HGBackend = {path = "lib/HGBackend"}
+HierarchicalGrids = {path = "/Users/tabel/Projects/HierarchicalGrids.jl"}
+R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}
+
+[extras]
+RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
+HGBackend = "1a2b3c4d-0003-4000-8000-000000000003"
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "RefMesh", "HGBackend"]
+
+[compat]
+julia = "1.10"

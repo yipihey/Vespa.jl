@@ -1,0 +1,13 @@
+name = "RefMesh"
+uuid = "1a2b3c4d-0002-4000-8000-000000000002"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[deps]
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+
+[sources]
+MeshInterface = {path = "../MeshInterface"}
+
+[compat]
+julia = "1.10"

@@ -1,0 +1,25 @@
+# Dedicated EnzoViz test environment. Activating this project makes its
+# [sources] authoritative so every path-dev'd package (plus the unregistered R3D
+# git dep pulled in transitively by HGBackend) resolves directly.
+[deps]
+EnzoViz = "1a2b3c4d-0004-4000-8000-000000000004"
+EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
+HGBackend = "1a2b3c4d-0003-4000-8000-000000000003"
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+EnzoViz = {path = ".."}
+EnzoNG = {path = "../../.."}
+MeshInterface = {path = "../../MeshInterface"}
+RefMesh = {path = "../../RefMesh"}
+HGBackend = {path = "../../HGBackend"}
+HierarchicalGrids = {path = "/Users/tabel/Projects/HierarchicalGrids.jl"}
+R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}

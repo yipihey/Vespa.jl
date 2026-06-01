@@ -1,0 +1,18 @@
+name = "HGBackend"
+uuid = "1a2b3c4d-0003-4000-8000-000000000003"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[deps]
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+# Sources are honored only from the active root project (EnzoNG/Project.toml),
+# which declares the HierarchicalGrids path and the R3D git source. The entry
+# here documents the dependency for standalone development of this package.
+[sources]
+MeshInterface = {path = "../MeshInterface"}
+HierarchicalGrids = {path = "/Users/tabel/Projects/HierarchicalGrids.jl"}
+
+[compat]
+julia = "1.10"

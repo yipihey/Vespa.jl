@@ -1,0 +1,17 @@
+# Julia
+Manifest.toml
+lib/*/Manifest.toml
+/docs/build/
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+.DS_Store
+
+# EnzoViz: generated pages + provisioned Python env + copied web assets
+/out/
+lib/EnzoViz/.python-path
+lib/EnzoViz/.venv/
+lib/EnzoViz/assets/veusz-embed.js
+lib/EnzoViz/assets/wasm/
+# CondaPkg-provisioned env spec (generated; reproduced from CondaPkg.toml)
+**/.CondaPkg/
