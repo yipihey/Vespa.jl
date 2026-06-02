@@ -34,10 +34,12 @@ include("reconstruct.jl")
 include("problem.jl")
 include("driver.jl")
 include("reflux.jl")        # coarse–fine flux registers (used by evolve_level!)
+include("gravity.jl")       # self-gravity: composite Poisson (CG) + g source
 include("diagnostics.jl")
 include("exact_riemann.jl")
 
 export Problem, Simulation, evolve!, evolve_level!, step!, compute_dt,
+    enable_gravity!, GravityField, solve_poisson!, apply_laplacian!,
     conserved_totals, dump_fields, cell_samples, primitive_at,
     exact_riemann_sample, sod_problem_defaults,
     RefinementPolicy, regrid!, density_gradient_indicator,

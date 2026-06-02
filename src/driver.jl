@@ -38,6 +38,7 @@ mutable struct Simulation{B,P,S,V}
     layout::AbstractLayout
     t::Float64
     step::Int
+    grav::Any           # nothing, or a GravityField (self-gravity; default off)
 end
 
 function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA())
@@ -49,7 +50,7 @@ function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA())
     views(store) = ntuple(i -> field_view(backend, store, FIELD_NAMES[i]), NVAR)
     bcs = _as_bcs(prob.bcs, N)
     sim = Simulation(backend, prob, bcs, prob.γ, state, u0, acc,
-                     views(state), views(u0), views(acc), layout, 0.0, 0)
+                     views(state), views(u0), views(acc), layout, 0.0, 0, nothing)
     set_initial_conditions!(sim)
     return sim
 end
@@ -122,7 +123,9 @@ single-rate global step). Returns `Inf` if the level has no leaves.
 function compute_dt(sim::Simulation; level = nothing)
     b, γ, cfl = sim.backend, sim.γ, sim.problem.cfl
     N = rank(b)
+    grav = sim.grav
     invdt = 0.0
+    grav_invdt = 0.0
     for_each_cell(b; level = level) do cell
         W = _W(sim, cell)
         c = sound_speed(W, γ)
@@ -131,7 +134,9 @@ function compute_dt(sim::Simulation; level = nothing)
             vd = (W[2], W[3], W[4])[d]
             invdt = max(invdt, (abs(vd) + c) / w[d])
         end
+        grav === nothing || (grav_invdt = max(grav_invdt, _gravity_invdt(grav, W[1])))
     end
+    invdt = max(invdt, grav_invdt)               # free-fall limiter (gravity on)
     return invdt == 0.0 ? Inf : cfl / invdt
 end
 
@@ -260,9 +265,11 @@ when `level` is given (the subcycle driver owns time bookkeeping).
 function step!(sim::Simulation, dt::Float64; level = nothing)
     _copy_state!(sim, sim.u0v, sim.sv; level = level)        # u0 ← Uⁿ
     accumulate_flux!(sim)                                     # acc ← L(Uⁿ)
-    _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level)   # U1 = Uⁿ − dt·L(Uⁿ)
+    sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
+    _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level)   # U1 = Uⁿ − dt·(L−S)(Uⁿ)
     accumulate_flux!(sim)                                     # acc ← L(U1)
-    _rk2_combine!(sim, dt; level = level)                     # Uⁿ⁺¹ = ½Uⁿ + ½(U1 − dt·L(U1))
+    sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
+    _rk2_combine!(sim, dt; level = level)                     # Uⁿ⁺¹ = ½Uⁿ + ½(U1 − dt·(L−S)(U1))
     if level === nothing
         sim.t += dt
         sim.step += 1
@@ -280,9 +287,11 @@ function step_level!(sim::Simulation, dt::Float64, level::Int, regs, signs)
     _copy_state!(sim, sim.u0v, sim.sv; level = level)
     _set_scales!(regs, signs, 0.5 * dt)
     accumulate_flux!(sim; reflux = regs)                     # stage 1, ½dt weight
+    sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
     _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level)
     _set_scales!(regs, signs, 0.5 * dt)
     accumulate_flux!(sim; reflux = regs)                     # stage 2, ½dt weight
+    sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
     _rk2_combine!(sim, dt; level = level)
     return sim
 end
@@ -395,6 +404,7 @@ function evolve!(sim::Simulation; verbose::Bool = false,
             n = regrid!(sim, policy)
             verbose && n > 0 && @printf("  regrid: +%d cells → %d leaves\n", n, n_cells(sim.backend))
         end
+        sim.grav === nothing || solve_poisson!(sim, sim.grav)   # φ(ρⁿ): g held over the step
         dt = min(compute_dt(sim), tfinal - sim.t)
         step!(sim, dt)
         if callback !== nothing && callback_every > 0 && sim.step % callback_every == 0
@@ -485,6 +495,10 @@ function _evolve_subcycle!(sim::Simulation; verbose, policy, callback, callback_
             n = regrid!(sim, policy)
             verbose && n > 0 && @printf("  regrid: +%d cells → %d leaves\n", n, n_cells(sim.backend))
         end
+        # Self-gravity: one composite Poisson solve per root step; g = −∇φ is held
+        # across all fine subcycles (1st-order-in-time coupling). To tighten it,
+        # move this solve into evolve_level!'s substep loop at level 0.
+        sim.grav === nothing || solve_poisson!(sim, sim.grav)
         # Root step size is the level-0 CFL dt, clipped to land on tfinal.
         dt_root = min(compute_dt(sim; level = 0), tfinal - sim.t)
         evolve_level!(sim, 0, dt_root; verbose = verbose)
