@@ -39,6 +39,7 @@ mutable struct Simulation{B,P,S,V}
     t::Float64
     step::Int
     grav::Any           # nothing, or a GravityField (self-gravity; default off)
+    cosmo::Any          # nothing, or a Cosmology (comoving expansion; default off)
 end
 
 function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA())
@@ -50,7 +51,7 @@ function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA())
     views(store) = ntuple(i -> field_view(backend, store, FIELD_NAMES[i]), NVAR)
     bcs = _as_bcs(prob.bcs, N)
     sim = Simulation(backend, prob, bcs, prob.γ, state, u0, acc,
-                     views(state), views(u0), views(acc), layout, 0.0, 0, nothing)
+                     views(state), views(u0), views(acc), layout, 0.0, 0, nothing, nothing)
     set_initial_conditions!(sim)
     return sim
 end
@@ -137,7 +138,16 @@ function compute_dt(sim::Simulation; level = nothing)
         grav === nothing || (grav_invdt = max(grav_invdt, _gravity_invdt(grav, W[1])))
     end
     invdt = max(invdt, grav_invdt)               # free-fall limiter (gravity on)
-    return invdt == 0.0 ? Inf : cfl / invdt
+    invdt == 0.0 && return Inf
+    dt = cfl / invdt
+    if sim.cosmo !== nothing
+        # Comoving CFL: the flux divergence is scaled by 1/a, so the comoving
+        # signal speed is (|v|+c)/a ⇒ dt ≤ cfl·a·dx/(|v|+c). Then cap by the
+        # expansion limiter (dt ≤ MaxExpansionRate·a/ȧ).
+        dt *= sim.cosmo.a
+        dt = min(dt, expansion_dt(sim.cosmo))
+    end
+    return dt
 end
 
 # Accumulate net-flux-out (pre-÷V) for the current `sim.state` into `sim.acc`.
@@ -227,11 +237,15 @@ function _copy_state!(sim::Simulation, dst, src; level = nothing)
     return nothing
 end
 
-# Forward-Euler-style apply: dst = base − dt·acc/V  (acc = net flux out).
-function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing)
+# Forward-Euler-style apply: dst = base − dt·acc/(aexp·V)  (acc = net flux out).
+# `aexp` is the comoving expansion factor at the half step: the comoving flux
+# divergence carries a 1/a factor (and so does the gravity source, which shares
+# this accumulator). `aexp=1.0` (default) is the ordinary non-cosmological path
+# and is byte-identical (1.0·V == V).
+function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing, aexp::Float64 = 1.0)
     b = sim.backend
     for_each_cell(b; level = level) do cell
-        invV = dt / cell_volume(b, cell)
+        invV = dt / (aexp * cell_volume(b, cell))
         Ub = get_U(base, cell)
         A = get_U(sim.accv, cell)
         set_U!(dst, cell, ntuple(i -> Ub[i] - invV * A[i], NVAR))
@@ -239,11 +253,11 @@ function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing)
     return nothing
 end
 
-# SSP-RK2 combine: state = 0.5·u0 + 0.5·(state − dt·acc/V).
-function _rk2_combine!(sim::Simulation, dt; level = nothing)
+# SSP-RK2 combine: state = 0.5·u0 + 0.5·(state − dt·acc/(aexp·V)).
+function _rk2_combine!(sim::Simulation, dt; level = nothing, aexp::Float64 = 1.0)
     b = sim.backend
     for_each_cell(b; level = level) do cell
-        invV = dt / cell_volume(b, cell)
+        invV = dt / (aexp * cell_volume(b, cell))
         U0 = get_U(sim.u0v, cell)
         U1 = get_U(sim.sv, cell)
         A = get_U(sim.accv, cell)
@@ -263,16 +277,26 @@ leaves — the single-rate path, unchanged. `step!` does not advance `sim.t`/`st
 when `level` is given (the subcycle driver owns time bookkeeping).
 """
 function step!(sim::Simulation, dt::Float64; level = nothing)
+    # Comoving coupling is applied on the single-rate path only (level===nothing);
+    # subcycled cosmology under AMR is a follow-up. a is evaluated at the half step
+    # (n+½), matching Enzo, for both the 1/a flux scaling and the Hubble drag.
+    cosmo = level === nothing ? sim.cosmo : nothing
+    aexp, dadt_half = 1.0, 0.0
+    if cosmo !== nothing
+        aexp, dadt_half = expansion_at(cosmo, cosmo.t_initial + sim.t + 0.5 * dt)
+    end
     _copy_state!(sim, sim.u0v, sim.sv; level = level)        # u0 ← Uⁿ
     accumulate_flux!(sim)                                     # acc ← L(Uⁿ)
     sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
-    _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level)   # U1 = Uⁿ − dt·(L−S)(Uⁿ)
+    _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level, aexp = aexp)
     accumulate_flux!(sim)                                     # acc ← L(U1)
     sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
-    _rk2_combine!(sim, dt; level = level)                     # Uⁿ⁺¹ = ½Uⁿ + ½(U1 − dt·(L−S)(U1))
+    _rk2_combine!(sim, dt; level = level, aexp = aexp)
+    cosmo === nothing || apply_expansion_terms!(sim, dt, aexp, dadt_half)
     if level === nothing
         sim.t += dt
         sim.step += 1
+        cosmo === nothing || set_expansion!(cosmo, cosmo.t_initial + sim.t)   # cache aⁿ⁺¹
     end
     return sim
 end
@@ -397,7 +421,7 @@ function evolve!(sim::Simulation; verbose::Bool = false,
         return _evolve_subcycle!(sim; verbose = verbose, policy = policy,
                                  callback = callback, callback_every = callback_every)
     end
-    tfinal = sim.problem.tfinal
+    tfinal = sim.cosmo === nothing ? sim.problem.tfinal : cosmology_tfinal(sim.cosmo)
     callback !== nothing && callback(sim, :init)
     while sim.t < tfinal * (1 - 1e-12)
         if policy !== nothing && policy.every > 0 && sim.step % policy.every == 0

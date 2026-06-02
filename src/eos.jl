@@ -13,7 +13,14 @@
     vz = U[4] * inv
     kinetic = T(0.5) * ρ * (vx * vx + vy * vy + vz * vz)
     p = (γ - 1) * (U[5] - kinetic)
-    return (ρ, vx, vy, vz, p)
+    # Pressure floor. Without a dual-energy formalism, in very cold supersonic flow
+    # (e.g. the Zel'dovich pancake, thermal energy orders of magnitude below kinetic)
+    # the difference U[5]−kinetic loses all precision and p can go ≤ 0. A *strictly
+    # positive* floor is required: p=0 gives c=0, which makes the HLLC contact-speed
+    # denominator ρL(SL−unL)−ρR(SR−unR) degenerate to 0/0 when velocities straddle
+    # zero. Floor to a negligible (1e-12) fraction of the kinetic energy density —
+    # scale-free, keeps c>0, and is a no-op wherever the gas is resolved (p ≫ floor).
+    return (ρ, vx, vy, vz, max(p, T(1e-12) * kinetic))
 end
 
 "Convert a primitive state `W` to conserved `U` for adiabatic index `γ`."

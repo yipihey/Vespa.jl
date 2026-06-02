@@ -176,9 +176,13 @@ function _fill_poisson_rhs!(sim::Simulation, grav::GravityField)
         end
         ρ̄ = s / vol
     end
+    # Comoving Poisson carries a 1/a factor: ∇²φ = (4πG/a)(ρ − ρ̄). With the
+    # cosmology G-normalization (4πG = 1) this is (1/a)(ρ − ρ̄); a = aⁿ (the cached
+    # value at the current time, φ held over the step). Non-cosmological: a = 1.
+    inv_a = sim.cosmo === nothing ? 1.0 : 1.0 / sim.cosmo.a
     for_each_cell(b) do c
         ρ = get_U(sim.sv, c)[1]
-        grav.bv[c] = -FOURπ * grav.G * (ρ - ρ̄) * cell_volume(b, c)
+        grav.bv[c] = -FOURπ * grav.G * (ρ - ρ̄) * cell_volume(b, c) * inv_a
     end
     return nothing
 end

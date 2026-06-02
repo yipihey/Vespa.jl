@@ -16,4 +16,7 @@ using EnzoNG
     include("test_gravity_poisson.jl") # self-gravity Phase 3a (composite CG Poisson vs analytic)
     include("test_gravity_hydro.jl")   # self-gravity Phase 3b (g source: sign gate, Jeans growth)
     include("test_gravity_amr.jl")     # self-gravity Phase 3c (AMR + subcycle: conservation, regrid)
+    include("test_cosmology_units.jl") # cosmology C1 (Enzo-compatible units + Friedmann a(t))
+    include("test_cosmology_expansion.jl") # cosmology C2 (Hubble drag: v∝1/a, T∝a⁻²)
+    include("test_zeldovich_pancake.jl")   # cosmology C3 (comoving hydro+gravity vs analytic Zel'dovich)
 end
