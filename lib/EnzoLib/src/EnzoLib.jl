@@ -139,4 +139,6 @@ function ppm_sweep_1d!(dslice::Vector{Float64}, eslice::Vector{Float64},
     return fluxes ? (df, ef, uf) : nothing
 end
 
+include("session.jl")   # live-Session C-ABI (full-replication via the Enzo grid lib)
+
 end # module
