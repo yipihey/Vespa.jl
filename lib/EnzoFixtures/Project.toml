@@ -1,0 +1,7 @@
+name = "EnzoFixtures"
+uuid = "1a2b3c4d-0005-4000-8000-000000000005"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
