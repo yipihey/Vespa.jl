@@ -197,10 +197,13 @@ function apply_expansion_terms!(sim::Simulation, dt::Float64, a::Float64, dadt::
     C  = dt * dadt / a
     fv = (1.0 - 0.5 * C) / (1.0 + 0.5 * C)     # peculiar-velocity redshift (rate ȧ/a)
     fe = (1.0 - C) / (1.0 + C)                 # total energy (rate 2ȧ/a)
+    mom = momentum_indices(sim.model); ei = energy_index(sim.model)
     sv = sim.sv
     for_each_cell(sim.backend) do c
         U = get_U(sv, c)
-        set_U!(sv, c, (U[1], U[2] * fv, U[3] * fv, U[4] * fv, U[5] * fe))
+        # momenta redshift, energy decays, all other variables unchanged
+        set_U!(sv, c, ntuple(k -> k in mom ? U[k] * fv : (k == ei ? U[k] * fe : U[k]),
+                             nvars_val(sim.model)))
     end
     return nothing
 end

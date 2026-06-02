@@ -4,6 +4,7 @@ using RefMesh
 using EnzoNG
 
 @testset "EnzoNG — hydro on two backends + AMR" begin
+    include("test_equationset.jl")    # EquationSet: reordered variable layout ≡ identical physics
     include("test_interface.jl")      # backend-contract conformance (RefMesh)
     include("test_sod.jl")            # Sod vs exact Riemann (RefMesh)
     include("test_layout_swap.jl")    # layout independence (P3)

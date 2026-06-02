@@ -23,14 +23,10 @@ module EnzoNG
 using MeshInterface
 using Printf
 
-# Conserved-variable layout used throughout the hydro kernels.
-const NVAR = 5
-const FIELD_NAMES = (:density, :momentum_x, :momentum_y, :momentum_z, :total_energy)
-const MOM_INDEX = (2, 3, 4)   # momentum_x, _y, _z in conserved/primitive vectors
-
 include("eos.jl")
 include("riemann.jl")
 include("reconstruct.jl")
+include("equationset.jl")   # the swappable physics/variable model (default IdealHydro)
 include("problem.jl")
 include("driver.jl")
 include("reflux.jl")        # coarse–fine flux registers (used by evolve_level!)
@@ -40,6 +36,8 @@ include("diagnostics.jl")
 include("exact_riemann.jl")
 
 export Problem, Simulation, evolve!, evolve_level!, step!, compute_dt,
+    EquationSet, IdealHydro, nvars, conserved_names,
+    density_index, momentum_indices, energy_index,
     enable_gravity!, GravityField, solve_poisson!, apply_laplacian!,
     Cosmology, enable_cosmology!, cosmology_units, cosmology_tfinal,
     gravitational_constant_code,

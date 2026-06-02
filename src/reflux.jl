@@ -48,24 +48,25 @@ the coarse step's two RK stages, `+½·dt_f` on each fine substep's two stages �
 the register ends a coarse step holding `Σ(fine flux·dt_f) − (coarse flux·dt_c)`
 in net-flux-out units, ready to apply as `U_coarse −= register / V_coarse`.
 """
-mutable struct FluxRegister
-    delta::Dict{Any,NTuple{NVAR,Float64}}  # coarse leaf handle → accumulated mismatch
+mutable struct FluxRegister{NV}
+    delta::Dict{Any,NTuple{NV,Float64}}     # coarse leaf handle → accumulated mismatch
     coarse_level::Int                       # the coarser side's level
     scale::Float64                          # signed dt × RK-stage weight, per pass
 end
 
-_flux_register(coarse_level::Int) =
-    FluxRegister(Dict{Any,NTuple{NVAR,Float64}}(), coarse_level, 0.0)
+# Register sized by the simulation's equation set (nvars conserved variables).
+_flux_register(sim::Simulation, coarse_level::Int) =
+    FluxRegister{nvars(sim.model)}(Dict{Any,NTuple{nvars(sim.model),Float64}}(), coarse_level, 0.0)
 
-@inline _reg_add!(reg::FluxRegister, c, v::NTuple{NVAR,Float64}) =
-    (reg.delta[c] = get(reg.delta, c, ntuple(_ -> 0.0, NVAR)) .+ v; nothing)
+@inline _reg_add!(reg::FluxRegister{NV}, c, v::NTuple{NV,Float64}) where {NV} =
+    (reg.delta[c] = get(reg.delta, c, ntuple(_ -> 0.0, Val(NV))) .+ v; nothing)
 
 # Capture one interior face's flux into the register IFF it is a coarse↔fine face
 # straddling (coarse_level, coarse_level+1). `F` is the HLLC flux, `area` the fine
 # sub-face area; the +axis normal points i→j (i=left, j=right). The coarse cell of
 # the pair gets `sign·weight·F·area` with sign set by which side it is on.
 @inline function _reflux_capture!(sim::Simulation, reg::FluxRegister, i, j,
-                                  F::NTuple{NVAR,Float64}, area::Float64)
+                                  F, area::Float64)
     b = sim.backend
     li = level_of(b, i)
     lj = level_of(b, j)
@@ -75,10 +76,10 @@ _flux_register(coarse_level::Int) =
     if li == cl && lj == cl + 1
         # coarse is the LEFT cell i: +axis normal leaves i, so flux that leaves
         # the coarse cell carries sign +1 in its net-flux-out accumulator.
-        _reg_add!(reg, i, ntuple(k -> s * F[k] * area, NVAR))
+        _reg_add!(reg, i, map(f -> s * f * area, F))
     elseif lj == cl && li == cl + 1
         # coarse is the RIGHT cell j: +axis normal enters j (−1 in net-flux-out).
-        _reg_add!(reg, j, ntuple(k -> -s * F[k] * area, NVAR))
+        _reg_add!(reg, j, map(f -> -s * f * area, F))
     end
     # any other level combination (deeper jump) is handled by that pair's own
     # register; level gaps across a face are ≤ 1 by the backend's balance rule.
@@ -93,7 +94,7 @@ function _reflux_apply!(sim::Simulation, reg::FluxRegister)
     for (c, d) in reg.delta
         invV = 1.0 / cell_volume(b, c)
         U = get_U(sim.sv, c)
-        set_U!(sim.sv, c, ntuple(k -> U[k] - invV * d[k], NVAR))
+        set_U!(sim.sv, c, map((u, dd) -> u - invV * dd, U, d))
     end
     empty!(reg.delta)
     return nothing

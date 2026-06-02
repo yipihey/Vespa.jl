@@ -167,12 +167,13 @@ end
 # the old projection left b non-orthogonal to the null space and CG diverged.)
 function _fill_poisson_rhs!(sim::Simulation, grav::GravityField)
     b = sim.backend
+    di = density_index(sim.model)
     ρ̄ = 0.0
     if grav.project_mean
         s = 0.0; vol = 0.0
         for_each_cell(b) do c
             V = cell_volume(b, c)
-            s += get_U(sim.sv, c)[1] * V; vol += V
+            s += get_U(sim.sv, c)[di] * V; vol += V
         end
         ρ̄ = s / vol
     end
@@ -181,7 +182,7 @@ function _fill_poisson_rhs!(sim::Simulation, grav::GravityField)
     # value at the current time, φ held over the step). Non-cosmological: a = 1.
     inv_a = sim.cosmo === nothing ? 1.0 : 1.0 / sim.cosmo.a
     for_each_cell(b) do c
-        ρ = get_U(sim.sv, c)[1]
+        ρ = get_U(sim.sv, c)[di]
         grav.bv[c] = -FOURπ * grav.G * (ρ - ρ̄) * cell_volume(b, c) * inv_a
     end
     return nothing
@@ -263,15 +264,18 @@ fixed across the step (φ solved once per root step).
 function apply_gravity_source!(sim::Simulation, grav::GravityField; level = nothing)
     b = sim.backend
     av = sim.accv
+    mom = momentum_indices(sim.model)
+    ei = energy_index(sim.model)
+    di = density_index(sim.model)
     for_each_cell(b; level = level) do c
         U = get_U(sim.sv, c)
-        ρ = U[1]
+        ρ = U[di]
         V = cell_volume(b, c)
         g = gravity_accel(sim, grav, c)
         @inbounds for d in 1:rank(b)
-            mi = MOM_INDEX[d]
+            mi = mom[d]
             av[mi][c] -= ρ * g[d] * V               # momentum source +ρg
-            av[5][c]  -= U[mi] * g[d] * V            # energy source +ρv·g  (U[mi]=ρv_d)
+            av[ei][c] -= U[mi] * g[d] * V            # energy source +ρv·g  (U[mi]=ρv_d)
         end
     end
     return nothing

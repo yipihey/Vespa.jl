@@ -16,18 +16,22 @@ const SEAM_PROB = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
 # Lazily builds the EnzoGridMesh + Simulation from the live handle on first call.
 function enzo_seam_hydro_slot(; γ = 1.4, nghost = 3)
     cache = Ref{Any}(nothing)
+    model = IdealHydro(γ)                 # the equation set drives the field map below
     return function (h, dt)
         if cache[] === nothing
-            mesh = EnzoGridMesh(h; γ = γ, nghost = nghost, domain = ((0.0, 1.0),))
+            mesh = EnzoGridMesh(h; nghost = nghost, domain = ((0.0, 1.0),),
+                                cons_density = density_index(model),    # roles FROM the model
+                                cons_momentum = momentum_indices(model),
+                                cons_energy = energy_index(model))
             N = MeshInterface.n_cells(mesh)
             prob = Problem(; name = "enzo-seam", dims = (N,), domain = ((0.0, 1.0),),
                            γ = γ, bcs = Outflow(),
                            init = (x, y, z) -> (1.0, 0.0, 0.0, 0.0, 1.0),  # overwritten by sync
                            tfinal = 1.0, cfl = 0.4)
-            cache[] = (mesh, Simulation(mesh, prob))
+            cache[] = (mesh, Simulation(mesh, prob; model = model))
         end
         mesh, sim = cache[]
-        sync_from_enzo!(sim.sv, mesh)      # Enzo → conserved
+        sync_from_enzo!(sim.sv, mesh)      # Enzo → conserved (model-driven roles)
         step!(sim, dt)                     # EnzoNG's unchanged driver, through the seam
         sync_to_enzo!(mesh, sim.sv)        # conserved → Enzo
         return nothing

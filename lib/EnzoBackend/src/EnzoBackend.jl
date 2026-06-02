@@ -20,31 +20,42 @@ import EnzoLib
 
 export EnzoGridMesh, sync_from_enzo!, sync_to_enzo!
 
-# Enzo FieldType ints we map: Density=0, TotalEnergy=1 (specific), Velocity1=4.
+# The backend stores only Ints — both the Enzo FieldType field indices and the
+# CONSERVED-state role indices (which sv component is density / momentum / energy).
+# The role indices are supplied by the caller FROM the EquationSet model
+# (`density_index`/`momentum_indices`/`energy_index`), so the variable choice is
+# the model's, not hardcoded here — and EnzoBackend stays free of any EnzoNG dep.
 struct EnzoGridMesh{N} <: MI.AbstractMeshBackend
     inner::UniformMesh{N,Float64}     # uniform mesh over the active region (seam delegate)
     h::Ptr{Cvoid}                     # live Enzo session/problem handle
     grid::Int                         # grid index in the hierarchy
     nghost::Int                       # ghost zones per side
-    di::Int; vi::Int; ei::Int         # 0-based field indices: Density, Velocity1, TotalEnergy
-    γ::Float64
+    di::Int; vi::Int; ei::Int         # Enzo 0-based field indices: Density, Velocity1, TotalEnergy
+    cdi::Int                          # conserved index of mass density
+    cmom::NTuple{3,Int}               # conserved indices of (x,y,z) momentum
+    cei::Int                          # conserved index of total energy
 end
 
 """
-    EnzoGridMesh(h; grid=0, nghost=3, γ=1.4, domain=((0.0,1.0),))
+    EnzoGridMesh(h; grid=0, nghost=3, domain=((0.0,1.0),),
+                 cons_density=1, cons_momentum=(2,3,4), cons_energy=5)
 
-Wrap live Enzo grid `grid` (a 1D hydro grid) as a seam backend. `domain` is the
-active-region physical extent (default the unit interval).
+Wrap live Enzo grid `grid` (a 1D hydro grid) as a seam backend. The `cons_*`
+role indices say which conserved-state components are density/momentum/energy —
+pass them from the `EquationSet` model (defaults are the ideal-hydro layout).
 """
 function EnzoGridMesh(h::Ptr{Cvoid}; grid::Integer = 0, nghost::Integer = 3,
-                      γ::Real = 1.4, domain = ((0.0, 1.0),))
+                      domain = ((0.0, 1.0),),
+                      cons_density::Integer = 1, cons_momentum = (2, 3, 4),
+                      cons_energy::Integer = 5)
     T = EnzoLib.problem_grid_size(h, grid)
     N = T - 2 * nghost
     inner = UniformMesh((N,), domain)
     di = EnzoLib.field_index(h, 0; grid = grid)    # Density
     vi = EnzoLib.field_index(h, 4; grid = grid)    # Velocity1 (x)
     ei = EnzoLib.field_index(h, 1; grid = grid)    # TotalEnergy (specific)
-    return EnzoGridMesh{1}(inner, h, Int(grid), Int(nghost), di, vi, ei, Float64(γ))
+    return EnzoGridMesh{1}(inner, h, Int(grid), Int(nghost), di, vi, ei,
+                           Int(cons_density), Tuple(Int.(cons_momentum)), Int(cons_energy))
 end
 
 # ── seam: delegate everything to the inner uniform mesh ───────────────────────
@@ -77,8 +88,9 @@ function sync_from_enzo!(sv, m::EnzoGridMesh{1})
         f = m.nghost + i
         ρ = d[f]; u = vx[f]; e = es[f]
         I = CartesianIndex(i)
-        sv[1][I] = ρ; sv[2][I] = ρ * u; sv[3][I] = 0.0; sv[4][I] = 0.0
-        sv[5][I] = ρ * e                                  # total energy density = ρ·e_specific
+        sv[m.cdi][I] = ρ
+        sv[m.cmom[1]][I] = ρ * u; sv[m.cmom[2]][I] = 0.0; sv[m.cmom[3]][I] = 0.0
+        sv[m.cei][I] = ρ * e                              # total energy density = ρ·e_specific
     end
     return nothing
 end
@@ -92,7 +104,7 @@ function sync_to_enzo!(m::EnzoGridMesh{1}, sv)
     @inbounds for i in 1:N
         f = m.nghost + i
         I = CartesianIndex(i)
-        ρ = sv[1][I]; mx = sv[2][I]; E = sv[5][I]
+        ρ = sv[m.cdi][I]; mx = sv[m.cmom[1]][I]; E = sv[m.cei][I]
         d[f] = ρ; vx[f] = mx / ρ; es[f] = E / ρ           # back to specific total energy
     end
     EnzoLib.problem_set_field(m.h, m.di, d; grid = m.grid)

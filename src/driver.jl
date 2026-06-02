@@ -24,15 +24,16 @@ Bind a `Problem` to a mesh `backend`, allocate the conserved fields (plus RK
 scratch) with the requested `layout`, and set initial conditions. `backend` may
 be a bare backend or an `Instrumented` wrapper (P10) — identical code path.
 """
-mutable struct Simulation{B,P,S,V}
+mutable struct Simulation{B,P,S,V,M<:EquationSet}
     backend::B
     problem::P
     bcs::BoundaryConditions
-    γ::Float64
+    model::M            # the equation set: variable names/roles/count + physics kernels
+    γ::Float64          # EOS adiabatic index (= adiabatic_index(model); kept for convenience)
     state::S            # conserved U (canonical, layout-tested)
     u0::S               # RK scratch: state at start of step
     acc::S              # net-flux-out accumulator (pre-÷V)
-    sv::V               # cached NTuple{5} views into `state`
+    sv::V               # cached NTuple{nvars} views into `state`
     u0v::V
     accv::V
     layout::AbstractLayout
@@ -42,15 +43,25 @@ mutable struct Simulation{B,P,S,V}
     cosmo::Any          # nothing, or a Cosmology (comoving expansion; default off)
 end
 
-function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA())
+"""
+    Simulation(backend, problem; layout=SoA(), model=IdealHydro(problem.γ))
+
+Bind a `Problem` to a mesh `backend` under an `EquationSet` `model` (default ideal
+hydro). The conserved fields are named and counted by the model
+(`conserved_names`/`nvars`), so a different variable set is a `model=` change, not
+a core change.
+"""
+function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA(),
+                    model::EquationSet = IdealHydro(prob.γ))
     N = rank(backend)
-    spec = FieldSpec(collect(FIELD_NAMES))
+    names = conserved_names(model)
+    spec = FieldSpec(collect(names))
     state = allocate_fields(backend, spec; layout = layout)
     u0 = allocate_fields(backend, spec; layout = layout)
     acc = allocate_fields(backend, spec; layout = layout)
-    views(store) = ntuple(i -> field_view(backend, store, FIELD_NAMES[i]), NVAR)
+    views(store) = map(nm -> field_view(backend, store, nm), names)
     bcs = _as_bcs(prob.bcs, N)
-    sim = Simulation(backend, prob, bcs, prob.γ, state, u0, acc,
+    sim = Simulation(backend, prob, bcs, model, prob.γ, state, u0, acc,
                      views(state), views(u0), views(acc), layout, 0.0, 0, nothing, nothing)
     set_initial_conditions!(sim)
     return sim
@@ -60,57 +71,56 @@ _as_bcs(bc::AbstractBC, N::Int) = BoundaryConditions(bc, Val(N))
 _as_bcs(bcs::BoundaryConditions, ::Int) = bcs
 _as_bcs(pairs::Tuple, ::Int) = BoundaryConditions(pairs)
 
-# -- per-cell conserved state access through cached views --
-@inline get_U(v, cell) = ntuple(i -> @inbounds(v[i][cell]), NVAR)
+# -- per-cell conserved state access through cached views (size from the views) --
+@inline get_U(v, cell) = map(vw -> @inbounds(vw[cell]), v)
 @inline function set_U!(v, cell, U)
-    @inbounds for i in 1:NVAR
+    @inbounds for i in eachindex(v)
         v[i][cell] = U[i]
     end
     return nothing
 end
 
 function set_initial_conditions!(sim::Simulation)
-    b, γ, init = sim.backend, sim.γ, sim.problem.init
+    b, init = sim.backend, sim.problem.init
     N = rank(b)
     for_each_cell(b) do cell
         c = cell_center(b, cell)
         coords = ntuple(d -> d <= N ? c[d] : 0.0, 3)
-        W = NTuple{5,Float64}(init(coords...))
-        set_U!(sim.sv, cell, prim2cons(W, γ))
+        W = map(Float64, init(coords...))               # primitive tuple (size = nvars)
+        set_U!(sim.sv, cell, prim2cons(sim.model, W))
     end
     return sim
 end
 
 # -- boundary ghost state from a face state (no ghost cells; synthesized) --
-@inline function ghost_state(W::NTuple{5,Float64}, ::Outflow, ::Int)
-    return W                                   # zero-gradient
+# The model gives the primitive normal-velocity index for Reflecting; sized by the
+# model's nvars (type-stable).
+@inline ghost_state(W, ::Outflow, ::Int, ::EquationSet) = W            # zero-gradient
+@inline function ghost_state(W, ::Reflecting, axis::Int, model::EquationSet)
+    vi = momentum_indices(model)[axis]                  # primitive normal-velocity index
+    return ntuple(i -> i == vi ? -W[i] : W[i], nvars_val(model))
 end
-@inline function ghost_state(W::NTuple{5,Float64}, ::Reflecting, axis::Int)
-    # Mirror: flip the velocity component normal to this boundary.
-    return ntuple(i -> i == axis + 1 ? -W[i] : W[i], 5)
-end
-@inline ghost_state(W::NTuple{5,Float64}, ::Periodic, ::Int) = W   # never reached
+@inline ghost_state(W, ::Periodic, ::Int, ::EquationSet) = W           # never reached
 
 # Primitive state at a cell.
-@inline _W(sim::Simulation, cell) = cons2prim(get_U(sim.sv, cell), sim.γ)
+@inline _W(sim::Simulation, cell) = cons2prim(sim.model, get_U(sim.sv, cell))
 
 # Neighbor primitive state across (axis, side): interior cell, or BC ghost of the
 # current cell's primitive state.
-@inline function _neighbor_W(sim::Simulation, cell, Wc::NTuple{5,Float64},
-                             axis::Int, side::Symbol)
+@inline function _neighbor_W(sim::Simulation, cell, Wc, axis::Int, side::Symbol)
     nb = neighbor(sim.backend, cell, axis, side; bcs = sim.bcs)
     if nb isa Interior
         return _W(sim, nb.cell)
     else
-        return ghost_state(Wc, nb.bc, axis)
+        return ghost_state(Wc, nb.bc, axis, sim.model)
     end
 end
 
 # minmod-limited PLM slope of every primitive component along `axis` at `cell`.
-@inline function _plm_slope(sim::Simulation, cell, Wc::NTuple{5,Float64}, axis::Int)
+@inline function _plm_slope(sim::Simulation, cell, Wc, axis::Int)
     WL = _neighbor_W(sim, cell, Wc, axis, :lo)
     WR = _neighbor_W(sim, cell, Wc, axis, :hi)
-    return ntuple(i -> limited_slope(WL[i], Wc[i], WR[i]), NVAR)
+    return map(limited_slope, WL, Wc, WR)
 end
 
 """
@@ -122,20 +132,22 @@ step — the basis for subcycling); `nothing` takes it over all leaves (the
 single-rate global step). Returns `Inf` if the level has no leaves.
 """
 function compute_dt(sim::Simulation; level = nothing)
-    b, γ, cfl = sim.backend, sim.γ, sim.problem.cfl
+    b, cfl = sim.backend, sim.problem.cfl
     N = rank(b)
+    mom = momentum_indices(sim.model)
+    di = density_index(sim.model)
     grav = sim.grav
     invdt = 0.0
     grav_invdt = 0.0
     for_each_cell(b; level = level) do cell
         W = _W(sim, cell)
-        c = sound_speed(W, γ)
+        c = sound_speed(sim.model, W)
         w = cell_width(b, cell)
         for d in 1:N
-            vd = (W[2], W[3], W[4])[d]
+            vd = W[mom[d]]
             invdt = max(invdt, (abs(vd) + c) / w[d])
         end
-        grav === nothing || (grav_invdt = max(grav_invdt, _gravity_invdt(grav, W[1])))
+        grav === nothing || (grav_invdt = max(grav_invdt, _gravity_invdt(grav, W[di])))
     end
     invdt = max(invdt, grav_invdt)               # free-fall limiter (gravity on)
     invdt == 0.0 && return Inf
@@ -161,8 +173,9 @@ end
 function accumulate_flux!(sim::Simulation; reflux = nothing)
     b = sim.backend
     av = sim.accv
+    z = ntuple(_ -> 0.0, nvars_val(sim.model))
     for_each_cell(b) do cell
-        set_U!(av, cell, ntuple(_ -> 0.0, NVAR))
+        set_U!(av, cell, z)
     end
     for_each_face(b; bcs = sim.bcs) do leftref, rightref, axis, area
         _flux_face!(sim, leftref, rightref, axis, area; reflux = reflux)
@@ -176,7 +189,7 @@ end
     Wi = _W(sim, i)
     s = _plm_slope(sim, i, Wi, axis)
     h = side === :hi ? 0.5 : -0.5
-    return ntuple(k -> Wi[k] + h * s[k], NVAR)
+    return map((w, sl) -> w + h * sl, Wi, s)
 end
 
 # interior↔interior face: +axis normal points i→j.
@@ -185,9 +198,9 @@ end
     i, j = left.cell, right.cell
     WL = _face_value(sim, i, axis, :hi)
     WR = _face_value(sim, j, axis, :lo)
-    F = hllc_flux(WL, WR, sim.γ, axis)
+    F = riemann_flux(sim.model, WL, WR, axis)
     av = sim.accv
-    @inbounds for k in 1:NVAR
+    @inbounds for k in eachindex(F)
         fk = F[k] * area
         av[k][i] += fk        # flux leaves i
         av[k][j] -= fk        # flux enters j
@@ -205,10 +218,10 @@ end
                              axis::Int, area::Float64; reflux = nothing)
     i = left.cell
     WL = _face_value(sim, i, axis, :hi)
-    Wg = ghost_state(WL, right.bc, axis)
-    F = hllc_flux(WL, Wg, sim.γ, axis)
+    Wg = ghost_state(WL, right.bc, axis, sim.model)
+    F = riemann_flux(sim.model, WL, Wg, axis)
     av = sim.accv
-    @inbounds for k in 1:NVAR
+    @inbounds for k in eachindex(F)
         av[k][i] += F[k] * area      # outward normal +axis
     end
     return nothing
@@ -219,10 +232,10 @@ end
                              axis::Int, area::Float64; reflux = nothing)
     j = right.cell
     WR = _face_value(sim, j, axis, :lo)
-    Wg = ghost_state(WR, left.bc, axis)
-    F = hllc_flux(Wg, WR, sim.γ, axis)
+    Wg = ghost_state(WR, left.bc, axis, sim.model)
+    F = riemann_flux(sim.model, Wg, WR, axis)
     av = sim.accv
-    @inbounds for k in 1:NVAR
+    @inbounds for k in eachindex(F)
         av[k][j] -= F[k] * area      # outward normal −axis
     end
     return nothing
@@ -248,7 +261,7 @@ function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing, aexp::Fl
         invV = dt / (aexp * cell_volume(b, cell))
         Ub = get_U(base, cell)
         A = get_U(sim.accv, cell)
-        set_U!(dst, cell, ntuple(i -> Ub[i] - invV * A[i], NVAR))
+        set_U!(dst, cell, map((u, a) -> u - invV * a, Ub, A))
     end
     return nothing
 end
@@ -261,7 +274,7 @@ function _rk2_combine!(sim::Simulation, dt; level = nothing, aexp::Float64 = 1.0
         U0 = get_U(sim.u0v, cell)
         U1 = get_U(sim.sv, cell)
         A = get_U(sim.accv, cell)
-        set_U!(sim.sv, cell, ntuple(i -> 0.5 * U0[i] + 0.5 * (U1[i] - invV * A[i]), NVAR))
+        set_U!(sim.sv, cell, map((u0, u1, a) -> 0.5 * u0 + 0.5 * (u1 - invV * a), U0, U1, A))
     end
     return nothing
 end
@@ -492,7 +505,7 @@ function evolve_level!(sim::Simulation, level::Int, dt_target::Float64;
     n = max(1, ceil(Int, dt_target / dt_stable * (1 - 1e-12)))
     dt_sub = dt_target / n
     has_finer = level < max_level(b)
-    own_reg = has_finer ? _flux_register(level) : nothing
+    own_reg = has_finer ? _flux_register(sim, level) : nothing
     regs, signs = _active_regs(parent_reg, own_reg)
     for _ in 1:n
         own_reg === nothing || empty!(own_reg.delta)   # fresh per coarse substep

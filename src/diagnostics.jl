@@ -3,8 +3,8 @@
 # any backend regardless of cell ordering. Conservation tallies are the core
 # acceptance check for the finite-volume scheme.
 
-"Primitive state `(ρ, vx, vy, vz, p)` at a cell handle."
-primitive_at(sim::Simulation, cell) = cons2prim(get_U(sim.sv, cell), sim.γ)
+"Primitive state at a cell handle (the model's `cons2prim` of the conserved state)."
+primitive_at(sim::Simulation, cell) = cons2prim(sim.model, get_U(sim.sv, cell))
 
 """
     conserved_totals(sim) -> NamedTuple
@@ -15,16 +15,19 @@ non-leaky boundaries.
 """
 function conserved_totals(sim::Simulation)
     b = sim.backend
-    tot = zeros(Float64, NVAR)
+    nv = nvars(sim.model)
+    tot = zeros(Float64, nv)
     for_each_cell(b) do cell
         U = get_U(sim.sv, cell)
         v = cell_volume(b, cell)
-        @inbounds for i in 1:NVAR
+        @inbounds for i in 1:nv
             tot[i] += U[i] * v
         end
     end
-    return (mass = tot[1], momentum_x = tot[2], momentum_y = tot[3],
-            momentum_z = tot[4], energy = tot[5])
+    mom = momentum_indices(sim.model)
+    return (mass = tot[density_index(sim.model)],
+            momentum_x = tot[mom[1]], momentum_y = tot[mom[2]], momentum_z = tot[mom[3]],
+            energy = tot[energy_index(sim.model)])
 end
 
 """
@@ -37,7 +40,7 @@ directly; `dump_fields` sorts it for 1D plotting.
 function cell_samples(sim::Simulation)
     b = sim.backend
     N = rank(b)
-    out = Tuple{NTuple{N,Float64},NTuple{5,Float64}}[]
+    out = Tuple{NTuple{N,Float64},NTuple{nvars(sim.model),Float64}}[]
     for_each_cell(b) do cell
         push!(out, (cell_center(b, cell), primitive_at(sim, cell)))
     end
