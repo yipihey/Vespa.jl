@@ -57,6 +57,25 @@ session_solve_hydro(h::Handle, level::Integer = 0) =
 session_advance_time(h::Handle, level::Integer = 0) =
     ccall(_gsym(:enzomodules_session_advance_time), Cvoid, (Handle, Cint), h, level)
 
+# AMR EvolveLevel steps (the conservation machinery): flux storage, projection +
+# flux-correction from finer levels, and regridding.
+session_clear_boundary_fluxes(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_clear_boundary_fluxes), Cvoid, (Handle, Cint), h, level)
+session_create_fluxes(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_create_fluxes), Cint, (Handle, Cint), h, level)
+session_finalize_fluxes(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_finalize_fluxes), Cint, (Handle, Cint), h, level)
+session_update_from_finer(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_update_from_finer), Cint, (Handle, Cint), h, level)
+session_copy_baryon_to_old(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_copy_baryon_to_old), Cvoid, (Handle, Cint), h, level)
+session_update_particles(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_update_particles), Cvoid, (Handle, Cint), h, level)
+session_rebuild(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_rebuild), Cint, (Handle, Cint), h, level)
+session_num_grids_on_level(h::Handle, level::Integer) =
+    ccall(_gsym(:enzomodules_session_num_grids_on_level), Cint, (Handle, Cint), h, level)
+
 problem_num_grids(h::Handle) = ccall(_gsym(:enzomodules_problem_num_grids), Cint, (Handle,), h)
 problem_grid_size(h::Handle, grid::Integer = 0) =
     ccall(_gsym(:enzomodules_problem_grid_size), Cint, (Handle, Cint), h, grid)
@@ -165,6 +184,78 @@ function reference_density(paramfile::AbstractString)
         h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
         try
             return read_density(h)
+        finally
+            free_problem(h)
+        end
+    end
+end
+
+# ── AMR: the recursive EvolveLevel, written in Julia on the certified steps ───
+"""
+    evolve_level!(h, level, dt_above; hydro!, regrid=true) -> ncycles
+
+Julia reimplementation of Enzo's recursive `EvolveLevel`, built entirely from the
+certified Session steps (mirrors EnzoModules' Python `evolve_level`): clear the
+boundary fluxes, then sub-cycle this level to its parent's `dt_above` — each
+sub-cycle solving the grids, recursing into level+1, then conservatively
+flux-correcting + projecting (`update_from_finer`) on the way back up, regridding
+finer levels between sub-cycles. `dt_above == 0` ⇒ a single (top-grid) step.
+`hydro!(h, level, dt)` is the swappable hydro slot.
+"""
+function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
+                       hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
+                       regrid::Bool = true, maxsub::Int = 100000)
+    session_clear_boundary_fluxes(h, level)
+    done = 0.0; n = 0
+    while n < maxsub
+        session_set_boundary(h, level)                       # interpolate from parent
+        dt = session_compute_dt(h, level)
+        dt_above > 0.0 && (dt = min(dt, dt_above - done))
+        session_set_dt(h, dt, level)
+        session_create_fluxes(h, level)
+        session_copy_baryon_to_old(h, level)
+        hydro!(h, level, dt)                                 # fills boundary fluxes
+        session_update_particles(h, level)
+        session_advance_time(h, level)
+        last = dt_above <= 0.0 || done + dt >= dt_above * (1 - 1e-6)
+        if session_num_grids_on_level(h, level + 1) > 0
+            session_set_boundary(h, level)                   # refresh before projection
+            evolve_level!(h, level + 1, dt; hydro! = hydro!, regrid = regrid)
+            session_update_from_finer(h, level)              # project + flux-correct
+        end
+        session_finalize_fluxes(h, level)
+        n += 1; done += dt
+        (last || dt <= 0.0) && break
+        regrid && session_rebuild(h, level)                  # regrid finer levels
+    end
+    return n
+end
+
+"""
+    run_amr_density(paramfile; hydro!, regrid=true) -> Vector{Float64}
+
+Drive a full AMR run FROM JULIA — an initial regrid, then repeatedly evolve the
+whole hierarchy one root step (`evolve_level!(h,0,0)`) and regrid, to StopTime —
+and return the root-grid Density. Mirrors `EvolveHierarchy`/Python `run_amr`.
+`hydro!` defaults to the legacy `session_solve_hydro` (drives Enzo's hydro under
+the Julia-owned AMR control flow).
+"""
+function run_amr_density(paramfile::AbstractString;
+                         hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
+                         regrid::Bool = true, maxcycle::Int = 100000)
+    pf = abspath(paramfile)
+    cd(mktempdir()) do
+        h = session_init(pf)
+        h == C_NULL && error("session_init failed for $pf")
+        try
+            regrid && session_rebuild(h, 0)
+            n = 0
+            while session_time(h) < session_stop_time(h) && n < maxcycle
+                evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid)
+                regrid && session_rebuild(h, 0)
+                n += 1
+            end
+            return read_density(h)                           # root grid
         finally
             free_problem(h)
         end

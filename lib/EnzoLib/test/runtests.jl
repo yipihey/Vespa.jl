@@ -7,4 +7,5 @@ using EnzoNG, MeshInterface, RefMesh
     include("test_replicate_sod.jl")     # E1b/E1d: legacy-PPM replication + Julia-HLLC parity
     include("test_session_replication.jl") # E2: Julia EvolveLevel ≡ Enzo EvolveHierarchy (if grid lib built)
     include("test_julia_slot_swap.jl")     # E3: Julia HLLC hydro slot on live Enzo grid (if grid lib built)
+    include("test_amr_replication.jl")     # E4: Julia recursive EvolveLevel ≈ Enzo AMR (if grid lib built)
 end
