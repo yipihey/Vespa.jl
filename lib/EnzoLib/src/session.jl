@@ -76,6 +76,29 @@ function problem_get_field(h::Handle, fi::Integer, grid::Integer = 0)
     return out
 end
 
+"""
+    problem_set_field(h, fi, data; grid=0)
+
+Write a field (flat, incl. ghost zones) back into the LIVE grid's BaryonField.
+This is the enabling primitive for the `:julia` slot swap: a Julia physics method
+reads the state (`problem_get_field`), computes, and writes it back here —
+mutating the same Enzo memory Enzo's own kernels operate on.
+"""
+function problem_set_field(h::Handle, fi::Integer, data::Vector{Float64}; grid::Integer = 0)
+    length(data) == problem_grid_size(h, grid) ||
+        throw(DimensionMismatch("field length $(length(data)) ≠ grid size $(problem_grid_size(h, grid))"))
+    ccall(_gsym(:enzomodules_problem_set_field), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, fi, data)
+    return nothing
+end
+
+"0-based field index of a given Enzo `FieldType` (Density=0, TotalEnergy=1, Velocity1=4)."
+function field_index(h::Handle, ftype::Integer; grid::Integer = 0)
+    i = findfirst(==(ftype), problem_field_types(h, grid))
+    i === nothing && error("no field of FieldType $ftype in grid $grid")
+    return i - 1
+end
+
 # ── high-level: read Density, the Julia-driven loop, the EvolveHierarchy ref ──
 "Read the Density field (FieldType 0) of `grid` from a live/evolved hierarchy."
 function read_density(h::Handle; grid::Integer = 0)
@@ -93,6 +116,21 @@ compute_dt → set_dt → solve_hydro → advance_time) — and return the final
 This is full-replication mode: the new Julia driver, the old Enzo routines.
 """
 function session_replicate_density(paramfile::AbstractString; level::Integer = 0, maxcycle = 100000)
+    return session_evolve_density(paramfile, (h, dt) -> session_solve_hydro(h, level);
+                                  level = level, maxcycle = maxcycle)
+end
+
+"""
+    session_evolve_density(paramfile, hydro!; level=0, maxcycle=…) -> Vector{Float64}
+
+Generic Julia-driven EvolveLevel: each cycle does `set_boundary → compute_dt →
+set_dt → hydro!(h, dt) → advance_time` on the live hierarchy, then returns the
+final Density. `hydro!` is the swappable hydro SLOT — pass the legacy
+`session_solve_hydro` (full replication) or a Julia method that reads/computes/
+writes the live grid (the `:julia` mix-and-match swap).
+"""
+function session_evolve_density(paramfile::AbstractString, hydro!::Function;
+                                level::Integer = 0, maxcycle = 100000)
     pf = abspath(paramfile)
     cd(mktempdir()) do
         h = session_init(pf)
@@ -101,8 +139,9 @@ function session_replicate_density(paramfile::AbstractString; level::Integer = 0
             n = 0
             while session_time(h) < session_stop_time(h) && n < maxcycle
                 session_set_boundary(h, level)
-                session_set_dt(h, session_compute_dt(h, level), level)
-                session_solve_hydro(h, level)
+                dt = session_compute_dt(h, level)
+                session_set_dt(h, dt, level)
+                hydro!(h, dt)
                 session_advance_time(h, level)
                 n += 1
             end
