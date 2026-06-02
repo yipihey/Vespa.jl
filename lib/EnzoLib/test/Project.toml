@@ -4,6 +4,7 @@
 [deps]
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
+EnzoBackend = "1a2b3c4d-0006-4000-8000-000000000006"
 EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
 MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
 RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
@@ -12,6 +13,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 [sources]
 EnzoLib = {path = ".."}
 EnzoFixtures = {path = "../../EnzoFixtures"}
+EnzoBackend = {path = "../../EnzoBackend"}
 EnzoNG = {path = "../../.."}
 MeshInterface = {path = "../../MeshInterface"}
 RefMesh = {path = "../../RefMesh"}

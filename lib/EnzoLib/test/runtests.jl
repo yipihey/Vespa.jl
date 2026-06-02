@@ -8,4 +8,5 @@ using EnzoNG, MeshInterface, RefMesh
     include("test_session_replication.jl") # E2: Julia EvolveLevel ≡ Enzo EvolveHierarchy (if grid lib built)
     include("test_julia_slot_swap.jl")     # E3: Julia HLLC hydro slot on live Enzo grid (if grid lib built)
     include("test_amr_replication.jl")     # E4: Julia recursive EvolveLevel ≈ Enzo AMR (if grid lib built)
+    include("test_enzo_backend.jl")        # E5: EnzoNG driver through the seam on a live Enzo grid (if grid lib built)
 end

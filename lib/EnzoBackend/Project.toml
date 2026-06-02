@@ -1,0 +1,17 @@
+name = "EnzoBackend"
+uuid = "1a2b3c4d-0006-4000-8000-000000000006"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+[deps]
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
+EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
+
+[sources]
+MeshInterface = {path = "../MeshInterface"}
+RefMesh = {path = "../RefMesh"}
+EnzoLib = {path = "../EnzoLib"}
+
+[compat]
+julia = "1.10"
