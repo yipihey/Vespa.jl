@@ -15,11 +15,15 @@ const SUITE_CASES = [
     ("Hydro/Hydro-1D/Toro-2-ShockTubeAMR/Toro-2-ShockTubeAMR.enzo", 1e-3, "4-level AMR"),
     ("MHD/1D/BrioWu-MHD-1D/BrioWu-MHD-1D.enzo",              1e-2, "MHD (Dedner), 9 fields"),
     ("MHD/2D/MHDCTOrszagTang/MHDCTOrszagTang.enzo",          1e-10, "MHD constrained transport, bit-for-bit"),
+    # AMR constrained-transport: the EMF refluxing (ClearAvgElectricField +
+    # MHD_UpdateMagneticField across levels). Smooth flow → near bit-for-bit; a
+    # tight gate that the AMR-CT div(B) machinery stays correct.
+    ("Cosmology/MHDAdiabaticExpansion_CT/MHDAdiabaticExpansion_CT.enzo", 1e-3, "AMR + CT + cosmology"),
     ("Cosmology/ZeldovichPancake/ZeldovichPancake.enzo",     1e-3, "cosmology: gravity + comoving expansion"),
-    # AMR+cosmology, StopCycle=5: density matches to ~7e-4; residual ~1.7% is the
-    # cold-gas Hubble-drag/gravity coupling at 16-cell resolution (operator split,
-    # 2e-5 at 256 cells). Gated at 2.5e-2 to catch regression to the old blow-up.
-    ("Cosmology/AMRZeldovichPancake/AMRZeldovichPancake.enzo", 2.5e-2, "AMR + cosmology, StopCycle-limited"),
+    # AMR+cosmology, StopCycle=5: density matches to ~7e-4; residual is the cold-gas
+    # Hubble-drag/gravity coupling at 16-cell resolution (operator split, 2e-5 at
+    # 256 cells). Gated at 1e-2 to catch regression to the old StopCycle blow-up.
+    ("Cosmology/AMRZeldovichPancake/AMRZeldovichPancake.enzo", 1e-2, "AMR + cosmology, StopCycle-limited"),
 ]
 
 # Particle-only gravity problems (no baryon fields): compare final particle
