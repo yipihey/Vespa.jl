@@ -21,11 +21,11 @@ const RUN = normpath(joinpath(@__DIR__, "..", "..", "..", "..", "run"))
 ms(ns) = ns / 1e6
 
 # ── :julia hooks (EnzoNG kernels on the live grid, via EnzoBackend) ────────────
-function julia_hydro_hook(; γ = 1.4, nghost = 3, domain = ((0.0, 1.0),))
+function julia_hydro_hook(; γ = 1.4, nghost = 3, domain = ((0.0, 1.0),), precision = Float64)
     cache = Ref{Any}(nothing); model = IdealHydro(γ)
     return function (h, level, dt)
-        if cache[] === nothing
-            mesh = EnzoGridMesh(h; grid = 0, nghost = nghost, domain = domain,
+        if cache[] === nothing || cache[][1].h != h     # run_amr frees+reinits the handle per rep
+            mesh = EnzoGridMesh(h; grid = 0, nghost = nghost, domain = domain, precision = precision,
                                 cons_density = density_index(model), cons_momentum = momentum_indices(model),
                                 cons_energy = energy_index(model))
             N = MeshInterface.n_cells(mesh)
@@ -46,7 +46,7 @@ function julia_gravity_hook(; G = 1.0, nghost = 3, domain = ((0.0, 1.0),), γ = 
     cache = Ref{Any}(nothing); rec = Ref{Any}((iters = 0, relres = NaN))
     model = IdealHydro(γ)
     hook = function (h, level, dt)
-        if cache[] === nothing
+        if cache[] === nothing || cache[][1].h != h
             mesh = EnzoGridMesh(h; grid = 0, nghost = nghost, domain = domain,
                                 cons_density = density_index(model), cons_momentum = momentum_indices(model),
                                 cons_energy = energy_index(model))
@@ -87,10 +87,12 @@ end
 function bench_hydro(; cycles = 30, warmup = 1, reps = 3)
     pf = joinpath(RUN, "Hydro", "Hydro-1D", "Toro-1-ShockTube", "Toro-1-ShockTube.enzo")
     WL = (1.0, 0.75, 1.0); WR = (0.125, 0.0, 0.1); disc = 0.3; tend = 0.2
+    hjulia(p) = EnzoLib.EngineConfig(; hydro = :julia, probe = EnzoLib.SlotProbe(),
+                                     hooks = Dict{Symbol,Function}(:hydro => julia_hydro_hook(; precision = p)))
     rows = NamedTuple[]
-    for (name, eng) in (("enzo", EnzoLib.EngineConfig(; hydro = :enzo, probe = EnzoLib.SlotProbe())),
-                        ("julia", EnzoLib.EngineConfig(; hydro = :julia, probe = EnzoLib.SlotProbe(),
-                                                       hooks = Dict{Symbol,Function}(:hydro => julia_hydro_hook()))))
+    for (name, eng) in (("enzo f64", EnzoLib.EngineConfig(; hydro = :enzo, probe = EnzoLib.SlotProbe())),
+                        ("julia f64", hjulia(Float64)),
+                        ("julia f32", hjulia(Float32)))
         for _ in 1:warmup
             EnzoLib.run_amr(pf; engine = eng, reader = EnzoLib.read_density, regrid = false, maxcycle = cycles)
         end
@@ -146,31 +148,67 @@ end
 
 function print_table(title, rows)
     println("### ", title)
-    @printf("%-7s %7s %14s %7s %10s %10s %12s %10s %6s\n",
-            "impl", "cells", "accuracy", "calls", "min ms", "med ms", "µs/cell", "MB/call", "iters")
+    @printf("%-10s %6s %16s %6s %9s %9s %11s %9s %5s %6s\n",
+            "impl", "cells", "accuracy", "calls", "min ms", "med ms", "µs/cell", "MB/call", "iters", "×base")
     base = rows[1].s.min_ns
     for r in rows
         s = r.s
-        nactive = max(r.N, 1)
-        µs_cell = s.median_ns / nactive / 1e3
+        µs_cell = s.median_ns / max(r.N, 1) / 1e3
         mb_call = s.bytes / max(s.calls, 1) / 2^20
-        speed = @sprintf("%.3g (%s)", r.acc, r.acclabel)
-        @printf("%-7s %7d %14s %7d %10.3f %10.3f %12.4f %10.4f %6s\n",
-                r.name, r.N, speed, s.calls, ms(s.min_ns), ms(s.median_ns), µs_cell, mb_call,
-                r.iters == 0 ? "—" : string(r.iters))
+        @printf("%-10s %6d %16.7g %6d %9.3f %9.3f %11.4f %9.4f %5s %6.2f\n",
+                r.name, r.N, r.acc, s.calls, ms(s.min_ns), ms(s.median_ns), µs_cell, mb_call,
+                r.iters == 0 ? "—" : string(r.iters), s.min_ns / max(base, 1))
     end
-    # headline speed ratio (min, the cleanest)
-    if length(rows) == 2
-        a, b = rows[1], rows[2]
-        ratio = b.s.min_ns / max(a.s.min_ns, 1)
-        @printf("→ %s is %.2f× the cost of %s per call (min)\n\n", b.name, ratio, a.name)
-    else
-        println()
-    end
+    @printf("(accuracy column = %s)\n\n", rows[1].acclabel)
 end
 
+# ── precision study: PURE EnzoNG (no Enzo), state persists in T ───────────────
+# The guest-on-Enzo runs above round-trip the state through Enzo's f64 BaryonField
+# every step, so f32 barely shows. Here EnzoNG owns the state in T across the whole
+# run, so the precision effect on BOTH accuracy and speed is real. Sweeping
+# resolution shows the regime: at small N the cost is compute/overhead-bound (f32
+# ≈ f64); f32's bandwidth win only appears once the field arrays stop fitting cache.
+function l1_density(sim)
+    γ, t = sim.problem.γ, sim.t
+    WL = (1.0, 0.0, 1.0); WR = (0.125, 0.0, 0.1)
+    num = 0.0; n = 0
+    for (ctr, W) in cell_samples(sim)
+        ρe = exact_riemann_sample(WL, WR, γ, (ctr[1] - 0.5) / t)[1]
+        num += abs(W[1] - ρe); n += 1
+    end
+    return num / n
+end
+
+function bench_precision(; resolutions = (256, 1024, 4096), reps = 3)
+    println("### Precision study — pure EnzoNG Sod to t=0.2 (state persists in T)")
+    @printf("%-8s %7s %14s %8s %10s %9s %8s\n",
+            "prec", "cells", "L1 vs exact", "cycles", "time ms", "µs/cell", "MB live")
+    for N in resolutions
+        prev = nothing
+        for T in (Float64, Float32)
+            prob = sod_problem_defaults(n = N)
+            mk() = Simulation(UniformMesh(prob.dims, prob.domain; T = T), prob)
+            evolve!(mk())                      # warm: compile for T + one run
+            best = Inf; sim = nothing
+            for _ in 1:reps
+                s = mk(); e = @elapsed evolve!(s); best = min(best, e); sim = s
+            end
+            cyc = sim.step
+            live = N * 5 * sizeof(T) / 2^20    # conserved state footprint
+            ratio = prev === nothing ? "" : @sprintf(" (%.2f× f64 time)", best / prev)
+            @printf("%-8s %7d %14.7g %8d %10.3f %9.5f %8.4f%s\n",
+                    string(T), N, l1_density(sim), cyc, best * 1e3, best / (N * cyc) * 1e6, live, ratio)
+            prev = T === Float64 ? best : prev
+        end
+    end
+    println()
+end
+
+# Run the live :enzo-vs-:julia slot benchmarks FIRST (Enzo C++ on a clean process),
+# then the pure-Julia precision study LAST — its heavy allocation/GC churn must not
+# precede the Enzo calls in the same process (it can perturb the C++ heap → crash).
 if !EnzoLib.grid_available()
-    @info "Session bridge not built — cannot benchmark"
+    @info "Session bridge not built — skipping the live :enzo-vs-:julia slot benchmarks"
 else
     cyc, wu, rp = 30, 1, 3
     provenance(; cycles = cyc, warmup = wu, reps = rp)
@@ -179,3 +217,5 @@ else
         print_table(title, rows)
     end
 end
+
+bench_precision(; resolutions = (256, 1024, 4096), reps = 2)   # pure EnzoNG; no Enzo bridge needed

@@ -194,7 +194,7 @@ end
 
 # interior↔interior face: +axis normal points i→j.
 @inline function _flux_face!(sim::Simulation, left::Interior, right::Interior,
-                             axis::Int, area::Float64; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing)
     i, j = left.cell, right.cell
     WL = _face_value(sim, i, axis, :hi)
     WR = _face_value(sim, j, axis, :lo)
@@ -215,7 +215,7 @@ end
 
 # hi-side domain boundary: interior cell i on the left, ghost on the right.
 @inline function _flux_face!(sim::Simulation, left::Interior, right::DomainBoundary,
-                             axis::Int, area::Float64; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing)
     i = left.cell
     WL = _face_value(sim, i, axis, :hi)
     Wg = ghost_state(WL, right.bc, axis, sim.model)
@@ -229,7 +229,7 @@ end
 
 # lo-side domain boundary: ghost on the left, interior cell j on the right.
 @inline function _flux_face!(sim::Simulation, left::DomainBoundary, right::Interior,
-                             axis::Int, area::Float64; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing)
     j = right.cell
     WR = _face_value(sim, j, axis, :lo)
     Wg = ghost_state(WR, left.bc, axis, sim.model)

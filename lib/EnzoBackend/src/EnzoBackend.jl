@@ -25,8 +25,15 @@ export EnzoGridMesh, sync_from_enzo!, sync_to_enzo!
 # The role indices are supplied by the caller FROM the EquationSet model
 # (`density_index`/`momentum_indices`/`energy_index`), so the variable choice is
 # the model's, not hardcoded here — and EnzoBackend stays free of any EnzoNG dep.
-struct EnzoGridMesh{N} <: MI.AbstractMeshBackend
-    inner::UniformMesh{N,Float64}     # uniform mesh over the active region (seam delegate)
+# T is the FIELD-STATE precision (Float64 default, Float32 for the precision/perf
+# benchmark). GEOMETRY stays Float64 (`geom`) — the hydro kernels take `area::Float64`,
+# and widths/areas are O(N) and uniform — while the conserved-state ARRAYS the
+# kernels read/write are typed T (allocated from `alloc`, a same-shape T-mesh). So
+# a Float32 mesh is an f32-STORAGE solver (the bandwidth-dominant part) with f64
+# geometry: exactly the realistic precision knob.
+struct EnzoGridMesh{N,T} <: MI.AbstractMeshBackend
+    geom::UniformMesh{N,Float64}      # geometry/topology (f64): centers, widths, areas, faces
+    alloc::UniformMesh{N,T}           # same-shape T-mesh used ONLY for field allocation/views
     h::Ptr{Cvoid}                     # live Enzo session/problem handle
     grid::Int                         # grid index in the hierarchy
     nghost::Int                       # ghost zones per side
@@ -37,42 +44,44 @@ struct EnzoGridMesh{N} <: MI.AbstractMeshBackend
 end
 
 """
-    EnzoGridMesh(h; grid=0, nghost=3, domain=((0.0,1.0),),
+    EnzoGridMesh(h; grid=0, nghost=3, domain=((0.0,1.0),), precision=Float64,
                  cons_density=1, cons_momentum=(2,3,4), cons_energy=5)
 
-Wrap live Enzo grid `grid` (a 1D hydro grid) as a seam backend. The `cons_*`
-role indices say which conserved-state components are density/momentum/energy —
-pass them from the `EquationSet` model (defaults are the ideal-hydro layout).
+Wrap live Enzo grid `grid` (a 1D hydro grid) as a seam backend. `precision` is the
+field-state element type (Float64 / Float32). The `cons_*` role indices say which
+conserved-state components are density/momentum/energy — pass them from the
+`EquationSet` model (defaults are the ideal-hydro layout).
 """
 function EnzoGridMesh(h::Ptr{Cvoid}; grid::Integer = 0, nghost::Integer = 3,
-                      domain = ((0.0, 1.0),),
+                      domain = ((0.0, 1.0),), precision::Type = Float64,
                       cons_density::Integer = 1, cons_momentum = (2, 3, 4),
                       cons_energy::Integer = 5)
-    T = EnzoLib.problem_grid_size(h, grid)
-    N = T - 2 * nghost
-    inner = UniformMesh((N,), domain)
+    gsz = EnzoLib.problem_grid_size(h, grid)
+    N = gsz - 2 * nghost
+    geom  = UniformMesh((N,), domain)                  # f64 geometry
+    alloc = UniformMesh((N,), domain; T = precision)   # T-precision field template (same shape)
     di = EnzoLib.field_index(h, 0; grid = grid)    # Density
     vi = EnzoLib.field_index(h, 4; grid = grid)    # Velocity1 (x)
     ei = EnzoLib.field_index(h, 1; grid = grid)    # TotalEnergy (specific)
-    return EnzoGridMesh{1}(inner, h, Int(grid), Int(nghost), di, vi, ei,
-                           Int(cons_density), Tuple(Int.(cons_momentum)), Int(cons_energy))
+    return EnzoGridMesh{1,precision}(geom, alloc, h, Int(grid), Int(nghost), di, vi, ei,
+                                     Int(cons_density), Tuple(Int.(cons_momentum)), Int(cons_energy))
 end
 
-# ── seam: delegate everything to the inner uniform mesh ───────────────────────
-MI.rank(m::EnzoGridMesh)        = MI.rank(m.inner)
-MI.domain(m::EnzoGridMesh)      = MI.domain(m.inner)
-MI.n_cells(m::EnzoGridMesh)     = MI.n_cells(m.inner)
-MI.max_level(m::EnzoGridMesh)   = MI.max_level(m.inner)
-MI.level_of(m::EnzoGridMesh, args...)    = MI.level_of(m.inner, args...)
-MI.cell_center(m::EnzoGridMesh, args...) = MI.cell_center(m.inner, args...)
-MI.cell_width(m::EnzoGridMesh, args...)  = MI.cell_width(m.inner, args...)
-MI.cell_volume(m::EnzoGridMesh, args...) = MI.cell_volume(m.inner, args...)
-MI.face_area(m::EnzoGridMesh, args...)   = MI.face_area(m.inner, args...)
-MI.neighbor(m::EnzoGridMesh, args...; kw...)        = MI.neighbor(m.inner, args...; kw...)
-MI.allocate_fields(m::EnzoGridMesh, args...; kw...) = MI.allocate_fields(m.inner, args...; kw...)
-MI.field_view(m::EnzoGridMesh, args...)             = MI.field_view(m.inner, args...)
-MI.for_each_cell(f, m::EnzoGridMesh; kw...) = MI.for_each_cell(f, m.inner; kw...)
-MI.for_each_face(f, m::EnzoGridMesh; kw...) = MI.for_each_face(f, m.inner; kw...)
+# ── seam: geometry/topology → f64 `geom`; field storage → T-precision `alloc` ──
+MI.rank(m::EnzoGridMesh)        = MI.rank(m.geom)
+MI.domain(m::EnzoGridMesh)      = MI.domain(m.geom)
+MI.n_cells(m::EnzoGridMesh)     = MI.n_cells(m.geom)
+MI.max_level(m::EnzoGridMesh)   = MI.max_level(m.geom)
+MI.level_of(m::EnzoGridMesh, args...)    = MI.level_of(m.geom, args...)
+MI.cell_center(m::EnzoGridMesh, args...) = MI.cell_center(m.geom, args...)
+MI.cell_width(m::EnzoGridMesh, args...)  = MI.cell_width(m.geom, args...)
+MI.cell_volume(m::EnzoGridMesh, args...) = MI.cell_volume(m.geom, args...)
+MI.face_area(m::EnzoGridMesh, args...)   = MI.face_area(m.geom, args...)
+MI.neighbor(m::EnzoGridMesh, args...; kw...)        = MI.neighbor(m.geom, args...; kw...)
+MI.allocate_fields(m::EnzoGridMesh, args...; kw...) = MI.allocate_fields(m.alloc, args...; kw...)
+MI.field_view(m::EnzoGridMesh, args...)             = MI.field_view(m.alloc, args...)
+MI.for_each_cell(f, m::EnzoGridMesh; kw...) = MI.for_each_cell(f, m.geom; kw...)
+MI.for_each_face(f, m::EnzoGridMesh; kw...) = MI.for_each_face(f, m.geom; kw...)
 
 # ── field sync: live Enzo grid ↔ EnzoNG conserved views ───────────────────────
 # Active cell i (1..N) maps to flat index nghost+i (1-based) of the column-major
@@ -83,7 +92,7 @@ function sync_from_enzo!(sv, m::EnzoGridMesh{1})
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
     vx = EnzoLib.problem_get_field(m.h, m.vi, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)     # specific total energy
-    N = MI.n_cells(m.inner)
+    N = MI.n_cells(m.geom)
     @inbounds for i in 1:N
         f = m.nghost + i
         ρ = d[f]; u = vx[f]; e = es[f]
@@ -100,7 +109,7 @@ function sync_to_enzo!(m::EnzoGridMesh{1}, sv)
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
     vx = EnzoLib.problem_get_field(m.h, m.vi, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)
-    N = MI.n_cells(m.inner)
+    N = MI.n_cells(m.geom)
     @inbounds for i in 1:N
         f = m.nghost + i
         I = CartesianIndex(i)

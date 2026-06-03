@@ -9,7 +9,7 @@
 @inline function euler_flux(W::NTuple{5,T}, γ, dim::Int) where {T}
     ρ, vx, vy, vz, p = W
     un = (vx, vy, vz)[dim]
-    E = p / (γ - 1) + T(0.5) * ρ * (vx * vx + vy * vy + vz * vz)
+    E = p / (T(γ) - one(T)) + T(0.5) * ρ * (vx * vx + vy * vy + vz * vz)
     m = (ρ * vx, ρ * vy, ρ * vz)
     pflux = (dim == 1 ? p : zero(T), dim == 2 ? p : zero(T), dim == 3 ? p : zero(T))
     return (ρ * un,
@@ -35,8 +35,9 @@ isolated waves.
     pL, pR = WL[5], WR[5]
     unL = (WL[2], WL[3], WL[4])[dim]
     unR = (WR[2], WR[3], WR[4])[dim]
-    cL = sqrt(γ * pL / ρL)
-    cR = sqrt(γ * pR / ρR)
+    g = T(γ)                          # γ at the field precision (homogeneous-T wave speeds)
+    cL = sqrt(g * pL / ρL)
+    cR = sqrt(g * pR / ρR)
 
     # Davis wave-speed estimates.
     SL = min(unL - cL, unR - cR)
