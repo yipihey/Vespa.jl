@@ -56,7 +56,7 @@ function enable_gravity!(sim::Simulation; G::Real = 1.0,
     b = sim.backend
     N = rank(b)
     gbcs = _as_bcs(bcs, N)
-    mk(name) = allocate_fields(b, FieldSpec([name]); layout = sim.layout)
+    mk(name) = allocate_fields(b, FieldSpec([name]); layout = sim.layout, eltype = _Tf(sim))
     phi = mk(:phi); rr = mk(:r); pp = mk(:p); ap = mk(:Ap); bb = mk(:b)
     v(store, name) = field_view(b, store, name)
     grav = GravityField(phi, rr, pp, ap, bb,
@@ -80,8 +80,9 @@ end
 # then add the (negated) face-gradient flux into each side.
 function apply_laplacian!(sim::Simulation, grav::GravityField, xv, outv)
     b = sim.backend
+    z = zero(eltype(outv))
     for_each_cell(b) do c
-        outv[c] = 0.0
+        outv[c] = z
     end
     for_each_face(b; bcs = grav.bcs) do left, right, axis, area
         _lap_face!(sim, left, right, axis, area, xv, outv)
@@ -94,10 +95,11 @@ end
 # A=−∇²·V we subtract it from i and add it to j (giving +area/d on each diagonal,
 # −area/d symmetric off-diagonal — the SPD Poisson stencil).
 @inline function _lap_face!(sim::Simulation, left::Interior, right::Interior,
-                            axis::Int, area::Float64, xv, outv)
+                            axis::Int, area::Real, xv, outv)
     i, j = left.cell, right.cell
+    T = eltype(outv)
     d = _face_distance(sim.backend, i, j, axis)
-    gflux = (xv[j] - xv[i]) / d * area
+    gflux = (xv[j] - xv[i]) / T(d) * T(area)        # field precision
     outv[i] -= gflux
     outv[j] += gflux
     return nothing
@@ -106,21 +108,22 @@ end
 # Domain boundary: default to homogeneous Neumann (∂φ/∂n = 0) — zero gradient
 # flux, the natural "isolated" default. (Periodic faces never reach here; they
 # resolve as Interior. Dirichlet support is a later addition.)
-@inline _lap_face!(::Simulation, ::Interior, ::DomainBoundary, ::Int, ::Float64, xv, outv) = nothing
-@inline _lap_face!(::Simulation, ::DomainBoundary, ::Interior, ::Int, ::Float64, xv, outv) = nothing
+@inline _lap_face!(::Simulation, ::Interior, ::DomainBoundary, ::Int, ::Real, xv, outv) = nothing
+@inline _lap_face!(::Simulation, ::DomainBoundary, ::Interior, ::Int, ::Real, xv, outv) = nothing
 
 # ── CG vector primitives over the leaf set (the conserved_totals reduction shape)
 @inline function dot_cells(sim::Simulation, av, bv)
-    s = 0.0
+    s = zero(promote_type(eltype(av), Float64))      # reduction in ≥f64
     for_each_cell(sim.backend) do c
         s += av[c] * bv[c]
     end
     return s
 end
 
-@inline function axpy_cells!(sim::Simulation, α::Float64, xv, yv)  # y += α x
+@inline function axpy_cells!(sim::Simulation, α::Real, xv, yv)  # y += α x
+    a = eltype(yv)(α)
     for_each_cell(sim.backend) do c
-        yv[c] += α * xv[c]
+        yv[c] += a * xv[c]
     end
     return nothing
 end
@@ -133,9 +136,10 @@ end
 end
 
 # p ← x + β p  (CG direction update)
-@inline function _xpby_cells!(sim::Simulation, xv, β::Float64, pv)
+@inline function _xpby_cells!(sim::Simulation, xv, β::Real, pv)
+    b = eltype(pv)(β)
     for_each_cell(sim.backend) do c
-        pv[c] = xv[c] + β * pv[c]
+        pv[c] = xv[c] + b * pv[c]
     end
     return nothing
 end
@@ -143,12 +147,13 @@ end
 # Subtract the volume-weighted mean (the physical constant mode on the AMR mesh).
 function project_zero_mean!(sim::Simulation, xv)
     b = sim.backend
-    s = 0.0; vol = 0.0
+    Tr = promote_type(eltype(xv), Float64)
+    s = zero(Tr); vol = zero(Tr)
     for_each_cell(b) do c
         v = cell_volume(b, c)
         s += xv[c] * v; vol += v
     end
-    μ = s / vol
+    μ = eltype(xv)(s / vol)
     for_each_cell(b) do c
         xv[c] -= μ
     end
@@ -168,9 +173,10 @@ end
 function _fill_poisson_rhs!(sim::Simulation, grav::GravityField)
     b = sim.backend
     di = density_index(sim.model)
-    ρ̄ = 0.0
+    Tr = _Tr(sim)
+    ρ̄ = zero(Tr)
     if grav.project_mean
-        s = 0.0; vol = 0.0
+        s = zero(Tr); vol = zero(Tr)
         for_each_cell(b) do c
             V = cell_volume(b, c)
             s += get_U(sim.sv, c)[di] * V; vol += V
@@ -181,9 +187,10 @@ function _fill_poisson_rhs!(sim::Simulation, grav::GravityField)
     # cosmology G-normalization (4πG = 1) this is (1/a)(ρ − ρ̄); a = aⁿ (the cached
     # value at the current time, φ held over the step). Non-cosmological: a = 1.
     inv_a = sim.cosmo === nothing ? 1.0 : 1.0 / sim.cosmo.a
+    T = eltype(grav.bv)
     for_each_cell(b) do c
         ρ = get_U(sim.sv, c)[di]
-        grav.bv[c] = -FOURπ * grav.G * (ρ - ρ̄) * cell_volume(b, c) * inv_a
+        grav.bv[c] = -T(FOURπ) * T(grav.G) * (T(ρ) - T(ρ̄)) * T(cell_volume(b, c)) * T(inv_a)
     end
     return nothing
 end
@@ -237,8 +244,9 @@ end
     b = sim.backend
     N = rank(b)
     φc = grav.phiv[cell]
+    T = eltype(grav.phiv)
     return ntuple(3) do d
-        d > N && return 0.0
+        d > N && return zero(T)
         # central difference: (φ_hi − φ_lo) / (d_lo + d_hi)
         nlo = neighbor(b, cell, d, :lo; bcs = grav.bcs)
         nhi = neighbor(b, cell, d, :hi; bcs = grav.bcs)
@@ -246,7 +254,7 @@ end
         whi = nhi isa Interior ? grav.phiv[nhi.cell] : φc
         dlo = nlo isa Interior ? _face_distance(b, cell, nlo.cell, d) : 0.5 * cell_width(b, cell)[d]
         dhi = nhi isa Interior ? _face_distance(b, cell, nhi.cell, d) : 0.5 * cell_width(b, cell)[d]
-        -(whi - wlo) / (dlo + dhi)            # g_d = −∂φ/∂x_d
+        -(whi - wlo) / T(dlo + dhi)            # g_d = −∂φ/∂x_d (field precision)
     end
 end
 
@@ -267,10 +275,11 @@ function apply_gravity_source!(sim::Simulation, grav::GravityField; level = noth
     mom = momentum_indices(sim.model)
     ei = energy_index(sim.model)
     di = density_index(sim.model)
+    Tf = _Tf(sim)
     for_each_cell(b; level = level) do c
         U = get_U(sim.sv, c)
         ρ = U[di]
-        V = cell_volume(b, c)
+        V = Tf(cell_volume(b, c))                    # geometry → field precision
         g = gravity_accel(sim, grav, c)
         @inbounds for d in 1:rank(b)
             mi = mom[d]
@@ -282,6 +291,6 @@ function apply_gravity_source!(sim::Simulation, grav::GravityField; level = noth
 end
 
 # Free-fall timestep limiter, folded into the CFL reduction: dt ≲ η/√(4πGρ).
-@inline _gravity_invdt(grav::GravityField, ρ::Float64) =
+@inline _gravity_invdt(grav::GravityField, ρ::Real) =
     ρ > 0 ? sqrt(FOURπ * grav.G * ρ) / GRAV_DT_ETA : 0.0
 const GRAV_DT_ETA = 0.5

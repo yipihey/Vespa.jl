@@ -193,16 +193,17 @@ semi-implicit operator-split step, with `a`, `dadt` time-centered at n+½. With
 this is exactly: momentum density ×`(1−½C)/(1+½C)`, energy density ×`(1−C)/(1+C)`.
 The energy factor is exact for γ=5/3 (Enzo's note: "extra term missing if γ≠5/3").
 """
-function apply_expansion_terms!(sim::Simulation, dt::Float64, a::Float64, dadt::Float64)
-    C  = dt * dadt / a
+function apply_expansion_terms!(sim::Simulation, dt::Real, a::Real, dadt::Real)
+    C  = dt * dadt / a                         # expansion bookkeeping (geometry/time precision)
     fv = (1.0 - 0.5 * C) / (1.0 + 0.5 * C)     # peculiar-velocity redshift (rate ȧ/a)
     fe = (1.0 - C) / (1.0 + C)                 # total energy (rate 2ȧ/a)
     mom = momentum_indices(sim.model); ei = energy_index(sim.model)
     sv = sim.sv
+    Tf = _Tf(sim); fvT = Tf(fv); feT = Tf(fe)  # → field precision at the boundary
     for_each_cell(sim.backend) do c
         U = get_U(sv, c)
         # momenta redshift, energy decays, all other variables unchanged
-        set_U!(sv, c, ntuple(k -> k in mom ? U[k] * fv : (k == ei ? U[k] * fe : U[k]),
+        set_U!(sv, c, ntuple(k -> k in mom ? U[k] * fvT : (k == ei ? U[k] * feT : U[k]),
                              nvars_val(sim.model)))
     end
     return nothing
