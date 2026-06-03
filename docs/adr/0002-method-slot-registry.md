@@ -1,6 +1,6 @@
 # ADR-0002: Method-Slot Registry (mix-and-match legacy/Julia physics)
 
-- **Status:** Proposed (scope)
+- **Status:** Accepted — Phases A/B/C implemented (`lib/EnzoLib`, `test_method_slots.jl`)
 - **Date:** 2026-06-03
 - **Deciders:** T. Abel
 - **Builds on:** ADR-0001 (architecture), the EnzoLib integration layer
@@ -151,9 +151,33 @@ quicksuite harness is the per-run gate.
 - **Refactor risk in Phase A** is low but real — it touches the hot orchestration
   path; the all-`:enzo` default + the bit-for-bit quicksuite gate de-risk it.
 
+## Implementation status (2026-06-03)
+
+- **Phase A — done.** `EngineConfig`/`run_slot`/`engine_from_flags` in
+  `lib/EnzoLib/src/session.jl`; `evolve_level!`/`run_amr` route every physics step
+  through `run_slot`. All-`:enzo` default is bit-for-bit identical to before
+  (curated suite unchanged). Data-contract refinement found in testing: Enzo's
+  flux-register machinery (`clear/create/finalize_fluxes`) is the **`:enzo` hydro's**
+  conservation bookkeeping, so it is gated to `eng.hydro === :enzo` — a `:julia`
+  hydro owns its own conservation (single-grid per scope).
+- **Phase B — done.** `EngineConfig(hydro=:julia)` routes hydro to an EnzoBackend
+  hook running EnzoNG's unchanged driver on the live grid; Toro-1 via the registry
+  matches the exact Riemann oracle to L1=0.012 (`test_method_slots.jl`).
+- **Phase C — done (solver port certified on live memory).** `gravity=:julia`
+  runs EnzoNG's matrix-free CG Poisson on the **live Enzo grid's baryon density**
+  (ZeldovichPancake, 256 cells): converges to relres 8.4e-9 in 75 iters, potential
+  anti-correlates with density at −0.997 (wells at overdensities). This is the
+  first NEW physics solver running on live Enzo memory through the registry.
+  **Remaining for full gravity coupling:** a `set_acceleration_field` bridge so a
+  `:julia` gravity slot can feed an `:enzo` hydro (today it certifies the solve;
+  the evolution-level coupling either writes AccelerationField or pairs with a
+  `:julia` hydro). No non-cosmological 1D single-grid baryon self-gravity problem
+  exists in the quicksuite, so a per-run gravity certification needs either the
+  bridge or a purpose-built problem.
+
 ## Status of prerequisites
 
 Done: Julia `EvolveLevel`, the bridge step surface, `EnzoBackend` (1D
-single-grid), `EquationSet`, the certification harness, hydro `:julia` slot.
-Needed for the registry itself: only Phase A's refactor. Needed to make it
-*valuable*: at least one new `:julia` port (Phase C, gravity).
+single-grid), `EquationSet`, the certification harness, hydro + gravity `:julia`
+slots (A/B/C above). Next levers: the `set_acceleration_field` bridge (full
+gravity coupling) and the ND/AMR `EnzoBackend` (`:julia` slots under AMR).

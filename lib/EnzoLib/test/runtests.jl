@@ -10,4 +10,5 @@ using EnzoNG, MeshInterface, RefMesh
     include("test_amr_replication.jl")     # E4: Julia recursive EvolveLevel ≈ Enzo AMR (if grid lib built)
     include("test_enzo_suite.jl")          # SUITE: Enzo test problems (Sod/Toro-AMR/BrioWu) ≡ Enzo (if grid lib built)
     include("test_enzo_backend.jl")        # E5: EnzoNG driver through the seam on a live Enzo grid (if grid lib built)
+    include("test_method_slots.jl")        # ADR-0002: method-slot registry, hydro/gravity :julia slots (if grid lib built)
 end

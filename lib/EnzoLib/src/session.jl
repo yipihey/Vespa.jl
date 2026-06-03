@@ -386,7 +386,13 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                                     Dict{Symbol,Function}(:hydro => hydro!))
     rec(l, dta) = evolve_level!(h, l, dta; engine = eng, regrid = regrid, maxsub = maxsub)
     ct = eng.mhd_ct !== :off
-    session_clear_boundary_fluxes(h, level)
+    # Enzo's flux-register machinery (clear/create/finalize/project) is the :enzo
+    # hydro's conservation bookkeeping — SolveHydroEquations fills SubgridFluxes,
+    # finalize/project consume them. A :julia hydro slot does NOT fill them, so the
+    # registers are gated to :enzo hydro (a :julia slot owns its own conservation;
+    # it is single-grid per ADR-0002 until the ND/AMR backend lands).
+    ef = eng.hydro === :enzo
+    ef && session_clear_boundary_fluxes(h, level)
     ct && level > 0 && session_clear_avg_electric_field(h, level)   # CT EMF accumulator (EvolveLevel.C:377)
     done = 0.0; n = 0
     while n < maxsub
@@ -395,10 +401,10 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         dt_above > 0.0 && (dt = min(dt, dt_above - done))
         session_set_dt(h, dt, level)
         run_slot(:radiation, eng, h, level, dt)
-        session_create_fluxes(h, level)
+        ef && session_create_fluxes(h, level)
         run_slot(:gravity, eng, h, level, dt)
         session_copy_baryon_to_old(h, level)
-        run_slot(:hydro, eng, h, level, dt)                  # fills boundary fluxes
+        run_slot(:hydro, eng, h, level, dt)                  # :enzo fills boundary fluxes; :julia owns its own
         run_slot(:cooling, eng, h, level, dt)
         run_slot(:star_formation, eng, h, level, dt)
         session_update_particles(h, level)
@@ -412,7 +418,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         end
         ct && session_mhd_update_magnetic_field(h, level)    # CT B from EMF (EvolveLevel.C:899, every level)
         ct && session_set_boundary(h, level)                 # UseMHDCT: refresh face-B ghosts (EvolveLevel.C:912)
-        session_finalize_fluxes(h, level)
+        ef && session_finalize_fluxes(h, level)
         n += 1; done += dt
         (last || dt <= 0.0) && break
         regrid && session_rebuild(h, level)                  # regrid finer levels
