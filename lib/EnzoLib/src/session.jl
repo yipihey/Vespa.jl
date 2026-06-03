@@ -294,6 +294,33 @@ end
 # :julia slot is supplied as a hook closure `(h, level, dt)` by the integration
 # layer (which has EnzoNG/EnzoBackend). The AMR/conservation plumbing (boundaries,
 # flux registers, projection, regrid) is NOT a slot — it always runs.
+
+# ── performance probe (ADR-0002 reporting) ───────────────────────────────────
+# A zero-overhead-WHEN-ABSENT accumulator wired into run_slot. It times each
+# physics-slot CALL — a whole hydro/gravity step, so the ~20 ns `time_ns()` pair
+# is <1e-4 of the work and never an observer effect. When the engine's `probe` is
+# `nothing`, run_slot compiles to the bare call (production pays nothing). The
+# per-call sample is pushed AFTER the timed window, so bookkeeping never pollutes
+# the measurement. Allocation bytes per slot come from `Base.gc_bytes()` deltas.
+mutable struct SlotProbe
+    ns::Dict{Symbol,Vector{Int}}        # per-slot per-call wall-time samples (ns)
+    bytes::Dict{Symbol,Int}             # per-slot total allocated bytes
+end
+SlotProbe() = SlotProbe(Dict{Symbol,Vector{Int}}(), Dict{Symbol,Int}())
+reset!(p::SlotProbe) = (empty!(p.ns); empty!(p.bytes); p)
+
+"Per-slot timing summary: slot ⇒ (calls, min_ns, median_ns, total_ns, bytes)."
+function probe_summary(p::SlotProbe)
+    out = Dict{Symbol,NamedTuple}()
+    for (slot, samp) in p.ns
+        s = sort(samp); n = length(s)
+        out[slot] = (calls = n, min_ns = n == 0 ? 0 : s[1],
+                     median_ns = n == 0 ? 0 : s[(n + 1) ÷ 2],
+                     total_ns = sum(s; init = 0), bytes = get(p.bytes, slot, 0))
+    end
+    return out
+end
+
 """
     EngineConfig(; hydro=:enzo, gravity=:off, cooling=:off, comoving_expansion=:off,
                  mhd_ct=:off, radiation=:off, star_formation=:off, star_sources=false,
@@ -314,13 +341,15 @@ struct EngineConfig
     star_formation::Symbol
     star_sources::Bool                  # radiation sub-flag (not a slot)
     hooks::Dict{Symbol,Function}
+    probe::Union{Nothing,SlotProbe}     # nothing ⇒ no timing (zero overhead)
 end
 function EngineConfig(; hydro::Symbol = :enzo, gravity::Symbol = :off, cooling::Symbol = :off,
                       comoving_expansion::Symbol = :off, mhd_ct::Symbol = :off,
                       radiation::Symbol = :off, star_formation::Symbol = :off,
-                      star_sources::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}())
+                      star_sources::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}(),
+                      probe::Union{Nothing,SlotProbe} = nothing)
     EngineConfig(hydro, gravity, cooling, comoving_expansion, mhd_ct, radiation,
-                 star_formation, star_sources, hooks)
+                 star_formation, star_sources, hooks, probe)
 end
 
 # Build a config from the legacy boolean flags (every active slot → :enzo) so the
@@ -347,16 +376,25 @@ enzo_slot(::Val{:comoving_expansion}, h, level, dt, cfg) = session_comoving_expa
 enzo_slot(::Val{:radiation}, h, level, dt, cfg) = session_evolve_photons(h, level; stars = cfg.star_sources)
 enzo_slot(::Val{:star_formation}, h, level, dt, cfg) = session_star_particles(h, level)
 
+# Run the resolved implementation of `slot` (impl is :enzo or :julia here).
+@inline _slot_impl(slot, impl, cfg, h, level, dt) =
+    impl === :julia ? cfg.hooks[slot](h, level, dt) : enzo_slot(Val(slot), h, level, dt, cfg)
+
 # Dispatch a slot on (h, level, dt): :off no-op; :julia injected hook; :enzo bridge.
+# When a probe is attached, time the call (sample pushed AFTER the timed window).
 function run_slot(slot::Symbol, cfg::EngineConfig, h::Handle, level::Integer, dt::Float64)
     impl = getfield(cfg, slot)
     impl === :off && return nothing
-    if impl === :julia
-        hook = get(cfg.hooks, slot, nothing)
-        hook === nothing && error("EngineConfig: slot :$slot is :julia but no hook was provided")
-        return hook(h, level, dt)
-    end
-    return enzo_slot(Val(slot), h, level, dt, cfg)
+    impl === :julia && !haskey(cfg.hooks, slot) &&
+        error("EngineConfig: slot :$slot is :julia but no hook was provided")
+    cfg.probe === nothing && return _slot_impl(slot, impl, cfg, h, level, dt)
+    p = cfg.probe
+    a0 = Base.gc_bytes(); t0 = time_ns()
+    r = _slot_impl(slot, impl, cfg, h, level, dt)
+    el = Int(time_ns() - t0); da = Int(Base.gc_bytes() - a0)
+    push!(get!(() -> Int[], p.ns, slot), el)           # bookkeeping outside the timed window
+    p.bytes[slot] = get(p.bytes, slot, 0) + da
+    return r
 end
 
 # ── AMR: the recursive EvolveLevel, written in Julia on the certified steps ───
