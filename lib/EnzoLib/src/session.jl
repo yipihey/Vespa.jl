@@ -287,9 +287,81 @@ function _stop_cycle(paramfile::AbstractString)
     return 100000
 end
 
+# ── method-slot registry (ADR-0002) ──────────────────────────────────────────
+# Each physics step in the EvolveLevel skeleton is a SLOT resolving to
+# :off (skip), :enzo (the certified legacy bridge step), or :julia (an injected
+# EnzoNG kernel running on the live grid). EnzoLib has no EnzoNG dependency, so a
+# :julia slot is supplied as a hook closure `(h, level, dt)` by the integration
+# layer (which has EnzoNG/EnzoBackend). The AMR/conservation plumbing (boundaries,
+# flux registers, projection, regrid) is NOT a slot — it always runs.
+"""
+    EngineConfig(; hydro=:enzo, gravity=:off, cooling=:off, comoving_expansion=:off,
+                 mhd_ct=:off, radiation=:off, star_formation=:off, star_sources=false,
+                 hooks=Dict{Symbol,Function}())
+
+Per-slot implementation map for the Julia-driven EvolveLevel. Each physics slot is
+`:off | :enzo | :julia`; a `:julia` slot must have a matching entry in `hooks`
+(a `(h, level, dt)` closure). `all_enzo()`-equivalent (every active slot `:enzo`)
+is full replication and reproduces `EvolveHierarchy`.
+"""
+struct EngineConfig
+    hydro::Symbol
+    gravity::Symbol
+    cooling::Symbol
+    comoving_expansion::Symbol
+    mhd_ct::Symbol
+    radiation::Symbol
+    star_formation::Symbol
+    star_sources::Bool                  # radiation sub-flag (not a slot)
+    hooks::Dict{Symbol,Function}
+end
+function EngineConfig(; hydro::Symbol = :enzo, gravity::Symbol = :off, cooling::Symbol = :off,
+                      comoving_expansion::Symbol = :off, mhd_ct::Symbol = :off,
+                      radiation::Symbol = :off, star_formation::Symbol = :off,
+                      star_sources::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}())
+    EngineConfig(hydro, gravity, cooling, comoving_expansion, mhd_ct, radiation,
+                 star_formation, star_sources, hooks)
+end
+
+# Build a config from the legacy boolean flags (every active slot → :enzo) so the
+# existing flag-based callers keep their exact behaviour (full replication).
+function engine_from_flags(; hydro::Symbol = :enzo, gravity::Bool = false, cooling::Bool = false,
+                           radiation::Bool = false, star_sources::Bool = false,
+                           star_formation::Bool = false, cosmology::Bool = false,
+                           mhdct::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}())
+    EngineConfig(; hydro = hydro,
+                 gravity = gravity ? :enzo : :off,
+                 cooling = cooling ? :enzo : :off,
+                 comoving_expansion = cosmology ? :enzo : :off,
+                 mhd_ct = mhdct ? :enzo : :off,
+                 radiation = radiation ? :enzo : :off,
+                 star_formation = star_formation ? :enzo : :off,
+                 star_sources = star_sources, hooks = hooks)
+end
+
+# The :enzo (legacy bridge) implementation of each single-call physics slot.
+enzo_slot(::Val{:hydro}, h, level, dt, cfg) = session_solve_hydro(h, level)
+enzo_slot(::Val{:gravity}, h, level, dt, cfg) = session_gravity(h, level)
+enzo_slot(::Val{:cooling}, h, level, dt, cfg) = session_solve_cooling(h, level)
+enzo_slot(::Val{:comoving_expansion}, h, level, dt, cfg) = session_comoving_expansion(h, level)
+enzo_slot(::Val{:radiation}, h, level, dt, cfg) = session_evolve_photons(h, level; stars = cfg.star_sources)
+enzo_slot(::Val{:star_formation}, h, level, dt, cfg) = session_star_particles(h, level)
+
+# Dispatch a slot on (h, level, dt): :off no-op; :julia injected hook; :enzo bridge.
+function run_slot(slot::Symbol, cfg::EngineConfig, h::Handle, level::Integer, dt::Float64)
+    impl = getfield(cfg, slot)
+    impl === :off && return nothing
+    if impl === :julia
+        hook = get(cfg.hooks, slot, nothing)
+        hook === nothing && error("EngineConfig: slot :$slot is :julia but no hook was provided")
+        return hook(h, level, dt)
+    end
+    return enzo_slot(Val(slot), h, level, dt, cfg)
+end
+
 # ── AMR: the recursive EvolveLevel, written in Julia on the certified steps ───
 """
-    evolve_level!(h, level, dt_above; hydro!, regrid=true) -> ncycles
+    evolve_level!(h, level, dt_above; engine=EngineConfig(), regrid=true) -> ncycles
 
 Julia reimplementation of Enzo's recursive `EvolveLevel`, built entirely from the
 certified Session steps (mirrors EnzoModules' Python `evolve_level`): clear the
@@ -300,44 +372,46 @@ finer levels between sub-cycles. `dt_above == 0` ⇒ a single (top-grid) step.
 `hydro!(h, level, dt)` is the swappable hydro slot.
 """
 function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
-                       hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
+                       engine::Union{EngineConfig,Nothing} = nothing, hydro! = nothing,
                        regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                        radiation::Bool = false, star_sources::Bool = false,
                        star_formation::Bool = false, cosmology::Bool = false,
                        mhdct::Bool = false, maxsub::Int = 100000)
-    rec(l, dta) = evolve_level!(h, l, dta; hydro! = hydro!, regrid = regrid, gravity = gravity,
-                                cooling = cooling, radiation = radiation, star_sources = star_sources,
-                                star_formation = star_formation, cosmology = cosmology,
-                                mhdct = mhdct, maxsub = maxsub)
+    eng = engine !== nothing ? engine :
+          engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
+                            gravity = gravity, cooling = cooling, radiation = radiation,
+                            star_sources = star_sources, star_formation = star_formation,
+                            cosmology = cosmology, mhdct = mhdct,
+                            hooks = hydro! === nothing ? Dict{Symbol,Function}() :
+                                    Dict{Symbol,Function}(:hydro => hydro!))
+    rec(l, dta) = evolve_level!(h, l, dta; engine = eng, regrid = regrid, maxsub = maxsub)
+    ct = eng.mhd_ct !== :off
     session_clear_boundary_fluxes(h, level)
-    mhdct && level > 0 && session_clear_avg_electric_field(h, level)  # CT EMF accumulator (EvolveLevel.C:377)
+    ct && level > 0 && session_clear_avg_electric_field(h, level)   # CT EMF accumulator (EvolveLevel.C:377)
     done = 0.0; n = 0
     while n < maxsub
         session_set_boundary(h, level)                       # interpolate from parent
         dt = session_compute_dt(h, level)
         dt_above > 0.0 && (dt = min(dt, dt_above - done))
         session_set_dt(h, dt, level)
-        radiation && session_evolve_photons(h, level; stars = star_sources)
+        run_slot(:radiation, eng, h, level, dt)
         session_create_fluxes(h, level)
-        gravity && session_gravity(h, level)
+        run_slot(:gravity, eng, h, level, dt)
         session_copy_baryon_to_old(h, level)
-        hydro!(h, level, dt)                                 # fills boundary fluxes
-        cooling && session_solve_cooling(h, level)
-        star_formation && session_star_particles(h, level)
+        run_slot(:hydro, eng, h, level, dt)                  # fills boundary fluxes
+        run_slot(:cooling, eng, h, level, dt)
+        run_slot(:star_formation, eng, h, level, dt)
         session_update_particles(h, level)
         session_advance_time(h, level)
-        cosmology && session_comoving_expansion(h, level)    # Hubble drag (EvolveLevel.C)
+        run_slot(:comoving_expansion, eng, h, level, dt)     # Hubble drag (EvolveLevel.C)
         last = dt_above <= 0.0 || done + dt >= dt_above * (1 - 1e-6)
         if session_num_grids_on_level(h, level + 1) > 0
             session_set_boundary(h, level)                   # refresh before projection
             rec(level + 1, dt)
             session_update_from_finer(h, level)              # project + flux-correct (+ MHD_ProjectFace for CT)
         end
-        # CT: recompute B from the EMF; on level>0 this ALSO accumulates this grid's
-        # AvgElectricField that the parent's MHD_ProjectFace reads — so it must run on
-        # EVERY level (incl. leaves), unconditional like EvolveLevel.C:899.
-        mhdct && session_mhd_update_magnetic_field(h, level)
-        mhdct && session_set_boundary(h, level)              # UseMHDCT: refresh face-B ghosts (EvolveLevel.C:912)
+        ct && session_mhd_update_magnetic_field(h, level)    # CT B from EMF (EvolveLevel.C:899, every level)
+        ct && session_set_boundary(h, level)                 # UseMHDCT: refresh face-B ghosts (EvolveLevel.C:912)
         session_finalize_fluxes(h, level)
         n += 1; done += dt
         (last || dt <= 0.0) && break
@@ -362,11 +436,18 @@ Mirrors `EvolveHierarchy` / Python `run_amr`; the physics flags enable the
 corresponding certified Session steps each cycle.
 """
 function run_amr(paramfile::AbstractString; reader = read_density,
-                 hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
+                 engine::Union{EngineConfig,Nothing} = nothing, hydro! = nothing,
                  regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                  radiation::Bool = false, star_sources::Bool = false,
                  star_formation::Bool = false, cosmology::Bool = false,
                  mhdct::Bool = false, maxcycle::Int = 100000)
+    eng = engine !== nothing ? engine :
+          engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
+                            gravity = gravity, cooling = cooling, radiation = radiation,
+                            star_sources = star_sources, star_formation = star_formation,
+                            cosmology = cosmology, mhdct = mhdct,
+                            hooks = hydro! === nothing ? Dict{Symbol,Function}() :
+                                    Dict{Symbol,Function}(:hydro => hydro!))
     pf = abspath(paramfile)
     maxcycle = min(maxcycle, _stop_cycle(pf))    # honor the param file's StopCycle (as EvolveHierarchy does)
     cd(_workdir(pf)) do
@@ -376,9 +457,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
             regrid && session_rebuild(h, 0)
             n = 0
             while session_time(h) < session_stop_time(h) && n < maxcycle
-                evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid, gravity = gravity,
-                              cooling = cooling, radiation = radiation, star_sources = star_sources,
-                              star_formation = star_formation, cosmology = cosmology, mhdct = mhdct)
+                evolve_level!(h, 0, 0.0; engine = eng, regrid = regrid)
                 regrid && session_rebuild(h, 0)
                 n += 1
             end
