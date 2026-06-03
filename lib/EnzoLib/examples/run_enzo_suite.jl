@@ -52,7 +52,15 @@ function run_one(enzo_path; timeout = 200)
     err = ei === nothing ? NaN : parse(Float64, replace(parts[ei], "err=" => ""))
     ni = findfirst(p -> startswith(p, "nfields="), parts)
     nf = ni === nothing ? -1 : parse(Int, replace(parts[ni], "nfields=" => ""))
-    nf == 0 && return ("particle_only", "no baryon fields", NaN)   # e.g. GravityTest/TestOrbit
+    pei = findfirst(p -> startswith(p, "perr="), parts)
+    perr = pei === nothing ? NaN : parse(Float64, replace(parts[pei], "perr=" => ""))
+    npi = findfirst(p -> startswith(p, "nparticles="), parts)
+    npart = npi === nothing ? 0 : parse(Int, replace(parts[npi], "nparticles=" => ""))
+    # No baryon fields → it's a particle problem; judge by particle-position error.
+    if nf == 0
+        npart == 0 && return ("particle_only", "no fields/particles", NaN)
+        return (status, "particles=$npart", perr)   # GravityTest / TestOrbit
+    end
     return (status, "", err)
 end
 

@@ -128,6 +128,52 @@ function problem_set_field(h::Handle, fi::Integer, data::Vector{Float64}; grid::
     return nothing
 end
 
+# ── particles (positions) ────────────────────────────────────────────────────
+"Spatial rank (1/2/3) of a grid."
+problem_grid_rank(h::Handle, grid::Integer = 0) =
+    Int(ccall(_gsym(:enzomodules_problem_grid_rank), Cint, (Handle, Cint), h, grid))
+"Number of particles living on `grid`."
+problem_num_particles(h::Handle, grid::Integer = 0) =
+    Int(ccall(_gsym(:enzomodules_problem_num_particles), Cint, (Handle, Cint), h, grid))
+"Particle positions along axis `dim` (0-based) on `grid`, in code units."
+function problem_get_particle_pos(h::Handle, dim::Integer, grid::Integer = 0)
+    np = problem_num_particles(h, grid)
+    out = zeros(Float64, np)
+    np == 0 && return out
+    ccall(_gsym(:enzomodules_problem_get_particle_pos), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, out)
+    return out
+end
+
+"""
+    read_particles(h) -> Matrix{Float64} (Nparticles × rank)
+
+Gather every particle's position across ALL grids of the hierarchy into one
+`Np × rank` matrix (code units). Both the Enzo `EvolveHierarchy` reference and the
+Julia-driven `EvolveLevel` move the same particles with the same Enzo routines, so
+the resulting point sets agree (bit-for-bit single-grid; AMR-ordering otherwise).
+"""
+function read_particles(h::Handle)
+    ng = problem_num_grids(h)
+    rank = ng > 0 ? problem_grid_rank(h, 0) : 3
+    blocks = Matrix{Float64}[]
+    for g in 0:ng-1
+        np = problem_num_particles(h, g)
+        np == 0 && continue
+        M = Matrix{Float64}(undef, np, rank)
+        for d in 0:rank-1
+            M[:, d+1] = problem_get_particle_pos(h, d, g)
+        end
+        push!(blocks, M)
+    end
+    isempty(blocks) && return Matrix{Float64}(undef, 0, rank)
+    return reduce(vcat, blocks)
+end
+
+"All baryon fields AND particle positions of the hierarchy: (fields=Dict, particles=Matrix)."
+read_state(h::Handle; grid::Integer = 0) =
+    (fields = read_all_fields(h; grid = grid), particles = read_particles(h))
+
 "0-based field index of a given Enzo `FieldType` (Density=0, TotalEnergy=1, Velocity1=4)."
 function field_index(h::Handle, ftype::Integer; grid::Integer = 0)
     i = findfirst(==(ftype), problem_field_types(h, grid))
@@ -207,6 +253,17 @@ function reference_density(paramfile::AbstractString)
     end
 end
 
+# Enzo's StopCycle from a .enzo param file (top-grid cycle limit; default 100000,
+# i.e. effectively unlimited — StopTime governs). EvolveHierarchy honors this, so
+# the Julia-driven loop must too, or it runs to a different epoch than the reference.
+function _stop_cycle(paramfile::AbstractString)
+    for ln in eachline(paramfile)
+        m = match(r"^\s*StopCycle\s*=\s*([0-9]+)", ln)
+        m === nothing || return parse(Int, m.captures[1])
+    end
+    return 100000
+end
+
 # ── AMR: the recursive EvolveLevel, written in Julia on the certified steps ───
 """
     evolve_level!(h, level, dt_above; hydro!, regrid=true) -> ncycles
@@ -279,6 +336,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
                  radiation::Bool = false, star_sources::Bool = false,
                  star_formation::Bool = false, cosmology::Bool = false, maxcycle::Int = 100000)
     pf = abspath(paramfile)
+    maxcycle = min(maxcycle, _stop_cycle(pf))    # honor the param file's StopCycle (as EvolveHierarchy does)
     cd(mktempdir()) do
         h = session_init(pf)
         h == C_NULL && error("session_init failed for $pf")
@@ -303,6 +361,8 @@ end
 run_amr_density(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader = read_density, kwargs...)
 "AMR run returning ALL root-grid fields (Dict FieldType ⇒ vector)."
 run_amr_fields(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader = read_all_fields, kwargs...)
+"AMR run returning both root-grid fields and all particle positions: (fields, particles)."
+run_amr_state(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader = read_state, kwargs...)
 
 "Enzo's own `EvolveHierarchy` to StopTime, returning ALL root-grid fields — the reference."
 function evolve_problem_fields(paramfile::AbstractString; grid::Integer = 0)
@@ -312,6 +372,20 @@ function evolve_problem_fields(paramfile::AbstractString; grid::Integer = 0)
         h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
         try
             return read_all_fields(h; grid = grid)
+        finally
+            free_problem(h)
+        end
+    end
+end
+
+"Enzo's own `EvolveHierarchy` to StopTime, returning (fields, particles) — the reference."
+function evolve_problem_state(paramfile::AbstractString; grid::Integer = 0)
+    pf = abspath(paramfile)
+    cd(mktempdir()) do
+        h = evolve_problem(pf, 0.0, 0)
+        h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
+        try
+            return read_state(h; grid = grid)
         finally
             free_problem(h)
         end

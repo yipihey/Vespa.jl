@@ -43,6 +43,35 @@ function _max_field_error(dj::Dict{Int,Vector{Float64}}, de::Dict{Int,Vector{Flo
     return (err = maxerr, worst = worst, nfields = length(common))
 end
 
+# Order-independent particle-position agreement: for each Julia particle, the
+# distance to the nearest Enzo particle (matching is robust to cross-grid gather
+# ordering), max over particles, normalized by the point-cloud extent. ≈0 means
+# the two runs put the particles in the same places. Both pj/pe are Np×rank.
+function _max_particle_error(pj::AbstractMatrix, pe::AbstractMatrix)
+    (size(pj, 1) == 0 || size(pe, 1) == 0) && return (err = NaN, nparticles = 0)
+    size(pj, 2) == size(pe, 2) || return (err = Inf, nparticles = size(pj, 1))
+    # normalize by the largest per-axis span of the reference cloud (domain scale)
+    scale = 0.0
+    for d in 1:size(pe, 2)
+        col = @view pe[:, d]
+        scale = max(scale, maximum(col) - minimum(col))
+    end
+    scale += 1e-30
+    worst = 0.0
+    @inbounds for i in 1:size(pj, 1)
+        best = Inf
+        for j in 1:size(pe, 1)
+            s = 0.0
+            for d in 1:size(pj, 2)
+                δ = pj[i, d] - pe[j, d]; s += δ * δ
+            end
+            s < best && (best = s)
+        end
+        worst = max(worst, sqrt(best))
+    end
+    return (err = worst / scale, nparticles = size(pj, 1))
+end
+
 # The serial (use-mpi-no) build's root-grid FFT gravity solver requires
 # UnigridTranspose=0 (the default 2 is MPI-only); patch a temp copy of the .enzo
 # for self-gravitating problems so BOTH runs use identical parameters.
@@ -65,10 +94,12 @@ error between them on the root grid. `err ≈ 0` for single-grid (bit-for-bit),
 function compare_problem(pf0::AbstractString)
     fl = problem_flags(pf0)
     pf = paramfile_for(pf0)
-    de = EnzoLib.evolve_problem_fields(pf)
-    dj = EnzoLib.run_amr_fields(pf; gravity = fl.gravity, cooling = fl.cooling,
-                                radiation = fl.radiation, star_sources = fl.star_sources,
-                                star_formation = fl.star_formation, cosmology = fl.cosmology)
-    r = _max_field_error(dj, de)
-    return (err = r.err, worst = r.worst, nfields = r.nfields, flags = fl)
+    se = EnzoLib.evolve_problem_state(pf)
+    sj = EnzoLib.run_amr_state(pf; gravity = fl.gravity, cooling = fl.cooling,
+                               radiation = fl.radiation, star_sources = fl.star_sources,
+                               star_formation = fl.star_formation, cosmology = fl.cosmology)
+    r = _max_field_error(sj.fields, se.fields)
+    p = _max_particle_error(sj.particles, se.particles)
+    return (err = r.err, worst = r.worst, nfields = r.nfields,
+            perr = p.err, nparticles = p.nparticles, flags = fl)
 end
