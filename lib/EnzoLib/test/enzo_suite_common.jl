@@ -21,9 +21,10 @@ function problem_flags(pf::AbstractString)
     cool = enzo_param(pf, "RadiativeCooling") != 0 || enzo_param(pf, "MultiSpecies") != 0
     rad  = enzo_param(pf, "RadiativeTransfer") != 0
     star = enzo_param(pf, "StarParticleCreation") != 0
+    cosmo = enzo_param(pf, "ComovingCoordinates") != 0
     hm   = Int(enzo_param(pf, "HydroMethod"))
     return (gravity = g, cooling = cool, radiation = rad,
-            star_formation = star, star_sources = star, hydromethod = hm)
+            star_formation = star, star_sources = star, cosmology = cosmo, hydromethod = hm)
 end
 
 # Per-field L∞ error normalized by the field's magnitude (robust for near-zero
@@ -42,6 +43,17 @@ function _max_field_error(dj::Dict{Int,Vector{Float64}}, de::Dict{Int,Vector{Flo
     return (err = maxerr, worst = worst, nfields = length(common))
 end
 
+# The serial (use-mpi-no) build's root-grid FFT gravity solver requires
+# UnigridTranspose=0 (the default 2 is MPI-only); patch a temp copy of the .enzo
+# for self-gravitating problems so BOTH runs use identical parameters.
+function paramfile_for(pf::AbstractString)
+    problem_flags(pf).gravity || return pf
+    tmp = tempname() * ".enzo"
+    cp(pf, tmp)
+    open(tmp, "a") do io; println(io, "\nUnigridTranspose = 0"); end
+    return tmp
+end
+
 """
     compare_problem(enzo_file) -> NamedTuple
 
@@ -50,12 +62,13 @@ replication, physics from `problem_flags`), and return the max normalized field
 error between them on the root grid. `err ≈ 0` for single-grid (bit-for-bit),
 `~few×1e-5` for AMR (cross-level ordering).
 """
-function compare_problem(pf::AbstractString)
-    fl = problem_flags(pf)
+function compare_problem(pf0::AbstractString)
+    fl = problem_flags(pf0)
+    pf = paramfile_for(pf0)
     de = EnzoLib.evolve_problem_fields(pf)
     dj = EnzoLib.run_amr_fields(pf; gravity = fl.gravity, cooling = fl.cooling,
                                 radiation = fl.radiation, star_sources = fl.star_sources,
-                                star_formation = fl.star_formation)
+                                star_formation = fl.star_formation, cosmology = fl.cosmology)
     r = _max_field_error(dj, de)
     return (err = r.err, worst = r.worst, nfields = r.nfields, flags = fl)
 end

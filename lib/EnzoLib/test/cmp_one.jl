@@ -10,9 +10,10 @@ using EnzoLib
 include(joinpath(@__DIR__, "enzo_suite_common.jl"))
 
 function main()
-    pf = ARGS[1]
-    nm = basename(dirname(pf))
-    fl = problem_flags(pf)
+    pf0 = ARGS[1]
+    nm = basename(dirname(pf0))
+    fl = problem_flags(pf0)
+    pf = paramfile_for(pf0)        # serial-build gravity patch (UnigridTranspose=0) if needed
     # Reference first, so a failure here is attributed to Enzo (not the Julia driver).
     de = try
         d = EnzoLib.evolve_problem_fields(pf)
@@ -25,7 +26,7 @@ function main()
     try
         dj = EnzoLib.run_amr_fields(pf; gravity = fl.gravity, cooling = fl.cooling,
                                    radiation = fl.radiation, star_sources = fl.star_sources,
-                                   star_formation = fl.star_formation)
+                                   star_formation = fl.star_formation, cosmology = fl.cosmology)
         r = _max_field_error(dj, de)
         println("RESULT|", nm, "|status=ok|err=", r.err, "|nfields=", r.nfields,
                 "|hm=", fl.hydromethod, "|grav=", fl.gravity, "|cool=", fl.cooling, "|rad=", fl.radiation)

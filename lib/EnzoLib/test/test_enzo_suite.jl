@@ -14,6 +14,7 @@ const SUITE_CASES = [
     ("Hydro/Hydro-1D/SodShockTube/SodShockTube.enzo",        1e-12, "single-grid, bit-for-bit"),
     ("Hydro/Hydro-1D/Toro-2-ShockTubeAMR/Toro-2-ShockTubeAMR.enzo", 1e-3, "4-level AMR"),
     ("MHD/1D/BrioWu-MHD-1D/BrioWu-MHD-1D.enzo",              1e-2, "MHD (Dedner), 9 fields"),
+    ("Cosmology/ZeldovichPancake/ZeldovichPancake.enzo",     1e-3, "cosmology: gravity + comoving expansion"),
 ]
 
 if !EnzoLib.grid_available()

@@ -89,6 +89,9 @@ session_update_radiation_field(h::Handle, level::Integer = 0) =
 session_evolve_photons(h::Handle, level::Integer = 0; stars::Bool = false) =
     ccall(_gsym(:enzomodules_session_evolve_photons_ex), Cint, (Handle, Cint, Cint),
           h, level, stars ? 1 : 0)
+"Comoving (Hubble-drag) expansion source terms — call after advance_time for cosmology runs."
+session_comoving_expansion(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_comoving_expansion), Cint, (Handle, Cint), h, level)
 
 problem_num_grids(h::Handle) = ccall(_gsym(:enzomodules_problem_num_grids), Cint, (Handle,), h)
 problem_grid_size(h::Handle, grid::Integer = 0) =
@@ -220,10 +223,10 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
                        regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                        radiation::Bool = false, star_sources::Bool = false,
-                       star_formation::Bool = false, maxsub::Int = 100000)
+                       star_formation::Bool = false, cosmology::Bool = false, maxsub::Int = 100000)
     rec(l, dta) = evolve_level!(h, l, dta; hydro! = hydro!, regrid = regrid, gravity = gravity,
                                 cooling = cooling, radiation = radiation, star_sources = star_sources,
-                                star_formation = star_formation, maxsub = maxsub)
+                                star_formation = star_formation, cosmology = cosmology, maxsub = maxsub)
     session_clear_boundary_fluxes(h, level)
     done = 0.0; n = 0
     while n < maxsub
@@ -240,6 +243,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         star_formation && session_star_particles(h, level)
         session_update_particles(h, level)
         session_advance_time(h, level)
+        cosmology && session_comoving_expansion(h, level)    # Hubble drag (EvolveLevel.C)
         last = dt_above <= 0.0 || done + dt >= dt_above * (1 - 1e-6)
         if session_num_grids_on_level(h, level + 1) > 0
             session_set_boundary(h, level)                   # refresh before projection
@@ -273,7 +277,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
                  hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
                  regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                  radiation::Bool = false, star_sources::Bool = false,
-                 star_formation::Bool = false, maxcycle::Int = 100000)
+                 star_formation::Bool = false, cosmology::Bool = false, maxcycle::Int = 100000)
     pf = abspath(paramfile)
     cd(mktempdir()) do
         h = session_init(pf)
@@ -284,7 +288,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
             while session_time(h) < session_stop_time(h) && n < maxcycle
                 evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid, gravity = gravity,
                               cooling = cooling, radiation = radiation, star_sources = star_sources,
-                              star_formation = star_formation)
+                              star_formation = star_formation, cosmology = cosmology)
                 regrid && session_rebuild(h, 0)
                 n += 1
             end
