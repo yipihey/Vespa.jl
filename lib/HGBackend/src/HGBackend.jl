@@ -150,7 +150,7 @@ end
 
 @inline function MI.cell_volume(m::HGMesh{D}, i::Integer) where {D}
     lo, hi = cell_physical_box(m.frame, i)
-    v = 1.0
+    v = one(eltype(lo))                 # geometry precision (not leaked to Float64)
     @inbounds for d in 1:D
         v *= hi[d] - lo[d]
     end
@@ -159,7 +159,7 @@ end
 
 @inline function MI.face_area(m::HGMesh{D}, i::Integer, axis::Int) where {D}
     lo, hi = cell_physical_box(m.frame, i)
-    a = 1.0
+    a = one(eltype(lo))
     @inbounds for d in 1:D
         d == axis || (a *= hi[d] - lo[d])
     end
@@ -260,35 +260,41 @@ Seam-contract view: `v[cell]` reads/writes the scalar cell mean of `name`. It
 dereferences `parent(store.af)` on each access so it stays valid across regrids
 (AdaptiveField rebuilds the inner field set on refinement).
 """
-struct HGScalarView{S} <: AbstractArray{Float64,1}
+struct HGScalarView{T,S} <: AbstractArray{T,1}
     store::S
     name::Symbol
+end
+# Infer the coefficient precision T from the named polynomial field (degree-0 ⇒
+# the single coeff IS the cell mean; its element type is the field precision).
+function HGScalarView(store, name::Symbol)
+    pf = getproperty(Base.parent(store.af), name)
+    T = length(pf) == 0 ? Float64 : typeof(pf[1][1])   # coefficient precision from a live entry
+    return HGScalarView{T,typeof(store)}(store, name)
 end
 
 @inline _pfv(v::HGScalarView) = getproperty(Base.parent(v.store.af), v.name)
 Base.size(v::HGScalarView) = (Base.parent(v.store.af).n,)
 Base.IndexStyle(::Type{<:HGScalarView}) = IndexLinear()
 Base.@propagate_inbounds Base.getindex(v::HGScalarView, i::Integer) = _pfv(v)[Int(i)][1]
-Base.@propagate_inbounds Base.setindex!(v::HGScalarView, x, i::Integer) =
-    (_pfv(v)[Int(i)] = (Float64(x),); x)
+Base.@propagate_inbounds Base.setindex!(v::HGScalarView{T}, x, i::Integer) where {T} =
+    (_pfv(v)[Int(i)] = (T(x),); x)
 
-MI.field_eltype(::HGMesh) = Float64   # HG polynomial fields are Float64 until the Phase-6 unlock
+MI.field_eltype(::HGMesh{D,T}) where {D,T} = T   # default field precision = geometry T
 MI.coord_eltype(::HGMesh{D,T}) where {D,T} = T
 
 function MI.allocate_fields(m::HGMesh{D,T}, spec::FieldSpec;
                             layout::AbstractLayout = SoA(),
-                            eltype::Type = Float64) where {D,T}
+                            eltype::Type = T) where {D,T}
     layout isa SoA ||
         error("HGBackend: HG's adaptive polynomial storage is wired for SoA here " *
               "(got $(layout)). RefMesh exercises SoA/AoS/Blocked.")
-    eltype === Float64 ||
-        error("HGBackend: Float32 field storage not yet wired (ADR Phase 6); got eltype=$(eltype).")
     names = field_names(spec)
     basis = BernsteinBasis{D,0}()
-    nt = NamedTuple{Tuple(names)}(ntuple(_ -> Float64, length(names)))
+    nt = NamedTuple{Tuple(names)}(ntuple(_ -> eltype, length(names)))   # field precision per name
     pfs = allocate_polynomial_fields(_hg_layout(layout), basis, n_cells(m.mesh); nt...)
+    z = (zero(eltype),)
     @inbounds for nm in names, i in 1:n_cells(m.mesh)
-        getproperty(pfs, nm)[i] = (0.0,)
+        getproperty(pfs, nm)[i] = z
     end
     af = AdaptiveField(pfs, m.mesh)         # registers the conservative remap listener
     return HGFieldStore(af, collect(names))

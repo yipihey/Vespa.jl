@@ -34,6 +34,20 @@ end
     @test all(d.pressure .> 0)
 end
 
+@testset "HGBackend Float32 fields stay homogeneous (Phase 6)" begin
+    prob = sod_problem_defaults(n = 256)
+    mesh = HGMesh(prob.dims, prob.domain; T = Float32)
+    @test field_eltype(mesh) === Float32 && coord_eltype(mesh) === Float32
+    sim = Simulation(mesh, prob)
+    @test eltype(sim.sv[1]) === Float32
+    @test typeof(cell_volume(mesh, 1)) === Float32     # geometry not leaked to f64
+    evolve!(sim)
+    @test eltype(sim.sv[1]) === Float32                # STILL f32 after evolution
+    d = dump_fields(sim)
+    @test all(isfinite, d.density) && all(>(0), d.density)
+    @test sod_l1_error(sim) < 0.02                     # f32 accuracy near f64
+end
+
 @testset "Cross-backend agreement: RefMesh ≡ HGBackend (ADR oracle)" begin
     prob = sod_problem_defaults(n = 256)
 
