@@ -233,9 +233,27 @@ function for_each_face end
 
 # -- fields (P3) --
 """
-    allocate_fields(backend, spec::FieldSpec; layout=SoA()) → AbstractFieldStore
+    field_eltype(backend) → Type
 
-Allocate the declared cell-average fields with the requested memory layout.
+The backend's DEFAULT field-state element type (precision). `allocate_fields`
+uses it unless an explicit `eltype` is passed, so field precision can be chosen
+independently of the backend's geometry precision.
+"""
+function field_eltype end
+"""
+    coord_eltype(backend) → Type
+
+The backend's geometry/coordinate element type (cell centers/widths/areas, and the
+precision the simulation clock accumulates in). Default `Float64`.
+"""
+coord_eltype(::Any) = Float64
+"""
+    allocate_fields(backend, spec::FieldSpec; layout=SoA(), eltype=field_eltype(backend)) → AbstractFieldStore
+
+Allocate the declared cell-average fields with the requested memory layout and
+element type. `eltype` defaults to the backend's `field_eltype` (its geometry
+precision for uniform meshes), and can be overridden to decouple field-state
+precision from geometry/coordinate precision.
 """
 function allocate_fields end
 """
@@ -263,7 +281,7 @@ export AbstractMeshBackend,
     rank, domain, n_cells, for_each_cell, for_each_face, level_of, max_level,
     refine!, coarsen!,
     cell_center, cell_width, cell_volume, face_area, neighbor,
-    allocate_fields, field_view, restrict!, prolong!,
+    allocate_fields, field_eltype, coord_eltype, field_view, restrict!, prolong!,
     Instrumented, span_report, reset_spans!
 
 end # module

@@ -191,11 +191,15 @@ struct GridFields{N,L<:AbstractLayout} <: AbstractFieldStore
     view_of::Dict{Symbol,AbstractArray}
 end
 
+MI.field_eltype(::UniformMesh{N,T}) where {N,T} = T   # default field precision = geometry T
+MI.coord_eltype(::UniformMesh{N,T}) where {N,T} = T   # geometry/coordinate precision
+
 function MI.allocate_fields(m::UniformMesh{N,T}, spec::FieldSpec;
-                            layout::AbstractLayout = SoA()) where {N,T}
+                            layout::AbstractLayout = SoA(),
+                            eltype::Type = T) where {N,T}    # override ⇒ field precision ≠ geometry
     shape = m.dims
     names = field_names(spec)
-    return GridFields(layout, shape, names, _build_views(layout, T, shape, names))
+    return GridFields(layout, shape, names, _build_views(layout, eltype, shape, names))
 end
 
 function _build_views(::SoA, ::Type{T}, shape::NTuple{N,Int}, names) where {T,N}

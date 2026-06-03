@@ -24,12 +24,12 @@ Bind a `Problem` to a mesh `backend`, allocate the conserved fields (plus RK
 scratch) with the requested `layout`, and set initial conditions. `backend` may
 be a bare backend or an `Instrumented` wrapper (P10) — identical code path.
 """
-mutable struct Simulation{B,P,S,V,M<:EquationSet}
+mutable struct Simulation{B,P,S,V,M<:EquationSet,Tg<:AbstractFloat}
     backend::B
     problem::P
     bcs::BoundaryConditions
     model::M            # the equation set: variable names/roles/count + physics kernels
-    γ::Float64          # EOS adiabatic index (= adiabatic_index(model); kept for convenience)
+    γ::Tg               # EOS adiabatic index (= adiabatic_index(model); kept for convenience)
     state::S            # conserved U (canonical, layout-tested)
     u0::S               # RK scratch: state at start of step
     acc::S              # net-flux-out accumulator (pre-÷V)
@@ -37,11 +37,17 @@ mutable struct Simulation{B,P,S,V,M<:EquationSet}
     u0v::V
     accv::V
     layout::AbstractLayout
-    t::Float64
+    t::Tg               # simulation clock, accumulated in the geometry/time precision Tg
     step::Int
     grav::Any           # nothing, or a GravityField (self-gravity; default off)
     cosmo::Any          # nothing, or a Cosmology (comoving expansion; default off)
 end
+
+# Precision the kernels read off the data: Tf = field state, Tg = geometry/time,
+# Tr = reduction accumulator (≥ Float64; never downgrades a wider field type).
+@inline _Tf(sim::Simulation) = eltype(sim.sv[1])
+@inline _Tg(sim::Simulation{B,P,S,V,M,Tg}) where {B,P,S,V,M,Tg} = Tg
+@inline _Tr(sim::Simulation) = promote_type(_Tf(sim), Float64)
 
 """
     Simulation(backend, problem; layout=SoA(), model=IdealHydro(problem.γ))
@@ -52,17 +58,19 @@ hydro). The conserved fields are named and counted by the model
 a core change.
 """
 function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA(),
-                    model::EquationSet = IdealHydro(prob.γ))
+                    model::EquationSet = IdealHydro(prob.γ),
+                    eltype::Type = field_eltype(backend))   # field precision; may differ from geometry
     N = rank(backend)
+    Tg = coord_eltype(backend)                              # geometry/time precision
     names = conserved_names(model)
     spec = FieldSpec(collect(names))
-    state = allocate_fields(backend, spec; layout = layout)
-    u0 = allocate_fields(backend, spec; layout = layout)
-    acc = allocate_fields(backend, spec; layout = layout)
+    state = allocate_fields(backend, spec; layout = layout, eltype = eltype)
+    u0 = allocate_fields(backend, spec; layout = layout, eltype = eltype)
+    acc = allocate_fields(backend, spec; layout = layout, eltype = eltype)
     views(store) = map(nm -> field_view(backend, store, nm), names)
     bcs = _as_bcs(prob.bcs, N)
-    sim = Simulation(backend, prob, bcs, model, prob.γ, state, u0, acc,
-                     views(state), views(u0), views(acc), layout, 0.0, 0, nothing, nothing)
+    sim = Simulation(backend, prob, bcs, model, Tg(prob.γ), state, u0, acc,
+                     views(state), views(u0), views(acc), layout, zero(Tg), 0, nothing, nothing)
     set_initial_conditions!(sim)
     return sim
 end
@@ -83,10 +91,11 @@ end
 function set_initial_conditions!(sim::Simulation)
     b, init = sim.backend, sim.problem.init
     N = rank(b)
+    Tf = _Tf(sim)
     for_each_cell(b) do cell
-        c = cell_center(b, cell)
-        coords = ntuple(d -> d <= N ? c[d] : 0.0, 3)
-        W = map(Float64, init(coords...))               # primitive tuple (size = nvars)
+        c = cell_center(b, cell)                          # geometry coords (Tg)
+        coords = ntuple(d -> d <= N ? c[d] : zero(eltype(c)), 3)
+        W = map(Tf, init(coords...))                      # primitive tuple → field precision Tf
         set_U!(sim.sv, cell, prim2cons(sim.model, W))
     end
     return sim
@@ -137,20 +146,21 @@ function compute_dt(sim::Simulation; level = nothing)
     mom = momentum_indices(sim.model)
     di = density_index(sim.model)
     grav = sim.grav
-    invdt = 0.0
-    grav_invdt = 0.0
+    Tr = _Tr(sim)                                # reduction precision (≥ Float64)
+    invdt = zero(Tr)
+    grav_invdt = zero(Tr)
     for_each_cell(b; level = level) do cell
         W = _W(sim, cell)
         c = sound_speed(sim.model, W)
         w = cell_width(b, cell)
         for d in 1:N
             vd = W[mom[d]]
-            invdt = max(invdt, (abs(vd) + c) / w[d])
+            invdt = max(invdt, Tr(abs(vd) + c) / Tr(w[d]))
         end
-        grav === nothing || (grav_invdt = max(grav_invdt, _gravity_invdt(grav, W[di])))
+        grav === nothing || (grav_invdt = max(grav_invdt, Tr(_gravity_invdt(grav, W[di]))))
     end
     invdt = max(invdt, grav_invdt)               # free-fall limiter (gravity on)
-    invdt == 0.0 && return Inf
+    iszero(invdt) && return Inf
     dt = cfl / invdt
     if sim.cosmo !== nothing
         # Comoving CFL: the flux divergence is scaled by 1/a, so the comoving
@@ -173,7 +183,7 @@ end
 function accumulate_flux!(sim::Simulation; reflux = nothing)
     b = sim.backend
     av = sim.accv
-    z = ntuple(_ -> 0.0, nvars_val(sim.model))
+    z = ntuple(_ -> zero(_Tf(sim)), nvars_val(sim.model))
     for_each_cell(b) do cell
         set_U!(av, cell, z)
     end
@@ -188,7 +198,8 @@ end
 @inline function _face_value(sim::Simulation, i, axis::Int, side::Symbol)
     Wi = _W(sim, i)
     s = _plm_slope(sim, i, Wi, axis)
-    h = side === :hi ? 0.5 : -0.5
+    T = Base.eltype(Wi)
+    h = side === :hi ? T(0.5) : T(-0.5)
     return map((w, sl) -> w + h * sl, Wi, s)
 end
 
@@ -200,8 +211,9 @@ end
     WR = _face_value(sim, j, axis, :lo)
     F = riemann_flux(sim.model, WL, WR, axis)
     av = sim.accv
+    aT = Base.eltype(F)(area)             # face area at field precision
     @inbounds for k in eachindex(F)
-        fk = F[k] * area
+        fk = F[k] * aT
         av[k][i] += fk        # flux leaves i
         av[k][j] -= fk        # flux enters j
     end
@@ -221,8 +233,9 @@ end
     Wg = ghost_state(WL, right.bc, axis, sim.model)
     F = riemann_flux(sim.model, WL, Wg, axis)
     av = sim.accv
+    aT = Base.eltype(F)(area)
     @inbounds for k in eachindex(F)
-        av[k][i] += F[k] * area      # outward normal +axis
+        av[k][i] += F[k] * aT      # outward normal +axis
     end
     return nothing
 end
@@ -235,8 +248,9 @@ end
     Wg = ghost_state(WR, left.bc, axis, sim.model)
     F = riemann_flux(sim.model, Wg, WR, axis)
     av = sim.accv
+    aT = Base.eltype(F)(area)
     @inbounds for k in eachindex(F)
-        av[k][j] -= F[k] * area      # outward normal −axis
+        av[k][j] -= F[k] * aT      # outward normal −axis
     end
     return nothing
 end
@@ -255,10 +269,11 @@ end
 # divergence carries a 1/a factor (and so does the gravity source, which shares
 # this accumulator). `aexp=1.0` (default) is the ordinary non-cosmological path
 # and is byte-identical (1.0·V == V).
-function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing, aexp::Float64 = 1.0)
+function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing, aexp::Real = one(_Tf(sim)))
     b = sim.backend
+    T = _Tf(sim)
     for_each_cell(b; level = level) do cell
-        invV = dt / (aexp * cell_volume(b, cell))
+        invV = T(dt) / (T(aexp) * T(cell_volume(b, cell)))       # all-T ⇒ no f64 promotion
         Ub = get_U(base, cell)
         A = get_U(sim.accv, cell)
         set_U!(dst, cell, map((u, a) -> u - invV * a, Ub, A))
@@ -267,14 +282,15 @@ function _euler_apply!(sim::Simulation, dst, base, dt; level = nothing, aexp::Fl
 end
 
 # SSP-RK2 combine: state = 0.5·u0 + 0.5·(state − dt·acc/(aexp·V)).
-function _rk2_combine!(sim::Simulation, dt; level = nothing, aexp::Float64 = 1.0)
+function _rk2_combine!(sim::Simulation, dt; level = nothing, aexp::Real = one(_Tf(sim)))
     b = sim.backend
+    T = _Tf(sim); half = T(0.5)
     for_each_cell(b; level = level) do cell
-        invV = dt / (aexp * cell_volume(b, cell))
+        invV = T(dt) / (T(aexp) * T(cell_volume(b, cell)))
         U0 = get_U(sim.u0v, cell)
         U1 = get_U(sim.sv, cell)
         A = get_U(sim.accv, cell)
-        set_U!(sim.sv, cell, map((u0, u1, a) -> 0.5 * u0 + 0.5 * (u1 - invV * a), U0, U1, A))
+        set_U!(sim.sv, cell, map((u0, u1, a) -> half * u0 + half * (u1 - invV * a), U0, U1, A))
     end
     return nothing
 end
@@ -289,7 +305,7 @@ still reads neighbors at every level, so a finer level advances against its
 leaves — the single-rate path, unchanged. `step!` does not advance `sim.t`/`step`
 when `level` is given (the subcycle driver owns time bookkeeping).
 """
-function step!(sim::Simulation, dt::Float64; level = nothing)
+function step!(sim::Simulation, dt::Real; level = nothing)
     # Comoving coupling is applied on the single-rate path only (level===nothing);
     # subcycled cosmology under AMR is a follow-up. a is evaluated at the half step
     # (n+½), matching Enzo, for both the 1/a flux scaling and the Hubble drag.
@@ -320,7 +336,7 @@ end
 # the fine flux·dt), −1 when it is the COARSE side (subtract the coarse flux·dt).
 # SSP-RK2's effective flux is ½(stage-1)+½(stage-2), so each stage contributes
 # `sign · 0.5 · dt` to the register (set on `reg.scale` before each accumulate).
-function step_level!(sim::Simulation, dt::Float64, level::Int, regs, signs)
+function step_level!(sim::Simulation, dt::Real, level::Int, regs, signs)
     _copy_state!(sim, sim.u0v, sim.sv; level = level)
     _set_scales!(regs, signs, 0.5 * dt)
     accumulate_flux!(sim; reflux = regs)                     # stage 1, ½dt weight
@@ -333,7 +349,7 @@ function step_level!(sim::Simulation, dt::Float64, level::Int, regs, signs)
     return sim
 end
 
-@inline function _set_scales!(regs, signs, base::Float64)
+@inline function _set_scales!(regs, signs, base::Real)
     @inbounds for r in eachindex(regs)
         regs[r].scale = signs[r] * base
     end

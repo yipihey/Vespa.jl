@@ -42,3 +42,29 @@ end
     @test maximum(d.density) ≤ 1.0 + 1e-6
     @test minimum(d.density) ≥ 0.125 - 1e-6
 end
+
+@testset "Sod precision-genericity: Float32 fields stay homogeneous" begin
+    prob = sod_problem_defaults(n = 256)
+    l1_64 = let s = Simulation(UniformMesh(prob.dims, prob.domain), prob)
+        evolve!(s); sod_l1_error(s)
+    end
+
+    # Fully Float32: geometry, clock, AND field state are Float32.
+    s32 = Simulation(UniformMesh(prob.dims, prob.domain; T = Float32), prob)
+    @test eltype(s32.sv[1]) === Float32
+    @test typeof(s32.t) === Float32                       # clock is Tg (not pinned f64)
+    evolve!(s32)
+    @test eltype(s32.sv[1]) === Float32                   # STILL f32 — hot loop did not narrow through f64
+    d32 = dump_fields(s32)
+    @test all(isfinite, d32.density) && all(>(0), d32.density)
+    l1_32 = sod_l1_error(s32)
+    @info "Sod L1 (Float32 fields)" l1_32 l1_64
+    @test l1_32 < 0.02 && l1_32 < 5 * l1_64               # f32 accuracy near f64
+
+    # Decoupled: Float64 geometry/clock, Float32 field state (Enzo FLOAT/BFLOAT).
+    sd = Simulation(UniformMesh(prob.dims, prob.domain), prob; eltype = Float32)
+    @test eltype(sd.sv[1]) === Float32 && typeof(sd.t) === Float64
+    evolve!(sd)
+    @test eltype(sd.sv[1]) === Float32
+    @test all(isfinite, dump_fields(sd).density)
+end

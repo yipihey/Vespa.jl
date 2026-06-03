@@ -272,11 +272,17 @@ Base.@propagate_inbounds Base.getindex(v::HGScalarView, i::Integer) = _pfv(v)[In
 Base.@propagate_inbounds Base.setindex!(v::HGScalarView, x, i::Integer) =
     (_pfv(v)[Int(i)] = (Float64(x),); x)
 
+MI.field_eltype(::HGMesh) = Float64   # HG polynomial fields are Float64 until the Phase-6 unlock
+MI.coord_eltype(::HGMesh{D,T}) where {D,T} = T
+
 function MI.allocate_fields(m::HGMesh{D,T}, spec::FieldSpec;
-                            layout::AbstractLayout = SoA()) where {D,T}
+                            layout::AbstractLayout = SoA(),
+                            eltype::Type = Float64) where {D,T}
     layout isa SoA ||
         error("HGBackend: HG's adaptive polynomial storage is wired for SoA here " *
               "(got $(layout)). RefMesh exercises SoA/AoS/Blocked.")
+    eltype === Float64 ||
+        error("HGBackend: Float32 field storage not yet wired (ADR Phase 6); got eltype=$(eltype).")
     names = field_names(spec)
     basis = BernsteinBasis{D,0}()
     nt = NamedTuple{Tuple(names)}(ntuple(_ -> Float64, length(names)))
