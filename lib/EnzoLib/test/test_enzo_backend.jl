@@ -52,4 +52,38 @@ else
         @test all(isfinite, dj) && all(>(0), dj)
         @test l1 < 0.03                                       # EnzoNG's driver on Enzo memory matches truth
     end
+
+    # ND single-grid: the seam adapter over a 2D Enzo grid. The column-major
+    # flat-index map must be exact (round-trip identity) and EnzoNG's unchanged
+    # 2D driver must run on it conservatively.
+    @testset "EnzoBackend 2D single-grid (NohProblem2D)" begin
+        pf = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
+                               "run", "Hydro", "Hydro-2D", "NohProblem2D", "NohProblem2D.enzo"))
+        dom2 = ((0.0, 1.0), (0.0, 1.0)); model = IdealHydro(5 / 3)
+        cd(EnzoLib._workdir(pf)) do
+            h = EnzoLib.session_init(pf); EnzoLib.session_set_boundary(h, 0)
+            try
+                mesh = EnzoGridMesh(h; grid = 0, domain = dom2,
+                                    cons_density = density_index(model),
+                                    cons_momentum = momentum_indices(model), cons_energy = energy_index(model))
+                @test MeshInterface.rank(mesh) == 2
+                @test mesh.active == (100, 100) && mesh.strides == (1, 106)
+                prob = Problem(; name = "noh2d", dims = mesh.active, domain = dom2, γ = 5 / 3, bcs = Outflow(),
+                               init = (x, y, z) -> (1.0, 0.0, 0.0, 0.0, 1.0), tfinal = 1.0, cfl = 0.3)
+                sim = Simulation(mesh, prob; model = model)
+                ρ0 = copy(EnzoLib.problem_get_field(h, mesh.di, 0))
+                sync_from_enzo!(sim.sv, mesh); sync_to_enzo!(mesh, sim.sv)
+                @test EnzoLib.problem_get_field(h, mesh.di, 0) == ρ0          # round-trip identity, bit-for-bit
+                di = density_index(model)
+                m0 = sum(sim.sv[di][I] for I in CartesianIndices(mesh.active))
+                step!(sim, 1e-4)                                              # EnzoNG's 2D driver on the live grid
+                d = [sim.sv[di][I] for I in CartesianIndices(mesh.active)]
+                m1 = sum(d)
+                @test all(isfinite, d) && all(>(0), d)
+                @test abs(m1 - m0) / m0 < 1e-3                               # ~conservative (outflow edges)
+            finally
+                EnzoLib.free_problem(h)
+            end
+        end
+    end
 end

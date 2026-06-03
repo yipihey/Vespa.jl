@@ -10,7 +10,8 @@ a `RefMesh.UniformMesh` over the grid's ACTIVE region, and links the live Enzo
 handle + field map. Because EnzoNG stores **conserved** `(ρ, ρv, E)` while Enzo
 stores `(Density, Velocity1, TotalEnergy_specific)`, the field state cannot be a
 zero-copy alias — `sync_from_enzo!`/`sync_to_enzo!` transform between them around
-each EnzoNG step. 1D single-grid for now (the demo); ND/AMR is a follow-up.
+each EnzoNG step. ND single-grid (1D/2D/3D); AMR drives it per-grid per-level via
+the Julia EvolveLevel (the `:julia` hydro slot iterates the grids on a level).
 """
 module EnzoBackend
 
@@ -36,35 +37,63 @@ struct EnzoGridMesh{N,T} <: MI.AbstractMeshBackend
     alloc::UniformMesh{N,T}           # same-shape T-mesh used ONLY for field allocation/views
     h::Ptr{Cvoid}                     # live Enzo session/problem handle
     grid::Int                         # grid index in the hierarchy
+    active::NTuple{N,Int}             # active cells per dim (= geom dims, ghost-free)
+    strides::NTuple{N,Int}            # column-major strides into the flat Enzo array (incl ghosts)
     nghost::Int                       # ghost zones per side
-    di::Int; vi::Int; ei::Int         # Enzo 0-based field indices: Density, Velocity1, TotalEnergy
+    di::Int                           # Enzo 0-based field index: Density
+    vi::NTuple{3,Int}                 # Velocity1/2/3 field indices, -1 if absent
+    ei::Int                           # TotalEnergy field index
     cdi::Int                          # conserved index of mass density
     cmom::NTuple{3,Int}               # conserved indices of (x,y,z) momentum
     cei::Int                          # conserved index of total energy
 end
 
+# 0-based Enzo field index for a FieldType, or -1 if the grid lacks it.
+function _field_or(h, ftype::Integer, grid::Integer)
+    try
+        return EnzoLib.field_index(h, ftype; grid = grid)
+    catch
+        return -1
+    end
+end
+
 """
-    EnzoGridMesh(h; grid=0, nghost=3, domain=((0.0,1.0),), precision=Float64,
+    EnzoGridMesh(h; grid=0, nghost=3, domain, precision=Float64,
                  cons_density=1, cons_momentum=(2,3,4), cons_energy=5)
 
-Wrap live Enzo grid `grid` (a 1D hydro grid) as a seam backend. `precision` is the
-field-state element type (Float64 / Float32). The `cons_*` role indices say which
-conserved-state components are density/momentum/energy — pass them from the
-`EquationSet` model (defaults are the ideal-hydro layout).
+Wrap a live Enzo grid (1D/2D/3D) as a seam backend. `domain` is the N-tuple of
+per-axis `(lo,hi)` (must match the grid rank). `precision` is the field-state
+element type. The `cons_*` role indices come from the `EquationSet` model.
 """
 function EnzoGridMesh(h::Ptr{Cvoid}; grid::Integer = 0, nghost::Integer = 3,
                       domain = ((0.0, 1.0),), precision::Type = Float64,
                       cons_density::Integer = 1, cons_momentum = (2, 3, 4),
                       cons_energy::Integer = 5)
-    gsz = EnzoLib.problem_grid_size(h, grid)
-    N = gsz - 2 * nghost
-    geom  = UniformMesh((N,), domain)                  # f64 geometry
-    alloc = UniformMesh((N,), domain; T = precision)   # T-precision field template (same shape)
-    di = EnzoLib.field_index(h, 0; grid = grid)    # Density
-    vi = EnzoLib.field_index(h, 4; grid = grid)    # Velocity1 (x)
-    ei = EnzoLib.field_index(h, 1; grid = grid)    # TotalEnergy (specific)
-    return EnzoGridMesh{1,precision}(geom, alloc, h, Int(grid), Int(nghost), di, vi, ei,
-                                     Int(cons_density), Tuple(Int.(cons_momentum)), Int(cons_energy))
+    rank = EnzoLib.problem_grid_rank(h, grid)
+    rank == length(domain) ||
+        throw(ArgumentError("EnzoGridMesh: grid rank $rank ≠ domain length $(length(domain))"))
+    gd = EnzoLib.problem_grid_dims(h, grid)                       # full per-dim dims (incl ghosts)
+    gdims  = ntuple(d -> gd[d], rank)
+    active = ntuple(d -> gdims[d] - 2 * nghost, rank)
+    strides = ntuple(d -> d == 1 ? 1 : prod(ntuple(k -> gdims[k], d - 1)), rank)
+    geom  = UniformMesh(active, domain)
+    alloc = UniformMesh(active, domain; T = precision)
+    di = EnzoLib.field_index(h, 0; grid = grid)                  # Density
+    vi = ntuple(k -> _field_or(h, 3 + k, grid), 3)               # Velocity1/2/3 (types 4/5/6)
+    ei = EnzoLib.field_index(h, 1; grid = grid)                  # TotalEnergy (specific)
+    return EnzoGridMesh{rank,precision}(geom, alloc, h, Int(grid), active, strides, Int(nghost),
+                                        di, vi, ei, Int(cons_density),
+                                        Tuple(Int.(cons_momentum)), Int(cons_energy))
+end
+
+# 1-based flat index into the column-major Enzo field array (incl ghosts) for the
+# active cell at CartesianIndex `I` (1-based over the active region).
+@inline function _enzo_flat(m::EnzoGridMesh{N}, I::CartesianIndex{N}) where {N}
+    f = 0
+    @inbounds for d in 1:N
+        f += (m.nghost + I[d] - 1) * m.strides[d]
+    end
+    return f + 1
 end
 
 # ── seam: geometry/topology → f64 `geom`; field storage → T-precision `alloc` ──
@@ -85,42 +114,48 @@ MI.field_view(m::EnzoGridMesh, args...)             = MI.field_view(m.alloc, arg
 MI.for_each_cell(f, m::EnzoGridMesh; kw...) = MI.for_each_cell(f, m.geom; kw...)
 MI.for_each_face(f, m::EnzoGridMesh; kw...) = MI.for_each_face(f, m.geom; kw...)
 
-# ── field sync: live Enzo grid ↔ EnzoNG conserved views ───────────────────────
-# Active cell i (1..N) maps to flat index nghost+i (1-based) of the column-major
-# Enzo field; sv is the NTuple of 5 conserved views (ρ, ρvx, ρvy, ρvz, E_density),
-# indexed by the inner mesh's CartesianIndex handle.
+# ── field sync: live Enzo grid ↔ EnzoNG conserved views (ND) ──────────────────
+# Each active cell (CartesianIndex over the active region) maps to a column-major
+# flat index of the ghost-zoned Enzo field via `_enzo_flat`. Enzo stores
+# (Density, Velocity1..k, TotalEnergy_specific); EnzoNG stores conserved
+# (ρ, ρv, E_density). Velocity components absent on the grid contribute 0 momentum.
 "Pull the live Enzo grid state into EnzoNG's conserved views `sv` (Enzo → conserved)."
-function sync_from_enzo!(sv, m::EnzoGridMesh{1})
+function sync_from_enzo!(sv, m::EnzoGridMesh{N,T}) where {N,T}
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
-    vx = EnzoLib.problem_get_field(m.h, m.vi, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)     # specific total energy
-    N = MI.n_cells(m.geom)
-    @inbounds for i in 1:N
-        f = m.nghost + i
-        ρ = d[f]; u = vx[f]; e = es[f]
-        I = CartesianIndex(i)
+    vf = ntuple(k -> m.vi[k] >= 0 ? EnzoLib.problem_get_field(m.h, m.vi[k], m.grid) : nothing, 3)
+    @inbounds for I in CartesianIndices(m.active)
+        f = _enzo_flat(m, I)
+        ρ = d[f]
         sv[m.cdi][I] = ρ
-        sv[m.cmom[1]][I] = ρ * u; sv[m.cmom[2]][I] = 0.0; sv[m.cmom[3]][I] = 0.0
-        sv[m.cei][I] = ρ * e                              # total energy density = ρ·e_specific
+        for k in 1:3
+            vk = vf[k] === nothing ? 0.0 : vf[k][f]
+            sv[m.cmom[k]][I] = ρ * vk
+        end
+        sv[m.cei][I] = ρ * es[f]                          # total energy density = ρ·e_specific
     end
     return nothing
 end
 
 "Push EnzoNG's conserved views `sv` back into the live Enzo grid (conserved → Enzo)."
-function sync_to_enzo!(m::EnzoGridMesh{1}, sv)
+function sync_to_enzo!(m::EnzoGridMesh{N,T}, sv) where {N,T}
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
-    vx = EnzoLib.problem_get_field(m.h, m.vi, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)
-    N = MI.n_cells(m.geom)
-    @inbounds for i in 1:N
-        f = m.nghost + i
-        I = CartesianIndex(i)
-        ρ = sv[m.cdi][I]; mx = sv[m.cmom[1]][I]; E = sv[m.cei][I]
-        d[f] = ρ; vx[f] = mx / ρ; es[f] = E / ρ           # back to specific total energy
+    vf = ntuple(k -> m.vi[k] >= 0 ? EnzoLib.problem_get_field(m.h, m.vi[k], m.grid) : nothing, 3)
+    @inbounds for I in CartesianIndices(m.active)
+        f = _enzo_flat(m, I)
+        ρ = sv[m.cdi][I]; E = sv[m.cei][I]
+        d[f] = ρ
+        for k in 1:3
+            vf[k] === nothing || (vf[k][f] = sv[m.cmom[k]][I] / ρ)
+        end
+        es[f] = E / ρ                                     # back to specific total energy
     end
     EnzoLib.problem_set_field(m.h, m.di, d; grid = m.grid)
-    EnzoLib.problem_set_field(m.h, m.vi, vx; grid = m.grid)
     EnzoLib.problem_set_field(m.h, m.ei, es; grid = m.grid)
+    for k in 1:3
+        m.vi[k] >= 0 && EnzoLib.problem_set_field(m.h, m.vi[k], vf[k]; grid = m.grid)
+    end
     return nothing
 end
 

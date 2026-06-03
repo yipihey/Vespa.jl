@@ -162,6 +162,12 @@ end
 "Spatial rank (1/2/3) of a grid."
 problem_grid_rank(h::Handle, grid::Integer = 0) =
     Int(ccall(_gsym(:enzomodules_problem_grid_rank), Cint, (Handle, Cint), h, grid))
+"Full per-dim Enzo `GridDimension` (incl. ghosts; column-major; always length 3, 1 past the rank)."
+function problem_grid_dims(h::Handle, grid::Integer = 0)
+    d = zeros(Cint, 3)
+    ccall(_gsym(:enzomodules_problem_grid_dims), Cvoid, (Handle, Cint, Ptr{Cint}), h, grid, d)
+    return Int.(d)
+end
 "Number of particles living on `grid`."
 problem_num_particles(h::Handle, grid::Integer = 0) =
     Int(ccall(_gsym(:enzomodules_problem_num_particles), Cint, (Handle, Cint), h, grid))
