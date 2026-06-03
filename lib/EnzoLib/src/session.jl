@@ -92,6 +92,12 @@ session_evolve_photons(h::Handle, level::Integer = 0; stars::Bool = false) =
 "Comoving (Hubble-drag) expansion source terms — call after advance_time for cosmology runs."
 session_comoving_expansion(h::Handle, level::Integer = 0) =
     ccall(_gsym(:enzomodules_session_comoving_expansion), Cint, (Handle, Cint), h, level)
+"CT-MHD: zero+allocate the per-grid AvgElectricField accumulator (level>0 entry; EvolveLevel.C:377)."
+session_clear_avg_electric_field(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_clear_avg_electric_field), Cint, (Handle, Cint), h, level)
+"CT-MHD: recompute cell-centered B from face-corrected B using finer-grid EMF (post-UFG; EvolveLevel.C:899)."
+session_mhd_update_magnetic_field(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_mhd_update_magnetic_field), Cint, (Handle, Cint), h, level)
 
 problem_num_grids(h::Handle) = ccall(_gsym(:enzomodules_problem_num_grids), Cint, (Handle,), h)
 problem_grid_size(h::Handle, grid::Integer = 0) =
@@ -214,7 +220,7 @@ writes the live grid (the `:julia` mix-and-match swap).
 function session_evolve_density(paramfile::AbstractString, hydro!::Function;
                                 level::Integer = 0, maxcycle = 100000)
     pf = abspath(paramfile)
-    cd(mktempdir()) do
+    cd(_workdir(pf)) do
         h = session_init(pf)
         h == C_NULL && error("session_init failed for $pf")
         try
@@ -242,7 +248,7 @@ file's StopTime and return the final Density — the bit-for-bit reference.
 """
 function reference_density(paramfile::AbstractString)
     pf = abspath(paramfile)
-    cd(mktempdir()) do
+    cd(_workdir(pf)) do
         h = evolve_problem(pf, 0.0, 0)
         h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
         try
@@ -251,6 +257,23 @@ function reference_density(paramfile::AbstractString)
             free_problem(h)
         end
     end
+end
+
+# A fresh working directory for a run, with the param file's small sibling files
+# staged in (refine-region sequences, parameter includes, etc.). Enzo reads such
+# auxiliary files RELATIVE TO CWD, so a bare mktempdir would miss them (e.g.
+# MHDCTOrszagTangAMR's `RefineRegionFile = RefinementSequence`). The .enzo itself
+# is passed by absolute path, so it is not copied; large files (HDF5 ICs) are
+# skipped — problems that need those abort on their own anyway.
+function _workdir(paramfile::AbstractString)
+    d = mktempdir()
+    src = dirname(abspath(paramfile))
+    isdir(src) && for f in readdir(src)
+        p = joinpath(src, f)
+        (isfile(p) && filesize(p) < 1_000_000 && !endswith(f, ".enzo")) || continue
+        try; cp(p, joinpath(d, f); force = true); catch; end
+    end
+    return d
 end
 
 # Enzo's StopCycle from a .enzo param file (top-grid cycle limit; default 100000,
@@ -287,6 +310,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                                 star_formation = star_formation, cosmology = cosmology,
                                 mhdct = mhdct, maxsub = maxsub)
     session_clear_boundary_fluxes(h, level)
+    mhdct && level > 0 && session_clear_avg_electric_field(h, level)  # CT EMF accumulator (EvolveLevel.C:377)
     done = 0.0; n = 0
     while n < maxsub
         session_set_boundary(h, level)                       # interpolate from parent
@@ -307,8 +331,12 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         if session_num_grids_on_level(h, level + 1) > 0
             session_set_boundary(h, level)                   # refresh before projection
             rec(level + 1, dt)
-            session_update_from_finer(h, level)              # project + flux-correct
+            session_update_from_finer(h, level)              # project + flux-correct (+ MHD_ProjectFace for CT)
         end
+        # CT: recompute B from the EMF; on level>0 this ALSO accumulates this grid's
+        # AvgElectricField that the parent's MHD_ProjectFace reads — so it must run on
+        # EVERY level (incl. leaves), unconditional like EvolveLevel.C:899.
+        mhdct && session_mhd_update_magnetic_field(h, level)
         mhdct && session_set_boundary(h, level)              # UseMHDCT: refresh face-B ghosts (EvolveLevel.C:912)
         session_finalize_fluxes(h, level)
         n += 1; done += dt
@@ -341,7 +369,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
                  mhdct::Bool = false, maxcycle::Int = 100000)
     pf = abspath(paramfile)
     maxcycle = min(maxcycle, _stop_cycle(pf))    # honor the param file's StopCycle (as EvolveHierarchy does)
-    cd(mktempdir()) do
+    cd(_workdir(pf)) do
         h = session_init(pf)
         h == C_NULL && error("session_init failed for $pf")
         try
@@ -371,7 +399,7 @@ run_amr_state(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader 
 "Enzo's own `EvolveHierarchy` to StopTime, returning ALL root-grid fields — the reference."
 function evolve_problem_fields(paramfile::AbstractString; grid::Integer = 0)
     pf = abspath(paramfile)
-    cd(mktempdir()) do
+    cd(_workdir(pf)) do
         h = evolve_problem(pf, 0.0, 0)
         h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
         try
@@ -385,7 +413,7 @@ end
 "Enzo's own `EvolveHierarchy` to StopTime, returning (fields, particles) — the reference."
 function evolve_problem_state(paramfile::AbstractString; grid::Integer = 0)
     pf = abspath(paramfile)
-    cd(mktempdir()) do
+    cd(_workdir(pf)) do
         h = evolve_problem(pf, 0.0, 0)
         h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
         try
