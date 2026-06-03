@@ -180,7 +180,7 @@ end
 # is conservative by construction — an interior face adds +F·area to the left
 # cell's net-flux-out and −F·area to the right's — and stays conservative across
 # coarse↔fine sub-faces once the backend emits them (Phase B).
-function accumulate_flux!(sim::Simulation; reflux = nothing)
+function accumulate_flux!(sim::Simulation; reflux = nothing, bflux = nothing)
     b = sim.backend
     av = sim.accv
     z = ntuple(_ -> zero(_Tf(sim)), nvars_val(sim.model))
@@ -188,7 +188,7 @@ function accumulate_flux!(sim::Simulation; reflux = nothing)
         set_U!(av, cell, z)
     end
     for_each_face(b; bcs = sim.bcs) do leftref, rightref, axis, area
-        _flux_face!(sim, leftref, rightref, axis, area; reflux = reflux)
+        _flux_face!(sim, leftref, rightref, axis, area; reflux = reflux, bflux = bflux)
     end
     return nothing
 end
@@ -205,7 +205,7 @@ end
 
 # interior↔interior face: +axis normal points i→j.
 @inline function _flux_face!(sim::Simulation, left::Interior, right::Interior,
-                             axis::Int, area::Real; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing, bflux = nothing)
     i, j = left.cell, right.cell
     WL = _face_value(sim, i, axis, :hi)
     WR = _face_value(sim, j, axis, :lo)
@@ -227,7 +227,7 @@ end
 
 # hi-side domain boundary: interior cell i on the left, ghost on the right.
 @inline function _flux_face!(sim::Simulation, left::Interior, right::DomainBoundary,
-                             axis::Int, area::Real; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing, bflux = nothing)
     i = left.cell
     WL = _face_value(sim, i, axis, :hi)
     Wg = ghost_state(WL, right.bc, axis, sim.model)
@@ -237,18 +237,20 @@ end
     @inbounds for k in eachindex(F)
         av[k][i] += F[k] * aT      # outward normal +axis
     end
+    bflux === nothing || _bflux_capture!(bflux, axis, :hi, i, F, area)   # outer face on i's hi side
     return nothing
 end
 
 # lo-side domain boundary: ghost on the left, interior cell j on the right.
 @inline function _flux_face!(sim::Simulation, left::DomainBoundary, right::Interior,
-                             axis::Int, area::Real; reflux = nothing)
+                             axis::Int, area::Real; reflux = nothing, bflux = nothing)
     j = right.cell
     WR = _face_value(sim, j, axis, :lo)
     Wg = ghost_state(WR, left.bc, axis, sim.model)
     F = riemann_flux(sim.model, Wg, WR, axis)
     av = sim.accv
     aT = Base.eltype(F)(area)
+    bflux === nothing || _bflux_capture!(bflux, axis, :lo, j, F, area)   # outer face on j's lo side
     @inbounds for k in eachindex(F)
         av[k][j] -= F[k] * aT      # outward normal −axis
     end
@@ -305,7 +307,7 @@ still reads neighbors at every level, so a finer level advances against its
 leaves — the single-rate path, unchanged. `step!` does not advance `sim.t`/`step`
 when `level` is given (the subcycle driver owns time bookkeeping).
 """
-function step!(sim::Simulation, dt::Real; level = nothing)
+function step!(sim::Simulation, dt::Real; level = nothing, bflux = nothing)
     # Comoving coupling is applied on the single-rate path only (level===nothing);
     # subcycled cosmology under AMR is a follow-up. a is evaluated at the half step
     # (n+½), matching Enzo, for both the 1/a flux scaling and the Hubble drag.
@@ -314,11 +316,14 @@ function step!(sim::Simulation, dt::Real; level = nothing)
     if cosmo !== nothing
         aexp, dadt_half = expansion_at(cosmo, cosmo.t_initial + sim.t + 0.5 * dt)
     end
+    # SSP-RK2's effective flux is ½(stage1)+½(stage2): record each stage at ½dt so
+    # the boundary register accumulates ∫F·area dt consistent with the gas update.
+    bflux === nothing || (bflux.scale = oftype(bflux.scale, 0.5 * dt))
     _copy_state!(sim, sim.u0v, sim.sv; level = level)        # u0 ← Uⁿ
-    accumulate_flux!(sim)                                     # acc ← L(Uⁿ)
+    accumulate_flux!(sim; bflux = bflux)                      # acc ← L(Uⁿ)
     sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
     _euler_apply!(sim, sim.sv, sim.u0v, dt; level = level, aexp = aexp)
-    accumulate_flux!(sim)                                     # acc ← L(U1)
+    accumulate_flux!(sim; bflux = bflux)                      # acc ← L(U1)
     sim.grav === nothing || apply_gravity_source!(sim, sim.grav; level = level)
     _rk2_combine!(sim, dt; level = level, aexp = aexp)
     cosmo === nothing || apply_expansion_terms!(sim, dt, aexp, dadt_half)

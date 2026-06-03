@@ -14,6 +14,7 @@ using EnzoNG
     include("test_sedov.jl")          # 2D Sedov blast: dynamic AMR, symmetry, growth law
     include("test_subcycle.jl")       # AMR time subcycling Phase 1 (per-level dt, no-op invariance)
     include("test_reflux.jl")         # AMR subcycling Phase 2 (coarse–fine flux register conservation)
+    include("test_boundary_flux.jl")  # ADR-0003 part A: boundary-flux recording (∫F·area dt ≡ Δmass)
     include("test_gravity_poisson.jl") # self-gravity Phase 3a (composite CG Poisson vs analytic)
     include("test_gravity_hydro.jl")   # self-gravity Phase 3b (g source: sign gate, Jeans growth)
     include("test_gravity_amr.jl")     # self-gravity Phase 3c (AMR + subcycle: conservation, regrid)

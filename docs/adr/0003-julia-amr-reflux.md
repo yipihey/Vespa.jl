@@ -1,6 +1,8 @@
 # ADR-0003: Conservative `:julia` hydro under Enzo AMR (the SubgridFluxes contract)
 
-- **Status:** Proposed (design; implementation is a dedicated effort)
+- **Status:** In progress — Part A (EnzoNG boundary-flux recording) done; the
+  prerequisite grid→level bridge done; Part B (the bridge write + orchestration)
+  is the remaining conservation-critical piece.
 - **Date:** 2026-06-03
 - **Builds on:** ADR-0002 (method-slot registry), the ND single-grid `EnzoBackend`
   (`b15d99a2`), and the `set_acceleration_field` bridge (`5d917e0c`).
@@ -43,16 +45,15 @@ Enzo's exact format and extents.
 Two halves: (A) EnzoNG records per-face boundary fluxes; (B) a bridge writes them
 into Enzo's `fluxes` at matched global-index extents.
 
-### A. EnzoNG-side flux recording (it currently discards face fluxes)
+### A. EnzoNG-side flux recording — DONE
 
-`accumulate_flux!` computes `F·area` per face and folds it straight into `acc`,
-keeping nothing. Add an optional **boundary-flux sink**: when the cell on one side
-of a face is OUTSIDE the active region (an outer-boundary face) record `(field, dim,
-side, active-index, F)` — EnzoNG already has the machinery shape for this in its
-own `FluxRegister`/`reflux.jl` (used for composite AMR), so reuse the per-face
-capture, keyed here by Enzo grid + face instead of the composite mesh. The result
-is a per-(dim,side) plane of `nvars` fluxes over the grid's boundary — exactly the
-`Left/RightFluxes[field][dim]` Enzo wants.
+`BoundaryFluxRegister{NV,T}` (`src/reflux.jl`): `accumulate_flux!`/`step!` accept a
+`bflux` sink; the two boundary `_flux_face!` methods call `_bflux_capture!` with
+`scale=½dt` per SSP-RK2 stage, accumulating `∫F·area dt` keyed by `(axis, side,
+boundary-cell)` — exactly the `Left/RightFluxes[field][dim]` plane Enzo wants, and
+consistent with the gas update (same ½(F₁+F₂)·dt). Default `nothing` ⇒ the f64 path
+is untouched. Validated by the conservation identity `Δ(total mass) == Σ_lo bflux[ρ]
+− Σ_hi bflux[ρ]` to round-off (`test/test_boundary_flux.jl`, 5.5e-17 over 20 steps).
 
 ### B. The bridge (mirrors set_acceleration_field)
 

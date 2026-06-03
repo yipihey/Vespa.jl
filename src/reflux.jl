@@ -101,3 +101,29 @@ function _reflux_apply!(sim::Simulation, reg::FluxRegister{NV,T}) where {NV,T}
     empty!(reg.delta)
     return nothing
 end
+
+# ── boundary-flux recording (ADR-0003 part A) ─────────────────────────────────
+# Records the time-integrated +axis flux `∫ F·area dt` through each DOMAIN-BOUNDARY
+# face, keyed by (axis, side, boundary-cell). On the EnzoBackend a grid's outer
+# faces ARE the coarse–fine interface, so this is the fine grid's RefinedFluxes (and
+# a coarse grid's InitialFluxes at a subgrid) that Enzo's CorrectForRefinedFluxes
+# needs. Captured during `accumulate_flux!` (both SSP-RK2 stages, `scale=½dt` each),
+# exactly like the coarse↔fine `FluxRegister`, so the value is consistent with the
+# gas update the slot performed.
+mutable struct BoundaryFluxRegister{NV,T}
+    flux::Dict{Tuple{Int,Symbol,Any},NTuple{NV,T}}    # (axis, side, cell) → ∫F·area dt
+    scale::T                                          # dt × RK-stage weight, per pass
+end
+function _bflux_register(sim::Simulation)
+    nv = nvars(sim.model); T = _Tf(sim)
+    return BoundaryFluxRegister{nv,T}(Dict{Tuple{Int,Symbol,Any},NTuple{nv,T}}(), zero(T))
+end
+
+@inline function _bflux_capture!(reg::BoundaryFluxRegister{NV,T}, axis::Int, side::Symbol,
+                                 cell, F, area::Real) where {NV,T}
+    k = (axis, side, cell)
+    s = reg.scale; aT = T(area)
+    add = map(f -> s * f * aT, F)
+    reg.flux[k] = get(reg.flux, k, ntuple(_ -> zero(T), Val(NV))) .+ add
+    return nothing
+end
