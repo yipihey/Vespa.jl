@@ -55,6 +55,26 @@ consistent with the gas update (same ½(F₁+F₂)·dt). Default `nothing` ⇒ t
 is untouched. Validated by the conservation identity `Δ(total mass) == Σ_lo bflux[ρ]
 − Σ_hi bflux[ρ]` to round-off (`test/test_boundary_flux.jl`, 5.5e-17 over 20 steps).
 
+### B. Verified write target (traced from the Enzo source)
+
+- The fine grid's flux lives in its `grid::BoundaryFluxes` member (`fluxes*`);
+  `update_from_finer` reads it via `GetProjectedBoundaryFluxes(parent, refined)`
+  which projects it to the COARSE index space, then `CorrectForRefinedFluxes(
+  InitialFluxes=SubgridFluxesEstimate[coarse][subgrid], RefinedFluxes=that
+  projection, …)` applies `coarse += (RefinedFlux − InitialFlux)`.
+- `Grid_SolveHydroEquations.C:328-348` is the exact format to match: per `(field,
+  dim)`, `LeftFluxes[field][dim] = new float[plane_size]` over the face plane, with
+  `Left/RightFluxStartGlobalIndex[dim][j]` the plane corner in **global** zone index
+  at this level. EnzoNG's `bflux` (axis,side,cell)→∫F·area dt maps to it as
+  axis=dim, :lo→Left, :hi→Right, cell→(plane index, global-offset by the grid's
+  GridStartIndex/GridLeftEdge). Need bridges for the grid's global start + the
+  subgrid boxes to compute the extents.
+- **The failure mode is NOT silent given the gate:** a wrong index/sign/unit shows
+  as the `test_reflux` conservation drift jumping from ~1e-13 (round-off) to ~1e-3
+  (~0.45%, the documented reflux signature) — so part B is validatable by running a
+  2-level `:julia` AMR and asserting mass/energy conservation. Build B against that
+  assertion, not by eyeballing the index math.
+
 ### B. The bridge (mirrors set_acceleration_field)
 
 Grid methods + bridge fns + bindings:
