@@ -162,6 +162,12 @@ end
 "Spatial rank (1/2/3) of a grid."
 problem_grid_rank(h::Handle, grid::Integer = 0) =
     Int(ccall(_gsym(:enzomodules_problem_grid_rank), Cint, (Handle, Cint), h, grid))
+"Refinement level of grid `grid` (0 = root, -1 if absent) — to iterate a level's grids for a :julia AMR slot."
+problem_grid_level(h::Handle, grid::Integer = 0) =
+    Int(ccall(_gsym(:enzomodules_problem_grid_level), Cint, (Handle, Cint), h, grid))
+"Indices of all grids on `level` in the flat grid list (for a per-level :julia slot)."
+grids_on_level(h::Handle, level::Integer) =
+    [g for g in 0:problem_num_grids(h)-1 if problem_grid_level(h, g) == level]
 "Full per-dim Enzo `GridDimension` (incl. ghosts; column-major; always length 3, 1 past the rank)."
 function problem_grid_dims(h::Handle, grid::Integer = 0)
     d = zeros(Cint, 3)

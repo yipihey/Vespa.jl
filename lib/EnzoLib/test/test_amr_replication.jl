@@ -24,4 +24,27 @@ else
         @info "AMR replication (root grid)" cells = length(dj) L1 = l1 Linf = maximum(abs.(dj .- de))
         @test l1 < 2e-4                              # matches Enzo's AMR to ~5e-5
     end
+
+    # grid→level enumeration (ADR-0003 prerequisite): a :julia AMR slot needs to
+    # iterate the grids on a level. Verify every grid reports a consistent level
+    # and the per-level index lists match session_num_grids_on_level.
+    @testset "grid_level / grids_on_level (AMR slot prerequisite)" begin
+        cd(EnzoLib._workdir(AMR_PROB)) do
+            h = EnzoLib.session_init(AMR_PROB)
+            try
+                EnzoLib.session_rebuild(h, 0)
+                ng = EnzoLib.problem_num_grids(h)
+                levels = [EnzoLib.problem_grid_level(h, g) for g in 0:ng-1]
+                @test all(>=(0), levels)                  # every grid placed in the hierarchy
+                @test 0 in levels                         # a root grid exists
+                for L in 0:maximum(levels)
+                    idx = EnzoLib.grids_on_level(h, L)
+                    @test length(idx) == EnzoLib.session_num_grids_on_level(h, L)
+                    @test all(g -> EnzoLib.problem_grid_level(h, g) == L, idx)
+                end
+            finally
+                EnzoLib.free_problem(h)
+            end
+        end
+    end
 end
