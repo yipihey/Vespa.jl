@@ -76,6 +76,20 @@ session_rebuild(h::Handle, level::Integer = 0) =
 session_num_grids_on_level(h::Handle, level::Integer) =
     ccall(_gsym(:enzomodules_session_num_grids_on_level), Cint, (Handle, Cint), h, level)
 
+# Optional physics steps (no-ops when their physics is off) — for non-hydro problems.
+session_gravity(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_gravity), Cint, (Handle, Cint), h, level)
+session_solve_cooling(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_solve_cooling), Cint, (Handle, Cint), h, level)
+session_star_particles(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_star_particles), Cint, (Handle, Cint), h, level)
+session_update_radiation_field(h::Handle, level::Integer = 0) =
+    ccall(_gsym(:enzomodules_session_update_radiation_field), Cint, (Handle, Cint), h, level)
+"Emit + transport photons; `stars=true` converts star particles into sources."
+session_evolve_photons(h::Handle, level::Integer = 0; stars::Bool = false) =
+    ccall(_gsym(:enzomodules_session_evolve_photons_ex), Cint, (Handle, Cint, Cint),
+          h, level, stars ? 1 : 0)
+
 problem_num_grids(h::Handle) = ccall(_gsym(:enzomodules_problem_num_grids), Cint, (Handle,), h)
 problem_grid_size(h::Handle, grid::Integer = 0) =
     ccall(_gsym(:enzomodules_problem_grid_size), Cint, (Handle, Cint), h, grid)
@@ -204,7 +218,12 @@ finer levels between sub-cycles. `dt_above == 0` ⇒ a single (top-grid) step.
 """
 function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
-                       regrid::Bool = true, maxsub::Int = 100000)
+                       regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
+                       radiation::Bool = false, star_sources::Bool = false,
+                       star_formation::Bool = false, maxsub::Int = 100000)
+    rec(l, dta) = evolve_level!(h, l, dta; hydro! = hydro!, regrid = regrid, gravity = gravity,
+                                cooling = cooling, radiation = radiation, star_sources = star_sources,
+                                star_formation = star_formation, maxsub = maxsub)
     session_clear_boundary_fluxes(h, level)
     done = 0.0; n = 0
     while n < maxsub
@@ -212,15 +231,19 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         dt = session_compute_dt(h, level)
         dt_above > 0.0 && (dt = min(dt, dt_above - done))
         session_set_dt(h, dt, level)
+        radiation && session_evolve_photons(h, level; stars = star_sources)
         session_create_fluxes(h, level)
+        gravity && session_gravity(h, level)
         session_copy_baryon_to_old(h, level)
         hydro!(h, level, dt)                                 # fills boundary fluxes
+        cooling && session_solve_cooling(h, level)
+        star_formation && session_star_particles(h, level)
         session_update_particles(h, level)
         session_advance_time(h, level)
         last = dt_above <= 0.0 || done + dt >= dt_above * (1 - 1e-6)
         if session_num_grids_on_level(h, level + 1) > 0
             session_set_boundary(h, level)                   # refresh before projection
-            evolve_level!(h, level + 1, dt; hydro! = hydro!, regrid = regrid)
+            rec(level + 1, dt)
             session_update_from_finer(h, level)              # project + flux-correct
         end
         session_finalize_fluxes(h, level)
@@ -231,18 +254,26 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
     return n
 end
 
-"""
-    run_amr_density(paramfile; hydro!, regrid=true) -> Vector{Float64}
+# All baryon fields of a grid as a Dict FieldType ⇒ flat field (incl. ghost zones).
+function read_all_fields(h::Handle; grid::Integer = 0)
+    ts = problem_field_types(h, grid)
+    return Dict{Int,Vector{Float64}}(ts[i] => problem_get_field(h, i - 1, grid) for i in eachindex(ts))
+end
 
-Drive a full AMR run FROM JULIA — an initial regrid, then repeatedly evolve the
-whole hierarchy one root step (`evolve_level!(h,0,0)`) and regrid, to StopTime —
-and return the root-grid Density. Mirrors `EvolveHierarchy`/Python `run_amr`.
-`hydro!` defaults to the legacy `session_solve_hydro` (drives Enzo's hydro under
-the Julia-owned AMR control flow).
 """
-function run_amr_density(paramfile::AbstractString;
-                         hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
-                         regrid::Bool = true, maxcycle::Int = 100000)
+    run_amr(paramfile; reader=read_density, hydro!, regrid=true, gravity=…, cooling=…,
+            radiation=…, star_sources=…, star_formation=…) -> reader(h)
+
+Drive a full AMR run FROM JULIA — initial regrid, then root steps + regrid to
+StopTime — and return `reader(handle)` (e.g. `read_density` or `read_all_fields`).
+Mirrors `EvolveHierarchy` / Python `run_amr`; the physics flags enable the
+corresponding certified Session steps each cycle.
+"""
+function run_amr(paramfile::AbstractString; reader = read_density,
+                 hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
+                 regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
+                 radiation::Bool = false, star_sources::Bool = false,
+                 star_formation::Bool = false, maxcycle::Int = 100000)
     pf = abspath(paramfile)
     cd(mktempdir()) do
         h = session_init(pf)
@@ -251,11 +282,32 @@ function run_amr_density(paramfile::AbstractString;
             regrid && session_rebuild(h, 0)
             n = 0
             while session_time(h) < session_stop_time(h) && n < maxcycle
-                evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid)
+                evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid, gravity = gravity,
+                              cooling = cooling, radiation = radiation, star_sources = star_sources,
+                              star_formation = star_formation)
                 regrid && session_rebuild(h, 0)
                 n += 1
             end
-            return read_density(h)                           # root grid
+            return reader(h)
+        finally
+            free_problem(h)
+        end
+    end
+end
+
+"AMR run returning the root-grid Density (back-compat wrapper)."
+run_amr_density(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader = read_density, kwargs...)
+"AMR run returning ALL root-grid fields (Dict FieldType ⇒ vector)."
+run_amr_fields(paramfile::AbstractString; kwargs...) = run_amr(paramfile; reader = read_all_fields, kwargs...)
+
+"Enzo's own `EvolveHierarchy` to StopTime, returning ALL root-grid fields — the reference."
+function evolve_problem_fields(paramfile::AbstractString; grid::Integer = 0)
+    pf = abspath(paramfile)
+    cd(mktempdir()) do
+        h = evolve_problem(pf, 0.0, 0)
+        h == C_NULL && error("evolve_problem (EvolveHierarchy) failed for $pf")
+        try
+            return read_all_fields(h; grid = grid)
         finally
             free_problem(h)
         end
