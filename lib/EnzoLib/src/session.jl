@@ -280,10 +280,12 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
                        regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                        radiation::Bool = false, star_sources::Bool = false,
-                       star_formation::Bool = false, cosmology::Bool = false, maxsub::Int = 100000)
+                       star_formation::Bool = false, cosmology::Bool = false,
+                       mhdct::Bool = false, maxsub::Int = 100000)
     rec(l, dta) = evolve_level!(h, l, dta; hydro! = hydro!, regrid = regrid, gravity = gravity,
                                 cooling = cooling, radiation = radiation, star_sources = star_sources,
-                                star_formation = star_formation, cosmology = cosmology, maxsub = maxsub)
+                                star_formation = star_formation, cosmology = cosmology,
+                                mhdct = mhdct, maxsub = maxsub)
     session_clear_boundary_fluxes(h, level)
     done = 0.0; n = 0
     while n < maxsub
@@ -307,6 +309,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
             rec(level + 1, dt)
             session_update_from_finer(h, level)              # project + flux-correct
         end
+        mhdct && session_set_boundary(h, level)              # UseMHDCT: refresh face-B ghosts (EvolveLevel.C:912)
         session_finalize_fluxes(h, level)
         n += 1; done += dt
         (last || dt <= 0.0) && break
@@ -334,7 +337,8 @@ function run_amr(paramfile::AbstractString; reader = read_density,
                  hydro! = (hh, l, dt) -> session_solve_hydro(hh, l),
                  regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                  radiation::Bool = false, star_sources::Bool = false,
-                 star_formation::Bool = false, cosmology::Bool = false, maxcycle::Int = 100000)
+                 star_formation::Bool = false, cosmology::Bool = false,
+                 mhdct::Bool = false, maxcycle::Int = 100000)
     pf = abspath(paramfile)
     maxcycle = min(maxcycle, _stop_cycle(pf))    # honor the param file's StopCycle (as EvolveHierarchy does)
     cd(mktempdir()) do
@@ -346,7 +350,7 @@ function run_amr(paramfile::AbstractString; reader = read_density,
             while session_time(h) < session_stop_time(h) && n < maxcycle
                 evolve_level!(h, 0, 0.0; hydro! = hydro!, regrid = regrid, gravity = gravity,
                               cooling = cooling, radiation = radiation, star_sources = star_sources,
-                              star_formation = star_formation, cosmology = cosmology)
+                              star_formation = star_formation, cosmology = cosmology, mhdct = mhdct)
                 regrid && session_rebuild(h, 0)
                 n += 1
             end

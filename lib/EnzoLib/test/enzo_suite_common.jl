@@ -23,20 +23,29 @@ function problem_flags(pf::AbstractString)
     star = enzo_param(pf, "StarParticleCreation") != 0
     cosmo = enzo_param(pf, "ComovingCoordinates") != 0
     hm   = Int(enzo_param(pf, "HydroMethod"))
-    return (gravity = g, cooling = cool, radiation = rad,
-            star_formation = star, star_sources = star, cosmology = cosmo, hydromethod = hm)
+    mhdct = hm == 6 || enzo_param(pf, "UseMHDCT") != 0    # constrained-transport MHD
+    return (gravity = g, cooling = cool, radiation = rad, star_formation = star,
+            star_sources = star, cosmology = cosmo, mhdct = mhdct, hydromethod = hm)
 end
 
-# Per-field L∞ error normalized by the field's magnitude (robust for near-zero
-# fields); returns the max over all fields shared by the two runs.
+# Per-field L∞ error, normalized by the field magnitude with an ABSOLUTE floor
+# tied to the problem's characteristic scale (the largest field magnitude). This
+# is the crucial bit for MHD/multi-D: fields that are structurally zero (e.g. Bz
+# and Vz in a 2D problem, ~1e-17 roundoff) have an ill-defined relative error —
+# dividing by their own ~1e-17 magnitude turns machine noise into O(1) "error".
+# Using atol = 1e-9·(global scale) leaves active O(1) fields unchanged but reports
+# zero-fields as matching. Returns the max over all fields shared by the two runs.
 function _max_field_error(dj::Dict{Int,Vector{Float64}}, de::Dict{Int,Vector{Float64}})
     common = intersect(keys(dj), keys(de))
     isempty(common) && return (err = Inf, worst = -1, nfields = 0)
+    gscale = 0.0
+    for ft in common; gscale = max(gscale, maximum(abs, de[ft])); end
+    atol = 1e-9 * gscale + 1e-300
     maxerr = 0.0; worst = -1
     for ft in common
         a = dj[ft]; b = de[ft]
         length(a) == length(b) || return (err = Inf, worst = ft, nfields = length(common))
-        scale = maximum(abs, b) + 1e-30
+        scale = maximum(abs, b) + atol      # absolute floor kills zero-field noise
         e = maximum(abs.(a .- b)) / scale
         e > maxerr && (maxerr = e; worst = ft)
     end
@@ -97,7 +106,8 @@ function compare_problem(pf0::AbstractString)
     se = EnzoLib.evolve_problem_state(pf)
     sj = EnzoLib.run_amr_state(pf; gravity = fl.gravity, cooling = fl.cooling,
                                radiation = fl.radiation, star_sources = fl.star_sources,
-                               star_formation = fl.star_formation, cosmology = fl.cosmology)
+                               star_formation = fl.star_formation, cosmology = fl.cosmology,
+                               mhdct = fl.mhdct)
     r = _max_field_error(sj.fields, se.fields)
     p = _max_particle_error(sj.particles, se.particles)
     return (err = r.err, worst = r.worst, nfields = r.nfields,

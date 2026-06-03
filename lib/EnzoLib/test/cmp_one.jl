@@ -26,7 +26,8 @@ function main()
     try
         sj = EnzoLib.run_amr_state(pf; gravity = fl.gravity, cooling = fl.cooling,
                                    radiation = fl.radiation, star_sources = fl.star_sources,
-                                   star_formation = fl.star_formation, cosmology = fl.cosmology)
+                                   star_formation = fl.star_formation, cosmology = fl.cosmology,
+                                   mhdct = fl.mhdct)
         r = _max_field_error(sj.fields, se.fields)
         p = _max_particle_error(sj.particles, se.particles)
         println("RESULT|", nm, "|status=ok|err=", r.err, "|nfields=", r.nfields,
