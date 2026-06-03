@@ -134,6 +134,30 @@ function problem_set_field(h::Handle, fi::Integer, data::Vector{Float64}; grid::
     return nothing
 end
 
+"""
+    problem_set_acceleration(h, dim, data; grid=0)
+    problem_get_acceleration(h, dim, data; grid=0)
+
+Write / read the cell-centered `AccelerationField[dim]` (0-based dim) — the gravity
+source `SolveHydroEquations` reads. The enabling primitive for a `:julia` gravity
+slot: EnzoNG solves Poisson on the live density, computes `g = −∇φ`, and writes it
+here, so Enzo's hydro applies the Julia-computed gravity. `set` allocates if the
+field is absent (a Julia slot replaces `ComputeAccelerations`, which normally does).
+"""
+function problem_set_acceleration(h::Handle, dim::Integer, data::Vector{Float64}; grid::Integer = 0)
+    length(data) == problem_grid_size(h, grid) ||
+        throw(DimensionMismatch("acceleration length $(length(data)) ≠ grid size $(problem_grid_size(h, grid))"))
+    ccall(_gsym(:enzomodules_problem_set_acceleration), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, data)
+    return nothing
+end
+function problem_get_acceleration(h::Handle, dim::Integer, grid::Integer = 0)
+    out = zeros(Float64, problem_grid_size(h, grid))
+    ccall(_gsym(:enzomodules_problem_get_acceleration), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, out)
+    return out
+end
+
 # ── particles (positions) ────────────────────────────────────────────────────
 "Spatial rank (1/2/3) of a grid."
 problem_grid_rank(h::Handle, grid::Integer = 0) =
