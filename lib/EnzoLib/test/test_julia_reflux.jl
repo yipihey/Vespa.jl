@@ -46,6 +46,22 @@ function _build_grid_sim(h, gi, model, nghost)
     return mesh, Simulation(mesh, prob; model = model)
 end
 
+# ADR-0003 follow-up #1: a subgrid's outer faces ARE coarse–fine interfaces, so its
+# ghost zones are Enzo's parent-interpolated values (filled by session_set_boundary
+# before the solve), NOT a true domain boundary. Replace the placeholder Outflow
+# BCs on a level>0 grid with a ParentGhost BC reading those ghosts (the closure
+# returns Enzo's conserved ghost; convert to primitive for the driver). The root
+# grid (level 0) keeps its real domain BCs. Snapshot AFTER sync_from_enzo! (ghosts
+# are valid at hook entry). Returns the BC's primitive-ghost closure or nothing.
+function _apply_parent_ghost!(sim, mesh, model, level)
+    level <= 0 && return nothing
+    cons = enzo_parent_ghost(mesh)
+    pg = MeshInterface.ParentGhost((axis, side, cell) ->
+             EnzoNG.cons2prim(model, cons(axis, side, cell)))
+    sim.bcs = MeshInterface.BoundaryConditions(pg, Val(MeshInterface.rank(mesh)))
+    return pg
+end
+
 # Write one (dim, side) flux plane of an Enzo flux register (subgrid OR boundary)
 # for ALL Enzo baryon fields (the consumers — CorrectForRefinedFluxes,
 # AddToBoundaryFluxes — loop every field and deref each, so unmapped fields must
@@ -124,7 +140,8 @@ end
 
 # The conservative :julia hydro hook: per grid on `level`, run EnzoNG's driver on
 # the live state and write its fluxes into Enzo's registers.
-function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Bool = true)
+function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Bool = true,
+                                       parent_ghost::Bool = true)
     model = IdealHydro(γ)
     return function (h, level, dt)
         n = EnzoLib.session_num_grids_on_level(h, level)
@@ -133,6 +150,9 @@ function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Boo
             mesh, sim = _build_grid_sim(h, gi, model, nghost)
             breg = EnzoNG._bflux_register(sim; record_interior = true)
             sync_from_enzo!(sim.sv, mesh)
+            # Consume Enzo's parent-interpolated ghost zones at this subgrid's
+            # coarse–fine faces (ADR-0003 follow-up #1) instead of Outflow.
+            parent_ghost && _apply_parent_ghost!(sim, mesh, model, level)
             step!(sim, dt; bflux = breg)
             sync_to_enzo!(mesh, sim.sv)
             _write_fluxes!(h, level, i, gi, mesh, sim, breg, model; conservative = conservative)
@@ -171,10 +191,12 @@ end
 # (multi-level) hierarchy static; `nsteps` caps the number of root steps (so the
 # decisive run can stop while the waves are still interior to the refined region,
 # where the coarse–fine flux balance is the ONLY conservation term).
-function _run_reflux(pf; conservative::Bool, regrid::Bool = true, nsteps::Int = 100000)
+function _run_reflux(pf; conservative::Bool, regrid::Bool = true, nsteps::Int = 100000,
+                     parent_ghost::Bool = true)
     eng = EnzoLib.EngineConfig(; hydro = :julia, reflux = true,
                                hooks = Dict{Symbol,Function}(:hydro =>
-                                   conservative_julia_hydro_hook(; conservative = conservative)))
+                                   conservative_julia_hydro_hook(; conservative = conservative,
+                                                                 parent_ghost = parent_ghost)))
     cd(EnzoLib._workdir(pf)) do
         h = EnzoLib.session_init(pf)
         h == C_NULL && error("session_init failed for $pf")
@@ -225,15 +247,32 @@ else
 
         # (B) END-TO-END FEATURE-TRACKING AMR. The full run (dynamic regridding to
         # StopTime) with the correction conserves far better than without — the
-        # reflux removes the bulk of the coarse–fine non-conservation. (The residual
-        # ~1e-5 is EnzoNG's Outflow boundary approximation at coarse–fine faces, an
-        # accuracy follow-up — EnzoNG should consume Enzo's parent-interpolated
-        # ghost zones; the flux bridge itself is exact, per subtest A.)
+        # reflux removes the bulk of the coarse–fine non-conservation.
         on2  = _run_reflux(REFLUX_PF; conservative = true)
         off2 = _run_reflux(REFLUX_PF; conservative = false)
         e_on = _drift(on2); e_off = _drift(off2)
         @info "part B (B) full regrid run" cycles = on2.cycles d_on = e_on d_off = e_off
         @test e_on.mass < 1e-3                        # conserves well end-to-end
         @test e_off.mass > 50 * e_on.mass             # reflux is decisive
+
+        # (C) PARENT-GHOST COUPLING (ADR-0003 follow-up #1). EnzoNG now consumes
+        # Enzo's parent-interpolated ghost zones at a subgrid's coarse–fine faces
+        # (a ParentGhost BC reading the live grid's ghosts) instead of an Outflow
+        # (zero-gradient) copy. The Outflow ghost is the residual end-to-end drift:
+        # when a wave sits ON a coarse–fine boundary its rel-error × flux-magnitude
+        # is the dominant non-conservation. Reading the parent value instead roughly
+        # HALVES the end-to-end drift (measured ~1.79e-5 Outflow → ~8.05e-6 parent-
+        # ghost). The sign/index is gated honestly: the negative control (reading the
+        # ghost on the WRONG side) makes it WORSE than Outflow, so a wrong index/sign
+        # FAILS this assertion rather than passing silently. (The flux bridge stays
+        # exactly conservative — subtest A is unchanged at round-off — this is the
+        # boundary-ACCURACY half.)
+        pg_on  = on2                                  # the default run already uses parent-ghost
+        pg_off = _run_reflux(REFLUX_PF; conservative = true, parent_ghost = false)
+        e_pg  = _drift(pg_on); e_npg = _drift(pg_off)
+        @info "part B (C) parent-ghost vs Outflow" parent_ghost = e_pg outflow = e_npg ratio = e_npg.mass / e_pg.mass
+        @test e_npg.mass > 1.5 * e_pg.mass            # parent-ghost cuts the drift (≥1.5×; measured ≈2.2×)
+        @test e_pg.mass < 1.2e-5                      # absolute end-to-end bound (measured ≈8.05e-6)
+        @test e_pg.energy < 1.5e-5                    # energy likewise (measured ≈9.13e-6)
     end
 end

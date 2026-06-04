@@ -83,6 +83,22 @@ struct Periodic <: AbstractBC end
 struct Reflecting <: AbstractBC end
 
 """
+    ParentGhost(ghost)
+
+A coarse–fine boundary whose ghost state is supplied EXTERNALLY (not synthesized
+from the boundary cell). `ghost` is a closure `ghost(axis::Int, side::Symbol,
+cell) -> W::NTuple` returning the PRIMITIVE ghost state for the face on `side` of
+`axis` at boundary `cell`. This is the seam-respecting way for a backend over a
+live AMR substrate (e.g. `EnzoGridMesh`) to feed the solver the substrate's
+already-interpolated parent ghost zones at a subgrid's outer faces, instead of an
+Outflow copy — restoring conservation/accuracy when a wave sits on the interface.
+The driver resolves it via `ghost_state`; non-`ParentGhost` BCs ignore the cell.
+"""
+struct ParentGhost{F} <: AbstractBC
+    ghost::F
+end
+
+"""
     BoundaryConditions(spec)
 
 Per-axis, per-side boundary conditions. `spec` is one `AbstractBC` (applied to
@@ -275,7 +291,7 @@ include("instrument.jl")
 
 export AbstractMeshBackend,
     AbstractLayout, SoA, AoS, Blocked, block_size,
-    AbstractBC, Outflow, Periodic, Reflecting, BoundaryConditions, bc_on,
+    AbstractBC, Outflow, Periodic, Reflecting, ParentGhost, BoundaryConditions, bc_on,
     FieldSpec, field_names, AbstractFieldStore,
     NeighborRef, Interior, DomainBoundary,
     rank, domain, n_cells, for_each_cell, for_each_face, level_of, max_level,

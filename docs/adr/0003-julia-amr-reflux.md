@@ -173,11 +173,27 @@ boundary, not the bridge.
   composite mass drift `5.9e-15` / energy `3.3e-14` (WITH) vs `1.2e-3` / `3.0e-3`
   (WITHOUT) — round-off, on genuine 60-cell and 4-cell face planes. 1D unchanged
   (bit-identical `7.9e-16`).
-- **Parent-ghost coupling (accuracy + the residual conservation).** EnzoNG evolves
-  each subgrid with Outflow BCs; it should instead consume Enzo's parent-interpolated
-  ghost zones (a fixed/Dirichlet BC reading the live grid's ghost cells). This is
-  what limits the end-to-end (feature-tracking) run to ~1e-5 rather than round-off.
-  The flux bridge itself is exact (the static-interior subtest proves it).
+- **Parent-ghost coupling (accuracy + the residual conservation). — DONE.** EnzoNG
+  now consumes Enzo's parent-interpolated ghost zones at a subgrid's coarse–fine
+  faces instead of an Outflow copy. Mechanism: a `ParentGhost{F}` BC
+  (`MeshInterface`) carrying a closure `(axis, side, cell) -> W_prim`; the driver's
+  `_boundary_ghost` resolves it (the existing Outflow/Reflecting/Periodic paths are
+  byte-unchanged — core stays 203/203). The closure reads the live Enzo grid's
+  already-interpolated ghost zone one zone OUTWARD of the boundary active cell
+  (`enzo_parent_ghost` in `EnzoBackend`, using the existing `problem_get_field`
+  flat array that already includes ghosts — no new C-ABI bridge function needed),
+  returns it as a conserved role-ordered tuple, and the hook converts to primitive.
+  Applied only on level>0 grids (the root's outer faces are real domain BCs).
+  **Result (subtest C):** end-to-end mass drift `1.79e-5` (Outflow) → `8.05e-6`
+  (parent-ghost), a ~2.2× reduction; energy `2.05e-5` → `9.13e-6`. The flux bridge
+  stays exactly conservative (subtest A unchanged at `7.9e-16`) — this is the
+  boundary-ACCURACY half, not the conservation half. The sign/index is gated
+  honestly: the negative control (reading the ghost on the WRONG side) makes drift
+  WORSE than Outflow (`2.63e-5`), so a wrong index/sign FAILS the assertion. (The
+  residual `~8e-6` is the coarse↔fine interpolation accuracy itself — EnzoNG reads
+  the innermost interpolated layer; Enzo's multi-layer ghost + its own boundary
+  reconstruction differ at higher order. Reaching round-off would require matching
+  Enzo's reconstruction exactly, which is beyond consuming the parent ghost.)
 
 ## Why this is a dedicated effort, not a tail-end task
 

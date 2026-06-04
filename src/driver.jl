@@ -111,6 +111,18 @@ end
 end
 @inline ghost_state(W, ::Periodic, ::Int, ::EquationSet) = W           # never reached
 
+# Boundary ghost primitive state at the face on `side` of `axis` at boundary
+# `cell`, given the boundary cell's own face-extrapolated primitive `W`. For the
+# state-synthesizing BCs (Outflow/Reflecting/Periodic) the cell/side are unused.
+# `ParentGhost` ignores `W` entirely and asks its closure for the substrate's
+# already-interpolated parent ghost zone — the conservative coarse–fine coupling
+# (ADR-0003 follow-up #1): a wave on the interface sees Enzo's parent value, not
+# an Outflow copy.
+@inline _boundary_ghost(sim::Simulation, W, bc::AbstractBC, axis::Int, ::Symbol, cell) =
+    ghost_state(W, bc, axis, sim.model)
+@inline _boundary_ghost(sim::Simulation, W, bc::ParentGhost, axis::Int, side::Symbol, cell) =
+    bc.ghost(axis, side, cell)
+
 # Primitive state at a cell.
 @inline _W(sim::Simulation, cell) = cons2prim(sim.model, get_U(sim.sv, cell))
 
@@ -121,7 +133,7 @@ end
     if nb isa Interior
         return _W(sim, nb.cell)
     else
-        return ghost_state(Wc, nb.bc, axis, sim.model)
+        return _boundary_ghost(sim, Wc, nb.bc, axis, side, cell)
     end
 end
 
@@ -231,7 +243,7 @@ end
                              axis::Int, area::Real; reflux = nothing, bflux = nothing)
     i = left.cell
     WL = _face_value(sim, i, axis, :hi)
-    Wg = ghost_state(WL, right.bc, axis, sim.model)
+    Wg = _boundary_ghost(sim, WL, right.bc, axis, :hi, i)
     F = riemann_flux(sim.model, WL, Wg, axis)
     av = sim.accv
     aT = Base.eltype(F)(area)
@@ -247,7 +259,7 @@ end
                              axis::Int, area::Real; reflux = nothing, bflux = nothing)
     j = right.cell
     WR = _face_value(sim, j, axis, :lo)
-    Wg = ghost_state(WR, left.bc, axis, sim.model)
+    Wg = _boundary_ghost(sim, WR, left.bc, axis, :lo, j)
     F = riemann_flux(sim.model, Wg, WR, axis)
     av = sim.accv
     aT = Base.eltype(F)(area)
