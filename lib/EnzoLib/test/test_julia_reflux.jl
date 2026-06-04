@@ -145,8 +145,13 @@ function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Boo
     model = IdealHydro(γ)
     return function (h, level, dt)
         n = EnzoLib.session_num_grids_on_level(h, level)
+        me = EnzoLib.session_my_rank(h)
         for i in 0:n-1
             gi = EnzoLib.problem_grid_index_on_level(h, level, i)
+            # Only touch grids resident on this rank — a non-local grid's fields
+            # and flux registers are not allocated here (mirrors Enzo's
+            # SolveHydroEquations).  No-op filter in the serial flavor (all local).
+            EnzoLib.problem_grid_processor(h, gi) == me || continue
             mesh, sim = _build_grid_sim(h, gi, model, nghost)
             breg = EnzoNG._bflux_register(sim; record_interior = true)
             sync_from_enzo!(sim.sv, mesh)

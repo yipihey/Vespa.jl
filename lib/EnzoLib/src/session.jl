@@ -8,24 +8,62 @@
 # Build the library with EnzoModules/deps/build_grid_darwin.sh (macOS) /
 # build_grid.sh (Linux); located via ENV["ENZOMODULES_GRID_LIB"] or deps/.
 
+"True when the opt-in MPI flavor of the Enzo substrate is selected (`ENV[\"ENZONG_ENZO_MPI\"]==\"1\"`)."
+enzo_mpi_enabled() = get(ENV, "ENZONG_ENZO_MPI", "") == "1"
+
 "Path to the EnzoModules grid/session bridge library (links the full Enzo .so)."
 function grid_libpath()
     env = get(ENV, "ENZOMODULES_GRID_LIB", "")
     isempty(env) || return abspath(env)
     base = normpath(joinpath(@__DIR__, "..", "..", "..", "..", "EnzoModules", "deps"))
-    for name in ("libenzomodules_grid.dylib", "libenzomodules_grid.so")
+    # Default is the serial bridge; the MPI flavor (built by build_grid_darwin.sh mpi)
+    # is opt-in and carries an _mpi suffix so both artifacts coexist.
+    names = enzo_mpi_enabled() ?
+        ("libenzomodules_grid_mpi.dylib", "libenzomodules_grid_mpi.so") :
+        ("libenzomodules_grid.dylib", "libenzomodules_grid.so")
+    for name in names
         p = joinpath(base, name); isfile(p) && return p
     end
-    return joinpath(base, "libenzomodules_grid.dylib")
+    return joinpath(base, first(names))
 end
 grid_available() = isfile(grid_libpath())
+
+# The MPI flavor's libenzo/bridge are linked with `-undefined dynamic_lookup` and
+# carry NO libmpitrampoline dependency (linking one would load a SECOND trampoline
+# instance and MPItrampoline aborts on double-load).  Their MPI_* symbols are
+# resolved at bridge-load time from the host process's already-loaded MPItrampoline
+# (MPI.jl's) — but only if it is in GLOBAL scope.  Promote it before dlopening the
+# bridge: prefer ENV["ENZONG_MPITRAMPOLINE"] (explicit path), else promote the
+# already-loaded image by leaf name (RTLD_NOLOAD).
+function _promote_mpitrampoline()
+    flags = Libdl.RTLD_GLOBAL | Libdl.RTLD_LAZY
+    path = get(ENV, "ENZONG_MPITRAMPOLINE", "")
+    try
+        if !isempty(path)
+            Libdl.dlopen(path, flags)
+        else
+            Libdl.dlopen("libmpitrampoline.dylib", flags | Libdl.RTLD_NOLOAD)
+        end
+    catch e
+        @warn "EnzoLib: could not promote MPItrampoline to global scope; the MPI \
+               bridge's MPI_* symbols may be unresolved. Set ENV[\"ENZONG_MPITRAMPOLINE\"] \
+               to libmpitrampoline's path." exception = e
+    end
+    return nothing
+end
 
 const _GHANDLE = Ref{Ptr{Cvoid}}(C_NULL)
 function _ghandle()
     if _GHANDLE[] == C_NULL
         grid_available() || error("grid/session library not found at $(grid_libpath()). " *
                                   "Build it: bash EnzoModules/deps/build_grid_darwin.sh")
-        _GHANDLE[] = Libdl.dlopen(grid_libpath())
+        if enzo_mpi_enabled()
+            _promote_mpitrampoline()
+            # RTLD_GLOBAL so the bridge participates in flat MPI_* resolution.
+            _GHANDLE[] = Libdl.dlopen(grid_libpath(), Libdl.RTLD_GLOBAL | Libdl.RTLD_LAZY)
+        else
+            _GHANDLE[] = Libdl.dlopen(grid_libpath())
+        end
     end
     return _GHANDLE[]
 end
@@ -251,6 +289,27 @@ problem_grid_level(h::Handle, grid::Integer = 0) =
 "Indices of all grids on `level` in the flat grid list (for a per-level :julia slot)."
 grids_on_level(h::Handle, level::Integer) =
     [g for g in 0:problem_num_grids(h)-1 if problem_grid_level(h, g) == level]
+
+"This rank's MPI id (0 in the serial flavor)."
+session_my_rank(h::Handle) =
+    Int(ccall(_gsym(:enzomodules_session_my_rank), Cint, (Handle,), h))
+"Total MPI rank count (1 in the serial flavor)."
+session_num_ranks(h::Handle) =
+    Int(ccall(_gsym(:enzomodules_session_num_ranks), Cint, (Handle,), h))
+"Home processor (rank) of grid `grid` (always 0 in the serial flavor; -1 if absent)."
+problem_grid_processor(h::Handle, grid::Integer) =
+    Int(ccall(_gsym(:enzomodules_problem_grid_processor), Cint, (Handle, Cint), h, grid))
+
+# Grids on `level` RESIDENT on this rank — the only ones whose BaryonField/flux
+# registers are allocated here, so the only ones a :julia hydro slot may touch
+# (mirrors Enzo's SolveHydroEquations, which skips grids with ProcessorNumber !=
+# MyProcessorNumber).  In the serial flavor every grid is local, so this equals
+# `grids_on_level`.  Enzo's own SetBoundaryConditions / UpdateFromFinerGrids move
+# data across ranks; the :julia kernel only ever runs on local grids.
+local_grids_on_level(h::Handle, level::Integer) =
+    let me = session_my_rank(h)
+        [g for g in grids_on_level(h, level) if problem_grid_processor(h, g) == me]
+    end
 "Full per-dim Enzo `GridDimension` (incl. ghosts; column-major; always length 3, 1 past the rank)."
 function problem_grid_dims(h::Handle, grid::Integer = 0)
     d = zeros(Cint, 3)

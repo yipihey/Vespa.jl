@@ -1,19 +1,19 @@
-# Isolated test env for the Enzo-integration layer (native build lives here, so
-# it never gates the core suite). [sources] are authoritative when this project
-# is active (`--project=lib/EnzoLib/test`).
 [deps]
-EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
-EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
 EnzoBackend = "1a2b3c4d-0006-4000-8000-000000000006"
+EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
+EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+MPIPreferences = "3da0fdf6-3ccc-4f1b-acd9-58baa6c99267"
+MPItrampoline_jll = "f1f71cc9-e9ae-5b93-9b94-4fe0e1ad3748"
 MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
 RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-EnzoLib = {path = ".."}
-EnzoFixtures = {path = "../../EnzoFixtures"}
 EnzoBackend = {path = "../../EnzoBackend"}
+EnzoFixtures = {path = "../../EnzoFixtures"}
+EnzoLib = {path = ".."}
 EnzoNG = {path = "../../.."}
 MeshInterface = {path = "../../MeshInterface"}
 RefMesh = {path = "../../RefMesh"}
