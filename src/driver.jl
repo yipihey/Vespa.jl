@@ -222,6 +222,7 @@ end
             _reflux_capture!(sim, reg, i, j, F, area)
         end
     end
+    bflux === nothing || _bflux_capture_interior!(bflux, axis, i, F, area)  # +axis lo cell = i
     return nothing
 end
 

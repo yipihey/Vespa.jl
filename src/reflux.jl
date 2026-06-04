@@ -111,12 +111,15 @@ end
 # exactly like the coarse↔fine `FluxRegister`, so the value is consistent with the
 # gas update the slot performed.
 mutable struct BoundaryFluxRegister{NV,T}
-    flux::Dict{Tuple{Int,Symbol,Any},NTuple{NV,T}}    # (axis, side, cell) → ∫F·area dt
+    flux::Dict{Tuple{Int,Symbol,Any},NTuple{NV,T}}    # outer (axis, side, cell) → ∫F·area dt
+    interior::Dict{Tuple{Int,Any},NTuple{NV,T}}       # interior (axis, lo_cell) → ∫F·area dt
     scale::T                                          # dt × RK-stage weight, per pass
+    record_interior::Bool                             # capture interior faces? (AMR coarse InitialFluxes)
 end
-function _bflux_register(sim::Simulation)
+function _bflux_register(sim::Simulation; record_interior::Bool = false)
     nv = nvars(sim.model); T = _Tf(sim)
-    return BoundaryFluxRegister{nv,T}(Dict{Tuple{Int,Symbol,Any},NTuple{nv,T}}(), zero(T))
+    return BoundaryFluxRegister{nv,T}(Dict{Tuple{Int,Symbol,Any},NTuple{nv,T}}(),
+                                      Dict{Tuple{Int,Any},NTuple{nv,T}}(), zero(T), record_interior)
 end
 
 @inline function _bflux_capture!(reg::BoundaryFluxRegister{NV,T}, axis::Int, side::Symbol,
@@ -125,5 +128,19 @@ end
     s = reg.scale; aT = T(area)
     add = map(f -> s * f * aT, F)
     reg.flux[k] = get(reg.flux, k, ntuple(_ -> zero(T), Val(NV))) .+ add
+    return nothing
+end
+
+# Interior face (between two same-grid cells), keyed by the +axis LO cell. The
+# coarse grid's flux at a subgrid-boundary face IS an interior face here; the
+# AMR reflux bridge looks these up to fill Enzo's InitialFluxes. Only recorded
+# when the register opts in (single-grid / part-A paths leave `interior` empty).
+@inline function _bflux_capture_interior!(reg::BoundaryFluxRegister{NV,T}, axis::Int,
+                                          lo_cell, F, area::Real) where {NV,T}
+    reg.record_interior || return nothing
+    k = (axis, lo_cell)
+    s = reg.scale; aT = T(area)
+    add = map(f -> s * f * aT, F)
+    reg.interior[k] = get(reg.interior, k, ntuple(_ -> zero(T), Val(NV))) .+ add
     return nothing
 end

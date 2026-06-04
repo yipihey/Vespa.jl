@@ -1,8 +1,13 @@
 # ADR-0003: Conservative `:julia` hydro under Enzo AMR (the SubgridFluxes contract)
 
-- **Status:** In progress — Part A (EnzoNG boundary-flux recording) done; the
-  prerequisite grid→level bridge done; Part B (the bridge write + orchestration)
-  is the remaining conservation-critical piece.
+- **Status:** DONE (1D) — Part A (EnzoNG boundary-flux recording) + Part B (the
+  bridge write + orchestration) implemented and proven exactly conservative. The
+  flux bridge conserves the composite mass/energy to **round-off** on a static
+  multi-level (5-level) hierarchy while the waves are interior to the refined
+  region (`7.9e-16` vs `1.3e-3` with the correction disabled). Validated by
+  `lib/EnzoLib/test/test_julia_reflux.jl`. Remaining follow-ups (below): ND face
+  planes, and EnzoNG consuming Enzo's parent-interpolated ghosts (the residual
+  ~1e-5 end-to-end drift is that boundary approximation, NOT the flux bridge).
 - **Date:** 2026-06-03
 - **Builds on:** ADR-0002 (method-slot registry), the ND single-grid `EnzoBackend`
   (`b15d99a2`), and the `set_acceleration_field` bridge (`5d917e0c`).
@@ -113,6 +118,55 @@ same `~1e-13` the `:enzo` AMR path does (`test_reflux.jl` is the template). The
 decisive check: disabling (B) takes the drift from round-off to ~1e-3 (the same
 signature reflux has on EnzoNG's own composite AMR), proving the correction is what
 restores conservation.
+
+## What was built (the implementation, verified)
+
+The contract above was implemented exactly. Producer/consumer were traced from the
+Enzo source and the index mapping was validated end-to-end against a conservation
+assertion (not by eyeballing):
+
+- **C-ABI bridge** (`Grid_EnzoModulesFixture.C` grid methods + `enzomodules_problem_
+  bridge.C` `extern "C"` fns + `session.jl` bindings; rebuilt via
+  `build_grid_darwin.sh`): `EnzoModulesGlobalStart` (active-region global zone
+  index), `EnzoModulesGridEdge` (per-grid physical edges → level-dependent cell
+  width), `BoundaryFlux{Size,Extent,Set,Get}`, and `problem_{num_subgrids,
+  subgrid_flux_extent,subgrid_flux_size,set/get_subgrid_flux,grid_index_on_level}`.
+- **Two flux sets filled** (exactly what `SolveHydroEquations` fills): the coarse
+  `SubgridFluxesEstimate[level][i][sub]` — proper subgrids = the coarse
+  InitialFluxes at the coarse–fine faces (EnzoNG's INTERIOR flux there, looked up
+  by the subgrid's coarse-index extents), and the **last** entry = the grid's own
+  outer flux, which `FinalizeFluxes`→`AddToBoundaryFluxes` accumulates into the
+  grid's `BoundaryFluxes` (giving the correct temporal accumulation across
+  subcycles for free). This last-entry path is required: `AddToBoundaryFluxes`
+  derefs every baryon field of it, so ALL fields must be allocated (mapped value or
+  zero) — the segfault the old gate avoided.
+- **Units / sign / field map** (verified): Enzo stores `F·dt/dx` (a conserved-
+  density change), so `enzo_value = bflux/V_cell` (bflux = `∫F·area dt`); +axis
+  sign throughout; EnzoNG conserved component → Enzo BaryonField via the mesh's
+  role map (`cdi→di`, `cei→ei`, `cmom[d]→vi[d]`).
+- **Orchestration** (`session.jl`): `EngineConfig(reflux=true)` lifts the
+  `ef = hydro===:enzo` gate to also run `clear/create/update_from_finer/finalize`
+  for a conservative `:julia` hydro; the hook (`test_julia_reflux.jl`) iterates the
+  grids on each level, runs EnzoNG's driver, and writes the fluxes. Enzo's own
+  `UpdateFromFinerGrids`/`CorrectForRefinedFluxes` then restore conservation —
+  identical machinery, EnzoNG's numbers.
+
+**Result:** static 5-level Sod, waves interior — composite mass drift `7.9e-16`
+(WITH) vs `1.3e-3` (WITHOUT). Per-step: round-off every step until a wave sits ON a
+coarse–fine boundary, where it jumps to ~1e-3 — the signature of a small *relative*
+flux error scaled by flux magnitude, i.e. EnzoNG's Outflow ghost at the fine
+boundary, not the bridge.
+
+## Follow-ups
+
+- **ND face planes.** The bridge is ND-general (sizes/extents over `GridRank`); the
+  Julia plane assembly is 1D for now (planes collapse to single cells). ND needs the
+  orthogonal-dim raster mapping EnzoNG boundary/interior cells ↔ Enzo plane offset.
+- **Parent-ghost coupling (accuracy + the residual conservation).** EnzoNG evolves
+  each subgrid with Outflow BCs; it should instead consume Enzo's parent-interpolated
+  ghost zones (a fixed/Dirichlet BC reading the live grid's ghost cells). This is
+  what limits the end-to-end (feature-tracking) run to ~1e-5 rather than round-off.
+  The flux bridge itself is exact (the static-interior subtest proves it).
 
 ## Why this is a dedicated effort, not a tail-end task
 

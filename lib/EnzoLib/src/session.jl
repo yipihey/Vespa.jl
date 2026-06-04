@@ -158,6 +158,89 @@ function problem_get_acceleration(h::Handle, dim::Integer, grid::Integer = 0)
     return out
 end
 
+# ── ADR-0003 part B: BoundaryFluxes bridge (conservative :julia hydro under AMR) ──
+# Write EnzoNG's recorded face fluxes (in Enzo's F·dt/dx units, BaryonField order)
+# into Enzo's flux registers so UpdateFromFinerGrids/CorrectForRefinedFluxes restore
+# conservation across coarse–fine boundaries. `side`: 0 = Left face, 1 = Right face.
+
+"Flat grid-list index of the `i`-th grid on `level` (GenerateGridArray order) — matches subgrid-flux indexing."
+problem_grid_index_on_level(h::Handle, level::Integer, i::Integer) =
+    Int(ccall(_gsym(:enzomodules_problem_grid_index_on_level), Cint, (Handle, Cint, Cint), h, level, i))
+
+"Global zone index of grid `gi`'s first ACTIVE cell per dim (length 3) — to map local faces to global flux indices."
+function problem_grid_global_start(h::Handle, gi::Integer = 0)
+    g = zeros(Int64, 3)
+    ccall(_gsym(:enzomodules_problem_grid_global_start), Cvoid, (Handle, Cint, Ptr{Clonglong}), h, gi, g)
+    return Int.(g)
+end
+
+"Physical edges (left, right), each length 3, of grid `gi` — for a per-grid mesh's cell width."
+function problem_grid_edge(h::Handle, gi::Integer = 0)
+    l = zeros(Float64, 3); r = zeros(Float64, 3)
+    ccall(_gsym(:enzomodules_problem_grid_edge), Cvoid, (Handle, Cint, Ptr{Cdouble}, Ptr{Cdouble}), h, gi, l, r)
+    return (l, r)
+end
+
+"Number of plane cells in grid `gi`'s `dim` boundary-flux face (1 in 1D)."
+problem_boundary_flux_size(h::Handle, gi::Integer, dim::Integer) =
+    Int(ccall(_gsym(:enzomodules_problem_boundary_flux_size), Cint, (Handle, Cint, Cint), h, gi, dim))
+
+"Global-index extents (start, end), each length 3, of grid `gi`'s `dim`/`side` boundary-flux plane."
+function problem_boundary_flux_extent(h::Handle, gi::Integer, dim::Integer, side::Integer)
+    s = zeros(Int64, 3); e = zeros(Int64, 3)
+    ccall(_gsym(:enzomodules_problem_boundary_flux_extent), Cvoid,
+          (Handle, Cint, Cint, Cint, Ptr{Clonglong}, Ptr{Clonglong}), h, gi, dim, side, s, e)
+    return (Int.(s), Int.(e))
+end
+
+"ADD a boundary-flux plane into grid `gi`'s BoundaryFluxes[field][dim][side] (accumulates over subcycles)."
+function problem_set_boundary_flux(h::Handle, gi::Integer, field::Integer, dim::Integer,
+                                   side::Integer, plane::Vector{Float64})
+    ccall(_gsym(:enzomodules_problem_set_boundary_flux), Cvoid,
+          (Handle, Cint, Cint, Cint, Cint, Ptr{Cdouble}), h, gi, field, dim, side, plane)
+    return nothing
+end
+function problem_get_boundary_flux(h::Handle, gi::Integer, field::Integer, dim::Integer, side::Integer)
+    out = zeros(Float64, problem_boundary_flux_size(h, gi, dim))
+    ccall(_gsym(:enzomodules_problem_get_boundary_flux), Cvoid,
+          (Handle, Cint, Cint, Cint, Cint, Ptr{Cdouble}), h, gi, field, dim, side, out)
+    return out
+end
+
+"Number of subgrid flux entries for the `i`-th grid on `level` (proper subgrids + 1 own-boundary); needs create_fluxes(level)."
+problem_num_subgrids(h::Handle, level::Integer, i::Integer) =
+    Int(ccall(_gsym(:enzomodules_problem_num_subgrids), Cint, (Handle, Cint, Cint), h, level, i))
+
+"Coarse-index global extents (start, end) of subgrid flux (level,i,sub) for `dim`/`side`."
+function problem_subgrid_flux_extent(h::Handle, level::Integer, i::Integer, sub::Integer,
+                                     dim::Integer, side::Integer)
+    s = zeros(Int64, 3); e = zeros(Int64, 3)
+    ccall(_gsym(:enzomodules_problem_subgrid_flux_extent), Cvoid,
+          (Handle, Cint, Cint, Cint, Cint, Cint, Ptr{Clonglong}, Ptr{Clonglong}),
+          h, level, i, sub, dim, side, s, e)
+    return (Int.(s), Int.(e))
+end
+problem_subgrid_flux_size(h::Handle, level::Integer, i::Integer, sub::Integer, dim::Integer) =
+    Int(ccall(_gsym(:enzomodules_problem_subgrid_flux_size), Cint, (Handle, Cint, Cint, Cint, Cint),
+              h, level, i, sub, dim))
+
+"SET a coarse InitialFlux plane into SubgridFluxesEstimate[level][i][sub][field][dim][side] (allocates if needed)."
+function problem_set_subgrid_flux(h::Handle, level::Integer, i::Integer, sub::Integer,
+                                  field::Integer, dim::Integer, side::Integer, plane::Vector{Float64})
+    ccall(_gsym(:enzomodules_problem_set_subgrid_flux), Cvoid,
+          (Handle, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}),
+          h, level, i, sub, field, dim, side, plane)
+    return nothing
+end
+function problem_get_subgrid_flux(h::Handle, level::Integer, i::Integer, sub::Integer,
+                                  field::Integer, dim::Integer, side::Integer)
+    out = zeros(Float64, problem_subgrid_flux_size(h, level, i, sub, dim))
+    ccall(_gsym(:enzomodules_problem_get_subgrid_flux), Cvoid,
+          (Handle, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}),
+          h, level, i, sub, field, dim, side, out)
+    return out
+end
+
 # ── particles (positions) ────────────────────────────────────────────────────
 "Spatial rank (1/2/3) of a grid."
 problem_grid_rank(h::Handle, grid::Integer = 0) =
@@ -378,14 +461,15 @@ struct EngineConfig
     star_sources::Bool                  # radiation sub-flag (not a slot)
     hooks::Dict{Symbol,Function}
     probe::Union{Nothing,SlotProbe}     # nothing ⇒ no timing (zero overhead)
+    reflux::Bool                        # :julia hydro fills Enzo's flux registers (ADR-0003 part B)
 end
 function EngineConfig(; hydro::Symbol = :enzo, gravity::Symbol = :off, cooling::Symbol = :off,
                       comoving_expansion::Symbol = :off, mhd_ct::Symbol = :off,
                       radiation::Symbol = :off, star_formation::Symbol = :off,
                       star_sources::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}(),
-                      probe::Union{Nothing,SlotProbe} = nothing)
+                      probe::Union{Nothing,SlotProbe} = nothing, reflux::Bool = false)
     EngineConfig(hydro, gravity, cooling, comoving_expansion, mhd_ct, radiation,
-                 star_formation, star_sources, hooks, probe)
+                 star_formation, star_sources, hooks, probe, reflux)
 end
 
 # Build a config from the legacy boolean flags (every active slot → :enzo) so the
@@ -460,12 +544,14 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                                     Dict{Symbol,Function}(:hydro => hydro!))
     rec(l, dta) = evolve_level!(h, l, dta; engine = eng, regrid = regrid, maxsub = maxsub)
     ct = eng.mhd_ct !== :off
-    # Enzo's flux-register machinery (clear/create/finalize/project) is the :enzo
-    # hydro's conservation bookkeeping — SolveHydroEquations fills SubgridFluxes,
-    # finalize/project consume them. A :julia hydro slot does NOT fill them, so the
-    # registers are gated to :enzo hydro (a :julia slot owns its own conservation;
-    # it is single-grid per ADR-0002 until the ND/AMR backend lands).
-    ef = eng.hydro === :enzo
+    # Enzo's flux-register machinery (clear/create/finalize/project) is the hydro's
+    # conservation bookkeeping — SolveHydroEquations fills SubgridFluxes, finalize/
+    # project consume them. A plain :julia hydro slot does NOT fill them (so the
+    # registers stay gated off, single-grid). But a CONSERVATIVE :julia slot
+    # (engine.reflux=true, ADR-0003 part B) writes EnzoNG's recorded fluxes into the
+    # registers from its hook, so the machinery runs and Enzo's UpdateFromFinerGrids/
+    # CorrectForRefinedFluxes restore conservation across coarse–fine boundaries.
+    ef = eng.hydro === :enzo || (eng.hydro === :julia && eng.reflux)
     ef && session_clear_boundary_fluxes(h, level)
     ct && level > 0 && session_clear_avg_electric_field(h, level)   # CT EMF accumulator (EvolveLevel.C:377)
     done = 0.0; n = 0
