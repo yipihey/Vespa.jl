@@ -89,6 +89,70 @@ Symptom: a batch of tool calls all "Cancelled" with one real error.
   HG's absolute tree level. This is the AMR-policy semantics; HGBackend subtracts
   `base_level`. (Getting this wrong silently disables refinement.)
 
+## The live-Enzo bridge (EnzoLib) — `:enzo` slots, `:remote` worker, MPI
+
+`lib/EnzoLib` is a native binding to a **live Enzo hierarchy** through a C-ABI
+bridge (`EnzoModules/src/enzomodules_problem_bridge.C` +
+`src/enzo/Grid_EnzoModulesFixture.C` ↔ `lib/EnzoLib/src/session.jl`). It lets a
+Julia-driven `EvolveLevel` call Enzo's own certified kernels per step (the
+`:enzo` method slots / full-replication mode), and lets a `:julia` slot mutate the
+same Enzo memory Enzo's kernels operate on. Built into `libenzomodules_grid.dylib`
+(links the full Enzo `.so`); `EnzoLib.grid_available()` gates every live call.
+
+**One call macro, two transports (`@xcall`).** Every bridge call goes through
+`@xcall(:c_symbol, Ret, (Argtypes…), args…)` in `session.jl`, which dispatches on
+`EnzoLib.backend()`:
+- `:local` (default) — in-process `ccall`. The fast path and the differential oracle.
+- `:remote` — a **subprocess worker** over a control channel + shared file (ADR-0005).
+  This exists because hosting the **MPI** Enzo (gcc/libstdc++) *inside* the Julia
+  process (libc++) aborts in C++ static init — a runtime collision. A separate
+  worker process carries no Julia runtime, so the collision cannot occur. Switch
+  with `EnzoLib.connect_worker!(cmd; shm) … disconnect_worker!()`.
+
+**Single source of truth = the manifest.** `EnzoLib.manifest()` parses the
+`@xcall` sites out of `session.jl`; it generates (a) the Julia RPC marshalling and
+(b) the C++ worker's typed dispatch (`EnzoModules/tools/gen_worker_dispatch.jl` →
+`enzomodules_worker_dispatch.inc`). A `contract_hash()` (FNV-1a over the surface) is
+checked at the worker handshake, so a worker built from a different `session.jl`
+than the client is **refused, not silently corrupt**. *After adding/changing an
+`@xcall`, the workers must be rebuilt* (the build does this) so the hash matches.
+
+**Building the bridge** (stage-2 only; reuses a cached `libenzo`). `julia` must be
+resolvable — juliaup's binary is **not** on the non-interactive PATH, so pass
+`JULIA=`:
+```
+JULIA=~/.julia/juliaup/<ver>/bin/julia bash EnzoModules/deps/build_grid_darwin.sh        # serial (default)
+JULIA=<jl> MPITRAMPOLINE_DIR=<artifact> bash EnzoModules/deps/build_grid_darwin.sh mpi    # MPI flavor
+```
+- `<artifact>` = `julia --project=lib/EnzoLib/test -e 'import MPItrampoline_jll as T; print(T.artifact_dir)'`
+  (the script's own `is_available()` probe is false on this depot, hence the explicit dir).
+- Artifacts: serial `libenzomodules_grid.dylib` + `enzomodules_worker`; MPI
+  `libenzomodules_grid_mpi.dylib` + `enzomodules_worker_mpi`. Both bridge dylibs
+  coexist; `ENV["ENZONG_ENZO_MPI"]=="1"` selects the MPI one for in-process loads.
+- **Gotcha (fixed in-script but know it):** stage-1 sets the `Make.config` MPI flag
+  only when it *builds* `libenzo`; with `libenzo` cached, the bridge inherits the
+  *last* flavor's flag. The script now re-pins `make use-mpi-{yes,no}` before
+  extracting DFLAGS, else a serial bridge build picks up a stale `-DUSE_MPI` and
+  fails the link on `_MPI_*`.
+
+**Running under MPI** (the subprocess worker, mpiexec'd N ranks). The Julia client
+loads **no** MPI; it spawns `mpiexec -n N enzomodules_worker_mpi <shm> <mpi-bridge>`.
+Rank 0 owns the control channel and `MPI_Bcast`s each command so collective bridge
+calls (`session_init`→`CommunicationPartitionGrid`, `set_boundary`, `compute_dt`,
+`update_from_finer`) run in lockstep. The opt-in gate (skips cleanly if the
+toolchain is absent):
+```
+MPITRAMPOLINE_LIB=$HOME/opt/mpiwrapper/lib/libmpiwrapper.so \
+  julia --project=lib/EnzoLib/test lib/EnzoLib/test/test_mpi_worker.jl
+```
+It asserts `num_ranks==2`, that the hierarchy distributed (`grid_owners=[0,1]`), and
+**global mass conservation** (`session_global_field_integral` = per-rank local tile
+sum, `CommunicationAllSumValues`-reduced; the distributed total equals the serial
+total to round-off). The serial `:local`≡`:remote` parity oracle is
+`test_rpc_parity.jl` (in `runtests.jl`). **Design + full rationale: `docs/adr/0005-…`
+(subprocess boundary) and `docs/adr/0004-…` (Enzo-substrate MPI). The conservative
+`:julia`-under-AMR path is `docs/adr/0003-…`.**
+
 ## HierarchicalGrids.jl (the substrate) gotchas
 
 - Local at `/Users/tabel/Projects/HierarchicalGrids.jl`; pulled in via

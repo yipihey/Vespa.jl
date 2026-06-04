@@ -1,8 +1,15 @@
 # ADR-0004: Optional MPI for the Enzo substrate (MPItrampoline standard)
 
-- **Status:** IN PROGRESS — source changes landed and serial-verified (core 203/203,
-  EnzoLib 102/102, zero impact on the default serial path). The MPI build flavor +
-  MPItrampoline toolchain bring-up and the multi-rank smoke gate are the remaining work.
+- **Status:** DONE (substrate + toolchain), but the **in-process** MPI delivery this
+  ADR assumes (MPI.jl owns `MPI_Init`, the bridge dlopen'd into the Julia process) was
+  **superseded by ADR-0005** for the multi-rank case: loading the gcc/libstdc++ MPI
+  `libenzo` into the libc++ Julia process aborts in C++ static init (a runtime
+  collision). The MPI substrate now runs in a **subprocess worker** (ADR-0005,
+  COMPLETE) — read that ADR for how to build/run multi-rank. The source changes here
+  (the `#ifdef USE_MPI` bridge/substrate work, the dual-artifact build, the
+  MPItrampoline toolchain) all stand and are what the subprocess worker hosts; only
+  the *in-process* hosting was abandoned. Serial path: core 203/203, EnzoLib green,
+  zero impact.
 - **Date:** 2026-06-04
 - **Builds on:** ADR-0002 (method-slot registry), ADR-0003 (conservative `:julia` AMR),
   the EnzoNG↔Enzo C-ABI bridge (`EnzoModules/src/enzomodules_problem_bridge.C` ↔
