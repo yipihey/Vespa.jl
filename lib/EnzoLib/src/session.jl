@@ -119,6 +119,16 @@ session_stop_time(h::Handle) = @xcall(:enzomodules_session_stop_time, Cdouble, (
 session_cycle(h::Handle)     = @xcall(:enzomodules_session_cycle, Cint, (Handle,), h)
 session_compute_dt(h::Handle, level::Integer = 0) =
     @xcall(:enzomodules_session_compute_dt, Cdouble, (Handle, Cint), h, level)
+"""
+    session_global_field_integral(h, fi) -> Float64
+
+Cell-volume-weighted integral of field `fi` (0-based) over the ROOT grid (the
+conserved composite total — mass for Density), summed over this rank's local tiles
+and Allreduce'd across ranks.  The multi-rank conservation primitive (ADR-0005 #4);
+in the serial flavor it is just the local total (the reduction is a no-op).
+"""
+session_global_field_integral(h::Handle, fi::Integer) =
+    @xcall(:enzomodules_session_global_field_integral, Cdouble, (Handle, Cint), h, fi)
 session_set_dt(h::Handle, dt::Real, level::Integer = 0) =
     @xcall(:enzomodules_session_set_dt, Cvoid, (Handle, Cint, Cdouble), h, level, dt)
 session_set_boundary(h::Handle, level::Integer = 0) =

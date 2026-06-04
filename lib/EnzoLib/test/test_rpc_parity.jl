@@ -56,6 +56,7 @@ function _gather(h)
     rec("density_index", di)
     rho = EnzoLib.problem_get_field(h, di, 0)            # OUT Float64 buffer (the big one)
     rec("density", rho)
+    rec("mass_integral", EnzoLib.session_global_field_integral(h, di))  # #4 reduction (Cdouble)
 
     # IN-buffer round-trip: scale Density by 2, write it back, read it again.  This
     # exercises set_field (IN Float64 buffer) and proves the live grid mutated

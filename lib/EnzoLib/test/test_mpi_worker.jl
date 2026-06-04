@@ -41,8 +41,18 @@ end
 if !_mpi_ready()
     @info "ADR-0005 #3b multi-rank gate skipped (toolchain not built)"
 else
-    @testset "ADR-0005 #3b: $(NRANKS)-rank Enzo substrate over the subprocess boundary" begin
-        wd  = EnzoLib._workdir(MPI_PF)
+    @testset "ADR-0005 #3b/#4: $(NRANKS)-rank Enzo substrate over the subprocess boundary" begin
+        wd = EnzoLib._workdir(MPI_PF)
+
+        # Serial reference: the composite root-grid mass via the in-process SERIAL
+        # bridge (one grid, the full total).  The distributed run must reproduce it.
+        EnzoLib.set_backend!(:local)
+        hS = cd(() -> EnzoLib.session_init(MPI_PF), wd)
+        diS = EnzoLib.field_index(hS, 0; grid = 0)
+        mass_serial = EnzoLib.session_global_field_integral(hS, diS)
+        EnzoLib.free_problem(hS)
+        @test mass_serial > 0
+
         shm = tempname()
         env = copy(ENV); env["MPITRAMPOLINE_LIB"] = WRAPPER_LIB
         cmd = setenv(`$MPIEXEC -n $NRANKS $WORKER_MPI $shm $MPI_BRIDGE`, env; dir = wd)
@@ -65,6 +75,16 @@ else
             @info "MPI partition" nranks = NRANKS ngrids = ng grid_owners = owners
             @test length(owners) == NRANKS             # every rank owns ≥1 grid
             @test maximum(owners) == NRANKS - 1
+
+            # (c) #4 — multi-rank CONSERVATION.  The composite root-grid mass is an
+            # Allreduce over each rank's LOCAL tile; with the hierarchy split across
+            # ranks it must still equal the serial total (same fixture, same ICs).
+            # This verifies the distributed reduction sums the partitioned tiles
+            # correctly — the conservation primitive for a :julia AMR slot under MPI.
+            di = EnzoLib.field_index(h, 0; grid = 0)
+            mass_mpi = EnzoLib.session_global_field_integral(h, di)
+            @info "MPI conservation" mass_serial = mass_serial mass_mpi = mass_mpi rel_err = abs(mass_mpi - mass_serial) / mass_serial
+            @test mass_mpi ≈ mass_serial rtol = 1e-12   # distributed sum ≡ serial total
 
             EnzoLib.free_problem(h)                     # collective free, per-rank handle
         finally
