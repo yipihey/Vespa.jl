@@ -69,89 +69,122 @@ function _ghandle()
 end
 @inline _gsym(name::Symbol) = Libdl.dlsym(_ghandle(), name)
 
+# ── transport seam (ADR-0005) ─────────────────────────────────────────────────
+# Every bridge call goes through `@xcall`, which expands to either the in-process
+# `ccall` (local, the default and the serial-verified path) or a remote RPC to a
+# worker process (remote).  The C symbol + return type + arg types are written
+# ONCE at the call site — there is no second hand-maintained interface to drift,
+# and the same declaration is what a manifest generator (#2) reads to produce the
+# worker dispatch + remote stubs.  Switch with `set_backend!`.
+const _BACKEND = Ref{Symbol}(:local)
+"Select the bridge transport: `:local` (in-process ccall) or `:remote` (worker RPC)."
+set_backend!(b::Symbol) = (b in (:local, :remote) || error("backend must be :local or :remote"); _BACKEND[] = b)
+backend() = _BACKEND[]
+
+# Remote dispatch — wired in ADR-0005 #2 (manifest-generated worker + shm buffers).
+_rpc(sym::Symbol, ret, argtypes, args) =
+    error("remote bridge backend not yet wired for $sym (ADR-0005 #2)")
+
+"""
+    @xcall(:c_symbol, RetType, (ArgTypes...), args...)
+
+Backend-dispatching bridge call.  Local → `ccall(_gsym(:c_symbol), RetType,
+(ArgTypes...), args...)` (literal types preserved); remote → `_rpc(...)`.
+"""
+macro xcall(sym, ret, argtypes, args...)
+    a = map(esc, args)
+    quote
+        if _BACKEND[] === :local
+            ccall(_gsym($(esc(sym))), $(esc(ret)), $(esc(argtypes)), $(a...))
+        else
+            _rpc($(esc(sym)), $(esc(ret)), $(esc(argtypes)), ($(a...),))
+        end
+    end
+end
+
 # ── low-level Session / problem entry points (signatures per problems.py) ─────
 const Handle = Ptr{Cvoid}
 
 "Initialize a problem and hold the LIVE hierarchy (InitializeNew). Returns a handle."
 session_init(paramfile::AbstractString) =
-    ccall(_gsym(:enzomodules_session_init), Handle, (Cstring,), paramfile)
+    @xcall(:enzomodules_session_init, Handle, (Cstring,), paramfile)
 "Run Enzo's full time integrator (EvolveHierarchy) to stop_time/stop_cycle (0 ⇒ param file)."
 evolve_problem(paramfile::AbstractString, stop_time::Real = 0.0, stop_cycle::Integer = 0) =
-    ccall(_gsym(:enzomodules_evolve_problem), Handle, (Cstring, Cdouble, Cint),
+    @xcall(:enzomodules_evolve_problem, Handle, (Cstring, Cdouble, Cint),
           paramfile, stop_time, stop_cycle)
-free_problem(h::Handle) = ccall(_gsym(:enzomodules_free_problem), Cvoid, (Handle,), h)
+free_problem(h::Handle) = @xcall(:enzomodules_free_problem, Cvoid, (Handle,), h)
 
-session_time(h::Handle)      = ccall(_gsym(:enzomodules_session_time), Cdouble, (Handle,), h)
-session_stop_time(h::Handle) = ccall(_gsym(:enzomodules_session_stop_time), Cdouble, (Handle,), h)
-session_cycle(h::Handle)     = ccall(_gsym(:enzomodules_session_cycle), Cint, (Handle,), h)
+session_time(h::Handle)      = @xcall(:enzomodules_session_time, Cdouble, (Handle,), h)
+session_stop_time(h::Handle) = @xcall(:enzomodules_session_stop_time, Cdouble, (Handle,), h)
+session_cycle(h::Handle)     = @xcall(:enzomodules_session_cycle, Cint, (Handle,), h)
 session_compute_dt(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_compute_dt), Cdouble, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_compute_dt, Cdouble, (Handle, Cint), h, level)
 session_set_dt(h::Handle, dt::Real, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_set_dt), Cvoid, (Handle, Cint, Cdouble), h, level, dt)
+    @xcall(:enzomodules_session_set_dt, Cvoid, (Handle, Cint, Cdouble), h, level, dt)
 session_set_boundary(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_set_boundary), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_set_boundary, Cint, (Handle, Cint), h, level)
 session_solve_hydro(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_solve_hydro), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_solve_hydro, Cint, (Handle, Cint), h, level)
 session_advance_time(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_advance_time), Cvoid, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_advance_time, Cvoid, (Handle, Cint), h, level)
 
 # AMR EvolveLevel steps (the conservation machinery): flux storage, projection +
 # flux-correction from finer levels, and regridding.
 session_clear_boundary_fluxes(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_clear_boundary_fluxes), Cvoid, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_clear_boundary_fluxes, Cvoid, (Handle, Cint), h, level)
 session_create_fluxes(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_create_fluxes), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_create_fluxes, Cint, (Handle, Cint), h, level)
 session_finalize_fluxes(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_finalize_fluxes), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_finalize_fluxes, Cint, (Handle, Cint), h, level)
 session_update_from_finer(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_update_from_finer), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_update_from_finer, Cint, (Handle, Cint), h, level)
 session_copy_baryon_to_old(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_copy_baryon_to_old), Cvoid, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_copy_baryon_to_old, Cvoid, (Handle, Cint), h, level)
 session_update_particles(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_update_particles), Cvoid, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_update_particles, Cvoid, (Handle, Cint), h, level)
 session_rebuild(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_rebuild), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_rebuild, Cint, (Handle, Cint), h, level)
 session_num_grids_on_level(h::Handle, level::Integer) =
-    ccall(_gsym(:enzomodules_session_num_grids_on_level), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_num_grids_on_level, Cint, (Handle, Cint), h, level)
 
 # Optional physics steps (no-ops when their physics is off) — for non-hydro problems.
 session_gravity(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_gravity), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_gravity, Cint, (Handle, Cint), h, level)
 session_solve_cooling(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_solve_cooling), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_solve_cooling, Cint, (Handle, Cint), h, level)
 session_star_particles(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_star_particles), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_star_particles, Cint, (Handle, Cint), h, level)
 session_update_radiation_field(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_update_radiation_field), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_update_radiation_field, Cint, (Handle, Cint), h, level)
 "Emit + transport photons; `stars=true` converts star particles into sources."
 session_evolve_photons(h::Handle, level::Integer = 0; stars::Bool = false) =
-    ccall(_gsym(:enzomodules_session_evolve_photons_ex), Cint, (Handle, Cint, Cint),
+    @xcall(:enzomodules_session_evolve_photons_ex, Cint, (Handle, Cint, Cint),
           h, level, stars ? 1 : 0)
 "Comoving (Hubble-drag) expansion source terms — call after advance_time for cosmology runs."
 session_comoving_expansion(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_comoving_expansion), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_comoving_expansion, Cint, (Handle, Cint), h, level)
 "CT-MHD: zero+allocate the per-grid AvgElectricField accumulator (level>0 entry; EvolveLevel.C:377)."
 session_clear_avg_electric_field(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_clear_avg_electric_field), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_clear_avg_electric_field, Cint, (Handle, Cint), h, level)
 "CT-MHD: recompute cell-centered B from face-corrected B using finer-grid EMF (post-UFG; EvolveLevel.C:899)."
 session_mhd_update_magnetic_field(h::Handle, level::Integer = 0) =
-    ccall(_gsym(:enzomodules_session_mhd_update_magnetic_field), Cint, (Handle, Cint), h, level)
+    @xcall(:enzomodules_session_mhd_update_magnetic_field, Cint, (Handle, Cint), h, level)
 
-problem_num_grids(h::Handle) = ccall(_gsym(:enzomodules_problem_num_grids), Cint, (Handle,), h)
+problem_num_grids(h::Handle) = @xcall(:enzomodules_problem_num_grids, Cint, (Handle,), h)
 problem_grid_size(h::Handle, grid::Integer = 0) =
-    ccall(_gsym(:enzomodules_problem_grid_size), Cint, (Handle, Cint), h, grid)
+    @xcall(:enzomodules_problem_grid_size, Cint, (Handle, Cint), h, grid)
 problem_num_fields(h::Handle, grid::Integer = 0) =
-    ccall(_gsym(:enzomodules_problem_num_fields), Cint, (Handle, Cint), h, grid)
+    @xcall(:enzomodules_problem_num_fields, Cint, (Handle, Cint), h, grid)
 function problem_field_types(h::Handle, grid::Integer = 0)
     n = problem_num_fields(h, grid)
     t = zeros(Cint, n)
-    ccall(_gsym(:enzomodules_problem_field_types), Cint, (Handle, Cint, Ptr{Cint}), h, grid, t)
+    @xcall(:enzomodules_problem_field_types, Cint, (Handle, Cint, Ptr{Cint}), h, grid, t)
     return Int.(t)
 end
 "Read one field (flat, incl. ghost zones) by 0-based field index."
 function problem_get_field(h::Handle, fi::Integer, grid::Integer = 0)
     out = zeros(Float64, problem_grid_size(h, grid))
-    ccall(_gsym(:enzomodules_problem_get_field), Cint, (Handle, Cint, Cint, Ptr{Cdouble}),
+    @xcall(:enzomodules_problem_get_field, Cint, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, fi, out)
     return out
 end
@@ -167,7 +200,7 @@ mutating the same Enzo memory Enzo's own kernels operate on.
 function problem_set_field(h::Handle, fi::Integer, data::Vector{Float64}; grid::Integer = 0)
     length(data) == problem_grid_size(h, grid) ||
         throw(DimensionMismatch("field length $(length(data)) ≠ grid size $(problem_grid_size(h, grid))"))
-    ccall(_gsym(:enzomodules_problem_set_field), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+    @xcall(:enzomodules_problem_set_field, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, fi, data)
     return nothing
 end
@@ -185,13 +218,13 @@ field is absent (a Julia slot replaces `ComputeAccelerations`, which normally do
 function problem_set_acceleration(h::Handle, dim::Integer, data::Vector{Float64}; grid::Integer = 0)
     length(data) == problem_grid_size(h, grid) ||
         throw(DimensionMismatch("acceleration length $(length(data)) ≠ grid size $(problem_grid_size(h, grid))"))
-    ccall(_gsym(:enzomodules_problem_set_acceleration), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+    @xcall(:enzomodules_problem_set_acceleration, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, dim, data)
     return nothing
 end
 function problem_get_acceleration(h::Handle, dim::Integer, grid::Integer = 0)
     out = zeros(Float64, problem_grid_size(h, grid))
-    ccall(_gsym(:enzomodules_problem_get_acceleration), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+    @xcall(:enzomodules_problem_get_acceleration, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, dim, out)
     return out
 end
@@ -203,30 +236,30 @@ end
 
 "Flat grid-list index of the `i`-th grid on `level` (GenerateGridArray order) — matches subgrid-flux indexing."
 problem_grid_index_on_level(h::Handle, level::Integer, i::Integer) =
-    Int(ccall(_gsym(:enzomodules_problem_grid_index_on_level), Cint, (Handle, Cint, Cint), h, level, i))
+    Int(@xcall(:enzomodules_problem_grid_index_on_level, Cint, (Handle, Cint, Cint), h, level, i))
 
 "Global zone index of grid `gi`'s first ACTIVE cell per dim (length 3) — to map local faces to global flux indices."
 function problem_grid_global_start(h::Handle, gi::Integer = 0)
     g = zeros(Int64, 3)
-    ccall(_gsym(:enzomodules_problem_grid_global_start), Cvoid, (Handle, Cint, Ptr{Clonglong}), h, gi, g)
+    @xcall(:enzomodules_problem_grid_global_start, Cvoid, (Handle, Cint, Ptr{Clonglong}), h, gi, g)
     return Int.(g)
 end
 
 "Physical edges (left, right), each length 3, of grid `gi` — for a per-grid mesh's cell width."
 function problem_grid_edge(h::Handle, gi::Integer = 0)
     l = zeros(Float64, 3); r = zeros(Float64, 3)
-    ccall(_gsym(:enzomodules_problem_grid_edge), Cvoid, (Handle, Cint, Ptr{Cdouble}, Ptr{Cdouble}), h, gi, l, r)
+    @xcall(:enzomodules_problem_grid_edge, Cvoid, (Handle, Cint, Ptr{Cdouble}, Ptr{Cdouble}), h, gi, l, r)
     return (l, r)
 end
 
 "Number of plane cells in grid `gi`'s `dim` boundary-flux face (1 in 1D)."
 problem_boundary_flux_size(h::Handle, gi::Integer, dim::Integer) =
-    Int(ccall(_gsym(:enzomodules_problem_boundary_flux_size), Cint, (Handle, Cint, Cint), h, gi, dim))
+    Int(@xcall(:enzomodules_problem_boundary_flux_size, Cint, (Handle, Cint, Cint), h, gi, dim))
 
 "Global-index extents (start, end), each length 3, of grid `gi`'s `dim`/`side` boundary-flux plane."
 function problem_boundary_flux_extent(h::Handle, gi::Integer, dim::Integer, side::Integer)
     s = zeros(Int64, 3); e = zeros(Int64, 3)
-    ccall(_gsym(:enzomodules_problem_boundary_flux_extent), Cvoid,
+    @xcall(:enzomodules_problem_boundary_flux_extent, Cvoid,
           (Handle, Cint, Cint, Cint, Ptr{Clonglong}, Ptr{Clonglong}), h, gi, dim, side, s, e)
     return (Int.(s), Int.(e))
 end
@@ -234,38 +267,38 @@ end
 "ADD a boundary-flux plane into grid `gi`'s BoundaryFluxes[field][dim][side] (accumulates over subcycles)."
 function problem_set_boundary_flux(h::Handle, gi::Integer, field::Integer, dim::Integer,
                                    side::Integer, plane::Vector{Float64})
-    ccall(_gsym(:enzomodules_problem_set_boundary_flux), Cvoid,
+    @xcall(:enzomodules_problem_set_boundary_flux, Cvoid,
           (Handle, Cint, Cint, Cint, Cint, Ptr{Cdouble}), h, gi, field, dim, side, plane)
     return nothing
 end
 function problem_get_boundary_flux(h::Handle, gi::Integer, field::Integer, dim::Integer, side::Integer)
     out = zeros(Float64, problem_boundary_flux_size(h, gi, dim))
-    ccall(_gsym(:enzomodules_problem_get_boundary_flux), Cvoid,
+    @xcall(:enzomodules_problem_get_boundary_flux, Cvoid,
           (Handle, Cint, Cint, Cint, Cint, Ptr{Cdouble}), h, gi, field, dim, side, out)
     return out
 end
 
 "Number of subgrid flux entries for the `i`-th grid on `level` (proper subgrids + 1 own-boundary); needs create_fluxes(level)."
 problem_num_subgrids(h::Handle, level::Integer, i::Integer) =
-    Int(ccall(_gsym(:enzomodules_problem_num_subgrids), Cint, (Handle, Cint, Cint), h, level, i))
+    Int(@xcall(:enzomodules_problem_num_subgrids, Cint, (Handle, Cint, Cint), h, level, i))
 
 "Coarse-index global extents (start, end) of subgrid flux (level,i,sub) for `dim`/`side`."
 function problem_subgrid_flux_extent(h::Handle, level::Integer, i::Integer, sub::Integer,
                                      dim::Integer, side::Integer)
     s = zeros(Int64, 3); e = zeros(Int64, 3)
-    ccall(_gsym(:enzomodules_problem_subgrid_flux_extent), Cvoid,
+    @xcall(:enzomodules_problem_subgrid_flux_extent, Cvoid,
           (Handle, Cint, Cint, Cint, Cint, Cint, Ptr{Clonglong}, Ptr{Clonglong}),
           h, level, i, sub, dim, side, s, e)
     return (Int.(s), Int.(e))
 end
 problem_subgrid_flux_size(h::Handle, level::Integer, i::Integer, sub::Integer, dim::Integer) =
-    Int(ccall(_gsym(:enzomodules_problem_subgrid_flux_size), Cint, (Handle, Cint, Cint, Cint, Cint),
+    Int(@xcall(:enzomodules_problem_subgrid_flux_size, Cint, (Handle, Cint, Cint, Cint, Cint),
               h, level, i, sub, dim))
 
 "SET a coarse InitialFlux plane into SubgridFluxesEstimate[level][i][sub][field][dim][side] (allocates if needed)."
 function problem_set_subgrid_flux(h::Handle, level::Integer, i::Integer, sub::Integer,
                                   field::Integer, dim::Integer, side::Integer, plane::Vector{Float64})
-    ccall(_gsym(:enzomodules_problem_set_subgrid_flux), Cvoid,
+    @xcall(:enzomodules_problem_set_subgrid_flux, Cvoid,
           (Handle, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}),
           h, level, i, sub, field, dim, side, plane)
     return nothing
@@ -273,7 +306,7 @@ end
 function problem_get_subgrid_flux(h::Handle, level::Integer, i::Integer, sub::Integer,
                                   field::Integer, dim::Integer, side::Integer)
     out = zeros(Float64, problem_subgrid_flux_size(h, level, i, sub, dim))
-    ccall(_gsym(:enzomodules_problem_get_subgrid_flux), Cvoid,
+    @xcall(:enzomodules_problem_get_subgrid_flux, Cvoid,
           (Handle, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}),
           h, level, i, sub, field, dim, side, out)
     return out
@@ -282,23 +315,23 @@ end
 # ── particles (positions) ────────────────────────────────────────────────────
 "Spatial rank (1/2/3) of a grid."
 problem_grid_rank(h::Handle, grid::Integer = 0) =
-    Int(ccall(_gsym(:enzomodules_problem_grid_rank), Cint, (Handle, Cint), h, grid))
+    Int(@xcall(:enzomodules_problem_grid_rank, Cint, (Handle, Cint), h, grid))
 "Refinement level of grid `grid` (0 = root, -1 if absent) — to iterate a level's grids for a :julia AMR slot."
 problem_grid_level(h::Handle, grid::Integer = 0) =
-    Int(ccall(_gsym(:enzomodules_problem_grid_level), Cint, (Handle, Cint), h, grid))
+    Int(@xcall(:enzomodules_problem_grid_level, Cint, (Handle, Cint), h, grid))
 "Indices of all grids on `level` in the flat grid list (for a per-level :julia slot)."
 grids_on_level(h::Handle, level::Integer) =
     [g for g in 0:problem_num_grids(h)-1 if problem_grid_level(h, g) == level]
 
 "This rank's MPI id (0 in the serial flavor)."
 session_my_rank(h::Handle) =
-    Int(ccall(_gsym(:enzomodules_session_my_rank), Cint, (Handle,), h))
+    Int(@xcall(:enzomodules_session_my_rank, Cint, (Handle,), h))
 "Total MPI rank count (1 in the serial flavor)."
 session_num_ranks(h::Handle) =
-    Int(ccall(_gsym(:enzomodules_session_num_ranks), Cint, (Handle,), h))
+    Int(@xcall(:enzomodules_session_num_ranks, Cint, (Handle,), h))
 "Home processor (rank) of grid `grid` (always 0 in the serial flavor; -1 if absent)."
 problem_grid_processor(h::Handle, grid::Integer) =
-    Int(ccall(_gsym(:enzomodules_problem_grid_processor), Cint, (Handle, Cint), h, grid))
+    Int(@xcall(:enzomodules_problem_grid_processor, Cint, (Handle, Cint), h, grid))
 
 # Grids on `level` RESIDENT on this rank — the only ones whose BaryonField/flux
 # registers are allocated here, so the only ones a :julia hydro slot may touch
@@ -313,18 +346,18 @@ local_grids_on_level(h::Handle, level::Integer) =
 "Full per-dim Enzo `GridDimension` (incl. ghosts; column-major; always length 3, 1 past the rank)."
 function problem_grid_dims(h::Handle, grid::Integer = 0)
     d = zeros(Cint, 3)
-    ccall(_gsym(:enzomodules_problem_grid_dims), Cvoid, (Handle, Cint, Ptr{Cint}), h, grid, d)
+    @xcall(:enzomodules_problem_grid_dims, Cvoid, (Handle, Cint, Ptr{Cint}), h, grid, d)
     return Int.(d)
 end
 "Number of particles living on `grid`."
 problem_num_particles(h::Handle, grid::Integer = 0) =
-    Int(ccall(_gsym(:enzomodules_problem_num_particles), Cint, (Handle, Cint), h, grid))
+    Int(@xcall(:enzomodules_problem_num_particles, Cint, (Handle, Cint), h, grid))
 "Particle positions along axis `dim` (0-based) on `grid`, in code units."
 function problem_get_particle_pos(h::Handle, dim::Integer, grid::Integer = 0)
     np = problem_num_particles(h, grid)
     out = zeros(Float64, np)
     np == 0 && return out
-    ccall(_gsym(:enzomodules_problem_get_particle_pos), Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+    @xcall(:enzomodules_problem_get_particle_pos, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, dim, out)
     return out
 end
