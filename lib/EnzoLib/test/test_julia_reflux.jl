@@ -46,19 +46,54 @@ function _build_grid_sim(h, gi, model, nghost)
     return mesh, Simulation(mesh, prob; model = model)
 end
 
-# ADR-0003 follow-up #1: a subgrid's outer faces ARE coarse–fine interfaces, so its
-# ghost zones are Enzo's parent-interpolated values (filled by session_set_boundary
-# before the solve), NOT a true domain boundary. Replace the placeholder Outflow
-# BCs on a level>0 grid with a ParentGhost BC reading those ghosts (the closure
-# returns Enzo's conserved ghost; convert to primitive for the driver). The root
-# grid (level 0) keeps its real domain BCs. Snapshot AFTER sync_from_enzo! (ghosts
-# are valid at hook entry). Returns the BC's primitive-ghost closure or nothing.
+# ADR-0003 follow-up #1 (+ ND follow-up): a subgrid's outer faces are EITHER a
+# coarse–fine interface (Enzo's parent-interpolated ghost, filled by
+# session_set_boundary before the solve) OR a real domain boundary. In 1D the
+# refined region is interior, so BOTH faces are coarse–fine. In ND a subgrid can
+# abut the domain edge on some axes (e.g. the 2D Sod strip spans the full y-extent:
+# its y-faces ARE the domain boundary, only its x-faces are coarse–fine). Reading a
+# parent ghost on a domain-boundary face is wrong and breaks conservation, so we
+# decide PER (axis, side): a face whose grid edge coincides with the domain edge
+# keeps the original (real) domain BC; an interior face gets a ParentGhost reading
+# Enzo's already-interpolated parent ghost zone (the closure returns Enzo's conserved
+# ghost; convert to primitive for the driver). The (D−1)-plane of ghosts is read
+# cell-by-cell — the driver invokes the BC at every boundary cell's CartesianIndex,
+# so `enzo_parent_ghost` (one zone outward via `m.strides[axis]`) is ND-general. The
+# root grid (level 0) keeps its real domain BCs. Snapshot AFTER sync_from_enzo!
+# (ghosts are valid at hook entry). Returns the ParentGhost BC (or nothing on level 0).
+
+# Per-(axis,side) test: is grid `gi`'s face a real domain boundary (its physical
+# edge coincides with the domain edge) rather than a coarse–fine interface? Uses an
+# absolute+relative tolerance scaled by the domain extent (edges are exact powers-of-
+# two fractions, but compare robustly).
+function _is_domain_face(h, gi, dl, dr, axis::Int, side::Symbol)
+    l, r = EnzoLib.problem_grid_edge(h, gi)
+    span = dr[axis] - dl[axis]
+    tol = 1e-9 * (span == 0 ? 1.0 : abs(span))
+    return side === :lo ? abs(l[axis] - dl[axis]) <= tol : abs(r[axis] - dr[axis]) <= tol
+end
+
 function _apply_parent_ghost!(sim, mesh, model, level)
     level <= 0 && return nothing
+    h = mesh.h; gi = mesh.grid
+    R = MeshInterface.rank(mesh)
+    # domain edges = the root grid's physical extent
+    g0 = EnzoLib.problem_grid_index_on_level(h, 0, 0)
+    dl, dr = EnzoLib.problem_grid_edge(h, g0)
     cons = enzo_parent_ghost(mesh)
     pg = MeshInterface.ParentGhost((axis, side, cell) ->
              EnzoNG.cons2prim(model, cons(axis, side, cell)))
-    sim.bcs = MeshInterface.BoundaryConditions(pg, Val(MeshInterface.rank(mesh)))
+    # Per axis: (lo, hi) pair — ParentGhost on coarse–fine faces, the original
+    # domain BC where the grid edge is the domain edge.
+    orig = sim.bcs
+    pairs = ntuple(R) do axis
+        lo = _is_domain_face(h, gi, dl, dr, axis, :lo) ?
+                 MeshInterface.bc_on(orig, axis, :lo) : pg
+        hi = _is_domain_face(h, gi, dl, dr, axis, :hi) ?
+                 MeshInterface.bc_on(orig, axis, :hi) : pg
+        (lo, hi)
+    end
+    sim.bcs = MeshInterface.BoundaryConditions(pairs)
     return pg
 end
 

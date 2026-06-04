@@ -8,8 +8,12 @@
   `lib/EnzoLib/test/test_julia_reflux.jl`. **Follow-up #2 (ND face planes) is now
   DONE** — the Julia plane assembly rasterizes 2D/3D coarse–fine face planes
   (`test_julia_reflux_2d.jl`: 2D Sod-AMR strip conserves to round-off `5.9e-15`).
-  Remaining follow-up: EnzoNG consuming Enzo's parent-interpolated ghosts (the
-  residual ~1e-5 end-to-end drift is that boundary approximation, NOT the flux bridge).
+  **Parent-ghost coupling is DONE in 1D AND ND** — EnzoNG consumes Enzo's
+  parent-interpolated ghosts at a subgrid's coarse–fine faces; the ND fix selects
+  ParentGhost per (axis, side) so a subgrid's real domain-boundary faces keep their
+  domain BC (2D subtest C: parent-ghost ON `1.47e-6` vs broken blanket `1.5e-4` vs
+  no-reflux `1.2e-3`). The residual ~1e-6 is the boundary-interpolation accuracy,
+  NOT the flux bridge.
 - **Date:** 2026-06-03
 - **Builds on:** ADR-0002 (method-slot registry), the ND single-grid `EnzoBackend`
   (`b15d99a2`), and the `set_acceleration_field` bridge (`5d917e0c`).
@@ -194,13 +198,29 @@ boundary, not the bridge.
   the innermost interpolated layer; Enzo's multi-layer ghost + its own boundary
   reconstruction differ at higher order. Reaching round-off would require matching
   Enzo's reconstruction exactly, which is beyond consuming the parent ghost.)
-- **ND parent-ghost — REMAINING.** Follow-up #1 (`enzo_parent_ghost`) reads a
-  single innermost interpolated layer and is verified in **1D only**; the ND flux
-  raster (#2) is independent of it. Enabling parent-ghost on a 2D/3D subgrid breaks
-  conservation (a wrong ghost plane), so the 2D gate (`test_julia_reflux_2d.jl`)
-  pins `parent_ghost=false` to isolate the raster. Generalizing the parent-ghost
-  reader to ND face planes (the (D−1)-plane of interpolated ghosts, same raster as
-  #2) is the next step before parent-ghost can default on under ND AMR.
+- **ND parent-ghost — DONE.** The reader itself (`enzo_parent_ghost` in
+  `EnzoBackend`) was already ND-general: the driver invokes the `ParentGhost` BC at
+  every boundary cell's `CartesianIndex`, and the closure reads one zone outward via
+  `m.strides[axis]` — so the (D−1)-plane of interpolated ghosts is read cell-by-cell
+  for free in any D. The actual ND bug was in the BC SELECTION: the old
+  `_apply_parent_ghost!` blanket-replaced ALL of a level>0 grid's outer faces with
+  ParentGhost. In ND a subgrid's faces are a MIX — the 2D Sod strip's x-faces are
+  coarse–fine interfaces, but its y-faces span the full domain and ARE the (Outflow)
+  domain boundary. Putting a parent ghost on those domain faces broke conservation
+  (the static-interior 2D drift blew up from round-off to `~1.5e-4`, almost the
+  no-reflux `~1.2e-3`). The fix decides PER (axis, side): a face whose grid edge
+  coincides with the domain edge (`problem_grid_edge` vs the root grid's extent)
+  keeps the real domain BC; an interior face gets ParentGhost. In 1D every level>0
+  grid is interior on both faces, so this reduces EXACTLY to the blanket replacement
+  (1D bit-identical: static `7.894919286223351e-16`, end-to-end subtest C `8.07e-6`
+  vs Outflow `1.79e-5`, ratio 2.22×). **Result (2D, `test_julia_reflux_2d.jl`
+  subtest C, static interior):** parent-ghost ON mass drift `1.47e-6` / energy
+  `1.87e-6` — `~100×` better than the broken blanket version (`1.5e-4`) and `~800×`
+  below the no-reflux signature (`1.2e-3`). NOT round-off (the raster-only path stays
+  `5.9e-15`): the residual is the same coarse↔fine interpolation accuracy the 1D
+  end-to-end parent-ghost shows — EnzoNG reads the innermost interpolated layer,
+  Enzo's multi-layer reconstruction differs at higher order. The flux bridge stays
+  EXACTLY conservative; this is the boundary-ACCURACY half in ND.
 
 ## Why this is a dedicated effort, not a tail-end task
 
