@@ -140,5 +140,6 @@ function ppm_sweep_1d!(dslice::Vector{Float64}, eslice::Vector{Float64},
 end
 
 include("session.jl")   # live-Session C-ABI (full-replication via the Enzo grid lib)
+include("rpc.jl")       # ADR-0005 #2: :remote transport (subprocess worker + shm)
 
 end # module

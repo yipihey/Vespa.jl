@@ -81,9 +81,9 @@ const _BACKEND = Ref{Symbol}(:local)
 set_backend!(b::Symbol) = (b in (:local, :remote) || error("backend must be :local or :remote"); _BACKEND[] = b)
 backend() = _BACKEND[]
 
-# Remote dispatch — wired in ADR-0005 #2 (manifest-generated worker + shm buffers).
-_rpc(sym::Symbol, ret, argtypes, args) =
-    error("remote bridge backend not yet wired for $sym (ADR-0005 #2)")
+# Remote dispatch (`_rpc`) is defined in rpc.jl (ADR-0005 #2): a worker process +
+# shared-memory transport.  It is resolved at call time, so the local path here
+# never depends on it.
 
 """
     @xcall(:c_symbol, RetType, (ArgTypes...), args...)
