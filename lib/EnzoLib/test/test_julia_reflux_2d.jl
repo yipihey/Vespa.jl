@@ -32,8 +32,12 @@ else
         # per-cell flux registers; Enzo's UpdateFromFinerGrids/CorrectForRefined-
         # Fluxes then restore conservation. nsteps capped so the blast stays
         # interior (centred energy injection, refined center 0.4–0.6).
-        on  = _run_reflux(REFLUX_PF_2D; conservative = true,  regrid = false, nsteps = 20)
-        off = _run_reflux(REFLUX_PF_2D; conservative = false, regrid = false, nsteps = 20)
+        # parent_ghost=false: this gate isolates the ND flux RASTER (follow-up #2),
+        # which is orthogonal to the parent-ghost BC (follow-up #1). Parent-ghost is
+        # 1D-only for now (`enzo_parent_ghost` reads a single innermost layer); ND
+        # parent-ghost is its own follow-up, so we run plain Outflow BCs here.
+        on  = _run_reflux(REFLUX_PF_2D; conservative = true,  regrid = false, nsteps = 20, parent_ghost = false)
+        off = _run_reflux(REFLUX_PF_2D; conservative = false, regrid = false, nsteps = 20, parent_ghost = false)
         d_on = _drift(on); d_off = _drift(off)
         @info "follow-up #2 (2D) static, waves interior" max_level = on.max_level d_on d_off
         @test on.max_level >= 1                       # 2D AMR actually engaged (≥2 levels)

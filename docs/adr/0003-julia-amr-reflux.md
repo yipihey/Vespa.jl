@@ -194,6 +194,13 @@ boundary, not the bridge.
   the innermost interpolated layer; Enzo's multi-layer ghost + its own boundary
   reconstruction differ at higher order. Reaching round-off would require matching
   Enzo's reconstruction exactly, which is beyond consuming the parent ghost.)
+- **ND parent-ghost — REMAINING.** Follow-up #1 (`enzo_parent_ghost`) reads a
+  single innermost interpolated layer and is verified in **1D only**; the ND flux
+  raster (#2) is independent of it. Enabling parent-ghost on a 2D/3D subgrid breaks
+  conservation (a wrong ghost plane), so the 2D gate (`test_julia_reflux_2d.jl`)
+  pins `parent_ghost=false` to isolate the raster. Generalizing the parent-ghost
+  reader to ND face planes (the (D−1)-plane of interpolated ghosts, same raster as
+  #2) is the next step before parent-ghost can default on under ND AMR.
 
 ## Why this is a dedicated effort, not a tail-end task
 
