@@ -1,9 +1,10 @@
 # ADR-0005: Subprocess worker boundary (runtime-agnostic, single-contract RPC)
 
-- **Status:** ACCEPTED — #1 (`@xcall` seam) + #2 (manifest + generic RPC worker)
-  DONE and parity-gated; #3 (C++ MPI worker host) + #4 (multi-rank conservation
-  oracle) remain. Supersedes the in-process embedding approach of ADR-0004 for the
-  multi-rank case.
+- **Status:** ACCEPTED & COMPLETE — #1 (`@xcall` seam), #2 (manifest + generic RPC
+  worker), #3 (serial + MPI C++ worker host), #4 (multi-rank conservation) all DONE
+  and gated. The Enzo substrate runs under MPI across ranks, driven from a Julia
+  client with no MPI/foreign-C++ in its process, and is globally conservative.
+  Supersedes the in-process embedding approach of ADR-0004 for the multi-rank case.
 - **Date:** 2026-06-04
 - **Builds on:** ADR-0004 (optional MPI for the Enzo substrate). The C-ABI bridge
   (`EnzoModules/src/enzomodules_problem_bridge.C` ↔ `EnzoNG.jl/lib/EnzoLib/src/session.jl`).
@@ -121,10 +122,22 @@ it to the full bridge. *(Landed `d8aec419`; superseded by #1/#2 below.)*
     buffers (Float64/Int32/Int64), multi-buffer `grid_edge`, IN-buffer `set_field` round-trip.
     EnzoLib suite 154/154.
 
-- **#3 C++ MPI worker host — REMAINING.** Replace the Julia `rpc_worker.jl` with a non-Julia
-  process linking the MPI `libenzo`, launched `mpiexec -n N` — this is what finally avoids the
-  libstdc++/libc++ collision (no Julia runtime in the worker). Reuses the manifest to generate the
-  C++ dispatch; mmaps the shared region for true zero-copy.
+- **#3 C++ worker host (`36e175f8` serial, `11d9864b` MPI).** A standalone non-Julia process
+  (`EnzoModules/src/enzomodules_worker.C`) that `dlopen`s the bridge and serves the wire protocol;
+  its per-symbol typed dispatch is GENERATED from the manifest (`tools/gen_worker_dispatch.jl` →
+  `enzomodules_worker_dispatch.inc`), with the contract hash baked in. Carrying no Julia runtime,
+  its gcc/libstdc++ stack never meets Julia's libc++ — the collision cannot occur.
+  - **#3a serial:** passes the same parity oracle as the Julia worker (bit-identical, 22 calls).
+  - **#3b MPI (`-DUSE_MPI`, MPItrampoline):** `MPI_Init` owns the world; a master-driven SPMD loop
+    has rank 0 read each control line and `MPI_Bcast` it so collective bridge calls run in lockstep;
+    rank 0 alone replies. Per-rank handle remap (each rank's `session_init` returns its own handle;
+    a `p` token is unambiguously the handle since all other pointers are shm buffers). stdout is
+    claimed for the protocol (Enzo's diagnostics → stderr; mpiexec merges every rank's stdout).
+    Gate `test_mpi_worker.jl`: `mpiexec -n 2` → `num_ranks==2`, partition spans both ranks
+    (`grid_owners=[0,1]`), clean teardown. Supersedes the in-process `test_mpi_session.jl`.
 
-- **#4 Multi-rank conservation oracle — REMAINING.** Global `MPI_Allreduce` over per-rank composite
-  totals for both `:enzo` and `:julia` hooks across 2 ranks, asserted against the serial reflux gate.
+- **#4 Multi-rank conservation (`58ffe5ae`).** `Grid::EnzoModulesActiveFieldIntegral(field)` +
+  `enzomodules_session_global_field_integral(h, field)`: each rank sums its LOCAL level-0 tiles,
+  `CommunicationAllSumValues` reduces to all ranks. With the hierarchy split across ranks, the
+  distributed composite mass equals the serial total (`0.5625` vs `0.5625`, rel_err `2.4e-15`).
+  A scalar Cdouble call on the proven RPC path; also in the serial parity oracle. EnzoLib 201/201.
