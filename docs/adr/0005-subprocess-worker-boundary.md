@@ -1,7 +1,9 @@
 # ADR-0005: Subprocess worker boundary (runtime-agnostic, single-contract RPC)
 
-- **Status:** PROPOSED (design agreed; prototype next). Supersedes the in-process
-  embedding approach of ADR-0004 for the multi-rank case.
+- **Status:** ACCEPTED — #1 (`@xcall` seam) + #2 (manifest + generic RPC worker)
+  DONE and parity-gated; #3 (C++ MPI worker host) + #4 (multi-rank conservation
+  oracle) remain. Supersedes the in-process embedding approach of ADR-0004 for the
+  multi-rank case.
 - **Date:** 2026-06-04
 - **Builds on:** ADR-0004 (optional MPI for the Enzo substrate). The C-ABI bridge
   (`EnzoModules/src/enzomodules_problem_bridge.C` ↔ `EnzoNG.jl/lib/EnzoLib/src/session.jl`).
@@ -82,10 +84,47 @@ parity oracle, with no change to EnzoNG above `session.jl`.
 - Out of scope: cross-host Julia↔worker (each host is self-contained), and replacing the
   serial in-process path (it stays as both the fast local mode and the oracle).
 
-## Prototype (decisive first slice)
+## Prototype (decisive first slice) — DONE
 
 Before the manifest generator: build the `_invoke` seam, one function round-trip
 (`session_my_rank`) over the control channel, one shm field round-trip
 (`problem_get_field`), and the parity assertion local≡remote on that pair. This proves the
 boundary's correctness contract on the smallest surface, then the manifest generator scales
-it to the full bridge.
+it to the full bridge. *(Landed `d8aec419`; superseded by #1/#2 below.)*
+
+## Implementation status
+
+- **#1 `@xcall` transport seam (`bf962fd1`).** All 55 bridge calls go through one
+  backend-dispatching macro: `:local` → `ccall(_gsym(sym), …)` (the default + serial-verified
+  path), `:remote` → `_rpc(sym, ret, argtypes, args)`. The C symbol + types are written ONCE at
+  the call site; that single declaration is what the manifest reads. Verified behavior-identical.
+
+- **#2 manifest + generic RPC worker (`b27eaa25`, `lib/EnzoLib/src/rpc.jl`).**
+  - **Manifest** = `(symbol → (ret, argtypes))` PARSED OUT OF `session.jl`'s `@xcall` sites with
+    Julia's own parser (`Meta.parseall` + AST walk) — no regex, genuinely source-derived, 55
+    symbols. `contract_hash()` over the surface is exchanged at the worker handshake.
+  - **Worker (`serve`)** dispatches raw C symbols via `ccall` thunks GENERATED from the manifest's
+    literal type ASTs (`@eval` lifts `ret`/`argtypes` into a type-stable `ccall`; called via
+    `invokelatest` for world-age). It pre-inits nothing — `session_init` is itself an RPC, so the
+    client drives the whole hierarchy lifecycle.
+  - **No in/out direction table.** Every array arg is round-tripped through the shared file
+    BIDIRECTIONALLY: client ships the arg's current bytes (real data for IN, zeros for OUT) and
+    reads them back after the call. Correctness needs only element type + length (both on the
+    wire), so the buffer wrappers need ZERO remote-specific code. `_rpc` detects buffers by value
+    (`isa AbstractArray`), since `@xcall` passes `ret`/`argtypes` already evaluated.
+  - **Transport.** Line-based control channel (scalars as whitespace-free typed tokens; floats by
+    exact bit pattern; strings base64); bulk arrays via a shared file (seek/read/write of raw
+    bytes) — a stand-in for POSIX shm whose `(offset,len,eltype)` descriptors are identical to what
+    the #3 C++ worker will mmap for true zero-copy.
+  - **Differential oracle (`test_rpc_parity.jl`).** Same wrappers through `:local` and `:remote`,
+    asserted bit-identical: 22 calls / 49 assertions — scalar returns (Cint/Cdouble/Handle), OUT
+    buffers (Float64/Int32/Int64), multi-buffer `grid_edge`, IN-buffer `set_field` round-trip.
+    EnzoLib suite 154/154.
+
+- **#3 C++ MPI worker host — REMAINING.** Replace the Julia `rpc_worker.jl` with a non-Julia
+  process linking the MPI `libenzo`, launched `mpiexec -n N` — this is what finally avoids the
+  libstdc++/libc++ collision (no Julia runtime in the worker). Reuses the manifest to generate the
+  C++ dispatch; mmaps the shared region for true zero-copy.
+
+- **#4 Multi-rank conservation oracle — REMAINING.** Global `MPI_Allreduce` over per-rank composite
+  totals for both `:enzo` and `:julia` hooks across 2 ranks, asserted against the serial reflux gate.
