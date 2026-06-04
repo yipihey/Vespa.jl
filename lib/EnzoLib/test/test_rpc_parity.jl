@@ -18,6 +18,9 @@ using EnzoLib, EnzoFixtures, EnzoNG, MeshInterface, RefMesh, EnzoBackend
 const RPC_PF = abspath(joinpath(@__DIR__, "..", "..", "..", "..",
                                 "run", "Hydro", "Hydro-1D", "SodShockTube", "SodShockTubeAMR.enzo"))
 const RPC_WORKER = joinpath(@__DIR__, "rpc_worker.jl")
+# The generated C++ worker (ADR-0005 #3) — built by build_grid_darwin.sh, optional.
+const RPC_WORKER_CPP = abspath(joinpath(@__DIR__, "..", "..", "..", "..",
+                                        "EnzoModules", "deps", "enzomodules_worker"))
 
 # A battery of bridge reads (+ one write round-trip) over the whole surface.  Runs
 # against whatever backend is active; returns an ordered name=>value list to diff.
@@ -64,10 +67,41 @@ function _gather(h)
     return out
 end
 
+# Drive the SAME wrappers through a worker process (`:remote`).  `mkcmd(shm)` builds
+# the launch command given the shared-file path (the worker takes it as ARGS[1]);
+# the worker runs in the fixture's workdir (Enzo reads files relative to cwd) and
+# session_init itself is an RPC, so the worker pre-inits nothing.  Restores
+# `:local` on the way out.
+function _gather_remote_with_shm(mkcmd, wd)
+    shm = tempname()
+    EnzoLib.connect_worker!(mkcmd(shm); shm = shm)
+    try
+        @assert EnzoLib.backend() === :remote
+        hR = EnzoLib.session_init(RPC_PF)
+        @assert hR != C_NULL "remote session_init returned NULL"
+        res = _gather(hR)
+        EnzoLib.free_problem(hR)
+        return res
+    finally
+        EnzoLib.disconnect_worker!()
+        rm(shm; force = true)
+    end
+end
+
+# Assert a worker's gathered results are BIT-IDENTICAL to the local reference.
+function _assert_parity(local_results, remote_results, label)
+    @test length(local_results) == length(remote_results)
+    for ((lk, lv), (rk, rv)) in zip(local_results, remote_results)
+        @test lk == rk                                  # same call order/surface
+        @test lv == rv                                  # BIT-IDENTICAL local vs remote
+    end
+    @info "ADR-0005 parity" worker = label calls = length(remote_results)
+end
+
 if !EnzoLib.grid_available()
     @info "Session bridge not built — skipping ADR-0005 RPC parity oracle"
 else
-    @testset "ADR-0005 #2: local ≡ remote parity (full bridge surface)" begin
+    @testset "ADR-0005: local ≡ remote parity (full bridge surface)" begin
         # (a) LOCAL reference — in-process ccall.
         EnzoLib.set_backend!(:local)
         hL = cd(EnzoLib._workdir(RPC_PF)) do
@@ -76,32 +110,32 @@ else
         @test hL != C_NULL
         local_results = _gather(hL)
         EnzoLib.free_problem(hL)
+        wd = EnzoLib._workdir(RPC_PF)
 
-        # (b) REMOTE — a worker process drives the SAME wrappers via RPC + shm.  The
-        # worker is launched in the fixture's workdir (Enzo reads files relative to
-        # cwd); session_init itself is an RPC, so the worker pre-inits nothing.
-        shm = tempname()
-        jl  = Base.julia_cmd()
-        cmd = setenv(`$jl --project=$(@__DIR__) $RPC_WORKER $shm`;
-                     dir = EnzoLib._workdir(RPC_PF))
-        EnzoLib.connect_worker!(cmd; shm = shm)
-        @test EnzoLib.backend() === :remote
-        try
-            hR = EnzoLib.session_init(RPC_PF)
-            @test hR != C_NULL
-            remote_results = _gather(hR)
-            EnzoLib.free_problem(hR)
-
-            @test length(local_results) == length(remote_results)
-            for ((lk, lv), (rk, rv)) in zip(local_results, remote_results)
-                @test lk == rk                          # same call order/surface
-                @test lv == rv                          # BIT-IDENTICAL local vs remote
+        # (b) #2 — the Julia reference worker (rpc.jl `serve`).
+        @testset "Julia worker (#2)" begin
+            jl = Base.julia_cmd()
+            res = _gather_remote_with_shm(wd) do shm
+                setenv(`$jl --project=$(@__DIR__) $RPC_WORKER $shm`; dir = wd)
             end
-            @info "ADR-0005 #2 parity" calls = length(local_results) backend = EnzoLib.backend()
-        finally
-            EnzoLib.disconnect_worker!()
-            rm(shm; force = true)
+            _assert_parity(local_results, res, "julia")
         end
+
+        # (c) #3 — the generated C++ worker (no Julia runtime → no libstdc++/libc++
+        # collision; the path that hosts MPI libenzo).  Optional: built by
+        # build_grid_darwin.sh.  Same wire protocol, same oracle.
+        if isfile(RPC_WORKER_CPP)
+            @testset "C++ worker (#3)" begin
+                bridge = EnzoLib.grid_libpath()
+                res = _gather_remote_with_shm(wd) do shm
+                    setenv(`$RPC_WORKER_CPP $shm $bridge`; dir = wd)
+                end
+                _assert_parity(local_results, res, "cpp")
+            end
+        else
+            @info "C++ worker not built — skipping #3 parity (build: bash EnzoModules/deps/build_grid_darwin.sh)" RPC_WORKER_CPP
+        end
+
         @test EnzoLib.backend() === :local              # disconnect restored local
     end
 end

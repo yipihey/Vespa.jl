@@ -62,22 +62,42 @@ end
 manifest() = (_MANIFEST[] === nothing && (_MANIFEST[] = _collect_xcall_manifest()); _MANIFEST[])
 
 """
-    contract_hash() -> UInt
+    contract_canonical() -> String
 
-A stable hash over the bridge surface (symbol set + each call's return/argtype
-source text).  Exchanged at the worker handshake; a mismatch means the worker and
-client were built from different bindings (a rebuilt-one-side bug) and the
-connection is refused rather than silently corrupting data.
+The canonical, language-independent serialization of the bridge surface: the seed
+tag followed by one `\\nsym|ret|argtypes` line per symbol in sorted order.  Both
+the Julia client and the generated C++ worker hash THIS exact string, so their
+handshake values agree without the worker reimplementing Julia internals.
 """
-function contract_hash()
+function contract_canonical()
     m = manifest()
-    h = hash("enzong-bridge-contract-v1")
+    io = IOBuffer()
+    print(io, "enzong-bridge-contract-v1")
     for k in sort!(collect(keys(m)); by = string)
         ret, at = m[k]
-        h = hash((string(k), string(ret), string(at)), h)
+        print(io, '\n', k, '|', ret, '|', at)
+    end
+    return String(take!(io))
+end
+
+"FNV-1a 64-bit (the one hash the C++ worker's generator also computes — reproducible, version-stable)."
+function _fnv1a64(s::AbstractString)
+    h = 0xcbf29ce484222325
+    for b in codeunits(s)
+        h = (h ⊻ UInt64(b)) * 0x100000001b3      # UInt64 arithmetic wraps mod 2^64
     end
     return h
 end
+
+"""
+    contract_hash() -> UInt64
+
+A stable hash over the bridge surface (`contract_canonical`).  Exchanged at the
+worker handshake; a mismatch means the worker and client were built from different
+bindings (a rebuilt-one-side bug, incl. a stale generated C++ dispatch) and the
+connection is refused rather than silently corrupting data.
+"""
+contract_hash() = _fnv1a64(contract_canonical())
 
 # ── shared-file buffer I/O (byte-packed; offsets dictated by the client) ──────
 # A plain temp file standing in for POSIX shm: seek+write / seek+read! of an
