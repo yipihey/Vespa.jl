@@ -15,24 +15,26 @@ export ppm_sweep_1d!
 
 """
     ppm_sweep_1d!(dslice, eslice, geslice, uslice, vslice, wslice, pslice, grslice, dxi;
-                  idim, i1, i2, dt, gamma, gravity=0, idual=0, eta1=0.0, eta2=0.0,
+                  idim, i1, i2, jdim=1, dt, gamma, gravity=0, idual=0, eta1=0.0, eta2=0.0,
                   isteep=0, iflatten=0, idiff=0, ipresfree=0, pmin=1e-20, dfloor=0.0)
         -> (df, ef, uf)
 
-One directional PPM hydro update of a 1-D slab. The six zone-centred slices are
-updated IN PLACE; `pslice` (input) is the precomputed pressure; `grslice` the
-gravitational acceleration (used when `gravity≠0`). Returns the density / energy /
-normal-momentum face fluxes. Element type sets the working precision; all arrays
-must live on the same backend. Mirrors `EnzoLib.ppm_sweep_1d_full!`.
+One directional PPM hydro update of a column-major `idim×jdim` slab — i.e. `jdim`
+independent 1-D pencils swept along the leading axis at once (the directional-
+split primitive Phase 4 batches over). The six zone-centred slices are updated IN
+PLACE; `pslice` (input) is the precomputed pressure; `grslice` the gravitational
+acceleration (used when `gravity≠0`). `dxi` is the length-`idim` cell-width array.
+Returns the density / energy / normal-momentum face fluxes. Mirrors
+`EnzoLib.ppm_sweep_1d_full!` (per pencil).
 """
 function ppm_sweep_1d!(dslice, eslice, geslice, uslice, vslice, wslice, pslice, grslice, dxi;
-                       idim::Integer, i1::Integer, i2::Integer, dt::Real, gamma::Real,
-                       gravity::Integer = 0, idual::Integer = 0, eta1::Real = 0.0,
-                       eta2::Real = 0.0, isteep::Integer = 0, iflatten::Integer = 0,
-                       idiff::Integer = 0, ipresfree::Integer = 0, pmin::Real = 1e-20,
-                       dfloor::Real = 0.0)
+                       idim::Integer, i1::Integer, i2::Integer, jdim::Integer = 1,
+                       dt::Real, gamma::Real, gravity::Integer = 0, idual::Integer = 0,
+                       eta1::Real = 0.0, eta2::Real = 0.0, isteep::Integer = 0,
+                       iflatten::Integer = 0, idiff::Integer = 0, ipresfree::Integer = 0,
+                       pmin::Real = 1e-20, dfloor::Real = 0.0)
     idim, i1, i2 = Int(idim), Int(i1), Int(i2)
-    j1, j2 = 1, 1
+    j1, j2 = 1, Int(jdim)
 
     # 0. flattening + diffusion coefficients (1-D regime)
     diffcoef = _zlike(dslice); flatten = _zlike(dslice)
