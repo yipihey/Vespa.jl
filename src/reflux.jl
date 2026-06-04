@@ -144,3 +144,48 @@ end
     reg.interior[k] = get(reg.interior, k, ntuple(_ -> zero(T), Val(NV))) .+ add
     return nothing
 end
+
+# ── ND face-plane raster (ADR-0003 follow-up #2) ──────────────────────────────
+# Enzo stores a coarse–fine face flux as a flat plane `Left/RightFluxes[field][dim]`
+# of `prod(Dim)` cells, where `Dim[d] = EndGlobalIndex[dim][d] − StartGlobalIndex
+# [dim][d] + 1` and the flux dim is collapsed (Dim[dim]=1). Its consumer
+# (`Grid_CorrectForRefinedFluxes.C:460`) addresses cell at global index `g` by
+#   FluxIndex = Σ_d (g[d] − StartGlobalIndex[dim][d]) · Π_{e<d} Dim[e]
+# i.e. column-major over the orthogonal dims, dim-0 fastest. In 1D the plane is a
+# single cell; in ND it is the (D−1)-plane of the face. `bflux_plane` rasterizes
+# one (dim, side) plane: it walks the plane offsets, maps each to EnzoNG's active
+# CartesianIndex (1-based), looks up the recorded flux NTuple, and returns the
+# `Vector{Float64}` in Enzo's units (`enzo_value = bflux/Vcell`) for component `comp`.
+#
+# `start`,`stop` are the length-`rank` global StartGlobalIndex/EndGlobalIndex of
+# this face plane; `g0` is the grid's first-active-cell global index (length-rank).
+# `flux_off` is the active-index offset along the flux dim itself: the orthogonal
+# dims map straight (`a = g − g0 + 1`), but the flux-dim register key follows the
+# verified 1D mapping (Left subgrid face → lo cell `g − g0`, Right → `g − g0 + 1`;
+# own outer boundary → the boundary cell directly), supplied by the caller.
+# `lookup(I)` returns the recorded flux for active cell `I`, or `nothing` (⇒ 0).
+@inline function _plane_dims(start::NTuple{R,Int}, stop::NTuple{R,Int}) where {R}
+    return ntuple(d -> stop[d] - start[d] + 1, Val(R))
+end
+
+function bflux_plane(::Val{R}, dim::Int, start::NTuple{R,Int}, stop::NTuple{R,Int},
+                     g0::NTuple{R,Int}, flux_off::Int, comp::Int, Vcell::Real,
+                     lookup) where {R}
+    Dim = _plane_dims(start, stop)
+    n = prod(Dim)
+    out = Vector{Float64}(undef, n)
+    @inbounds for lin in 0:n-1
+        # decode column-major (dim-0 fastest) plane offset → per-dim global index
+        rem = lin
+        active = ntuple(Val(R)) do d
+            od = rem % Dim[d]
+            rem ÷= Dim[d]
+            g = start[d] + od
+            d == dim + 1 ? flux_off : (g - g0[d] + 1)   # flux dim: caller-supplied active key; else direct
+        end
+        I = CartesianIndex(active)
+        F = lookup(I)
+        out[lin+1] = (F !== nothing && comp > 0) ? Float64(F[comp]) / Float64(Vcell) : 0.0
+    end
+    return out
+end

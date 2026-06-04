@@ -14,4 +14,5 @@ using EnzoBackend
     include("test_method_slots.jl")        # ADR-0002: method-slot registry, hydro/gravity :julia slots (if grid lib built)
     include("test_set_acceleration.jl")    # set_acceleration bridge: :julia gravity → :enzo hydro coupling primitive
     include("test_julia_reflux.jl")        # ADR-0003 part B: conservative :julia hydro under AMR (SubgridFluxes bridge)
+    include("test_julia_reflux_2d.jl")     # ADR-0003 follow-up #2: ND face-plane raster — 2D conservation (if grid lib built)
 end

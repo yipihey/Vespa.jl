@@ -5,9 +5,11 @@
   flux bridge conserves the composite mass/energy to **round-off** on a static
   multi-level (5-level) hierarchy while the waves are interior to the refined
   region (`7.9e-16` vs `1.3e-3` with the correction disabled). Validated by
-  `lib/EnzoLib/test/test_julia_reflux.jl`. Remaining follow-ups (below): ND face
-  planes, and EnzoNG consuming Enzo's parent-interpolated ghosts (the residual
-  ~1e-5 end-to-end drift is that boundary approximation, NOT the flux bridge).
+  `lib/EnzoLib/test/test_julia_reflux.jl`. **Follow-up #2 (ND face planes) is now
+  DONE** — the Julia plane assembly rasterizes 2D/3D coarse–fine face planes
+  (`test_julia_reflux_2d.jl`: 2D Sod-AMR strip conserves to round-off `5.9e-15`).
+  Remaining follow-up: EnzoNG consuming Enzo's parent-interpolated ghosts (the
+  residual ~1e-5 end-to-end drift is that boundary approximation, NOT the flux bridge).
 - **Date:** 2026-06-03
 - **Builds on:** ADR-0002 (method-slot registry), the ND single-grid `EnzoBackend`
   (`b15d99a2`), and the `set_acceleration_field` bridge (`5d917e0c`).
@@ -159,9 +161,18 @@ boundary, not the bridge.
 
 ## Follow-ups
 
-- **ND face planes.** The bridge is ND-general (sizes/extents over `GridRank`); the
-  Julia plane assembly is 1D for now (planes collapse to single cells). ND needs the
-  orthogonal-dim raster mapping EnzoNG boundary/interior cells ↔ Enzo plane offset.
+- **ND face planes — DONE.** The C++ bridge was already ND-general (sizes/extents
+  over `GridRank`). The Julia plane assembly is now ND too: `EnzoNG.bflux_plane`
+  (`src/reflux.jl`) rasterizes one `(dim, side)` face plane in Enzo's exact
+  linearization (column-major over the orthogonal dims, dim-0 fastest, flux dim
+  collapsed — the `Grid_CorrectForRefinedFluxes.C:460` `FluxIndex`), mapping each
+  plane cell's global index to EnzoNG's per-cell boundary/interior flux register
+  (orthogonal dims map straight `g−g0+1`; the flux-dim key follows the verified 1D
+  mapping). `test_julia_reflux.jl`'s `_write_fluxes!` is now `EnzoGridMesh{R}`
+  generic. **Result (2D Sod-AMR strip, `test_julia_reflux_2d.jl`, waves interior):**
+  composite mass drift `5.9e-15` / energy `3.3e-14` (WITH) vs `1.2e-3` / `3.0e-3`
+  (WITHOUT) — round-off, on genuine 60-cell and 4-cell face planes. 1D unchanged
+  (bit-identical `7.9e-16`).
 - **Parent-ghost coupling (accuracy + the residual conservation).** EnzoNG evolves
   each subgrid with Outflow BCs; it should instead consume Enzo's parent-interpolated
   ghost zones (a fixed/Dirichlet BC reading the live grid's ghost cells). This is

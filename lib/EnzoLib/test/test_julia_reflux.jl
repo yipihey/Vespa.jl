@@ -46,15 +46,20 @@ function _build_grid_sim(h, gi, model, nghost)
     return mesh, Simulation(mesh, prob; model = model)
 end
 
-# Write one (dim, side) flux plane of subgrid entry `sub` for ALL Enzo baryon
-# fields (the consumers — CorrectForRefinedFluxes, AddToBoundaryFluxes — loop
-# every field and deref each, so unmapped fields must still be allocated/zeroed).
-# `F` is EnzoNG's flux NTuple for that face (or nothing ⇒ all zeros). 1D: 1-cell.
-function _write_subgrid_plane!(h, level, i, sub, mesh, nf, dim, side, F, Vcell)
+# Write one (dim, side) flux plane of an Enzo flux register (subgrid OR boundary)
+# for ALL Enzo baryon fields (the consumers — CorrectForRefinedFluxes,
+# AddToBoundaryFluxes — loop every field and deref each, so unmapped fields must
+# still be allocated/zeroed). `lookup(I)` returns EnzoNG's recorded flux NTuple for
+# active cell `I` (or nothing ⇒ zeros). The plane is rasterized in Enzo's exact
+# linearization by `EnzoNG.bflux_plane` (ND-general; 1D ⇒ a single cell). `setter`
+# pushes one field's `Vector{Float64}` plane (subgrid vs own-boundary destination).
+function _write_plane!(::Val{R}, setter, mesh, nf, dim::Int, start, stop, g0,
+                       flux_off::Int, Vcell, lookup) where {R}
+    s = ntuple(d -> start[d], Val(R)); e = ntuple(d -> stop[d], Val(R)); g = ntuple(d -> g0[d], Val(R))
     for fld in 0:nf-1
-        k = _engng_comp_of(mesh, fld)
-        val = (F !== nothing && k > 0) ? F[k] / Vcell : 0.0
-        EnzoLib.problem_set_subgrid_flux(h, level, i, sub, fld, dim, side, [val])
+        comp = _engng_comp_of(mesh, fld)
+        plane = EnzoNG.bflux_plane(Val(R), dim, s, e, g, flux_off, comp, Vcell, lookup)
+        setter(fld, plane)
     end
     return nothing
 end
@@ -68,35 +73,52 @@ end
 #     RefinedFluxes its parent projects), giving the correct temporal accumulation
 #     across subcycles for free.
 # `conservative=false` writes ZEROS (arrays still allocated, but zero correction) —
-# the non-conservative baseline that isolates the reflux effect. 1D for now (the
-# face planes collapse to single cells); ND plane assembly is a follow-up.
-function _write_fluxes!(h, level, i, gi, mesh::EnzoGridMesh{1}, sim, breg, model; conservative::Bool)
-    Vcell = MeshInterface.cell_volume(mesh, CartesianIndex(1))
-    g0 = EnzoLib.problem_grid_global_start(h, gi)
+# the non-conservative baseline that isolates the reflux effect. ND face planes are
+# rasterized cell-by-cell from EnzoNG's per-cell flux registers (ADR-0003 follow-up
+# #2): the orthogonal dims sweep the (D−1)-plane, the flux dim is the single
+# interface/boundary cell (the verified 1D mapping, generalized).
+function _write_fluxes!(h, level, i, gi, mesh::EnzoGridMesh{R}, sim, breg, model; conservative::Bool) where {R}
+    Vcell = MeshInterface.cell_volume(mesh, first(CartesianIndices(mesh.active)))
+    g0 = EnzoLib.problem_grid_global_start(h, gi)        # length-3 global start
     nf = EnzoLib.problem_num_fields(h, gi)
     nsub = EnzoLib.problem_num_subgrids(h, level, i)
-    dim = 0; axis = 1                                   # 1D
 
-    # ── proper subgrids: coarse InitialFluxes at the coarse–fine interface faces.
+    # An interior-register lookup along flux dim `dim` (0-based), side (0=Left/lo,
+    # 1=Right/hi). The flux-dim active key follows the verified 1D mapping: the
+    # coarse interior face's +axis LO cell is `start[dim]-g0[dim]` (Left) or
+    # `start[dim]-g0[dim]+1` (Right); `bflux_plane` supplies the orthogonal dims.
+    axis_of(dim) = dim + 1
+    interior_lookup(dim, side, start) = begin
+        ax = axis_of(dim)
+        off = start[dim+1] - g0[dim+1] + (side == 0 ? 0 : 1)
+        I -> conservative ? get(breg.interior, (ax, I), nothing) : nothing, off
+    end
+
+    # ── proper subgrids: coarse InitialFluxes at each coarse–fine interface face,
+    # for every flux dim and both sides (ND: a subgrid touches faces on all dims).
     for sub in 0:nsub-2
-        ls, _ = EnzoLib.problem_subgrid_flux_extent(h, level, i, sub, dim, 0)  # Left face coarse global
-        rs, _ = EnzoLib.problem_subgrid_flux_extent(h, level, i, sub, dim, 1)  # Right face coarse global
-        lo_left  = ls[dim+1] - g0[dim+1]                # EnzoNG interior key lo cell (1-based active)
-        lo_right = rs[dim+1] - g0[dim+1] + 1
-        FL = conservative ? get(breg.interior, (axis, CartesianIndex(lo_left)), nothing) : nothing
-        FR = conservative ? get(breg.interior, (axis, CartesianIndex(lo_right)), nothing) : nothing
-        _write_subgrid_plane!(h, level, i, sub, mesh, nf, dim, 0, FL, Vcell)
-        _write_subgrid_plane!(h, level, i, sub, mesh, nf, dim, 1, FR, Vcell)
+        for dim in 0:R-1, side in 0:1
+            st, en = EnzoLib.problem_subgrid_flux_extent(h, level, i, sub, dim, side)
+            lk, off = interior_lookup(dim, side, st)
+            _write_plane!(Val(R), (fld, pl) -> EnzoLib.problem_set_subgrid_flux(h, level, i, sub, fld, dim, side, pl),
+                          mesh, nf, dim, st, en, g0, off, Vcell, lk)
+        end
     end
 
-    # ── own-boundary entry (last): the grid's outer-face flux (breg.flux :lo/:hi).
-    flo = nothing; fhi = nothing
-    for ((ax, side, cell), F) in breg.flux
-        side === :lo ? (flo = F) : (fhi = F)
-    end
+    # ── own-boundary entry (last): the grid's outer-face flux (breg.flux register,
+    # keyed by (axis, side, boundary-cell)). The flux-dim active key is the boundary
+    # cell: 1 on the lo side, active[dim] on the hi side. Orthogonal dims sweep the
+    # boundary plane; bflux_plane maps each to its (axis, side, CartesianIndex) key.
     own = nsub - 1
-    _write_subgrid_plane!(h, level, i, own, mesh, nf, dim, 0, conservative ? flo : nothing, Vcell)
-    _write_subgrid_plane!(h, level, i, own, mesh, nf, dim, 1, conservative ? fhi : nothing, Vcell)
+    for dim in 0:R-1, side in 0:1
+        st, en = EnzoLib.problem_subgrid_flux_extent(h, level, i, own, dim, side)
+        sym = side == 0 ? :lo : :hi
+        boundary_cell = side == 0 ? 1 : mesh.active[dim+1]
+        ax = axis_of(dim)
+        lk = I -> conservative ? get(breg.flux, (ax, sym, I), nothing) : nothing
+        _write_plane!(Val(R), (fld, pl) -> EnzoLib.problem_set_subgrid_flux(h, level, i, own, fld, dim, side, pl),
+                      mesh, nf, dim, st, en, g0, boundary_cell, Vcell, lk)
+    end
     return nothing
 end
 
