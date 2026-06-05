@@ -105,16 +105,19 @@ end
 
 """
     ppm_step_3d!(d, e, ge, vx, vy, vz, grx, gry, grz, dims, ng;
-                 dt, gamma, order=(1,2,3), kw...)
+                 dt, gamma, order=(1,2,3), bc!=nothing, kw...)
 
 A full directional-split timestep: pressure is recomputed before each axis sweep
 and the three sweeps are applied in `order` (alternate `(1,2,3)`/`(3,2,1)` across
 steps for second-order Strang accuracy). Gravity is DIRECTIONAL — each sweep uses
 its own acceleration component (`grx`/`gry`/`grz`); pass zero arrays when gravity
-is off. Mutates the state in place.
+is off. `bc!(d,e,ge,vx,vy,vz)` (optional) refills the ghost zones before EACH
+directional sweep (e.g. a periodic wrap) — needed for a conservative standalone run;
+omit it under a framework (e.g. Enzo) that sets the boundaries externally. Mutates
+the state in place.
 """
 function ppm_step_3d!(d, e, ge, vx, vy, vz, grx, gry, grz, dims::NTuple{3,Int}, ng::Int;
-                      dt::Real, gamma::Real, order::NTuple{3,Int} = (1, 2, 3), kw...)
+                      dt::Real, gamma::Real, order::NTuple{3,Int} = (1, 2, 3), bc! = nothing, kw...)
     p = similar(d)
     gr = (grx, gry, grz)
     be = KA.get_backend(d)
@@ -123,6 +126,10 @@ function ppm_step_3d!(d, e, ge, vx, vy, vz, grx, gry, grz, dims::NTuple{3,Int}, 
         # sweep ensures it has completed before its scratch is recycled.
         KA.synchronize(be)
         _pool_reset!()
+        # directional split: refill the ghost zones consistent with the state the
+        # PREVIOUS sweep just updated (e.g. a periodic wrap), else the inter-sweep
+        # ghosts are stale and the boundary is non-conservative.
+        bc! === nothing || bc!(d, e, ge, vx, vy, vz)
         _recompute_pressure!(p, d, e, vx, vy, vz, gamma)
         sweep_axis!(d, e, ge, vx, vy, vz, p, gr[axis], dims, ng, axis; dt = dt, gamma = gamma, kw...)
     end

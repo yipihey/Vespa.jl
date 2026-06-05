@@ -58,11 +58,14 @@ function turb_ic(n; mach, seed = 271, kmin = 2, kmax = 3, specidx = 4.0)
 end
 
 # ── RMS-Mach / KE diagnostics from host primitive arrays (interior only) ──────
-function diag(ρ, vx, vy, vz, eint, dims, dx)
+# `etot` is the SPECIFIC TOTAL energy; internal energy = etot − ½|v|² (the conserved,
+# shock-heat-bearing quantity — same definition for every solver, so DirectEuler's
+# advected gas-energy `ge` no longer makes its temperature look different).
+function diag(ρ, vx, vy, vz, etot, dims, dx)
     nx, ny, nz = dims; v2s = 0.0; cs2s = 0.0; ke = 0.0; m = 0.0; nc = 0; emin = Inf
     @inbounds for k in (NG+1):(nz-NG), j in (NG+1):(ny-NG), i in (NG+1):(nx-NG)
         q = i + nx * (j - 1) + nx * ny * (k - 1)
-        v2 = vx[q]^2 + vy[q]^2 + vz[q]^2; e = eint[q]
+        v2 = vx[q]^2 + vy[q]^2 + vz[q]^2; e = etot[q] - 0.5 * v2     # internal energy
         v2s += v2; cs2s += GAMMA * (GAMMA - 1) * max(e, 0.0); ke += 0.5 * ρ[q] * v2
         m += ρ[q]; emin = min(emin, e); nc += 1
     end
@@ -85,22 +88,21 @@ function run_solver(name, ic, dt, nsteps)
     dims = ic.dims; dx = ic.dx; N = ic.N; nb = dims[1]
     pbc(f...) = _P.fill_periodic!(dims, NG, f...)
     # PPM-DirectEuler works on primitive arrays; everyone else on the conserved set.
+    pbc6(a, b, c, dd, ee, ff) = _P.fill_periodic!(dims, NG, a, b, c, dd, ee, ff)
     if name == "PPM-DirectEuler"
         d = dev(ic.d); e = dev(ic.etot); ge = dev(ic.eint)
         vx = dev(ic.vx); vy = dev(ic.vy); vz = dev(ic.vz); z = dev(zeros(N))
-        # NOTE: DirectEuler has no bc! hook, so it only gets a per-STEP periodic refill
-        # (not between its 3 internal sweeps) ⇒ a small conservation handicap vs the
-        # conserved-variable solvers; its absolute numbers are not strictly comparable.
-        full!(o) = begin
-            _P.fill_periodic!(dims, NG, d, e, ge, vx, vy, vz)
-            _P.ppm_step_3d!(d, e, ge, vx, vy, vz, z, z, z, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
-                            order = o, idual = 1, iflatten = 3, isteep = 0, idiff = 0, gravity = 0, eta2 = 0.1)
-        end
+        # `bc! = pbc6` ⇒ a periodic ghost refill before EACH internal sweep, the same
+        # inter-sweep BC treatment the conserved-variable solvers get ⇒ conservative.
+        full!(o) = _P.ppm_step_3d!(d, e, ge, vx, vy, vz, z, z, z, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
+                                   order = o, bc! = pbc6, idual = 1, iflatten = 3, isteep = 0, idiff = 0, gravity = 0, eta2 = 0.1)
         tw = _P.with_pool() do
             full!((1, 2, 3))                                   # warm
             @elapsed for s in 1:nsteps; full!(isodd(s) ? (1, 2, 3) : (3, 2, 1)); end
         end
-        p = (_P.to_host(d), _P.to_host(vx), _P.to_host(vy), _P.to_host(vz), _P.to_host(ge))
+        # diagnostic eint from the conserved TOTAL energy `e` (= specific etot), so
+        # DirectEuler is read on the same footing as the conserved solvers.
+        p = (_P.to_host(d), _P.to_host(vx), _P.to_host(vy), _P.to_host(vz), _P.to_host(e))
         return (diag(p..., dims, dx), tw, n^3 * nsteps / tw / 1e6, any(isnan, p[1]))
     end
     # conserved staging (dual energy: Ge = ρ·eint)
@@ -123,14 +125,14 @@ function run_solver(name, ic, dt, nsteps)
         step!((1, 2, 3))                                       # warm up (compile + prime pool/state)
         @elapsed for s in 1:nsteps; step!(isodd(s) ? (3, 2, 1) : (1, 2, 3)); end
     end
-    hD = _P.to_host(D)
-    p = (hD, _P.to_host(S1) ./ hD, _P.to_host(S2) ./ hD, _P.to_host(S3) ./ hD, _P.to_host(Ge) ./ hD)
+    hD = _P.to_host(D)                                         # eint from total energy τ/ρ − ½v²
+    p = (hD, _P.to_host(S1) ./ hD, _P.to_host(S2) ./ hD, _P.to_host(S3) ./ hD, _P.to_host(Tau) ./ hD)
     return (diag(p..., dims, dx), tw, n^3 * nsteps / tw / 1e6, any(isnan, p[1]))
 end
 
 # ── driver ───────────────────────────────────────────────────────────────────
 ic = turb_ic(n; mach = MACH)
-d0 = diag(ic.d, ic.vx, ic.vy, ic.vz, ic.eint, ic.dims, ic.dx)
+d0 = diag(ic.d, ic.vx, ic.vy, ic.vz, ic.etot, ic.dims, ic.dx)
 tcross = 1.0 / d0.vrms                                          # L / v_rms
 tfinal = TFRAC * tcross
 vm = vmax_ic(ic); dt = 0.2 * ic.dx / vm; nsteps = ceil(Int, tfinal / dt)
