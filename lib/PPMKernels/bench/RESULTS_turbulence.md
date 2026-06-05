@@ -10,10 +10,11 @@ Five solvers timed:
 - **RK2** = `muscl_step_3d!` — unsplit RK2 MUSCL (Enzo HydroMethod=3 / HD_RK class).
 - **Hancock** = `muscl_hancock_step_3d!` (recon=:plm) — dim-split, 3 sweeps/step, PLM.
 - **Hancock-PPM** = `muscl_hancock_step_3d!` (recon=:ppm) — same predictor+HLL, parabolic recon.
-- **PPML** = `ppml_step_3d!` — PPM-on-a-Local-stencil (Ustyugov+ 2009): a STATEFUL
-  characteristic-traced solver (persistent face pair + RGK limiter + CW84 monotonize +
-  shock flatten + characteristic-trace predictor + HLL-with-star corrector). 9 kernels/
-  sweep + 30 grid-arrays of persistent state — by far the heaviest per-cell scheme.
+- **PPML** = `ppml_step_3d!` — PPM-on-a-Local-stencil (Ustyugov+ 2009): the FULL method —
+  a STATEFUL characteristic-traced solver (persistent face pair + RGK characteristic
+  limiter + CW84 monotonize + shock flatten + §6 WENO5 smooth-extremum fallback +
+  characteristic-trace predictor + HLLC). 9 kernels/sweep + 30 grid-arrays of persistent
+  state — by far the heaviest per-cell scheme.
 
 ## Throughput (Mcell/s — higher is better)
 
@@ -23,7 +24,7 @@ Five solvers timed:
 | RK2 (unsplit)     | 3.02 | 3.22 |  2.15 | 3.75 | 4.13 | 10.95 | 4.36 | 4.60 |  42.41 | 4.54 |  96.51 |
 | Hancock (PLM)     | 5.00 | 5.14 | 10.61 | 6.06 | 6.75 | 63.93 | 7.12 | 7.50 | 189.34 | 7.40 | 233.12 |
 | Hancock-PPM       | 2.11 | 2.14 |  9.12 | 2.72 | 2.81 | 78.75 | 3.05 | 3.16 | 174.83 | 3.04 | 197.16 |
-| PPML (Ustyugov)   | 1.40 | 1.36 |  4.74 | 1.76 | 1.87 | 23.48 | 2.10 | 2.14 |  69.20 | 2.25 |  76.93 |
+| PPML (Ustyugov)   | 1.19 | 1.24 |  4.47 | 1.50 | 1.63 | 34.34 | 1.78 | 1.85 |  65.50 | 1.93 |  74.87 |
 
 256³ CPU-f64 is omitted: 16.8M cells × the ~100-buffer scratch pool exceeds the f64
 memory cap (`CPU_F64_MAX = 150³`), so the bench auto-skips it. (Raw legacy Fortran
@@ -37,7 +38,7 @@ memory cap (`CPU_F64_MAX = 150³`), so the bench auto-skips it. (Raw legacy Fort
 | RK2           | 0.01084 | 0.01019 | 0.01525 | 0.06988| 0.0635 | 0.02395 | 0.4811 | 0.4558 | 0.04945 | 3.693 | 0.1738  |
 | Hancock (PLM) | 0.006549| 0.006372| 0.003087| 0.04326| 0.03885| 0.004101| 0.2946 | 0.2798 | 0.01108 | 2.268 | 0.07197 |
 | Hancock-PPM   | 0.01554 | 0.01534 | 0.003593| 0.09655| 0.09343| 0.003329| 0.6866 | 0.6646 | 0.012   | 5.518 | 0.0851  |
-| PPML          | 0.02346 | 0.02415 | 0.006911| 0.1492 | 0.1403 | 0.01116 | 0.9969 | 0.9807 | 0.0303  | 7.471 | 0.2181  |
+| PPML          | 0.02755 | 0.02647 | 0.007333| 0.1745 | 0.1607 | 0.007634| 1.179  | 1.132  | 0.03202 | 8.701 | 0.2241  |
 
 ## Accuracy — DecayingTurbulence, 64³, Mach₀ = 1.0, γ = 1.4, evolved to t = 0.4 (Metal f32)
 
@@ -50,17 +51,22 @@ less numerically diffusive) over the same physical time.
 |--------------|--------------:|--------:|----------:|
 | Hancock-PPM  | **34.2 %**    | 1.7e-9  | 2.5e-9    |
 | Hancock-PLM  | 40.7 %        | 6.6e-10 | 4.8e-10   |
-| PPML         | 55.0 %        | 3.4e-10 | 2.1e-9    |
+| PPML (HLL)            | 55.0 % | 3.4e-10 | 2.1e-9 |
+| PPML (HLLC)           | 53.2 % | 2.0e-10 | 6.6e-10 |
+| PPML (HLLC + WENO5)   | 52.9 % | 7.2e-10 | 8.2e-10 |
 
 **Reading**: Hancock-PPM is the least diffusive (parabolic reconstruction preserves the
-most small-scale KE); PLM is the middle; **PPML is the MOST dissipative at moderate Mach**.
-This is a genuine, expected signature of our *faithful* PPML port: the RGK two-stage
-characteristic limiter + CW84 monotonize + the 5-point shock flattener form an aggressive
-limiter stack, and we pair it with the diffusive **HLL** Riemann solver (the reference Rust
-uses contact-resolving **HLLC**). The Rust itself notes the flattener costs ~10–11 % extra
-KE dissipation in M~2 turbulence. So PPML's value is its method (stateful characteristic
-tracing + the local face-pair), not raw low-Mach sharpness; the clearest accuracy upgrade
-would be swapping HLL→HLLC in the flux (a documented faithful refinement).
+most small-scale KE); PLM is the middle; **PPML is the most dissipative at moderate Mach**.
+This is a genuine signature of the *full* Ustyugov+ 2009 method: the RGK characteristic
+limiter + CW84 monotonize + the shock flattener form an aggressive limiter stack. Upgrading
+the Riemann solver HLL→HLLC (contact-resolving) shaves ~1.8 pts (55.0→53.2 %), and the
+WENO5 smooth-extremum fallback another ~0.3 pt (53.2→52.9 %) — both small *here* because
+M~1 compressible turbulence is shock-dominated (HLLC matters at strong contacts; the WENO5
+smoothness test correctly does NOT fire at shocks). WENO5's real payoff is on SMOOTH flow:
+a smooth entropy wave advected ~1 period retains ~0.5 % more amplitude with WENO5 than
+without (the median limiter slowly erodes smooth extrema; WENO5 does not) — see
+`test_ppml.jl`. PPML's value is its method (stateful characteristic tracing + local face
+pair + extremum-preserving reconstruction), not raw low-Mach sharpness.
 
 ## Findings
 
@@ -83,13 +89,14 @@ would be swapping HLL→HLLC in the flux (a documented faithful refinement).
   RK2's larger per-launch work amortizes the launch overhead once the grid is huge.
   Hancock-PPM's parabola recompute also starts to cost (~15% under PLM: 197 vs 233),
   no longer free as it was at 64³–128³.
-- **PPML is the heaviest solver everywhere** — ~2.1 Mcell/s CPU-f32, 69 / 77 Mcell/s
-  Metal at 128³/256³ (~2.8× slower than Hancock-PLM, on par with PPM-DirectEuler at
-  scale). The cost is structural: 9 kernels/sweep (predictor → HLL flux+star → conserved
-  update → corrector), the RGK + CW84 + flatten limiter stack, and a persistent face-pair
-  state read/written each sweep. The point of PPML is the *method* (stateful
-  characteristic tracing), not throughput — for raw speed Hancock-PLM wins; for low-Mach
-  sharpness Hancock-PPM wins (see accuracy table above).
+- **PPML (full method) is the heaviest solver everywhere** — ~1.9 Mcell/s CPU-f32, 65 / 75
+  Mcell/s Metal at 128³/256³ (~3× slower than Hancock-PLM, on par with PPM-DirectEuler at
+  scale). The cost is structural: 9 kernels/sweep (predictor → HLLC flux+star → conserved
+  update → corrector), the RGK + CW84 + flatten + WENO5 limiter/reconstruction stack, and a
+  persistent face-pair state read/written each sweep. The WENO5 smooth-extremum fallback
+  adds only ~3–5 % (it branches in only at extrema). The point of PPML is the *method*
+  (stateful characteristic tracing + extremum-preserving reconstruction), not throughput —
+  for raw speed Hancock-PLM wins; for low-Mach sharpness Hancock-PPM wins.
 - **Optimization — per-axis transposed face-pair storage (+42–46% on Metal at scale).**
   The face pair (30 grid-arrays) is only ever touched in its own axis's sweep, so it is
   stored *permanently in that axis's transposed frame* (velocities pre-rotated to
