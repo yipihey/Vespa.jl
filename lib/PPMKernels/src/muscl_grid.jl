@@ -228,10 +228,16 @@ end
 # (conserved momenta rotated to (normal,t1,t2) order, like the velocities), solve,
 # update in place, untranspose back.
 function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
-                              dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real)
+                              dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
+                              recon::Symbol = :plm, coeffs = nothing)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
     dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx))
+    fl(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz) =
+        muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
+                                 ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
+                                 theta = theta, cpred = cpred, small_rho = small_rho,
+                                 recon = recon, coeffs = coeffs)
     # conserved momenta in cyclic (normal, t1, t2) role for this axis
     Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
     rho = _scratch(D, N; zero = false); eint = _scratch(D, N; zero = false)
@@ -241,9 +247,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
 
     if axis == 1                                   # contiguous — work in place
         _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau; ndrange = N)
-        muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
-                                 ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
-                                 theta = theta, cpred = cpred, small_rho = small_rho)
+        fl(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz)
         _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
     else
@@ -251,9 +255,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
         DT = transpose3(D, dims, perm); TauT = transpose3(Tau, dims, perm)
         SnT = transpose3(Sn, dims, perm); St1T = transpose3(St1, dims, perm); St2T = transpose3(St2, dims, perm)
         _cons2prim_k!(be)(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT; ndrange = N)
-        muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
-                                 ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
-                                 theta = theta, cpred = cpred, small_rho = small_rho)
+        fl(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz)
         _cons_update_k!(be)(DT, SnT, St1T, St2T, TauT, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         # scatter the updated slabs back into the original-layout arrays (one pass each)
@@ -272,14 +274,28 @@ One 2nd-order MUSCL-Hancock timestep on the conserved state, dimensionally split
 three in-place directional sweeps in `order` (alternate `(1,2,3)`/`(3,2,1)` across
 steps for Strang accuracy), each a single HLL flux solve with the Hancock ½-step
 predictor. Same physics class as [`muscl_step_3d!`](@ref) (PLM+HLL) but **3
-sweeps/step instead of 6**, to match the PPM grid driver's cost on the GPU. Mutates
-the state in place; wrap a loop in [`with_pool`](@ref) for the allocation win.
+sweeps/step instead of 6**, to match the PPM grid driver's cost on the GPU.
+
+`recon` selects the spatial reconstruction: `:plm` (default, minmod-θ piecewise
+linear) or `:ppm` (monotonized piecewise-parabolic, via the certified
+`_iv_recon_cell`; sharper, needs `ng ≥ 3`). Mutates the state in place; wrap a loop
+in [`with_pool`](@ref) for the allocation win.
 """
 function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
                                 order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
-                                bc! = nothing)
-    be = KA.get_backend(D)
+                                bc! = nothing, recon::Symbol = :plm)
+    be = KA.get_backend(D); T = eltype(D)
+    recon === :ppm && ng < 3 && error("muscl_hancock_step_3d!: recon=:ppm needs ng ≥ 3 (got $ng)")
+    # uniform-grid PPM coefficients (the dx-independent limit of _ie_geom1!/_ie_geom2!:
+    # c1=c2=c3=c4=½, c5=1/6, c6=−1/6); constant ⇒ one set reused for all axes/steps.
+    # NON-pooled (they must survive the per-sweep _pool_reset!).
+    coeffs = nothing
+    if recon === :ppm
+        nmax = maximum(dims)
+        mk(v) = (a = similar(D, nmax); fill!(a, T(v)); a)
+        coeffs = (mk(0.5), mk(0.5), mk(0.5), mk(0.5), mk(1//6), mk(-1//6))
+    end
     KA.synchronize(be); _pool_reset!()
     for axis in order
         KA.synchronize(be); _pool_reset!()
@@ -287,7 +303,8 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         # PREVIOUS sweep just updated, so refill BCs before each sweep.
         bc! === nothing || bc!(D, S1, S2, S3, Tau)
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
-                             dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho)
+                             dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
+                             recon = recon, coeffs = coeffs)
     end
     KA.synchronize(be)
     return nothing

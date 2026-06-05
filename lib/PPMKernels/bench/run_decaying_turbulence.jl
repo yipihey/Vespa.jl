@@ -102,6 +102,8 @@ n      = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 128
 solver = length(ARGS) >= 2 ? Symbol(ARGS[2]) : :hancock
 mach   = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 1.0
 tfinal = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 1.0
+recon  = length(ARGS) >= 5 ? Symbol(ARGS[5]) : :plm          # :plm | :ppm (hancock only)
+tag    = solver === :hancock ? "$(solver)_$(recon)" : String(Symbol(solver))
 const NG = 3; const GAMMA = 1.4; const COURANT = 0.3
 const T = Float32
 backend_name = PPMKernels.has_backend(:metal) ? :metal : :cpu
@@ -120,11 +122,11 @@ bcfn(d, s1, s2, s3, tau) = PPMKernels.fill_periodic!(dims, NG, d, s1, s2, s3, ta
 step!(dt, order) = solver === :rk2 ?
     PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = bcfn) :
     PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
-                                      order = order, bc! = bcfn)
+                                      order = order, bc! = bcfn, recon = recon)
 
 outdir = mkpath(joinpath(@__DIR__, "turb_out"))
 d0 = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
-save_density_png(D, dims, NG, joinpath(outdir, "rho_$(solver)_t0.png"))
+save_density_png(D, dims, NG, joinpath(outdir, "rho_$(tag)_t0.png"))
 @printf("%-6s %-9s %-9s %-11s %-11s %-11s %-9s %-9s\n",
         "step", "t", "dt", "KE", "IE", "TE", "Mach", "ρ[min,max]")
 @printf("%-6d %-9.4f %-9s %-11.5g %-11.5g %-11.5g %-9.4f %.3f/%.3f\n",
@@ -155,11 +157,11 @@ PPMKernels.with_pool() do
             abs(df.TE - d0.TE) / d0.TE, df.IE - d0.IE, KE0 - df.KE)
 end
 
-save_density_png(D, dims, NG, joinpath(outdir, "rho_$(solver)_tf.png"))
-open(joinpath(outdir, "ke_decay_$(solver).csv"), "w") do io
+save_density_png(D, dims, NG, joinpath(outdir, "rho_$(tag)_tf.png"))
+open(joinpath(outdir, "ke_decay_$(tag).csv"), "w") do io
     println(io, "t,KE,IE,TE,mass,mach")
     for (t, ke, ie, te, m, ma) in hist
         @printf(io, "%.6f,%.8g,%.8g,%.8g,%.8g,%.6f\n", t, ke, ie, te, m, ma)
     end
 end
-println("wrote slices + ke_decay_$(solver).csv to $outdir")
+println("wrote slices + ke_decay_$(tag).csv to $outdir")

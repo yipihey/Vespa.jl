@@ -115,6 +115,28 @@ end
 # SPLIT (one Riemann solve per direction = 3 sweeps/step, like PPM) yet stay 2nd
 # order, instead of the unsplit RK2's 2 stages × 3 axes = 6 sweeps/step.
 
+# Hancock ½-step predictor shared by PLM and PPM reconstruction: given a cell's two
+# boundary-extrapolated primitive face states (a = minus/left, b = plus/right; ρ
+# already floored), evolve BOTH by cpred·(F(W⁻) − F(W⁺)) in conserved form and
+# return the evolved primitives. `cpred = dt/(2·dx)`; cpred=0 ⇒ untouched faces.
+@inline function _hancock_predict(ρa::T, ea::T, ua::T, va::T, wa::T,
+                                  ρb::T, eb::T, ub::T, vb::T, wb::T,
+                                  gm1::T, cpred::T, small_rho::T) where {T}
+    h = T(0.5)
+    pa = gm1*ρa*ea; v2a = ua*ua + va*va + wa*wa; Ea = ρa*(ea + h*v2a)
+    pb = gm1*ρb*eb; v2b = ub*ub + vb*vb + wb*wb; Eb = ρb*(eb + h*v2b)
+    Ua1 = ρa; Ua2 = ρa*ua; Ua3 = ρa*va; Ua4 = ρa*wa; Ua5 = Ea
+    Ub1 = ρb; Ub2 = ρb*ub; Ub3 = ρb*vb; Ub4 = ρb*wb; Ub5 = Eb
+    Fa1 = ρa*ua; Fa2 = Ua2*ua + pa; Fa3 = Ua3*ua; Fa4 = Ua4*ua; Fa5 = (Ea + pa)*ua
+    Fb1 = ρb*ub; Fb2 = Ub2*ub + pb; Fb3 = Ub3*ub; Fb4 = Ub4*ub; Fb5 = (Eb + pb)*ub
+    d1 = cpred*(Fa1-Fb1); d2 = cpred*(Fa2-Fb2); d3 = cpred*(Fa3-Fb3); d4 = cpred*(Fa4-Fb4); d5 = cpred*(Fa5-Fb5)
+    ρas = max(Ua1+d1, small_rho); uas = (Ua2+d2)/ρas; vas = (Ua3+d3)/ρas; was = (Ua4+d4)/ρas
+    eas = (Ua5+d5)/ρas - h*(uas*uas + vas*vas + was*was)
+    ρbs = max(Ub1+d1, small_rho); ubs = (Ub2+d2)/ρbs; vbs = (Ub3+d3)/ρbs; wbs = (Ub4+d4)/ρbs
+    ebs = (Ub5+d5)/ρbs - h*(ubs*ubs + vbs*vbs + wbs*wbs)
+    return (ρas, eas, uas, vas, was, ρbs, ebs, ubs, vbs, wbs)
+end
+
 # `cpred = dt/(2·dx)`; cpred=0 makes this reduce to the bare reconstruction+HLL
 # (used to certify the reconstruction/HLL path against `muscl_flux_line!`).
 @inline function _hancock_faces(rm::T, r0::T, rp::T, em::T, e0::T, ep::T,
@@ -126,21 +148,25 @@ end
     # minus (a) / plus (b) PLM boundary-extrapolated primitive states
     ρa = max(r0 - h*sρ, small_rho); ea = e0 - h*se; ua = u0 - h*su; va = v0 - h*sv; wa = w0 - h*sw
     ρb = max(r0 + h*sρ, small_rho); eb = e0 + h*se; ub = u0 + h*su; vb = v0 + h*sv; wb = w0 + h*sw
-    # conserved + normal-direction physical flux of each face
-    pa = gm1*ρa*ea; v2a = ua*ua + va*va + wa*wa; Ea = ρa*(ea + h*v2a)
-    pb = gm1*ρb*eb; v2b = ub*ub + vb*vb + wb*wb; Eb = ρb*(eb + h*v2b)
-    Ua1 = ρa; Ua2 = ρa*ua; Ua3 = ρa*va; Ua4 = ρa*wa; Ua5 = Ea
-    Ub1 = ρb; Ub2 = ρb*ub; Ub3 = ρb*vb; Ub4 = ρb*wb; Ub5 = Eb
-    Fa1 = ρa*ua; Fa2 = Ua2*ua + pa; Fa3 = Ua3*ua; Fa4 = Ua4*ua; Fa5 = (Ea + pa)*ua
-    Fb1 = ρb*ub; Fb2 = Ub2*ub + pb; Fb3 = Ub3*ub; Fb4 = Ub4*ub; Fb5 = (Eb + pb)*ub
-    # Hancock half-step: both faces += cpred·(F⁻ − F⁺)
-    d1 = cpred*(Fa1-Fb1); d2 = cpred*(Fa2-Fb2); d3 = cpred*(Fa3-Fb3); d4 = cpred*(Fa4-Fb4); d5 = cpred*(Fa5-Fb5)
-    # evolved conserved → primitive (a = left/minus face, b = right/plus face)
-    ρas = max(Ua1+d1, small_rho); uas = (Ua2+d2)/ρas; vas = (Ua3+d3)/ρas; was = (Ua4+d4)/ρas
-    eas = (Ua5+d5)/ρas - h*(uas*uas + vas*vas + was*was)
-    ρbs = max(Ub1+d1, small_rho); ubs = (Ub2+d2)/ρbs; vbs = (Ub3+d3)/ρbs; wbs = (Ub4+d4)/ρbs
-    ebs = (Ub5+d5)/ρbs - h*(ubs*ubs + vbs*vbs + wbs*wbs)
-    return (ρas, eas, uas, vas, was, ρbs, ebs, ubs, vbs, wbs)
+    return _hancock_predict(ρa, ea, ua, va, wa, ρb, eb, ub, vb, wb, gm1, cpred, small_rho)
+end
+
+# PPM (piecewise-parabolic) faces: identical Hancock predictor, but the cell's two
+# face states are the monotonized-parabola edges (a_L=ql, a_R=qr) from the certified
+# `_iv_recon_cell` (intvar.jl), reconstructed per primitive. `cl..c6` are the
+# uniform-grid PPM coefficients; `idx`/`ci` are the cell's flat index / swept-axis
+# coordinate. Plain monotonized parabola (isteep=0, iflatten=0 ⇒ steepen/flatten
+# arrays unused, so the field array itself is passed as the dummy).
+@inline function _ppm_hancock_faces(rho, eint, vx, vy, vz,
+                                    c1, c2, c3, c4, c5, c6, idx::Int, ci::Int,
+                                    gm1::T, cpred::T, small_rho::T) where {T}
+    (ρa, ρb, _, _) = _iv_recon_cell(rho,  c1, c2, c3, c4, c5, c6, rho,  rho,  idx, ci, 0, 0)
+    (ea, eb, _, _) = _iv_recon_cell(eint, c1, c2, c3, c4, c5, c6, eint, eint, idx, ci, 0, 0)
+    (ua, ub, _, _) = _iv_recon_cell(vx,   c1, c2, c3, c4, c5, c6, vx,   vx,   idx, ci, 0, 0)
+    (va, vb, _, _) = _iv_recon_cell(vy,   c1, c2, c3, c4, c5, c6, vy,   vy,   idx, ci, 0, 0)
+    (wa, wb, _, _) = _iv_recon_cell(vz,   c1, c2, c3, c4, c5, c6, vz,   vz,   idx, ci, 0, 0)
+    return _hancock_predict(max(ρa, small_rho), ea, ua, va, wa,
+                            max(ρb, small_rho), eb, ub, vb, wb, gm1, cpred, small_rho)
 end
 
 @kernel function _muscl_hancock_kernel!(fd, fs1, fs2, fs3, fe,
@@ -168,25 +194,61 @@ end
     end
 end
 
+# PPM-Hancock per-interface kernel: same structure as `_muscl_hancock_kernel!` but
+# parabolic reconstruction (via `_ppm_hancock_faces`). `c1..c6` are the uniform-grid
+# PPM coefficients (length ≥ ncells); the swept-axis coordinate of cell cl is the
+# index into them. Needs nghost ≥ 3 (parabola reads cl−2 … cl+3 across an interface).
+@kernel function _ppm_hancock_kernel!(fd, fs1, fs2, fs3, fe,
+                                      @Const(rho), @Const(eint), @Const(vx), @Const(vy), @Const(vz),
+                                      @Const(c1), @Const(c2), @Const(c3), @Const(c4), @Const(c5), @Const(c6),
+                                      ncells::Int, nfi::Int, nghost::Int, j1::Int,
+                                      gamma, cpred, small_rho)
+    gi, gj = @index(Global, NTuple)
+    j = j1 + gj - 1
+    cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi (flat index)
+    cil = nghost + gi - 1                          # …and its swept-axis coordinate
+    fo = (j - 1) * nfi + gi
+    T = eltype(fd); g = gamma; gm1 = g - one(T); cp = cpred; sr = small_rho
+    @inbounds begin
+        Lf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     gm1, cp, sr)
+        Rf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, gm1, cp, sr)
+        F = _hll5(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
+                  Rf[1], Rf[2], Rf[3], Rf[4], Rf[5],    # minus face of cl+1
+                  g, gm1)
+        fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+    end
+end
+
 """
     muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                              ncells, nghost, jdim=1, gamma, theta=1.5, cpred,
-                             small_rho=1e-10)
+                             small_rho=1e-10, recon=:plm, coeffs=nothing)
 
 Like [`muscl_flux_line!`](@ref) but with the MUSCL-Hancock ½-step predictor folded
 in. `cpred = dt/(2·dx)` is the predictor coefficient; `cpred=0` recovers the bare
-reconstruction+HLL flux line (up to the conserved↔primitive round-trip).
+reconstruction+HLL flux line (up to the conserved↔primitive round-trip). `recon`
+selects PLM (`:plm`, minmod-θ) or PPM (`:ppm`, monotonized parabola); the PPM path
+needs `coeffs = (c1,…,c6)` (the uniform-grid coefficients) and `nghost ≥ 3`.
 """
 function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   ncells::Integer, nghost::Integer, jdim::Integer = 1,
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
-                                  small_rho::Real = 1e-10)
+                                  small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
-    _muscl_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
-                               ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho);
-                               ndrange = (nfi, Int(jdim)))
+    if recon === :ppm
+        coeffs === nothing && error("muscl_hancock_flux_line!: recon=:ppm needs coeffs=(c1,…,c6)")
+        c1, c2, c3, c4, c5, c6 = coeffs
+        _ppm_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
+                                 c1, c2, c3, c4, c5, c6,
+                                 ncells, nfi, nghost, 1, T(gamma), T(cpred), T(small_rho);
+                                 ndrange = (nfi, Int(jdim)))
+    else
+        _muscl_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
+                                   ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho);
+                                   ndrange = (nfi, Int(jdim)))
+    end
     KA.synchronize(be)
     return fd, fs1, fs2, fs3, fe
 end
