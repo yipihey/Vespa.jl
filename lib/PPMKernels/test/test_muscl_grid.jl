@@ -175,3 +175,123 @@ end
         end
     end
 end
+
+# ── transparent 1-D Hancock sweep reference (S1 = normal momentum) ────────────
+function _hancock_line_ref(D, Sn, St1, St2, Tau; na, ng, dt, dx, gamma, theta, small_rho = 1e-10)
+    active = na - 2ng; nfi = active + 1; dtdx = dt / dx; cpred = dt / (2dx)
+    rho = copy(D); vx = Sn ./ D; vy = St1 ./ D; vz = St2 ./ D
+    eint = Tau ./ D .- 0.5 .* (vx .^ 2 .+ vy .^ 2 .+ vz .^ 2)
+    fd = zeros(nfi); fs1 = zeros(nfi); fs2 = zeros(nfi); fs3 = zeros(nfi); fe = zeros(nfi)
+    PPMKernels.muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
+                                        ncells = na, nghost = ng, gamma = gamma, theta = theta,
+                                        cpred = cpred, small_rho = small_rho)
+    out = (copy(D), copy(Sn), copy(St1), copy(St2), copy(Tau))
+    flux = (fd, fs1, fs2, fs3, fe)
+    for f in 1:5, mm in 1:active
+        out[f][ng+mm] -= (flux[f][mm+1] - flux[f][mm]) * dtdx
+    end
+    return out
+end
+
+@testset "MUSCL-Hancock 3-D driver (dim-split, 3 sweeps)" begin
+    ng = 3; gamma, theta = 1.4, 1.5; dt, dx = 0.02, 1.0
+
+    # ── A. cpred=0 Hancock flux line ≡ bare reconstruction+HLL (muscl_flux_line!) ─
+    @testset "cpred=0 reduces to the bare flux line" begin
+        ncells = 24; active = ncells - 2 * ng
+        rho = zeros(ncells); eint = zeros(ncells); vx = zeros(ncells); vy = zeros(ncells); vz = zeros(ncells)
+        for i in 1:ncells
+            t = tanh((i - 12.5) * 0.9)
+            rho[i] = 0.5625 - 0.4375t; pr = 0.55 - 0.45t
+            vx[i] = 0.2 - 0.15t; vy[i] = 0.1; vz[i] = -0.05
+            eint[i] = pr / ((gamma - 1) * rho[i])
+        end
+        z() = zeros(active + 1)
+        b1 = (z(), z(), z(), z(), z()); b2 = (z(), z(), z(), z(), z())
+        PPMKernels.muscl_flux_line!(b1..., rho, eint, vx, vy, vz;
+                                    ncells = ncells, nghost = ng, gamma = gamma, theta = theta)
+        PPMKernels.muscl_hancock_flux_line!(b2..., rho, eint, vx, vy, vz;
+                                            ncells = ncells, nghost = ng, gamma = gamma,
+                                            theta = theta, cpred = 0.0)
+        for f in 1:5
+            @check("hancock.cpred0[$f]", b2[f], b1[f], RTOL_A)
+        end
+    end
+
+    # ── B. per-axis reduction: 3-D Hancock step ≡ 1-D Hancock sweep along the axis ─
+    momroles(axis) = axis == 1 ? (1, 2, 3) : axis == 2 ? (2, 3, 1) : (3, 1, 2)
+    @testset "reduces to 1-D Hancock along axis $(("x","y","z")[axis])" for axis in (1, 2, 3)
+        na = 22
+        odims = axis == 1 ? (na, 8, 7) : axis == 2 ? (7, na, 8) : (8, 7, na)
+        nx, ny, nz = odims; N = nx * ny * nz
+        idx3(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+        rho1 = zeros(na); pr1 = zeros(na); vn1 = zeros(na); vt1 = zeros(na); vt2 = zeros(na)
+        for m in 1:na
+            t = tanh((m - 11.0) * 0.8)
+            rho1[m] = 0.6 - 0.35t; pr1[m] = 0.6 - 0.45t; vn1[m] = 0.15 - 0.10t
+            vt1[m] = 0.05; vt2[m] = -0.03
+        end
+        eint1 = pr1 ./ ((gamma - 1) .* rho1)
+        etot1 = eint1 .+ 0.5 .* (vn1 .^ 2 .+ vt1 .^ 2 .+ vt2 .^ 2)
+        Dl = copy(rho1); Snl = rho1 .* vn1; St1l = rho1 .* vt1; St2l = rho1 .* vt2; Tl = rho1 .* etot1
+        ref = _hancock_line_ref(Dl, Snl, St1l, St2l, Tl; na = na, ng = ng, dt = dt, dx = dx,
+                                gamma = gamma, theta = theta)
+        refmap = Dict(:D => ref[1], :Sn => ref[2], :St1 => ref[3], :St2 => ref[4], :Tau => ref[5])
+
+        coord(i, j, k) = (i, j, k)[axis]
+        mn, mt1, mt2 = momroles(axis)
+        D0 = zeros(N); S0 = (zeros(N), zeros(N), zeros(N)); Tau0 = zeros(N)
+        for k in 1:nz, j in 1:ny, i in 1:nx
+            q = idx3(i, j, k); m = coord(i, j, k)
+            D0[q] = Dl[m]; Tau0[q] = Tl[m]
+            S0[mn][q] = Snl[m]; S0[mt1][q] = St1l[m]; S0[mt2][q] = St2l[m]
+        end
+        run_step(name, ::Type{T}, sym::Symbol) where {T} = begin
+            be = PPMKernels.backend(name)
+            dev(a) = PPMKernels.to_device(be, a, T)
+            D = dev(D0); S1 = dev(S0[1]); S2 = dev(S0[2]); S3 = dev(S0[3]); Tau = dev(Tau0)
+            PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, odims, ng;
+                                              dt = dt, gamma = gamma, theta = theta, dx = dx)
+            slot = (; D = D, S1 = S1, S2 = S2, S3 = S3, Tau = Tau)
+            field = sym === :D ? slot.D : sym === :Tau ? slot.Tau :
+                    sym === :Sn ? slot[(:S1, :S2, :S3)[mn]] :
+                    sym === :St1 ? slot[(:S1, :S2, :S3)[mt1]] : slot[(:S1, :S2, :S3)[mt2]]
+            h = PPMKernels.to_host(field)
+            [h[axis == 1 ? idx3(mm, 4, 4) : axis == 2 ? idx3(4, mm, 4) : idx3(4, 4, mm)] for mm in 1:na]
+        end
+        for sym in (:D, :Sn, :St1, :St2, :Tau)
+            r = refmap[sym]
+            layerA!("hancock3d.ax$axis.$sym", run_step(:cpu, Float64, sym), r)
+            layerB!("hancock3d.ax$axis.$sym", (nm, T) -> run_step(nm, T, sym))
+        end
+    end
+
+    # ── C. conservation (mass, momentum, energy) ────────────────────────────────
+    @testset "conservation (mass, momentum, energy)" begin
+        m = 26; cdims = (m, m, m); N = m^3
+        ci3(i, j, k) = i + m * (j - 1) + m * m * (k - 1)
+        rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+        for k in 1:m, j in 1:m, i in 1:m
+            x = (i - 13.5) / 2.2; y = (j - 13.5) / 2.2; z = (k - 13.5) / 2.2
+            b = exp(-(x^2 + y^2 + z^2)); q = ci3(i, j, k)
+            rho[q] = 1.0 + 0.4b; pr = 0.6 + 0.3b
+            vx[q] = 0.1x * b; vy[q] = 0.08y * b; vz[q] = -0.06z * b
+            etot[q] = pr / ((gamma - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+        end
+        be = PPMKernels.backend(:cpu); dev(a) = PPMKernels.to_device(be, a, Float64)
+        D = dev(rho); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
+        PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(rho), dev(vx), dev(vy), dev(vz), dev(etot))
+        tot(f) = PPMKernels.total_field(f, cdims, ng, dx)
+        m0 = tot(D); px0 = tot(S1); py0 = tot(S2); pz0 = tot(S3); e0 = tot(Tau)
+        for s in 1:3
+            PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, cdims, ng;
+                                              dt = dt, gamma = gamma, theta = theta, dx = dx,
+                                              order = isodd(s) ? (1, 2, 3) : (3, 2, 1))
+        end
+        @test abs(tot(D) - m0) / abs(m0) < 1e-12
+        @test abs(tot(S1) - px0) < 1e-11
+        @test abs(tot(S2) - py0) < 1e-11
+        @test abs(tot(S3) - pz0) < 1e-11
+        @test abs(tot(Tau) - e0) / abs(e0) < 1e-12
+    end
+end

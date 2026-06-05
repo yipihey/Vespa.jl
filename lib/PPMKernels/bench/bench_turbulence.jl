@@ -99,6 +99,23 @@ function time_steps_muscl(backend_name::Symbol, ::Type{T}, ic, nsteps::Int) wher
     end
 end
 
+# time `nsteps` of the MUSCL-Hancock driver (dim-split, 3 sweeps/step) at type T.
+function time_steps_hancock(backend_name::Symbol, ::Type{T}, ic, nsteps::Int) where {T}
+    be = PPMKernels.backend(backend_name)
+    dev(a) = PPMKernels.to_device(be, a, T)
+    d = dev(ic.d); vx = dev(ic.vx); vy = dev(ic.vy); vz = dev(ic.vz); etot = dev(ic.e)
+    D = similar(d); S1 = similar(d); S2 = similar(d); S3 = similar(d); Tau = similar(d)
+    PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, d, vx, vy, vz, etot)
+    dims = ic.dims; n = dims[1] - 2NG
+    dx = 1.0 / n; dt = 0.2 * dx
+    step!(o) = PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG;
+                                                 dt = dt, gamma = GAMMA, theta = 1.5, dx = dx, order = o)
+    return PPMKernels.with_pool() do
+        step!((1, 2, 3))
+        (@elapsed for s in 1:nsteps; step!(iseven(s) ? (3, 2, 1) : (1, 2, 3)); end) / nsteps
+    end
+end
+
 # raw legacy Fortran 1-D kernel throughput: one x-sweep worth of pencils (ccall'd)
 function fortran_pencil_throughput(ic)
     (@isdefined EnzoLib) && EnzoLib.available() || return nothing
@@ -150,13 +167,19 @@ for n in sizes
         end
     end
 
-    # MUSCL (Enzo HydroMethod=3) on the CPU — same code, conserved set
+    # MUSCL (Enzo HydroMethod=3) on the CPU — unsplit RK2 then dim-split Hancock
     for T in Ts
         guard() do
             sec = time_steps_muscl(:cpu, T, ic, ns)
             results["muscl-cpu/$T"] = sec
             sp = haskey(results, "cpu/$T") ? @sprintf("%.2f× vs ppm-cpu", results["cpu/$T"] / sec) : ""
-            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-cpu/$T", sec, ncell / sec / 1e6, sp)
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-rk2-cpu/$T", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
+        guard() do
+            sec = time_steps_hancock(:cpu, T, ic, ns)
+            sp = haskey(results, "cpu/$T") ? @sprintf("%.2f× vs ppm-cpu", results["cpu/$T"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-hanc-cpu/$T", sec, ncell / sec / 1e6, sp)
             flush(stdout)
         end
     end
@@ -174,7 +197,14 @@ for n in sizes
             sec = time_steps_muscl(:metal, Float32, ic, ns)
             results["muscl-metal"] = sec
             sp = haskey(results, "ppm-metal") ? @sprintf("%.2f× vs ppm/metal", results["ppm-metal"] / sec) : ""
-            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl/metal", sec, ncell / sec / 1e6, sp)
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-rk2/metal", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
+        guard() do
+            sec = time_steps_hancock(:metal, Float32, ic, ns)
+            results["hancock-metal"] = sec
+            sp = haskey(results, "ppm-metal") ? @sprintf("%.2f× vs ppm/metal", results["ppm-metal"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-hancock/metal", sec, ncell / sec / 1e6, sp)
             flush(stdout)
         end
     else

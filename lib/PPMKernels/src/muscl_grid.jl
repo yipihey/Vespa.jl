@@ -193,6 +193,99 @@ function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
     return nothing
 end
 
+# ══ MUSCL-Hancock: dimensionally-split, 2nd-order, 3 sweeps/step (≈ PPM cost) ══
+# Same conserved set as muscl_step_3d!, but instead of unsplit RK2 (2 stages × 3
+# axes = 6 sweeps) this is a Strang directional split (3 sweeps): each axis does
+# ONE MUSCL-Hancock flux solve and updates the conserved state in place, exactly
+# like the PPM grid sweep. The Hancock ½-step predictor (folded into the flux
+# kernel) supplies the 2nd-order-in-time accuracy that the unsplit version got from
+# the RK2 outer loop — so this matches PPM's sweep count and GPU memory traffic.
+
+export muscl_hancock_step_3d!
+
+# conservative in-place update of one axis-local conserved slab from its interface
+# fluxes:  U[cell] −= (F[i+1] − F[i])·dt/dx  over the active region (Sn = normal mom).
+@kernel function _cons_update_k!(D, Sn, St1, St2, Tau,
+                                 @Const(fd), @Const(fs1), @Const(fs2), @Const(fs3), @Const(fe),
+                                 na::Int, nfi::Int, nghost::Int, dtdx)
+    gi, gj = @index(Global, NTuple)
+    cl = (gj - 1) * na + nghost + gi
+    fo = (gj - 1) * nfi + gi
+    @inbounds begin
+        D[cl]   -= (fd[fo+1]  - fd[fo])  * dtdx
+        Sn[cl]  -= (fs1[fo+1] - fs1[fo]) * dtdx
+        St1[cl] -= (fs2[fo+1] - fs2[fo]) * dtdx
+        St2[cl] -= (fs3[fo+1] - fs3[fo]) * dtdx
+        Tau[cl] -= (fe[fo+1]  - fe[fo])  * dtdx
+    end
+end
+
+# one Hancock sweep along `axis`, mutating the conserved state in place. Mirrors
+# the PPM `sweep_axis!`: x is contiguous; y/z transpose the swept axis to the lead
+# (conserved momenta rotated to (normal,t1,t2) order, like the velocities), solve,
+# update in place, untranspose back.
+function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
+                              dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real)
+    be = KA.get_backend(D); T = eltype(D); N = length(D)
+    na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
+    dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx))
+    # conserved momenta in cyclic (normal, t1, t2) role for this axis
+    Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
+    rho = _scratch(D, N; zero = false); eint = _scratch(D, N; zero = false)
+    vx = _scratch(D, N; zero = false); vy = _scratch(D, N; zero = false); vz = _scratch(D, N; zero = false)
+    fd = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
+    fs3 = _scratch(D, nfi * ntr); fe = _scratch(D, nfi * ntr)
+
+    if axis == 1                                   # contiguous — work in place
+        _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau; ndrange = N)
+        muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
+                                 ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
+                                 theta = theta, cpred = cpred, small_rho = small_rho)
+        _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
+                            na, nfi, ng, dtdx; ndrange = (active, ntr))
+    else
+        perm = _axis_perm(axis)
+        DT = transpose3(D, dims, perm); TauT = transpose3(Tau, dims, perm)
+        SnT = transpose3(Sn, dims, perm); St1T = transpose3(St1, dims, perm); St2T = transpose3(St2, dims, perm)
+        _cons2prim_k!(be)(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT; ndrange = N)
+        muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
+                                 ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
+                                 theta = theta, cpred = cpred, small_rho = small_rho)
+        _cons_update_k!(be)(DT, SnT, St1T, St2T, TauT, fd, fs1, fs2, fs3, fe,
+                            na, nfi, ng, dtdx; ndrange = (active, ntr))
+        # scatter the updated slabs back into the original-layout arrays (one pass each)
+        _untranspose_into!(D, DT, dims, perm);    _untranspose_into!(Tau, TauT, dims, perm)
+        _untranspose_into!(Sn, SnT, dims, perm);  _untranspose_into!(St1, St1T, dims, perm)
+        _untranspose_into!(St2, St2T, dims, perm)
+    end
+    return nothing
+end
+
+"""
+    muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, ng;
+                           dt, gamma, theta=1.5, dx=1.0, order=(1,2,3), small_rho=1e-10)
+
+One 2nd-order MUSCL-Hancock timestep on the conserved state, dimensionally split:
+three in-place directional sweeps in `order` (alternate `(1,2,3)`/`(3,2,1)` across
+steps for Strang accuracy), each a single HLL flux solve with the Hancock ½-step
+predictor. Same physics class as [`muscl_step_3d!`](@ref) (PLM+HLL) but **3
+sweeps/step instead of 6**, to match the PPM grid driver's cost on the GPU. Mutates
+the state in place; wrap a loop in [`with_pool`](@ref) for the allocation win.
+"""
+function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
+                                dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
+                                order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10)
+    be = KA.get_backend(D)
+    KA.synchronize(be); _pool_reset!()
+    for axis in order
+        KA.synchronize(be); _pool_reset!()
+        _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
+                             dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho)
+    end
+    KA.synchronize(be)
+    return nothing
+end
+
 # ── primitive ↔ conserved helpers (host-side IC staging / diagnostics) ────────
 "`prim_to_cons!(D,S1,S2,S3,Tau, rho,vx,vy,vz,etot)` — conserved from primitives."
 function prim_to_cons!(D, S1, S2, S3, Tau, rho, vx, vy, vz, etot)
