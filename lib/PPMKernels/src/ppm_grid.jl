@@ -36,9 +36,18 @@ function transpose3(src, dims::NTuple{3,Int}, perm::NTuple{3,Int})
     return dst
 end
 
-# the inverse transpose: a slab in `perm` layout back to the original (dims) layout
-_untranspose3(slab, dims, perm) =
-    transpose3(slab, (dims[perm[1]], dims[perm[2]], dims[perm[3]]), _invperm3(perm))
+# inverse transpose written DIRECTLY into `dst` (the original-layout state array):
+# one gather pass, vs the old `dst .= transpose3(...)` which gathered into a temp
+# and then copied. Saves a full-grid read+write per written field per y/z sweep.
+function _untranspose_into!(dst, slab, dims::NTuple{3,Int}, perm::NTuple{3,Int})
+    invp = _invperm3(perm)
+    md = (dims[perm[1]], dims[perm[2]], dims[perm[3]])      # slab dims
+    mstr = (1, md[1], md[1] * md[2])
+    be = KA.get_backend(dst)
+    _gather3!(be)(dst, slab, dims[1], dims[2], mstr[invp[1]], mstr[invp[2]], mstr[invp[3]];
+                  ndrange = length(dst))
+    return dst
+end
 
 # per-axis cyclic spatial permutation (swept axis first) and velocity roles
 _axis_perm(axis) = axis == 1 ? (1, 2, 3) : axis == 2 ? (2, 1, 3) : (3, 1, 2)
@@ -72,11 +81,11 @@ function sweep_axis!(d, e, ge, vx, vy, vz, p, gr, dims::NTuple{3,Int}, ng::Int, 
         pT  = transpose3(p, dims, perm);  grT = transpose3(gr, dims, perm)
         ppm_sweep_1d!(dT, eT, geT, uT, vT, wT, pT, grT, dxi;
                       idim = na, i1 = i1, i2 = i2, jdim = ntr, dt = dt, gamma = gamma, kw...)
-        # write the mutated slabs back into the original-layout arrays
-        d  .= _untranspose3(dT, dims, perm);  e  .= _untranspose3(eT, dims, perm)
-        ge .= _untranspose3(geT, dims, perm)
-        vu .= _untranspose3(uT, dims, perm);  vv .= _untranspose3(vT, dims, perm)
-        vw .= _untranspose3(wT, dims, perm)
+        # scatter the mutated slabs back into the original-layout arrays (one pass)
+        _untranspose_into!(d, dT, dims, perm);  _untranspose_into!(e, eT, dims, perm)
+        _untranspose_into!(ge, geT, dims, perm)
+        _untranspose_into!(vu, uT, dims, perm); _untranspose_into!(vv, vT, dims, perm)
+        _untranspose_into!(vw, wT, dims, perm)
     end
     return nothing
 end

@@ -107,6 +107,13 @@ nsteps_for(n) = n >= 128 ? 3 : n >= 64 ? 5 : 8
 @printf("\n%-6s %-12s %-12s %-12s %-10s\n", "n^3", "backend/T", "sec/step", "Mcell/s", "speedup")
 println("-"^58)
 
+# each measurement is wrapped: an OOM/error on one backend/size reports and moves
+# on instead of killing the whole run. The pool holds ~100 full-grid buffers, so
+# CPU-f64 (8 B/elem) is the memory hog — skipped past `CPU_F64_MAX` cells.
+const CPU_F64_MAX = 150^3
+
+guard(f) = try f() catch err; @printf("    (skipped: %s)\n", sprint(showerror, err)); flush(stdout); nothing end
+
 for n in sizes
     ic = turbulence_ic(n)
     ns = nsteps_for(n)
@@ -114,26 +121,34 @@ for n in sizes
     results = Dict{String,Float64}()
 
     # CPU baselines (same code as the GPU path) — f64 is the certified-original numerics
-    for T in (Float64, Float32)
-        sec = time_steps(:cpu, T, ic, ns)
-        results["cpu/$T"] = sec
-        @printf("%-6d %-12s %-12.4g %-12.2f %-10s\n", ncell, "cpu/$T", sec, ncell / sec / 1e6, "1.0×")
+    Ts = ncell > CPU_F64_MAX ? (Float32,) : (Float64, Float32)
+    for T in Ts
+        guard() do
+            sec = time_steps(:cpu, T, ic, ns)
+            results["cpu/$T"] = sec
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "cpu/$T", sec, ncell / sec / 1e6, "1.0×")
+            flush(stdout)
+        end
     end
 
     # Metal GPU (f32 only)
     if metal_ok()
-        sec = time_steps(:metal, Float32, ic, ns)
-        sp = results["cpu/Float32"] / sec
-        @printf("%-6d %-12s %-12.4g %-12.2f %-10s\n", ncell, "metal/F32", sec, ncell / sec / 1e6,
-                @sprintf("%.1f× vs cpu-f32", sp))
+        guard() do
+            sec = time_steps(:metal, Float32, ic, ns)
+            sp = haskey(results, "cpu/Float32") ? @sprintf("%.1f× vs cpu-f32", results["cpu/Float32"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "metal/F32", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
     else
-        @printf("%-6d %-12s %-12s\n", ncell, "metal/F32", "(no GPU)")
+        @printf("%-8d %-12s %-12s\n", ncell, "metal/F32", "(no GPU)")
     end
 
     # raw legacy Fortran 1-D kernel throughput (single-thread, per-pencil ccall)
-    fth = fortran_pencil_throughput(ic)
-    fth === nothing || @printf("%-6d %-12s %-12s %-12.2f %-10s\n", ncell, "fortran-1d", "—",
-                               fth / 1e6, "(raw kernel)")
+    guard() do
+        fth = fortran_pencil_throughput(ic)
+        fth === nothing || @printf("%-8d %-12s %-12s %-12.2f %-10s\n", ncell, "fortran-1d", "—",
+                                   fth / 1e6, "(raw kernel)")
+    end
     flush(stdout)
 end
 println()
