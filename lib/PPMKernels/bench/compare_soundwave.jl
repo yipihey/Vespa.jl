@@ -60,10 +60,15 @@ function fmode(prof, m)
     return complex(re, im) * 2 / n
 end
 
-# wave metrics: amplitude retention, phase error (frac of wavelength), harmonic distortion
+# wave metrics. AMPLITUDE = peak-to-peak ratio (the HONEST amplitude — the Fourier
+# fundamental |c_k| is MISLEADING when the waveform distorts: a square wave has a
+# fundamental 4/π≈1.27× a sine of the same peak-to-peak, so a sine that squares off
+# reads as "amplitude > 1" though it never grew). PHASE from the fundamental's complex
+# angle (dispersion). DISTORTION = harmonic energy / fundamental (a sine→square shows up
+# here; a pure sine is 0) — this is what flags the squaring.
 function wave_metrics(prof_f, prof_0)
+    amp = (maximum(prof_f) - minimum(prof_f)) / (maximum(prof_0) - minimum(prof_0))
     c0 = fmode(prof_0, KW); cf = fmode(prof_f, KW)
-    amp = abs(cf) / abs(c0)
     dphi = angle(cf) - angle(c0); dphi = mod(dphi + π, 2π) - π          # wrap to (−π,π]
     phase = dphi / (2π)                                                # in wavelengths
     harm = sqrt(sum(abs2, fmode(prof_f, m) for m in (2KW, 3KW, 4KW))) / abs(cf)
@@ -118,7 +123,7 @@ ppw = nx / KW
 @printf("\nAdvected sound wave — %d×%d²  k=%d (%.0f cells/λ)  A=%.0e  u0=cs ⇒ travels 2cs\n", nx, NY, KW, ppw, AMP)
 @printf("→ %.0f box-translations (t=%.3f), fixed dt=%.2e ⇒ %d steps  [%s/%s]\n",
         NPER, tfinal, dt, nsteps, bkname, T)
-@printf("\n%-17s %-11s %-13s %-13s %-8s\n", "solver", "amp kept", "phase err(λ)", "asym/distort", "wall(s)")
+@printf("\n%-17s %-11s %-13s %-13s %-8s\n", "solver", "amp(p2p)", "phase err(λ)", "distort(→□)", "wall(s)")
 println("-"^66)
 for name in SOLVERS
     try

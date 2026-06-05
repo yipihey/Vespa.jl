@@ -119,35 +119,39 @@ Measured from the discrete Fourier mode at the fundamental wavenumber: amplitude
 |c_k|_f/|c_k|_0 (dissipation), phase error in wavelengths (dispersion), and harmonic
 distortion √(Σ_{m≥2}|c_mk|²)/|c_k| (waveform ASYMMETRY — a pure sine has zero).
 
-| Solver | amp kept | phase err (λ) | asymmetry/distort |
-|---|--:|--:|--:|
-| RK2 (PLM)       | 0.449 | −0.075 | 0.127 |
-| Hancock-PLM     | 0.677 | −0.021 | 0.125 |
-| Hancock-PPM     | 0.698 | **+0.024** | **0.095** |
-| PPM-DirectEuler | 0.931 | −0.017 | 0.206 |
-| PPML-trace      | 1.158† | −0.010 | 0.270 |
-| PPML-Hancock    | 1.209† | −0.010 | 0.312 |
+Amplitude is the PEAK-TO-PEAK ratio (the honest amplitude). NOTE: the Fourier-fundamental
+|c_k| ratio is MISLEADING here — a sine that distorts into a square wave has a fundamental
+4/π≈1.27× a sine of the same peak-to-peak, so PPML's squaring read as a spurious "amp 1.16–
+1.21 > 1" / "anti-dissipation" in an earlier draft; it never grew (see `bench/plot_soundwave.jl`).
 
-- **The ranking INVERTS vs supersonic turbulence.** On a SMOOTH wave the high-order
-  reconstructions retain amplitude far better: PLM is the most dissipative (amp 0.45–0.68),
-  PPM/PPML the least. This is the expected counterpart — PPM/PPML are *built* for smooth
-  accuracy; their aggressive limiter only dominates where the flow is shock-dominated.
-- **†PPML is mildly ANTI-DISSIPATIVE here (amp > 1): it AMPLIFIES the acoustic mode**
-  (1.16–1.21 over 10 crossings, and *more* at higher resolution — it is not converging to
-  lossless). Confirmed to come from the **stateful reconstruction + WENO5 extremum-
-  preservation, NOT the Riemann solver** (HLL gives 1.159, HLLC 1.158 — identical). It is
-  the flip side of WENO5's smooth-extremum design: too little numerical dissipation tips
-  into energy injection. PPML also has the **highest asymmetry/distortion** (0.27–0.31) —
-  the advected wave goes most lop-sided under it.
-- **Hancock-PPM is the sweet spot on smooth flow**: solid retention (0.70), the LOWEST
-  distortion (0.095, the cleanest waveform), and the smallest-magnitude phase error
-  (+0.024 — a slight lead, vs everyone else's lag). PPM-DirectEuler retains the most while
-  staying stable (0.93, amp < 1).
+| Solver | amp (p2p) | phase err (λ) | distortion (→□) |
+|---|--:|--:|--:|
+| RK2 (PLM)       | 0.41 | −0.075 | 0.13 |
+| Hancock-PLM     | 0.60 | −0.021 | 0.12 |
+| Hancock-PPM     | **0.68** | **+0.024** | **0.09** |
+| PPM-DirectEuler | 0.79 | −0.017 | 0.21 |
+| PPML-trace      | 0.94 | −0.010 | 0.27 |
+| PPML-Hancock    | 0.97 | −0.010 | 0.31 |
+
+- **The amplitude ranking INVERTS vs supersonic turbulence.** On a SMOOTH wave the
+  high-order reconstructions keep peak-to-peak far better: PLM is most dissipative
+  (amp 0.41–0.60), PPM/PPML least (0.79–0.97). Expected — PPM/PPML are *built* for smooth
+  accuracy; their aggressive limiter only dominates in shock-dominated flow.
+- **BUT PPML pays for that retention by DISTORTING the wave into a SQUARE wave** — the
+  smooth sine peaks get clipped flat and the sides steepen (distortion 0.27–0.31, far above
+  the others; visible already at 2 crossings in `plot_soundwave.jl`). So its high amplitude
+  is a flat-topped, harmonic-rich waveform, NOT a faithful sine. This is a limiter pathology
+  (the WENO5 smooth-extremum fallback is not fully preventing the extremum clipping on a
+  long advected wave) — a real defect to fix, not a virtue.
+- **Hancock-PPM is the genuine sweet spot on smooth flow**: good retention (0.68), the
+  LOWEST distortion (0.09 — the cleanest waveform), and the smallest phase error (+0.024).
+  PPM-DirectEuler keeps more amplitude (0.79) with modest distortion (0.21).
 - **Phase error (dispersion) shrinks with order**: PLM −0.075 → Hancock-PLM −0.021 → PPML
-  −0.010 λ; higher-order reconstruction tracks the phase speed better.
+  −0.010 λ.
 - **Together with the turbulence test** these bracket the methods honestly: PPML is robust
-  and (over-)dissipative at shocks but anti-dissipative/distorting on smooth advected waves;
-  PLM is the reverse; Hancock-PPM is the most balanced on both.
+  but over-dissipative at shocks, and on smooth advected waves it *keeps* amplitude only by
+  squaring the waveform; PLM is plainly diffusive; **Hancock-PPM is the most faithful on
+  both** (clean sine here, low dissipation in turbulence).
 
 ## Predictor study — characteristic trace vs Hancock half-step (PPML)
 
