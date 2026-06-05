@@ -54,5 +54,6 @@ include("harness.jl")
     include("test_ppm_grid.jl")         # Phase 4 ✓
     include("test_muscl.jl")            # MUSCL PLM+HLL vs live Enzo hydro_rk ✓
     include("test_muscl_grid.jl")       # 3-D unsplit RK2 MUSCL driver (HydroMethod=3)
+    include("test_ppml.jl")             # PPML stateful char-traced solver (Ustyugov+ 2009)
     # include("test_sweep.jl")          # Phase 3
 end

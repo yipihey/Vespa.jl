@@ -157,5 +157,7 @@ include("sweep.jl")            # composed 1-D directional sweep   (Phase 3) ✓
 include("ppm_grid.jl")         # 3-D Strang-split sweeps          (Phase 4) ✓
 include("muscl.jl")            # PLM + HLL flux line (Enzo HydroMethod=3, HD_RK)
 include("muscl_grid.jl")       # 3-D unsplit SSP-RK2 MUSCL driver (HydroMethod=3)
+include("ppml.jl")             # PPML per-cell primitives (Ustyugov+ 2009)
+include("ppml_grid.jl")        # 3-D Strang-split stateful PPML driver
 
 end # module
