@@ -68,6 +68,42 @@ without (the median limiter slowly erodes smooth extrema; WENO5 does not) — se
 `test_ppml.jl`. PPML's value is its method (stateful characteristic tracing + local face
 pair + extremum-preserving reconstruction), not raw low-Mach sharpness.
 
+## Supersonic decaying turbulence — all solvers, GPU, half a crossing time
+
+`bench/compare_turb_dissipation.jl 128 5 0.5` — solenoidal Mach₀=5 IC, evolved to
+0.5·t_cross (t_cross = L/v_rms), 128³, Metal f32, dual energy on, a SINGLE fixed dt
+shared by all solvers. Metric = FINAL state; a less-dissipative solver keeps a higher
+final RMS Mach / v_rms. **Whole sweep (6 solvers) ran in 194 s (~3.2 min).**
+
+| Solver | Mach_f | v_rms_f | KE diss % | Δmass/M | wall(s) |
+|---|--:|--:|--:|--:|--:|
+| Hancock-PPM    | 1.427 | **3.198** | **63.5** | 1.4e-9  | 19.0 |
+| RK2 (PLM)      | 1.378 | 3.121 | 65.3 | 3.2e-9  | 25.9 |
+| Hancock-PLM    | 1.380 | 3.124 | 65.3 | 5.3e-10 | 17.6 |
+| PPML-trace     | 1.254 | 2.937 | 69.0 | 4.6e-11 | 37.4 |
+| PPML-Hancock   | 1.242 | 2.918 | 69.4 | 5.7e-10 | 38.5 |
+| PPM-DirectEuler| 2.739† | 3.195 | 63.5 | 2.7e-4† | 33.9 |
+
+†DirectEuler uses the primitive interface with no inter-sweep BC hook (per-step refill
+only) ⇒ a conservation handicap (2.7e-4 mass drift) and its temperature did not
+thermalize properly — its Mach_f is not strictly comparable (its v_rms, however, tracks
+Hancock-PPM).
+
+- **The ranking is robust at developed Mach-5 turbulence** (and matches the earlier,
+  doubted Mach-1 result — it is NOT a startup artifact): **Hancock-PPM least dissipative
+  → PLM → PPML most dissipative.** Resolution matters in the absolute (PLM loses 65 % of
+  KE at 128³ vs 72 % at 48³ — finer grids dissipate less), but the order is unchanged.
+- **PPM reconstruction DOES help where the limiter is light**: Hancock-PPM (parabola +
+  Hancock predictor, no RGK/CW84/flatten/WENO5 stack) is the least dissipative of all,
+  beating both PLM and PPML. So "PPM beats PLM" holds for Hancock-PPM.
+- **PPML is the most dissipative** because its full Ustyugov limiter stack (RGK + CW84 +
+  flattener + HLLC) is aggressive, and Mach-5 turbulence is SHOCK-dominated — the
+  high-order machinery (parabola, WENO5) pays off in smooth flow, not at the shocks that
+  dominate here. PPML trades supersonic sharpness for robustness; the predictor choice
+  (trace vs Hancock) barely moves it (69.0 vs 69.4 %).
+- **Affordable on the GPU**: 17–39 s per solver at 128³ for ~900 steps (50–107 Mcell/s
+  incl. the periodic BC fills + dual energy + host diagnostics).
+
 ## Predictor study — characteristic trace vs Hancock half-step (PPML)
 
 PPML factors into a stateful **reconstruction** (carried face pair + RGK + CW84 + flatten +
