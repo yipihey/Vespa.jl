@@ -160,6 +160,5 @@ function flux_twoshock!(out, dls, drs, pls, prs, gels, gers, uls, urs, vls, vrs,
     if idual == 1
         _ft_ges!(be)(out.ges, pcent, ub, dx, idim, i1, j1, dtT; ndrange = (i2 - i1 + 1, nj))
     end
-    KA.synchronize(be)
     return out
 end

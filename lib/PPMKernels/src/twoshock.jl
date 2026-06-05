@@ -83,6 +83,5 @@ function twoshock!(pbar, ubar, dls, drs, pls, prs, uls, urs;
     _ts_kernel!(be)(pbar, ubar, dls, drs, pls, prs, uls, urs,
                     Int(idim), Int(i1), Int(j1), T(gamma), T(pmin), Int(ipresfree);
                     ndrange = (i2 - i1 + 1, nj))
-    KA.synchronize(be)
     return pbar, ubar
 end

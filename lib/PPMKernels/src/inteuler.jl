@@ -354,6 +354,5 @@ function inteuler!(out, dslice, pslice, uslice, vslice, wslice, geslice, grslice
     end
     _ie_finalize!(be)(out.pls, out.prs, out.dls, out.drs, dla, dra,
                       idim, i1, j1, Int(ipresfree); ndrange = nd)
-    KA.synchronize(be)
     return out
 end

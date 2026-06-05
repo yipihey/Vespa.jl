@@ -33,7 +33,6 @@ function transpose3(src, dims::NTuple{3,Int}, perm::NTuple{3,Int})
     be = KA.get_backend(src)
     _gather3!(be)(dst, src, m[1], m[2], str[perm[1]], str[perm[2]], str[perm[3]];
                   ndrange = prod(m))
-    KA.synchronize(be)
     return dst
 end
 
@@ -109,11 +108,16 @@ function ppm_step_3d!(d, e, ge, vx, vy, vz, grx, gry, grz, dims::NTuple{3,Int}, 
                       dt::Real, gamma::Real, order::NTuple{3,Int} = (1, 2, 3), kw...)
     p = similar(d)
     gr = (grx, gry, grz)
+    be = KA.get_backend(d)
     for axis in order
-        _pool_reset!()                    # recycle the previous sweep's scratch
+        # the ~50 kernels of a sweep pipeline (no per-kernel syncs); ONE sync per
+        # sweep ensures it has completed before its scratch is recycled.
+        KA.synchronize(be)
+        _pool_reset!()
         _recompute_pressure!(p, d, e, vx, vy, vz, gamma)
         sweep_axis!(d, e, ge, vx, vy, vz, p, gr[axis], dims, ng, axis; dt = dt, gamma = gamma, kw...)
     end
+    KA.synchronize(be)                    # flush the final sweep
     return nothing
 end
 

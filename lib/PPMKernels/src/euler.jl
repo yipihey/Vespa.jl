@@ -74,6 +74,5 @@ function euler!(dslice, eslice, geslice, uslice, vslice, wslice,
                     df, ef, uf, vf, wf, gef, ges, grslice, dx,
                     Int(idim), Int(i1), Int(j1), T(dt), Int(gravity), Int(idual), T(dfloor);
                     ndrange = (i2 - i1 + 1, nj))
-    KA.synchronize(be)
     return dslice, eslice, geslice, uslice, vslice, wslice
 end

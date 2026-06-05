@@ -73,8 +73,15 @@ function to_device(be, a::AbstractArray, ::Type{T} = eltype(a)) where {T}
     return d
 end
 
-"`to_host(a)` — a plain host `Array` copy of a device array (no-op-ish on CPU)."
-to_host(a::AbstractArray) = Array(a)
+# Host reads are THE synchronization boundary: the compute kernels launch without
+# per-kernel syncs (KA orders kernels on the backend queue; the sweep batches a
+# single sync before recycling its scratch), so we synchronize here once before
+# copying device memory to the host.
+"`to_host(a)` — a plain host `Array` copy of a device array; synchronizes first."
+function to_host(a::AbstractArray)
+    KA.synchronize(KA.get_backend(a))
+    return Array(a)
+end
 
 # ── scratch pool ──────────────────────────────────────────────────────────────
 # Profiling the 3-D sweep showed ALLOCATION (not synchronization) is the GPU

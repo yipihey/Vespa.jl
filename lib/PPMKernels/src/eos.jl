@@ -52,7 +52,6 @@ function pgas2d!(pslice, dslice, eslice, uslice, vslice, wslice;
     _pgas2d_kernel!(be)(pslice, dslice, eslice, uslice, vslice, wslice,
                         Int(idim), Int(i1), Int(j1), T(gamma), T(pmin);
                         ndrange = (ni, nj))
-    KA.synchronize(be)
     return pslice
 end
 
@@ -112,6 +111,5 @@ function pgas2d_dual!(eslice, geslice, pslice, dslice, uslice, vslice, wslice;
     _pgas2d_dual_kernel!(be)(eslice, geslice, pslice, dslice, uslice, vslice, wslice,
                              Int(idim), Int(i1), Int(i2), Int(j1),
                              T(eta1), T(eta2), T(gamma), T(pmin); ndrange = nj)
-    KA.synchronize(be)
     return eslice, geslice, pslice
 end

@@ -180,6 +180,5 @@ function calcdiss!(diffcoef, flatten, dslice, eslice, uslice, pslice;
         throw(ArgumentError("calcdiss!: only iflatten ∈ {0,1,3} supported (got $iflatten)"))
     end
 
-    KA.synchronize(be)
     return diffcoef, flatten
 end
