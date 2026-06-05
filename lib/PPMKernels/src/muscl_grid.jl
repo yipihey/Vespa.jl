@@ -156,9 +156,10 @@ driver itself holds live outside the pool so they survive the per-axis resets.
 """
 function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                         dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
-                        small_rho::Real = 1e-10)
+                        small_rho::Real = 1e-10, bc! = nothing)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     half = T(0.5)
+    bcfill!() = (bc! === nothing || bc!(D, S1, S2, S3, Tau))
     # ONE reset recycles the previous step's whole working set; every array below
     # (and inside _muscl_L!) is then drawn from the pool with no intra-step reset,
     # so there is no allocation after warm-up and no dangling-buffer hazard.
@@ -174,6 +175,7 @@ function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                   dims, ng, dt, gamma, theta, dx, small_rho)
 
     # stage 1: U1 = U0 + dU(U0)   (in place; D…Tau currently hold U0)
+    bcfill!()                                  # ghost zones for U0
     L!(D, S1, S2, S3, Tau)
     @. D   = D0   + dD
     @. S1  = S10  + dS1
@@ -183,6 +185,7 @@ function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
     KA.synchronize(be)
 
     # stage 2: Unew = ½(U0 + U1 + dU(U1))   (D…Tau currently hold U1)
+    bcfill!()                                  # ghost zones for U1
     L!(D, S1, S2, S3, Tau)
     @. D   = half * (D0   + D   + dD)
     @. S1  = half * (S10  + S1  + dS1)
@@ -274,11 +277,15 @@ the state in place; wrap a loop in [`with_pool`](@ref) for the allocation win.
 """
 function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
-                                order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10)
+                                order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
+                                bc! = nothing)
     be = KA.get_backend(D)
     KA.synchronize(be); _pool_reset!()
     for axis in order
         KA.synchronize(be); _pool_reset!()
+        # directional split needs the ghost zones consistent with the state the
+        # PREVIOUS sweep just updated, so refill BCs before each sweep.
+        bc! === nothing || bc!(D, S1, S2, S3, Tau)
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho)
     end
@@ -315,4 +322,61 @@ function total_field(f, dims::NTuple{3,Int}, ng::Int, dx::Real)
         s += h[i + nx * (j - 1) + nx * ny * (k - 1)]
     end
     return s * dV
+end
+
+# ── periodic boundary conditions + CFL timestep (for actual evolution runs) ────
+export fill_periodic!, max_wavespeed
+
+# Each ghost cell copies the periodic-image INTERIOR cell (the source is always
+# interior — every out-of-range axis wraps inward by the interior width — so the
+# in-place write is race-free: interior cells are never written here).
+@kernel function _fill_periodic_k!(f, nx::Int, ny::Int, nz::Int, ng::Int)
+    g = @index(Global, Linear)
+    i = (g - 1) % nx + 1
+    t = (g - 1) ÷ nx
+    j = t % ny + 1
+    k = t ÷ ny + 1
+    nix = nx - 2ng; niy = ny - 2ng; niz = nz - 2ng
+    ghost = i <= ng || i > nx - ng || j <= ng || j > ny - ng || k <= ng || k > nz - ng
+    if ghost
+        si = i <= ng ? i + nix : i > nx - ng ? i - nix : i
+        sj = j <= ng ? j + niy : j > ny - ng ? j - niy : j
+        sk = k <= ng ? k + niz : k > nz - ng ? k - niz : k
+        @inbounds f[g] = f[si + nx * (sj - 1) + nx * ny * (sk - 1)]
+    end
+end
+
+"`fill_periodic!(dims, ng, fields...)` — refill ghost zones of each field by periodic wrap."
+function fill_periodic!(dims::NTuple{3,Int}, ng::Int, fields...)
+    nx, ny, nz = dims
+    for f in fields
+        be = KA.get_backend(f)
+        _fill_periodic_k!(be)(f, nx, ny, nz, ng; ndrange = length(f))
+    end
+    isempty(fields) || KA.synchronize(KA.get_backend(fields[1]))
+    return nothing
+end
+
+@kernel function _wavespeed_k!(s, @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), gamma)
+    i = @index(Global, Linear)
+    T = eltype(s)
+    @inbounds begin
+        d = D[i]; u = S1[i] / d; v = S2[i] / d; w = S3[i] / d
+        eint = Tau[i] / d - T(0.5) * (u * u + v * v + w * w)
+        cs = sqrt(max(gamma * (gamma - one(T)) * eint, zero(T)))     # √(γ p/ρ), p=(γ−1)ρ·eint
+        s[i] = cs + max(abs(u), max(abs(v), abs(w)))
+    end
+end
+
+"""
+    max_wavespeed(scratch, D, S1, S2, S3, Tau; gamma) -> Float
+
+Maximum signal speed `|v|_∞ + c_s` over the grid (for a CFL timestep
+`dt = Courant·dx / max_wavespeed`). `scratch` is a full-grid work array.
+"""
+function max_wavespeed(scratch, D, S1, S2, S3, Tau; gamma::Real)
+    be = KA.get_backend(D); T = eltype(D)
+    _wavespeed_k!(be)(scratch, D, S1, S2, S3, Tau, T(gamma); ndrange = length(D))
+    KA.synchronize(be)
+    return maximum(scratch)
 end
