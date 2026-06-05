@@ -311,19 +311,20 @@ function inteuler!(out, dslice, pslice, uslice, vslice, wslice, geslice, grslice
                        ndrange = (i2 - i1 + 3, nj))
     end
 
-    # reconstruct each field; keep p's and u's parabola for the β-correction
+    # reconstruct each field; keep p's and u's parabola for the β-correction (only
+    # p and u allocate the parabola tmp — the fused path skips it for d/v/w/ge).
     mkout() = (_zlike(dslice), _zlike(dslice), _zlike(dslice), _zlike(dslice))
     mktmp() = (_zlike(dslice), _zlike(dslice), _zlike(dslice), _zlike(dslice))
     kw = (; idim, i1, i2, j1, j2, isteep, iflatten)
 
-    od = mkout(); intvar!(od, mktmp(), dslice, geom, steepen, flatten; kw...)
+    od = mkout(); intvar!(od, nothing, dslice, geom, steepen, flatten; kw...)
     tp = mktmp(); op = mkout(); intvar!(op, tp, pslice, geom, steepen, flatten; kw..., isteep = 0)
     tu = mktmp(); ou = mkout(); intvar!(ou, tu, uslice, geom, steepen, flatten; kw..., isteep = 0)
-    ov = mkout(); intvar!(ov, mktmp(), vslice, geom, steepen, flatten; kw..., isteep = 0)
-    ow = mkout(); intvar!(ow, mktmp(), wslice, geom, steepen, flatten; kw..., isteep = 0)
+    ov = mkout(); intvar!(ov, nothing, vslice, geom, steepen, flatten; kw..., isteep = 0)
+    ow = mkout(); intvar!(ow, nothing, wslice, geom, steepen, flatten; kw..., isteep = 0)
     oge = mkout()
     if idual == 1
-        intvar!(oge, mktmp(), geslice, geom, steepen, flatten; kw..., isteep = 0)
+        intvar!(oge, nothing, geslice, geom, steepen, flatten; kw..., isteep = 0)
     end
 
     (dla, dra, dl0, dr0) = od
