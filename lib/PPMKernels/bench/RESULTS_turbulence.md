@@ -68,6 +68,35 @@ without (the median limiter slowly erodes smooth extrema; WENO5 does not) — se
 `test_ppml.jl`. PPML's value is its method (stateful characteristic tracing + local face
 pair + extremum-preserving reconstruction), not raw low-Mach sharpness.
 
+## Predictor study — characteristic trace vs Hancock half-step (PPML)
+
+PPML factors into a stateful **reconstruction** (carried face pair + RGK + CW84 + flatten +
+WENO5) and a **predictor** that time-centres the limited face pair. `predictor=:trace`
+(default, full Ustyugov) integrates the whole parabola over each wave's departure region;
+`predictor=:hancock` uses the MUSCL-Hancock half-step on the same limited pair (only the two
+endpoint faces → drops the parabola-curvature term; eigen-free, system-agnostic). A
+three-way comparison (holding one factor fixed at a time) isolates what each piece buys:
+
+| Variant | recon | predictor | 64³ M~1 turb (KE diss) | smooth wave (amp kept) |
+|---|---|---|--:|--:|
+| Hancock-PPM   | stencil parabola | Hancock | 36.0 % | 97.09 % |
+| PPML-Hancock  | carried pair + RGK/WENO5 | Hancock | 55.9 % | 98.24 % |
+| PPML-trace    | carried pair + RGK/WENO5 | trace | 54.2 % | 98.98 % |
+
+- **The reconstruction drives most of the behaviour.** Swapping Hancock-PPM's stencil
+  reconstruction for PPML's carried-pair+RGK+WENO5 (same Hancock predictor) flips the
+  character: far more turbulence dissipation (36→56 %, the aggressive limiter stack) but
+  better smooth-extremum preservation (97.1→98.2 %, the carried pair + WENO5). PPML *is*
+  its reconstruction.
+- **The characteristic trace adds a small, consistent edge over Hancock** (same recon):
+  ~1.7 pts less turbulence dissipation (55.9→54.2 %) and +0.74 pt smooth-wave retention
+  (98.24→98.98 %) — precisely the parabola-curvature term the trace keeps in the time
+  update and the Hancock half-step drops.
+- **On Metal the two predictors are identical in throughput** at scale (128³ 72/73, 256³
+  78/78 Mcell/s) — both bandwidth-bound, so the trace's extra algebra hides under memory
+  traffic. So `:hancock` buys eigen-free / system-agnostic simplicity (useful for MHD) at
+  ~no GPU cost and ~1–2 % accuracy; `:trace` is the accurate, complete default.
+
 ## Findings
 
 - **Hancock (PLM) is the throughput champion everywhere** — 7.5 Mcell/s CPU-f32 and
