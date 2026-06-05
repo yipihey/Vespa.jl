@@ -58,24 +58,32 @@ function turbulence_ic(n::Int, ng::Int; mach, gamma, cs = 1.0, seed = 271,
     return (; d, vx = vxf, vy = vyf, vz = vzf, etot, dims = (N, N, N), dx, N)
 end
 
-# ── interior diagnostics: mass, kinetic / internal / total energy, RMS Mach ───
-function diagnostics(D, S1, S2, S3, Tau, dims, ng, dx, gamma)
+# ── interior diagnostics: mass, kinetic / internal / total energy, RMS Mach, ───
+# and the TEMPERATURE (T ∝ p/ρ = (γ−1)·eint). With the dual-energy formalism the
+# internal energy is taken DIRECTLY from `Ge=ρ·eint` (cancellation-free, accurate
+# at high Mach); without it, eint = τ/ρ − ½|v|² (which can go unphysically negative
+# in strong shocks). The Mach number and sound speed use the same eint, so they are
+# DEF-accurate too.
+function diagnostics(D, S1, S2, S3, Tau, dims, ng, dx, gamma; Ge = nothing)
     nx, ny, nz = dims
     hD = PPMKernels.to_host(D); h1 = PPMKernels.to_host(S1); h2 = PPMKernels.to_host(S2)
     h3 = PPMKernels.to_host(S3); hT = PPMKernels.to_host(Tau)
+    hGe = Ge === nothing ? nothing : PPMKernels.to_host(Ge)
     dV = dx^3; mass = 0.0; KE = 0.0; IE = 0.0; TE = 0.0; v2 = 0.0; cs2 = 0.0
-    dmin = Inf; dmax = -Inf; eimin = Inf                   # min SPECIFIC internal energy
+    dmin = Inf; dmax = -Inf; eimin = Inf; Tmin = Inf; Tmax = -Inf; Tsum = 0.0; nc = 0
     @inbounds for k in (ng+1):(nz-ng), j in (ng+1):(ny-ng), i in (ng+1):(nx-ng)
         q = i + nx * (j - 1) + nx * ny * (k - 1)
         d = hD[q]; ke = 0.5 * (h1[q]^2 + h2[q]^2 + h3[q]^2) / d
-        ie = hT[q] - ke                                    # ρ·eint = τ − ½ρ|v|²
+        ie = hGe === nothing ? hT[q] - ke : hGe[q]         # ρ·eint (DEF: straight from Ge)
+        eint = ie / d; Temp = (gamma - 1) * eint           # T ∝ p/ρ
         p = (gamma - 1) * ie
         mass += d; KE += ke; IE += ie; TE += hT[q]
         v2 += (h1[q]^2 + h2[q]^2 + h3[q]^2) / d^2; cs2 += gamma * max(p, 0.0) / d
-        dmin = min(dmin, d); dmax = max(dmax, d); eimin = min(eimin, ie / d)
+        dmin = min(dmin, d); dmax = max(dmax, d); eimin = min(eimin, eint)
+        Tmin = min(Tmin, Temp); Tmax = max(Tmax, Temp); Tsum += Temp; nc += 1
     end
     (; mass = mass * dV, KE = KE * dV, IE = IE * dV, TE = TE * dV,
-       mach = sqrt(v2 / cs2), dmin, dmax, eimin)
+       mach = sqrt(v2 / cs2), dmin, dmax, eimin, Tmin, Tmax, Tmean = Tsum / nc)
 end
 
 # ── density mid-plane slice → PNG (jet-ish colormap, via PPM + macOS `sips`) ───
@@ -96,6 +104,41 @@ function save_density_png(D, dims, ng, path; gamma = 1.4)
     end
     try; run(`sips -s format png $ppm --out $path`); rm(ppm); catch; end
     return (lo, hi)
+end
+
+# ── temperature mid-plane slice → PNG. T ∝ (γ−1)·eint, eint from Ge (DEF) or τ.
+# Physical T ≥ 0 is mapped through the jet colormap over [0, hi]; UNPHYSICAL T < 0
+# (the floor-only signature in strong shocks) is rendered BLACK to flag it.
+function save_temperature_png(D, S1, S2, S3, Tau, dims, ng, path; gamma, Ge = nothing, hi = nothing)
+    nx, ny, nz = dims
+    hD = PPMKernels.to_host(D); h1 = PPMKernels.to_host(S1); h2 = PPMKernels.to_host(S2)
+    h3 = PPMKernels.to_host(S3); hT = PPMKernels.to_host(Tau)
+    hGe = Ge === nothing ? nothing : PPMKernels.to_host(Ge)
+    Tf(q) = begin
+        d = hD[q]; ke = 0.5 * (h1[q]^2 + h2[q]^2 + h3[q]^2) / d
+        ie = hGe === nothing ? hT[q] - ke : hGe[q]
+        (gamma - 1) * ie / d
+    end
+    # slice at the plane containing the COLDEST cell, so an unphysical (negative-T)
+    # region — the floor-only signature — is actually visible.
+    kbest = nz ÷ 2; tlo = Inf
+    for k in (ng+1):(nz-ng), j in (ng+1):(ny-ng), i in (ng+1):(nx-ng)
+        t = Tf(i + nx * (j - 1) + nx * ny * (k - 1)); t < tlo && (tlo = t; kbest = k)
+    end
+    k = kbest
+    sl = [Tf(i + nx * (j - 1) + nx * ny * (k - 1)) for i in (ng+1):(nx-ng), j in (ng+1):(ny-ng)]
+    top = hi === nothing ? maximum(sl) : hi; top = top > 0 ? top : 1.0
+    jet(t) = (clamp(1.5 - abs(4t - 3), 0, 1), clamp(1.5 - abs(4t - 2), 0, 1), clamp(1.5 - abs(4t - 1), 0, 1))
+    m = size(sl, 1); ppm = path * ".ppm"
+    open(ppm, "w") do io
+        write(io, "P6\n$m $m\n255\n")
+        for j in 1:m, i in 1:m
+            r, g, b = sl[i, j] < 0 ? (0.0, 0.0, 0.0) : jet(clamp(sl[i, j] / top, 0, 1))  # T<0 ⇒ black
+            write(io, UInt8(round(255r)), UInt8(round(255g)), UInt8(round(255b)))
+        end
+    end
+    try; run(`sips -s format png $ppm --out $path`); rm(ppm); catch; end
+    return top
 end
 
 # ── driver ────────────────────────────────────────────────────────────────────
@@ -129,8 +172,9 @@ step!(dt, order) = solver === :rk2 ?
                                       order = order, bc! = bcfn, recon = recon, ge = Ge)
 
 outdir = mkpath(joinpath(@__DIR__, "turb_out"))
-d0 = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
+d0 = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA; Ge = Ge)
 save_density_png(D, dims, NG, joinpath(outdir, "rho_$(tag)_t0.png"))
+save_temperature_png(D, S1, S2, S3, Tau, dims, NG, joinpath(outdir, "temp_$(tag)_t0.png"); gamma = GAMMA, Ge = Ge)
 @printf("%-6s %-9s %-9s %-11s %-11s %-11s %-9s %-9s\n",
         "step", "t", "dt", "KE", "IE", "TE", "Mach", "ρ[min,max]")
 @printf("%-6d %-9.4f %-9s %-11.5g %-11.5g %-11.5g %-9.4f %.3f/%.3f\n",
@@ -147,23 +191,26 @@ PPMKernels.with_pool() do
         step!(dt, isodd(s) ? (3, 2, 1) : (1, 2, 3))
         t += dt; s += 1
         if s % 25 == 0 || t >= tfinal - 1e-9
-            d = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
+            d = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA; Ge = Ge)
             push!(hist, (t, d.KE, d.IE, d.TE, d.mass, d.mach))
-            @printf("%-6d %-9.4f %-9.2e %-11.5g %-11.5g %-9.4f %.3f/%.3f  eimin=%+.3g\n",
-                    s, t, dt, d.KE, d.IE, d.mach, d.dmin, d.dmax, d.eimin)
+            @printf("%-6d %-8.4f %-9.2e %-10.4g %-7.4f %.2f/%.2f  T[%+.3g,%.2g]\n",
+                    s, t, dt, d.KE, d.mach, d.dmin, d.dmax, d.Tmin, d.Tmax)
             (isnan(d.KE) || isinf(d.KE)) && (println("  NaN/Inf — aborting"); break)
         end
     end
-    df = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
+    df = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA; Ge = Ge)
     @printf("\nfinished %d steps in %.1fs (%.0f Mcell/s avg)\n", s, twall, n^3 * s / twall / 1e6)
     @printf("KE: %.5g → %.5g  (%.1f%% dissipated)\n", KE0, df.KE, 100 * (1 - df.KE / KE0))
     @printf("mass conservation:  Δ/M = %.2e\n", abs(df.mass - d0.mass) / d0.mass)
     @printf("total-energy cons:  Δ/E = %.2e   (KE→IE: ΔIE=%.4g, −ΔKE=%.4g)\n",
             abs(df.TE - d0.TE) / d0.TE, df.IE - d0.IE, KE0 - df.KE)
-    @printf("min specific eint:  %.4g  (τ/ρ−½v²; <0 ⇒ unphysical, DEF keeps it >0)\n", df.eimin)
+    @printf("temperature T=(γ−1)·eint  [from %s]:  min %+.4g  max %.4g  mean %.4g\n",
+            dual ? "Ge (DEF)" : "τ−½v²", df.Tmin, df.Tmax, df.Tmean)
+    df.Tmin < 0 && @printf("  ⚠ %s\n", "min T < 0 — UNPHYSICAL (use dual-energy: pass `dual`)")
 end
 
 save_density_png(D, dims, NG, joinpath(outdir, "rho_$(tag)_tf.png"))
+save_temperature_png(D, S1, S2, S3, Tau, dims, NG, joinpath(outdir, "temp_$(tag)_tf.png"); gamma = GAMMA, Ge = Ge)
 open(joinpath(outdir, "ke_decay_$(tag).csv"), "w") do io
     println(io, "t,KE,IE,TE,mass,mach")
     for (t, ke, ie, te, m, ma) in hist
