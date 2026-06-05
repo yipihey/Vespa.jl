@@ -16,15 +16,18 @@
 
 export muscl_step_3d!, prim_to_cons!, cons_to_prim!, total_field
 
-# cons (D,S1,S2,S3,τ) → prim (ρ,eint,vx,vy,vz) over the whole grid
+# cons (D,S1,S2,S3,τ) → prim (ρ,eint,vx,vy,vz) over the whole grid. `small` floors
+# the internal energy: at high Mach eint = τ/D − ½|v|² is a small difference of large
+# numbers and can dip negative (roundoff / strong shocks) ⇒ p<0 ⇒ √(γp/ρ) NaN; the
+# floor keeps it positive (no-op in normal flows where eint ≫ small).
 @kernel function _cons2prim_k!(rho, eint, vx, vy, vz,
-                               @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau))
+                               @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), small)
     i = @index(Global, Linear)
     T = eltype(rho)
     @inbounds begin
         d = D[i]; u = S1[i] / d; v = S2[i] / d; w = S3[i] / d
         rho[i] = d; vx[i] = u; vy[i] = v; vz[i] = w
-        eint[i] = Tau[i] / d - T(0.5) * (u * u + v * v + w * w)
+        eint[i] = max(Tau[i] / d - T(0.5) * (u * u + v * v + w * w), small)
     end
 end
 
@@ -98,7 +101,7 @@ function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
                    dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     rho, eint, vx, vy, vz = prim
-    _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, S1, S2, S3, Tau; ndrange = N)
+    _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, S1, S2, S3, Tau, T(small_rho); ndrange = N)
     fill!(dD, zero(T)); fill!(dS1, zero(T)); fill!(dS2, zero(T)); fill!(dS3, zero(T)); fill!(dE, zero(T))
     KA.synchronize(be)
     for axis in (1, 2, 3)
@@ -246,7 +249,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
     fs3 = _scratch(D, nfi * ntr); fe = _scratch(D, nfi * ntr)
 
     if axis == 1                                   # contiguous — work in place
-        _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau; ndrange = N)
+        _cons2prim_k!(be)(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau, T(small_rho); ndrange = N)
         fl(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz)
         _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
@@ -254,7 +257,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
         perm = _axis_perm(axis)
         DT = transpose3(D, dims, perm); TauT = transpose3(Tau, dims, perm)
         SnT = transpose3(Sn, dims, perm); St1T = transpose3(St1, dims, perm); St2T = transpose3(St2, dims, perm)
-        _cons2prim_k!(be)(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT; ndrange = N)
+        _cons2prim_k!(be)(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT, T(small_rho); ndrange = N)
         fl(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz)
         _cons_update_k!(be)(DT, SnT, St1T, St2T, TauT, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))

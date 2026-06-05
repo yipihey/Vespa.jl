@@ -131,9 +131,9 @@ end
     Fb1 = ρb*ub; Fb2 = Ub2*ub + pb; Fb3 = Ub3*ub; Fb4 = Ub4*ub; Fb5 = (Eb + pb)*ub
     d1 = cpred*(Fa1-Fb1); d2 = cpred*(Fa2-Fb2); d3 = cpred*(Fa3-Fb3); d4 = cpred*(Fa4-Fb4); d5 = cpred*(Fa5-Fb5)
     ρas = max(Ua1+d1, small_rho); uas = (Ua2+d2)/ρas; vas = (Ua3+d3)/ρas; was = (Ua4+d4)/ρas
-    eas = (Ua5+d5)/ρas - h*(uas*uas + vas*vas + was*was)
+    eas = max((Ua5+d5)/ρas - h*(uas*uas + vas*vas + was*was), small_rho)   # eint floor ⇒ p>0
     ρbs = max(Ub1+d1, small_rho); ubs = (Ub2+d2)/ρbs; vbs = (Ub3+d3)/ρbs; wbs = (Ub4+d4)/ρbs
-    ebs = (Ub5+d5)/ρbs - h*(ubs*ubs + vbs*vbs + wbs*wbs)
+    ebs = max((Ub5+d5)/ρbs - h*(ubs*ubs + vbs*vbs + wbs*wbs), small_rho)
     return (ρas, eas, uas, vas, was, ρbs, ebs, ubs, vbs, wbs)
 end
 
