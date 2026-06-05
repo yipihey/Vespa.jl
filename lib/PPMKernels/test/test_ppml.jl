@@ -32,6 +32,16 @@ const _P = PPMKernels
         # RGK clamps a gross overshoot toward the (zero) neighbour gradient
         ov = _P._ppml_rgk(w..., w..., w..., (2.0, 0.0, 0.0, 0.0, 1.0)..., w..., g)
         @test abs(ov[1] - 1.0) < 1e-12               # overshooting wL density clamps to avg
+        # WENO5 reconstructs a LINEAR field exactly at the two interfaces
+        b = 0.3; lin(i) = 1.0 + b * i
+        (qL, qR) = _P._ppml_weno5(lin(-2), lin(-1), lin(0), lin(1), lin(2))
+        @test abs(qL - (1.0 - 0.5b)) < 1e-12 && abs(qR - (1.0 + 0.5b)) < 1e-12
+        # smooth-extremum fallback FIRES at a smooth peak (limiter had clamped to (1,1))…
+        (mL, mR) = _P._ppml_extremum_fix(1.0, 1.0, 0.0, 0.8, 1.0, 0.8, 0.0)
+        @test !(mL == 1.0 && mR == 1.0) && mL > 1.0 - 1e-9 - 0.5 && mR < 1.0 + 1e-9
+        # …and leaves a monotone ramp untouched (no extremum ⇒ keep the limited values)
+        (rL, rR) = _P._ppml_extremum_fix(0.95, 1.05, 0.8, 0.9, 1.0, 1.1, 1.2)
+        @test rL == 0.95 && rR == 1.05
     end
 
     # ── B. rotation invariance: same 1-D problem on x/y/z ⇒ identical profiles ──
@@ -104,6 +114,39 @@ const _P = PPMKernels
         @test abs(tot(S3) - pz0) < 1e-11
         @test abs(tot(Tau) - e0) / abs(e0) < 1e-12
         @test !any(isnan, D)
+    end
+
+    # ── C2. WENO5 smooth-extremum fallback preserves a smooth advected wave ─────
+    # The full-PPML (Ustyugov §6) WENO5 fallback recovers 5th order at SMOOTH extrema
+    # that the median+CW84 limiter would otherwise slowly clip. A smooth entropy wave
+    # (ρ=1+A·sin, u=const, p=const ⇒ pure advection of ρ) advected ~1 period must keep
+    # MORE amplitude with WENO5 on than off — the limiter never re-adds amplitude, so
+    # the direction is deterministic.
+    @testset "WENO5 preserves smooth extrema (entropy-wave advection)" begin
+        ng = 3; n = 32; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3; dx = 1.0 / n
+        A = 0.4; u0 = 1.0; p0 = 1.0; nx, ny, nz = dims
+        idx(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+        amp(weno) = begin
+            D = zeros(N); S1 = zeros(N); S2 = zeros(N); S3 = zeros(N); Tau = zeros(N)
+            for k in 1:nz, j in 1:ny, i in 1:nx
+                x = (i - ng - 0.5) / n; q = idx(i, j, k); ρ = 1.0 + A * sinpi(2x)
+                D[q] = ρ; S1[q] = ρ * u0; Tau[q] = ρ * (p0 / ((g - 1) * ρ) + 0.5 * u0^2)
+            end
+            st = _P.ppml_alloc_state(D, dims, ng); _P.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = g)
+            dt = 0.2 * dx / (u0 + sqrt(g * p0))
+            _P.with_pool() do
+                for s in 1:120
+                    _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, ng; state = st, dt = dt, gamma = g, dx = dx,
+                                     order = isodd(s) ? (1, 2, 3) : (3, 2, 1), face_periodic = true, weno5 = weno)
+                end
+            end
+            ρl = [D[idx(i, ng + 1, ng + 1)] for i in (ng + 1):(nb - ng)]
+            maximum(ρl) - minimum(ρl)
+        end
+        a_off = amp(false); a_on = amp(true)
+        @test a_on > a_off                               # WENO5 retains more of the smooth wave
+        @test a_on <= 2A + 1e-9                           # but does not amplify (no overshoot)
+        @test a_on > 0.97 * 2A                            # both preserve the wave well
     end
 
     # ── D. with_pool ≡ no pool (bitwise) ────────────────────────────────────────

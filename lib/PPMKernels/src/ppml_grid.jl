@@ -100,7 +100,7 @@ end
                                   @Const(rho), @Const(un), @Const(ut1), @Const(ut2), @Const(pr),
                                   na::Int, nghost::Int, g, dt_dx, mode::Int)
     ic, gj = @index(Global, NTuple); T = eltype(rfρ)
-    gdegen = mode & 1; flat3 = (mode >> 1) & 1        # packed flags (Metal arg-count cap)
+    gdegen = mode & 1; flat3 = (mode >> 1) & 1; weno5 = (mode >> 2) & 1   # packed flags (Metal cap)
     nf2 = na - 2 * nghost + 2                         # = active + 2
     cl = (gj - 1) * na + nghost + ic - 1
     fo = (gj - 1) * nf2 + ic
@@ -129,6 +129,15 @@ end
             # CW84 monotonize (+ ρ/p positivity guard)
             (al, bl, cl_, dl, el, ar, br, cr, dr, er) =
                 _ppml_monotonize_all(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er)
+            # WENO5 smooth-extremum fallback (Ustyugov+ §6): recover 5th order where the
+            # limiter clamped a SMOOTH extremum to the cell average (per primitive, i±2).
+            if weno5 == 1
+                (al, ar) = _ppml_exfix_pos(al, ar, rho[cl-2], rho[cl-1], sρ, rho[cl+1], rho[cl+2])
+                (bl, br) = _ppml_extremum_fix(bl, br, un[cl-2],  un[cl-1],  su, un[cl+1],  un[cl+2])
+                (cl_, cr) = _ppml_extremum_fix(cl_, cr, ut1[cl-2], ut1[cl-1], sv, ut1[cl+1], ut1[cl+2])
+                (dl, dr) = _ppml_extremum_fix(dl, dr, ut2[cl-2], ut2[cl-1], sw, ut2[cl+1], ut2[cl+2])
+                (el, er) = _ppml_exfix_pos(el, er, pr[cl-2],  pr[cl-1],  sp, pr[cl+1],  pr[cl+2])
+            end
             # characteristic trace to t+dt/2 at the +axis (right) and −axis (left) faces
             (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
             (Lρ, Lu, Lv, Lw, Lp) = _ppml_face_left(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
@@ -165,7 +174,7 @@ end
 @kernel function _ppml_correct_k!(ρL, uL, vL, wL, pL, ρR, uR, vR, wR, pR,
                                   @Const(rho), @Const(un), @Const(ut1), @Const(ut2), @Const(pr),
                                   @Const(sρ), @Const(su), @Const(sv), @Const(sw), @Const(sp),
-                                  na::Int, nfi::Int, nghost::Int, g, flat3::Int)
+                                  na::Int, nfi::Int, nghost::Int, g, flat3::Int, weno5::Int)
     ica, gj = @index(Global, NTuple); T = eltype(ρL)
     cl = (gj - 1) * na + nghost + ica
     foM = (gj - 1) * nfi + ica          # −axis interface (between cl-1, cl)
@@ -181,10 +190,19 @@ end
         ω = flat3 == 1 ? _ppml_flatten_omega_3pt(pr[cl-1], un[cl-1], sc_p, sc_u, pr[cl+1], un[cl+1]) :
             _ppml_flatten_omega(pr[cl-2], un[cl-2], pr[cl-1], un[cl-1], sc_p, sc_u,
                                 pr[cl+1], un[cl+1], pr[cl+2], un[cl+2])
-        ρL[cl] = _ppml_flat1(al, sc_ρ, ω); uL[cl] = _ppml_flat1(bl, sc_u, ω)
-        vL[cl] = _ppml_flat1(cl_, sc_v, ω); wL[cl] = _ppml_flat1(dl, sc_w, ω); pL[cl] = _ppml_flat1(el, sc_p, ω)
-        ρR[cl] = _ppml_flat1(ar, sc_ρ, ω); uR[cl] = _ppml_flat1(br, sc_u, ω)
-        vR[cl] = _ppml_flat1(cr, sc_v, ω); wR[cl] = _ppml_flat1(dr, sc_w, ω); pR[cl] = _ppml_flat1(er, sc_p, ω)
+        ρl = _ppml_flat1(al, sc_ρ, ω); ul = _ppml_flat1(bl, sc_u, ω); vl = _ppml_flat1(cl_, sc_v, ω)
+        wl = _ppml_flat1(dl, sc_w, ω); pl = _ppml_flat1(el, sc_p, ω)
+        ρr = _ppml_flat1(ar, sc_ρ, ω); ur = _ppml_flat1(br, sc_u, ω); vr = _ppml_flat1(cr, sc_v, ω)
+        wr = _ppml_flat1(dr, sc_w, ω); pr_ = _ppml_flat1(er, sc_p, ω)
+        if weno5 == 1                                    # smooth-extremum fallback (Ustyugov+ §6)
+            (ρl, ρr) = _ppml_exfix_pos(ρl, ρr, rho[cl-2], rho[cl-1], sc_ρ, rho[cl+1], rho[cl+2])
+            (ul, ur) = _ppml_extremum_fix(ul, ur, un[cl-2],  un[cl-1],  sc_u, un[cl+1],  un[cl+2])
+            (vl, vr) = _ppml_extremum_fix(vl, vr, ut1[cl-2], ut1[cl-1], sc_v, ut1[cl+1], ut1[cl+2])
+            (wl, wr) = _ppml_extremum_fix(wl, wr, ut2[cl-2], ut2[cl-1], sc_w, ut2[cl+1], ut2[cl+2])
+            (pl, pr_) = _ppml_exfix_pos(pl, pr_, pr[cl-2], pr[cl-1], sc_p, pr[cl+1], pr[cl+2])
+        end
+        ρL[cl] = ρl; uL[cl] = ul; vL[cl] = vl; wL[cl] = wl; pL[cl] = pl
+        ρR[cl] = ρr; uR[cl] = ur; vR[cl] = vr; wR[cl] = wr; pR[cl] = pr_
     end
 end
 
@@ -192,7 +210,7 @@ end
 function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int}, ng::Int, axis::Int;
                            dt::Real, gamma::Real, dx::Real, small_rho::Real,
                            ge = nothing, eta1::Real = 1e-3, frec = nothing, face_periodic::Bool = false,
-                           hllc::Bool = true, flat3::Bool = false)
+                           hllc::Bool = true, flat3::Bool = false, weno5::Bool = true)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1; nf2 = active + 2
     dtdx = T(dt) / T(dx); g = T(gamma); gm1 = g - one(T); dual = ge !== nothing
@@ -234,7 +252,7 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
         _ppml_c2p_k!(be)(rho, un, ut1, ut2, pr, Dx, Snx, St1x, St2x, Taux, gm1, T(small_rho); ndrange = N)
     end
     # predictor + trace, Riemann flux + star
-    mode = (face_periodic ? 0 : 1) | (flat3 ? 2 : 0)     # bit0=degenerate-ghost, bit1=3-pt flatten
+    mode = (face_periodic ? 0 : 1) | (flat3 ? 2 : 0) | (weno5 ? 4 : 0)   # bits: degen|3pt-flat|weno5
     _ppml_predict_k!(be)(rfρ, rfu, rfv, rfw, rfp, lfρ, lfu, lfv, lfw, lfp,
                          ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
                          rho, un, ut1, ut2, pr, na, ng, g, dtdx, mode; ndrange = (nf2, ntr))
@@ -264,7 +282,7 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
     end
     _ppml_correct_k!(be)(ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
                          rho, un, ut1, ut2, pr, sρ, su, sv, sw, sp, na, nfi, ng, g,
-                         flat3 ? 1 : 0; ndrange = (active, ntr))
+                         flat3 ? 1 : 0, weno5 ? 1 : 0; ndrange = (active, ntr))
 
     # scatter the CONSERVED set back to the original layout (the corrector wrote the
     # face pair in place, in its persistent transposed frame — nothing to untranspose).
@@ -289,12 +307,19 @@ the RGK characteristic limiter + CW84 monotonize + shock flatten + the
 characteristic-traced half-step predictor, solves the Riemann problem with a star
 state, updates the conserved set, and re-derives the pair from the Riemann stars.
 
+This is the FULL Ustyugov+ 2009 reconstruction: median (RGK) limiter + CW84 monotonize +
+shock flatten + the §6 **WENO5 smooth-extremum fallback** (`weno5`, on by default with
+`:cw5`) that recovers 5th-order accuracy where the limiter would clip a smooth extremum.
+
 `riemann` ∈ `:hllc` (default, contact-resolving — sharper) | `:hll` (more diffusive).
 `flatten` ∈ `:cw5` (default, 5-point CW84 ramp) | `:cw3` (3-point narrow variant).
+`weno5`  smooth-extremum fallback on/off (default = `flatten===:cw5`).
 
-GHOST ZONES: the reconstruction core (RGK limiter + trace) is 1-ghost-LOCAL; the only
-wider piece is the flattener. Minimum `ng = (flatten==:cw5 ? 2 : 1) + (face_periodic ?
-1 : 0)` — e.g. `:cw3` runs at `ng=1` (degenerate boundary / Enzo) or `ng=2` (periodic).
+GHOST ZONES: the reconstruction core (RGK limiter + trace) is 1-ghost-LOCAL; the wider
+pieces are the flattener and the WENO5 fallback (both `i±2`). Minimum `ng = ((weno5 ||
+flatten==:cw5) ? 2 : 1) + (face_periodic ? 1 : 0)` — e.g. `:cw3` with `weno5=false` runs
+at `ng=1` (degenerate / Enzo) or `ng=2` (periodic); full PPML (`:cw5`+WENO5) needs `ng=2`
+(degenerate) / `ng=3` (periodic).
 `ge` (ρ·eint) turns on the dual-energy formalism; `fluxrec` records
 grid-frame interface fluxes for the AMR reflux (same convention as
 [`muscl_hancock_step_3d!`](@ref)). Mutates the state, `ge`, and `state` in place.
@@ -303,14 +328,16 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                        state::PpmlState, dt::Real, gamma::Real, dx::Real = 1.0,
                        order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
                        bc! = nothing, ge = nothing, eta1::Real = 1e-3, fluxrec = nothing,
-                       face_periodic::Bool = false, riemann::Symbol = :hllc, flatten::Symbol = :cw5)
+                       face_periodic::Bool = false, riemann::Symbol = :hllc, flatten::Symbol = :cw5,
+                       weno5::Bool = (flatten === :cw5))
     be = KA.get_backend(D); hllc = riemann === :hllc; flat3 = flatten === :cw3
     # PPML's reconstruction is LOCAL: the RGK limiter + trace are 3-point (1 ghost). The
-    # only wider piece is the flattener — :cw5 reads i±2, :cw3 (the Rust narrow variant)
-    # reads i±1. Plus 1 ghost when a periodic seam is reconstructed in-place. So the
-    # minimum ghost count is (flatten halfwidth) + (periodic ? 1 : 0).
-    need = (flat3 ? 1 : 2) + (face_periodic ? 1 : 0)
-    ng < need && error("ppml_step_3d!: flatten=$flatten, face_periodic=$face_periodic need ng ≥ $need, got $ng")
+    # wider pieces are the flattener (:cw5 reads i±2, :cw3 reads i±1) and the WENO5
+    # smooth-extremum fallback (reads i±2). Plus 1 ghost when a periodic seam is
+    # reconstructed in-place. So the minimum ghost count is halfwidth + (periodic?1:0).
+    halfw = (weno5 || !flat3) ? 2 : 1
+    need = halfw + (face_periodic ? 1 : 0)
+    ng < need && error("ppml_step_3d!: flatten=$flatten weno5=$weno5 face_periodic=$face_periodic need ng ≥ $need, got $ng")
     # `face_periodic` = periodic standalone mode: with no explicit `bc!`, also wrap the
     # CONSERVED ghosts each sweep (the seam flux is single-valued only when both the
     # cell averages AND the stored face pair are periodic-consistent ⇒ conservation).
@@ -326,7 +353,7 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
         _ppml_sweep_axis!(D, S1, S2, S3, Tau, state, dims, ng, axis;
                           dt = dt, gamma = gamma, dx = dx, small_rho = small_rho,
                           ge = ge, eta1 = eta1, frec = fluxrec, face_periodic = face_periodic,
-                          hllc = hllc, flat3 = flat3)
+                          hllc = hllc, flat3 = flat3, weno5 = weno5)
     end
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)
     KA.synchronize(be)

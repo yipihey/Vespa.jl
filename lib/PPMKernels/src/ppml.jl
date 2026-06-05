@@ -69,6 +69,56 @@ end
 # blend a face pair toward the cell average by ω (0=full PPM, 1=constant).
 @inline _ppml_flat1(q::T, qa::T, f::T) where {T} = (one(T) - f) * q + f * qa
 
+# ── WENO5 interface reconstruction (Jiang-Shu) + smooth-extremum fallback ──────
+# The median/RGK limiter (+ CW84) clamps SMOOTH extrema to the cell average (1st-order
+# there). Ustyugov+ 2009 §6 recovers 5th-order accuracy at smooth extrema by replacing
+# the clamped face pair with a 5-point WENO5 reconstruction — the piece that makes this
+# the FULL PPML, not a subset. `_ppml_weno5` returns the (left, right) interface values
+# q_{i−1/2}, q_{i+1/2} from the 5-cell stencil (qmm,qm,q0,qp,qpp = q_{i−2 … i+2}).
+@inline function _ppml_weno5(qmm::T, qm::T, q0::T, qp::T, qpp::T) where {T}
+    ε = T(1e-6); c13 = T(13)/T(12); c14 = T(0.25); s6 = one(T)/T(6)
+    d0 = T(0.1); d1 = T(0.6); d2 = T(0.3)
+    # right face q_{i+1/2} (left-biased): 3 candidate stencils + smoothness indicators
+    vr0 = (T(2)*qmm - T(7)*qm + T(11)*q0)*s6
+    vr1 = (-qm + T(5)*q0 + T(2)*qp)*s6
+    vr2 = (T(2)*q0 + T(5)*qp - qpp)*s6
+    β0 = c13*(qmm - T(2)*qm + q0)^2 + c14*(qmm - T(4)*qm + T(3)*q0)^2
+    β1 = c13*(qm - T(2)*q0 + qp)^2 + c14*(qm - qp)^2
+    β2 = c13*(q0 - T(2)*qp + qpp)^2 + c14*(T(3)*q0 - T(4)*qp + qpp)^2
+    a0 = d0/(ε+β0)^2; a1 = d1/(ε+β1)^2; a2 = d2/(ε+β2)^2; sa = a0+a1+a2
+    qR = (a0*vr0 + a1*vr1 + a2*vr2)/sa
+    # left face q_{i−1/2} (right-biased): mirror stencils (β1 is shared/central)
+    vl0 = (T(2)*qpp - T(7)*qp + T(11)*q0)*s6
+    vl1 = (-qp + T(5)*q0 + T(2)*qm)*s6
+    vl2 = (T(2)*q0 + T(5)*qm - qmm)*s6
+    γ0 = c13*(qpp - T(2)*qp + q0)^2 + c14*(qpp - T(4)*qp + T(3)*q0)^2
+    γ2 = c13*(q0 - T(2)*qm + qmm)^2 + c14*(T(3)*q0 - T(4)*qm + qmm)^2
+    b0 = d0/(ε+γ0)^2; b1 = d1/(ε+β1)^2; b2 = d2/(ε+γ2)^2; sb = b0+b1+b2
+    qL = (b0*vl0 + b1*vl1 + b2*vl2)/sb
+    return (qL, qR)
+end
+
+# Smooth-extremum fallback for one primitive: if cell i is a LOCAL EXTREMUM of the cell
+# averages (so the limiter clamped the face pair to the constant `q0`) AND it is SMOOTH
+# (consistent second-difference sign across i−2 … i+2, the Colella-Sekora test), replace
+# the clamped (qL,qR) with the WENO5 reconstruction. Else keep the limited values.
+@inline function _ppml_extremum_fix(qL::T, qR::T, qmm::T, qm::T, q0::T, qp::T, qpp::T) where {T}
+    if (qp - q0)*(q0 - qm) <= zero(T)                    # local extremum of the averages
+        d2m = qmm - T(2)*qm + q0; d20 = qm - T(2)*q0 + qp; d2p = q0 - T(2)*qp + qpp
+        if d2m*d20 > zero(T) && d20*d2p > zero(T)        # smooth ⇒ consistent curvature
+            return _ppml_weno5(qmm, qm, q0, qp, qpp)
+        end
+    end
+    return (qL, qR)
+end
+
+# positivity-guarded variant for ρ and p: a WENO5 face that goes non-positive (a smooth
+# minimum near zero) reverts to the limited value.
+@inline function _ppml_exfix_pos(qL::T, qR::T, qmm::T, qm::T, q0::T, qp::T, qpp::T) where {T}
+    (a, b) = _ppml_extremum_fix(qL, qR, qmm, qm, q0, qp, qpp)
+    return (a > zero(T) && b > zero(T)) ? (a, b) : (qL, qR)
+end
+
 # ── characteristic projections at a basis state (ρ,p,cs) along local-x ─────────
 # δw=(δρ,δu,δv,δw,δp) → wave amplitudes δα such that δw = Σ δα_k r_k.
 @inline function _ppml_prim2char(δρ::T, δu::T, δv::T, δw::T, δp::T,
