@@ -80,6 +80,25 @@ function time_steps(backend_name::Symbol, ::Type{T}, ic, nsteps::Int) where {T}
     end
 end
 
+# time `nsteps` of muscl_step_3d! (Enzo HydroMethod=3) at element type T; sec/step.
+# Same IC, converted to the conserved set (D,S1,S2,S3,τ=ρ·etot); the scratch pool
+# recycles the per-axis temporaries across steps exactly as for the PPM path.
+function time_steps_muscl(backend_name::Symbol, ::Type{T}, ic, nsteps::Int) where {T}
+    be = PPMKernels.backend(backend_name)
+    dev(a) = PPMKernels.to_device(be, a, T)
+    d = dev(ic.d); vx = dev(ic.vx); vy = dev(ic.vy); vz = dev(ic.vz); etot = dev(ic.e)
+    D = similar(d); S1 = similar(d); S2 = similar(d); S3 = similar(d); Tau = similar(d)
+    PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, d, vx, vy, vz, etot)
+    dims = ic.dims; n = dims[1] - 2NG
+    dx = 1.0 / n; dt = 0.2 * dx
+    step!() = PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG;
+                                        dt = dt, gamma = GAMMA, theta = 1.5, dx = dx)
+    return PPMKernels.with_pool() do
+        step!()                                              # warm up (compile + prime pool)
+        (@elapsed for _ in 1:nsteps; step!(); end) / nsteps
+    end
+end
+
 # raw legacy Fortran 1-D kernel throughput: one x-sweep worth of pencils (ccall'd)
 function fortran_pencil_throughput(ic)
     (@isdefined EnzoLib) && EnzoLib.available() || return nothing
@@ -131,16 +150,35 @@ for n in sizes
         end
     end
 
-    # Metal GPU (f32 only)
+    # MUSCL (Enzo HydroMethod=3) on the CPU — same code, conserved set
+    for T in Ts
+        guard() do
+            sec = time_steps_muscl(:cpu, T, ic, ns)
+            results["muscl-cpu/$T"] = sec
+            sp = haskey(results, "cpu/$T") ? @sprintf("%.2f× vs ppm-cpu", results["cpu/$T"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl-cpu/$T", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
+    end
+
+    # Metal GPU (f32 only) — PPM then MUSCL, with the head-to-head speedup
     if metal_ok()
         guard() do
             sec = time_steps(:metal, Float32, ic, ns)
+            results["ppm-metal"] = sec
             sp = haskey(results, "cpu/Float32") ? @sprintf("%.1f× vs cpu-f32", results["cpu/Float32"] / sec) : ""
-            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "metal/F32", sec, ncell / sec / 1e6, sp)
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "ppm/metal", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
+        guard() do
+            sec = time_steps_muscl(:metal, Float32, ic, ns)
+            results["muscl-metal"] = sec
+            sp = haskey(results, "ppm-metal") ? @sprintf("%.2f× vs ppm/metal", results["ppm-metal"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "muscl/metal", sec, ncell / sec / 1e6, sp)
             flush(stdout)
         end
     else
-        @printf("%-8d %-12s %-12s\n", ncell, "metal/F32", "(no GPU)")
+        @printf("%-8d %-12s %-12s\n", ncell, "metal", "(no GPU)")
     end
 
     # raw legacy Fortran 1-D kernel throughput (single-thread, per-pencil ccall)
