@@ -103,26 +103,29 @@ solver = length(ARGS) >= 2 ? Symbol(ARGS[2]) : :hancock
 mach   = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 1.0
 tfinal = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 1.0
 recon  = length(ARGS) >= 5 ? Symbol(ARGS[5]) : :plm          # :plm | :ppm (hancock only)
-tag    = solver === :hancock ? "$(solver)_$(recon)" : String(Symbol(solver))
+dual   = length(ARGS) >= 6 ? ARGS[6] == "dual" : false       # dual-energy formalism on/off
+tag    = (solver === :hancock ? "$(solver)_$(recon)" : String(Symbol(solver))) * (dual ? "_dual" : "")
 const NG = 3; const GAMMA = 1.4; const COURANT = 0.3
 const T = Float32
 backend_name = PPMKernels.has_backend(:metal) ? :metal : :cpu
 
-@printf("\nDecaying turbulence: %d^3  solver=%s  Mach0=%.2f  γ=%.1f  → t=%.2f  [%s/%s]\n",
-        n, solver, mach, GAMMA, tfinal, backend_name, T)
+@printf("\nDecaying turbulence: %d^3  solver=%s  Mach0=%.2f  γ=%.1f  → t=%.2f  dual=%s  [%s/%s]\n",
+        n, solver, mach, GAMMA, tfinal, dual, backend_name, T)
 ic = turbulence_ic(n, NG; mach = mach, gamma = GAMMA)
 dims = ic.dims; dx = ic.dx; ngc = dims[1] - 2NG
 be = PPMKernels.backend(backend_name)
 dev(a) = PPMKernels.to_device(be, a, T)
 D = similar(dev(ic.d)); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
 PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(ic.d), dev(ic.vx), dev(ic.vy), dev(ic.vz), dev(ic.etot))
+# dual-energy gas-energy field Ge = ρ·eint (eint = etot − ½|v|²)
+Ge = dual ? dev(ic.d .* (ic.etot .- 0.5 .* (ic.vx .^ 2 .+ ic.vy .^ 2 .+ ic.vz .^ 2))) : nothing
 ws = similar(D)
-bcfn(d, s1, s2, s3, tau) = PPMKernels.fill_periodic!(dims, NG, d, s1, s2, s3, tau)
+bcfn(f...) = PPMKernels.fill_periodic!(dims, NG, f...)
 
 step!(dt, order) = solver === :rk2 ?
-    PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = bcfn) :
+    PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = bcfn, ge = Ge) :
     PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
-                                      order = order, bc! = bcfn, recon = recon)
+                                      order = order, bc! = bcfn, recon = recon, ge = Ge)
 
 outdir = mkpath(joinpath(@__DIR__, "turb_out"))
 d0 = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
@@ -136,7 +139,8 @@ hist = [(0.0, d0.KE, d0.IE, d0.TE, d0.mass, d0.mach)]
 PPMKernels.with_pool() do
     t = 0.0; s = 0; KE0 = d0.KE
     twall = @elapsed while t < tfinal - 1e-9 && s < 5000
-        PPMKernels.fill_periodic!(dims, NG, D, S1, S2, S3, Tau)
+        dual ? PPMKernels.fill_periodic!(dims, NG, D, S1, S2, S3, Tau, Ge) :
+               PPMKernels.fill_periodic!(dims, NG, D, S1, S2, S3, Tau)
         vmax = PPMKernels.max_wavespeed(ws, D, S1, S2, S3, Tau; gamma = GAMMA)
         dt = min(COURANT * dx / vmax, tfinal - t)
         step!(dt, isodd(s) ? (3, 2, 1) : (1, 2, 3))

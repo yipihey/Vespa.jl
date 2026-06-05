@@ -51,11 +51,36 @@ end
             _hll(ap, am, FlE,  FrE,  UlE,  UrE))
 end
 
-@kernel function _muscl_hll_kernel!(fd, fs1, fs2, fs3, fe,
+# HLL flux 6-vector: the 5 hydro fluxes PLUS the advective gas-energy flux for the
+# dual-energy formalism (Enzo hydro_rk: Eint=ρe is a passively advected field,
+# U=ρe, F=ρe·u, same HLL wave speeds). Used only on the dual path.
+@inline function _hll6(ρl::T, el::T, ul::T, vl::T, wl::T,
+                       ρr::T, er::T, ur::T, vr::T, wr::T, g::T, gm1::T) where {T}
+    h = T(0.5)
+    v2l = ul*ul + vl*vl + wl*wl; pl = gm1*ρl*el; csl = sqrt(g*pl/ρl); etl = el + h*v2l
+    UlD = ρl; UlS1 = ρl*ul; UlS2 = ρl*vl; UlS3 = ρl*wl; UlE = ρl*etl; UlG = ρl*el
+    FlD = ρl*ul; FlS1 = UlS1*ul + pl; FlS2 = UlS2*ul; FlS3 = UlS3*ul; FlE = (UlE + pl)*ul; FlG = UlG*ul
+    lpl = ul + csl; lml = ul - csl
+    v2r = ur*ur + vr*vr + wr*wr; pr = gm1*ρr*er; csr = sqrt(g*pr/ρr); etr = er + h*v2r
+    UrD = ρr; UrS1 = ρr*ur; UrS2 = ρr*vr; UrS3 = ρr*wr; UrE = ρr*etr; UrG = ρr*er
+    FrD = ρr*ur; FrS1 = UrS1*ur + pr; FrS2 = UrS2*ur; FrS3 = UrS3*ur; FrE = (UrE + pr)*ur; FrG = UrG*ur
+    lpr = ur + csr; lmr = ur - csr
+    ap = max(zero(T), max(lpl, lpr)); am = max(zero(T), max(-lml, -lmr))
+    return (_hll(ap, am, FlD,  FrD,  UlD,  UrD),
+            _hll(ap, am, FlS1, FrS1, UlS1, UrS1),
+            _hll(ap, am, FlS2, FrS2, UlS2, UrS2),
+            _hll(ap, am, FlS3, FrS3, UlS3, UrS3),
+            _hll(ap, am, FlE,  FrE,  UlE,  UrE),
+            _hll(ap, am, FlG,  FrG,  UlG,  UrG))
+end
+
+# `idual==1` ⇒ also write the gas-energy flux `fge` (the dual-energy 6th flux); the
+# branch is uniform across threads. Non-dual callers pass idual=0 + a dummy fge.
+@kernel function _muscl_hll_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                     @Const(rho), @Const(eint), @Const(vx),
                                     @Const(vy), @Const(vz),
                                     ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                    gamma, theta, small_rho)
+                                    gamma, theta, small_rho, idual::Int)
     gi, gj = @index(Global, NTuple)              # gi: interface 1..active+1; gj: pencil
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi
@@ -75,31 +100,37 @@ end
         vr =     _plm_pt(vy[cl+2],   vy[cl+1],  vy[cl],    θ)
         wr =     _plm_pt(vz[cl+2],   vz[cl+1],  vz[cl],    θ)
 
-        F = _hll5(ρl, el, ul, vl, wl, ρr, er, ur, vr, wr, g, gm1)
+        F = _hll6(ρl, el, ul, vl, wl, ρr, er, ur, vr, wr, g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+        idual == 1 && (fge[fo] = F[6])
     end
 end
 
 """
     muscl_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
-                     ncells, nghost, jdim=1, gamma, theta=1.5, small_rho=1e-10)
+                     ncells, nghost, jdim=1, gamma, theta=1.5, small_rho=1e-10,
+                     fge=nothing)
 
 Fill the five interface-flux arrays (density, 3 momenta, total energy) over
 `active+1` interfaces per pencil via fused PLM+HLL. `rho/eint/vx/vy/vz` are the
 primitive lines (length `ncells·jdim`, `nghost` ghosts each side); flux arrays
 have length `(active+1)·jdim` where `active = ncells − 2·nghost`. Element type of
-`fd` sets the working precision.
+`fd` sets the working precision. Passing `fge` (a 6th flux array) turns on the
+dual-energy gas-energy flux (Eint=ρe advection).
 """
 function muscl_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                           ncells::Integer, nghost::Integer, jdim::Integer = 1,
-                          gamma::Real, theta::Real = 1.5, small_rho::Real = 1e-10)
+                          gamma::Real, theta::Real = 1.5, small_rho::Real = 1e-10,
+                          fge = nothing)
     be = KA.get_backend(fd)
     T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost
     nfi = active + 1
-    _muscl_hll_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
-                           ncells, nfi, nghost, 1, T(gamma), T(theta), T(small_rho);
+    _muscl_hll_kernel!(be)(fd, fs1, fs2, fs3, fe, fge === nothing ? fd : fge,
+                           rho, eint, vx, vy, vz,
+                           ncells, nfi, nghost, 1, T(gamma), T(theta), T(small_rho),
+                           fge === nothing ? 0 : 1;
                            ndrange = (nfi, Int(jdim)))
     KA.synchronize(be)
     return fd, fs1, fs2, fs3, fe
@@ -169,11 +200,11 @@ end
                             max(ρb, small_rho), eb, ub, vb, wb, gm1, cpred, small_rho)
 end
 
-@kernel function _muscl_hancock_kernel!(fd, fs1, fs2, fs3, fe,
+@kernel function _muscl_hancock_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                         @Const(rho), @Const(eint), @Const(vx),
                                         @Const(vy), @Const(vz),
                                         ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                        gamma, theta, cpred, small_rho)
+                                        gamma, theta, cpred, small_rho, idual::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi
@@ -187,10 +218,11 @@ end
         Rf = _hancock_faces(rho[cl], rho[cl+1], rho[cl+2], eint[cl], eint[cl+1], eint[cl+2],
                             vx[cl], vx[cl+1], vx[cl+2], vy[cl], vy[cl+1], vy[cl+2],
                             vz[cl], vz[cl+1], vz[cl+2], θ, gm1, cp, sr)
-        F = _hll5(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
+        F = _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
                   Rf[1], Rf[2], Rf[3], Rf[4], Rf[5],    # minus face of cl+1
                   g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+        idual == 1 && (fge[fo] = F[6])
     end
 end
 
@@ -198,11 +230,11 @@ end
 # parabolic reconstruction (via `_ppm_hancock_faces`). `c1..c6` are the uniform-grid
 # PPM coefficients (length ≥ ncells); the swept-axis coordinate of cell cl is the
 # index into them. Needs nghost ≥ 3 (parabola reads cl−2 … cl+3 across an interface).
-@kernel function _ppm_hancock_kernel!(fd, fs1, fs2, fs3, fe,
+@kernel function _ppm_hancock_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                       @Const(rho), @Const(eint), @Const(vx), @Const(vy), @Const(vz),
                                       @Const(c1), @Const(c2), @Const(c3), @Const(c4), @Const(c5), @Const(c6),
                                       ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                      gamma, cpred, small_rho)
+                                      gamma, cpred, small_rho, idual::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi (flat index)
@@ -212,10 +244,11 @@ end
     @inbounds begin
         Lf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     gm1, cp, sr)
         Rf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, gm1, cp, sr)
-        F = _hll5(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
+        F = _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
                   Rf[1], Rf[2], Rf[3], Rf[4], Rf[5],    # minus face of cl+1
                   g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+        idual == 1 && (fge[fo] = F[6])
     end
 end
 
@@ -228,25 +261,28 @@ Like [`muscl_flux_line!`](@ref) but with the MUSCL-Hancock ½-step predictor fol
 in. `cpred = dt/(2·dx)` is the predictor coefficient; `cpred=0` recovers the bare
 reconstruction+HLL flux line (up to the conserved↔primitive round-trip). `recon`
 selects PLM (`:plm`, minmod-θ) or PPM (`:ppm`, monotonized parabola); the PPM path
-needs `coeffs = (c1,…,c6)` (the uniform-grid coefficients) and `nghost ≥ 3`.
+needs `coeffs = (c1,…,c6)` (the uniform-grid coefficients) and `nghost ≥ 3`. Passing
+`fge` (a 6th flux array) turns on the dual-energy gas-energy flux (Eint=ρe).
 """
 function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   ncells::Integer, nghost::Integer, jdim::Integer = 1,
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
-                                  small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing)
+                                  small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing,
+                                  fge = nothing)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
+    gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
     if recon === :ppm
         coeffs === nothing && error("muscl_hancock_flux_line!: recon=:ppm needs coeffs=(c1,…,c6)")
         c1, c2, c3, c4, c5, c6 = coeffs
-        _ppm_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
+        _ppm_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, eint, vx, vy, vz,
                                  c1, c2, c3, c4, c5, c6,
-                                 ncells, nfi, nghost, 1, T(gamma), T(cpred), T(small_rho);
+                                 ncells, nfi, nghost, 1, T(gamma), T(cpred), T(small_rho), idu;
                                  ndrange = (nfi, Int(jdim)))
     else
-        _muscl_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz,
-                                   ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho);
+        _muscl_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, eint, vx, vy, vz,
+                                   ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho), idu;
                                    ndrange = (nfi, Int(jdim)))
     end
     KA.synchronize(be)

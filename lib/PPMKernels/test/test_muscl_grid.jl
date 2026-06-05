@@ -394,3 +394,59 @@ end
         @test maximum(abs.(d_plm .- d_ppm)) < 0.05            # but close (same physics class)
     end
 end
+
+@testset "Dual-energy formalism (Enzo hydro_rk style)" begin
+    ng = 3; gamma = 1.4; dx = 1.0; dt = 0.02; m = 26; cdims = (m, m, m); N = m^3
+    ci3(i, j, k) = i + m * (j - 1) + m * m * (k - 1)
+    rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N); eint = zeros(N)
+    for k in 1:m, j in 1:m, i in 1:m
+        x = (i - 13.5) / 2.2; y = (j - 13.5) / 2.2; z = (k - 13.5) / 2.2
+        b = exp(-(x^2 + y^2 + z^2)); q = ci3(i, j, k)
+        rho[q] = 1.0 + 0.4b; pr = 0.6 + 0.3b
+        vx[q] = 0.1x * b; vy[q] = 0.08y * b; vz[q] = -0.06z * b
+        ei = pr / ((gamma - 1) * rho[q]); eint[q] = ei
+        etot[q] = ei + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+    end
+    mkstate(be, ::Type{T} = Float64) where {T} = begin
+        dev(a) = PPMKernels.to_device(be, a, T)
+        D = dev(rho); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
+        PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(rho), dev(vx), dev(vy), dev(vz), dev(etot))
+        (D, S1, S2, S3, Tau)
+    end
+    tot(f) = PPMKernels.total_field(f, cdims, ng, dx)
+
+    # (a) both drivers, dual on: mass conserved, Ge>0, AND for this SUBSONIC flow the
+    #     density is bit-identical to dual-off (the η₁ selection picks eint_tot, so
+    #     the DEF changes nothing where it shouldn't).
+    @testset "$name: dual conserves + ≡ non-dual on subsonic" for (name, isrk2) in (("hancock", false), ("rk2", true))
+        be = PPMKernels.backend(:cpu); dev(a) = PPMKernels.to_device(be, a, Float64)
+        A = mkstate(be); Ge = dev(rho .* eint); B = mkstate(be); m0 = tot(A[1])
+        step!(st, ge) = isrk2 ?
+            PPMKernels.muscl_step_3d!(st..., cdims, ng; dt = dt, gamma = gamma, dx = dx, ge = ge) :
+            PPMKernels.muscl_hancock_step_3d!(st..., cdims, ng; dt = dt, gamma = gamma, dx = dx, ge = ge)
+        PPMKernels.with_pool() do
+            for _ in 1:3
+                step!(A, Ge); step!(B, nothing)
+            end
+        end
+        @test abs(tot(A[1]) - m0) / abs(m0) < 1e-11               # mass conserved
+        @test minimum(PPMKernels.to_host(Ge)) > 0                 # gas energy positive
+        @test PPMKernels.to_host(A[1]) == PPMKernels.to_host(B[1])  # subsonic ⇒ DEF inert (bit-identical)
+    end
+
+    # (b) metal-f32 ≡ cpu-f32 with dual on (GPU parity of the whole dual path).
+    if metal_ready()
+        run_d(nm) = begin
+            be = PPMKernels.backend(nm); dev(a) = PPMKernels.to_device(be, a, Float32)
+            st = mkstate(be, Float32); Ge = dev(Float32.(rho .* eint))
+            PPMKernels.with_pool() do
+                for s in 1:2
+                    PPMKernels.muscl_hancock_step_3d!(st..., cdims, ng; dt = dt, gamma = gamma, dx = dx,
+                                                      order = isodd(s) ? (1, 2, 3) : (3, 2, 1), ge = Ge, recon = :ppm)
+                end
+            end
+            PPMKernels.to_host(st[5])
+        end
+        @check("dual.metal≡cpu", run_d(:metal), run_d(:cpu), RTOL_B)
+    end
+end
