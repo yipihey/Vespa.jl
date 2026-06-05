@@ -6,7 +6,7 @@
 # the physics: kinetic-energy decay, mass/total-energy conservation, RMS Mach.
 #
 # Run:  <juliaup-julia> --project=test bench/run_decaying_turbulence.jl [n] [solver] [mach] [tfinal]
-#   solver ∈ {hancock, rk2};  e.g.  ... 128 hancock 1.0 1.0
+#   solver ∈ {hancock, rk2, ppml};  e.g.  ... 128 hancock 1.0 1.0
 
 using PPMKernels, KernelAbstractions, Printf, Random, LinearAlgebra
 const KA = KernelAbstractions
@@ -165,11 +165,18 @@ PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(ic.d), dev(ic.vx), dev(ic.vy), 
 Ge = dual ? dev(ic.d .* (ic.etot .- 0.5 .* (ic.vx .^ 2 .+ ic.vy .^ 2 .+ ic.vz .^ 2))) : nothing
 ws = similar(D)
 bcfn(f...) = PPMKernels.fill_periodic!(dims, NG, f...)
+# PPML carries a persistent face-state pair: allocate once + degenerate-init from the IC
+ppml_st = solver === :ppml ? PPMKernels.ppml_alloc_state(D, dims, NG) : nothing
+solver === :ppml && PPMKernels.ppml_init_state!(ppml_st, D, S1, S2, S3, Tau; gamma = GAMMA, ge = Ge)
 
-step!(dt, order) = solver === :rk2 ?
-    PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = bcfn, ge = Ge) :
-    PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
-                                      order = order, bc! = bcfn, recon = recon, ge = Ge)
+step!(dt, order) =
+    solver === :rk2 ?
+        PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = bcfn, ge = Ge) :
+    solver === :ppml ?
+        PPMKernels.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = ppml_st, dt = dt, gamma = GAMMA, dx = dx,
+                                 order = order, ge = Ge, face_periodic = true) :
+        PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx,
+                                          order = order, bc! = bcfn, recon = recon, ge = Ge)
 
 outdir = mkpath(joinpath(@__DIR__, "turb_out"))
 d0 = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA; Ge = Ge)

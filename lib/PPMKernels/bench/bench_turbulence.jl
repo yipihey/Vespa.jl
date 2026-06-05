@@ -120,6 +120,26 @@ function time_steps_hancock(backend_name::Symbol, ::Type{T}, ic, nsteps::Int;
     end
 end
 
+# time `nsteps` of the PPML driver (Ustyugov+ 2009 — stateful char-traced, 3 sweeps/
+# step). Allocates the persistent face-pair state once + a degenerate-init warm-up.
+function time_steps_ppml(backend_name::Symbol, ::Type{T}, ic, nsteps::Int) where {T}
+    be = PPMKernels.backend(backend_name)
+    dev(a) = PPMKernels.to_device(be, a, T)
+    d = dev(ic.d); vx = dev(ic.vx); vy = dev(ic.vy); vz = dev(ic.vz); etot = dev(ic.e)
+    D = similar(d); S1 = similar(d); S2 = similar(d); S3 = similar(d); Tau = similar(d)
+    PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, d, vx, vy, vz, etot)
+    dims = ic.dims; n = dims[1] - 2NG
+    dx = 1.0 / n; dt = 0.2 * dx
+    st = PPMKernels.ppml_alloc_state(D, dims, NG)
+    PPMKernels.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = GAMMA)
+    step!(o) = PPMKernels.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st,
+                                        dt = dt, gamma = GAMMA, dx = dx, order = o, face_periodic = true)
+    return PPMKernels.with_pool() do
+        step!((1, 2, 3))                                     # warm up (compile + prime pool + pair)
+        (@elapsed for s in 1:nsteps; step!(iseven(s) ? (3, 2, 1) : (1, 2, 3)); end) / nsteps
+    end
+end
+
 # raw legacy Fortran 1-D kernel throughput: one x-sweep worth of pencils (ccall'd)
 function fortran_pencil_throughput(ic)
     (@isdefined EnzoLib) && EnzoLib.available() || return nothing
@@ -192,6 +212,12 @@ for n in sizes
             @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "hanc-ppm-cpu/$T", sec, ncell / sec / 1e6, sp)
             flush(stdout)
         end
+        guard() do
+            sec = time_steps_ppml(:cpu, T, ic, ns)
+            sp = haskey(results, "cpu/$T") ? @sprintf("%.2f× vs ppm-cpu", results["cpu/$T"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "ppml-cpu/$T", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
     end
 
     # Metal GPU (f32 only) — PPM then MUSCL, with the head-to-head speedup
@@ -221,6 +247,12 @@ for n in sizes
             sec = time_steps_hancock(:metal, Float32, ic, ns; recon = :ppm)
             sp = haskey(results, "ppm-metal") ? @sprintf("%.2f× vs ppm/metal", results["ppm-metal"] / sec) : ""
             @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "hanc-ppm/metal", sec, ncell / sec / 1e6, sp)
+            flush(stdout)
+        end
+        guard() do
+            sec = time_steps_ppml(:metal, Float32, ic, ns)
+            sp = haskey(results, "ppm-metal") ? @sprintf("%.2f× vs ppm/metal", results["ppm-metal"] / sec) : ""
+            @printf("%-8d %-12s %-12.4g %-12.2f %-10s\n", ncell, "ppml/metal", sec, ncell / sec / 1e6, sp)
             flush(stdout)
         end
     else
