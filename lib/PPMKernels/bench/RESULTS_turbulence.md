@@ -23,7 +23,7 @@ Five solvers timed:
 | RK2 (unsplit)     | 3.02 | 3.22 |  2.15 | 3.75 | 4.13 | 10.95 | 4.36 | 4.60 |  42.41 | 4.54 |  96.51 |
 | Hancock (PLM)     | 5.00 | 5.14 | 10.61 | 6.06 | 6.75 | 63.93 | 7.12 | 7.50 | 189.34 | 7.40 | 233.12 |
 | Hancock-PPM       | 2.11 | 2.14 |  9.12 | 2.72 | 2.81 | 78.75 | 3.05 | 3.16 | 174.83 | 3.04 | 197.16 |
-| PPML (Ustyugov)   | 1.19 | 1.17 |  4.35 | 1.52 | 1.61 | 23.59 | 1.74 | 1.77 |  48.63 | 1.98 |  52.74 |
+| PPML (Ustyugov)   | 1.40 | 1.36 |  4.74 | 1.76 | 1.87 | 23.48 | 2.10 | 2.14 |  69.20 | 2.25 |  76.93 |
 
 256³ CPU-f64 is omitted: 16.8M cells × the ~100-buffer scratch pool exceeds the f64
 memory cap (`CPU_F64_MAX = 150³`), so the bench auto-skips it. (Raw legacy Fortran
@@ -37,7 +37,7 @@ memory cap (`CPU_F64_MAX = 150³`), so the bench auto-skips it. (Raw legacy Fort
 | RK2           | 0.01084 | 0.01019 | 0.01525 | 0.06988| 0.0635 | 0.02395 | 0.4811 | 0.4558 | 0.04945 | 3.693 | 0.1738  |
 | Hancock (PLM) | 0.006549| 0.006372| 0.003087| 0.04326| 0.03885| 0.004101| 0.2946 | 0.2798 | 0.01108 | 2.268 | 0.07197 |
 | Hancock-PPM   | 0.01554 | 0.01534 | 0.003593| 0.09655| 0.09343| 0.003329| 0.6866 | 0.6646 | 0.012   | 5.518 | 0.0851  |
-| PPML          | 0.02747 | 0.028   | 0.007527| 0.1725 | 0.1628 | 0.01111 | 1.207  | 1.183  | 0.04313 | 8.478 | 0.3181  |
+| PPML          | 0.02346 | 0.02415 | 0.006911| 0.1492 | 0.1403 | 0.01116 | 0.9969 | 0.9807 | 0.0303  | 7.471 | 0.2181  |
 
 ## Accuracy — DecayingTurbulence, 64³, Mach₀ = 1.0, γ = 1.4, evolved to t = 0.4 (Metal f32)
 
@@ -83,11 +83,19 @@ would be swapping HLL→HLLC in the flux (a documented faithful refinement).
   RK2's larger per-launch work amortizes the launch overhead once the grid is huge.
   Hancock-PPM's parabola recompute also starts to cost (~15% under PLM: 197 vs 233),
   no longer free as it was at 64³–128³.
-- **PPML is the heaviest solver everywhere** — ~1.8 Mcell/s CPU-f32, 48.6 / 52.7
-  Mcell/s Metal at 128³/256³ (~3.6× slower than Hancock-PLM, ~1.4× slower than
-  PPM-DirectEuler at scale). The cost is structural: 9 kernels/sweep (predictor → HLL
-  flux+star → conserved update → corrector), the RGK + CW84 + flatten limiter stack,
-  and 30 grid-arrays of persistent face-pair state read/written each sweep. Its Metal/
-  CPU speedup still grows with size (3.7× @32³ → 27× @256³). The point of PPML is the
-  *method* (stateful characteristic tracing), not throughput — for raw speed Hancock-PLM
-  wins; for low-Mach sharpness Hancock-PPM wins (see accuracy table above).
+- **PPML is the heaviest solver everywhere** — ~2.1 Mcell/s CPU-f32, 69 / 77 Mcell/s
+  Metal at 128³/256³ (~2.8× slower than Hancock-PLM, on par with PPM-DirectEuler at
+  scale). The cost is structural: 9 kernels/sweep (predictor → HLL flux+star → conserved
+  update → corrector), the RGK + CW84 + flatten limiter stack, and a persistent face-pair
+  state read/written each sweep. The point of PPML is the *method* (stateful
+  characteristic tracing), not throughput — for raw speed Hancock-PLM wins; for low-Mach
+  sharpness Hancock-PPM wins (see accuracy table above).
+- **Optimization — per-axis transposed face-pair storage (+42–46% on Metal at scale).**
+  The face pair (30 grid-arrays) is only ever touched in its own axis's sweep, so it is
+  stored *permanently in that axis's transposed frame* (velocities pre-rotated to
+  normal/transverse roles) instead of lab-frame. The y/z sweeps then read/write it
+  directly — eliminating 40 full-grid gather passes per step (10 transpose-in + 10
+  transpose-out × 2 non-x sweeps). Bit-identical results; Metal 128³ 48.6→69.2, 256³
+  52.7→76.9; CPU +14–21%. (64³ is flat — small grids are launch/compute-bound, not
+  transpose-bandwidth-bound.) Further fusion of predictor+Riemann into one kernel is
+  blocked by Metal's 31-buffer cap (the fused kernel needs 26 arrays + scalars > 31).

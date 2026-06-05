@@ -58,20 +58,34 @@ end
 end
 
 "`ppml_init_state!(st, D,S1,S2,S3,Tau; gamma, ge, …)` — degenerate pair wL=wR=⟨w⟩."
+# Each axis's pair is stored in THAT AXIS's transposed frame (swept axis leading,
+# velocities in normal/transverse roles) so the sweeps never transpose it. Init thus
+# writes the cell-average primitives in each axis's frame (1 transpose set per axis).
 function ppml_init_state!(st::PpmlState, D, S1, S2, S3, Tau; gamma::Real,
                           ge = nothing, eta1::Real = 1e-3, small_rho::Real = 1e-10)
     be = KA.get_backend(D); T = eltype(D); N = length(D); gm1 = T(gamma) - one(T)
-    w = st.wL[1]                                       # axis-1 store = lab frame
-    if ge === nothing
-        _ppml_c2p_k!(be)(w[1], w[2], w[3], w[4], w[5], D, S1, S2, S3, Tau, gm1, T(small_rho); ndrange = N)
-    else
-        _ppml_c2p_dual_k!(be)(w[1], w[2], w[3], w[4], w[5], D, S1, S2, S3, Tau, ge,
-                              T(gamma), T(eta1), T(small_rho); ndrange = N)
-    end
-    KA.synchronize(be)
-    for a in 1:3, k in 1:5
-        a == 1 || copyto!(st.wL[a][k], w[k])
-        copyto!(st.wR[a][k], w[k])
+    dims = st.dims
+    for a in 1:3
+        perm = _axis_perm(a)
+        Sn, St1, St2 = a == 1 ? (S1, S2, S3) : a == 2 ? (S2, S3, S1) : (S3, S1, S2)
+        if a == 1
+            Dx, Snx, St1x, St2x, Taux, Gex = D, Sn, St1, St2, Tau, ge
+        else
+            Dx = transpose3(D, dims, perm); Taux = transpose3(Tau, dims, perm)
+            Snx = transpose3(Sn, dims, perm); St1x = transpose3(St1, dims, perm); St2x = transpose3(St2, dims, perm)
+            Gex = ge === nothing ? nothing : transpose3(ge, dims, perm)
+        end
+        w = st.wL[a]
+        if ge === nothing
+            _ppml_c2p_k!(be)(w[1], w[2], w[3], w[4], w[5], Dx, Snx, St1x, St2x, Taux, gm1, T(small_rho); ndrange = N)
+        else
+            _ppml_c2p_dual_k!(be)(w[1], w[2], w[3], w[4], w[5], Dx, Snx, St1x, St2x, Taux, Gex,
+                                  T(gamma), T(eta1), T(small_rho); ndrange = N)
+        end
+        KA.synchronize(be)
+        for k in 1:5
+            copyto!(st.wR[a][k], w[k])
+        end
     end
     KA.synchronize(be)
     return nothing
@@ -175,16 +189,17 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1; nf2 = active + 2
     dtdx = T(dt) / T(dx); g = T(gamma); gm1 = g - one(T); dual = ge !== nothing
-    perm = _axis_perm(axis)
+    perm = _axis_perm(axis); pdims = (dims[perm[1]], dims[perm[2]], dims[perm[3]])
     Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
-    # the axis's face pair (lab-frame arrays), velocity roles rotated to (n,t1,t2)
+    # the axis's face pair is stored ALREADY in this axis's transposed frame, as
+    # (ρ, vn, vt1, vt2, p) — so the sweep never transposes/rotates it (the big save).
     fL = st.wL[axis]; fR = st.wR[axis]
-    # periodic state ⇒ wrap the stored face pair into the ghosts so the seam
-    # reconstruction (and thus the two seam fluxes) is bit-identical ⇒ conservative.
-    face_periodic && fill_periodic!(dims, ng, fL..., fR...)
-    vsel(f) = axis == 1 ? (f[2], f[3], f[4]) : axis == 2 ? (f[3], f[4], f[2]) : (f[4], f[2], f[3])
-    ρLs = fL[1]; pLs = fL[5]; (uLs, vLs, wLs) = vsel(fL)
-    ρRs = fR[1]; pRs = fR[5]; (uRs, vRs, wRs) = vsel(fR)
+    # periodic state ⇒ wrap the stored face pair into the ghosts (in the transposed
+    # frame, pdims) so the seam reconstruction — and the two seam fluxes — is bit-
+    # identical ⇒ conservative.
+    face_periodic && fill_periodic!(pdims, ng, fL..., fR...)
+    ρLx, uLx, vLx, wLx, pLx = fL[1], fL[2], fL[3], fL[4], fL[5]
+    ρRx, uRx, vRx, wRx, pRx = fR[1], fR[2], fR[3], fR[4], fR[5]
 
     # scratch (transposed frame): cell-average prims, traced faces, fluxes, stars
     rho = _scratch(D, N; zero = false); un = _scratch(D, N; zero = false)
@@ -195,19 +210,14 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
     fge = dual ? _scratch(D, nfi*ntr) : nothing
     sρ = _scratch(D, nfi*ntr); su = _scratch(D, nfi*ntr); sv = _scratch(D, nfi*ntr); sw = _scratch(D, nfi*ntr); sp = _scratch(D, nfi*ntr)
 
-    # bring the conserved set + face pair into the swept-axis-leading frame
+    # bring the CONSERVED set into the swept-axis-leading frame (the face pair already
+    # lives there — only the lab-frame conserved arrays need transposing).
     if axis == 1
         Dx, Snx, St1x, St2x, Taux, Gex = D, Sn, St1, St2, Tau, ge
-        ρLx, uLx, vLx, wLx, pLx = ρLs, uLs, vLs, wLs, pLs
-        ρRx, uRx, vRx, wRx, pRx = ρRs, uRs, vRs, wRs, pRs
     else
         Dx = transpose3(D, dims, perm); Taux = transpose3(Tau, dims, perm)
         Snx = transpose3(Sn, dims, perm); St1x = transpose3(St1, dims, perm); St2x = transpose3(St2, dims, perm)
         Gex = dual ? transpose3(ge, dims, perm) : nothing
-        ρLx = transpose3(ρLs, dims, perm); uLx = transpose3(uLs, dims, perm); vLx = transpose3(vLs, dims, perm)
-        wLx = transpose3(wLs, dims, perm); pLx = transpose3(pLs, dims, perm)
-        ρRx = transpose3(ρRs, dims, perm); uRx = transpose3(uRs, dims, perm); vRx = transpose3(vRs, dims, perm)
-        wRx = transpose3(wRs, dims, perm); pRx = transpose3(pRs, dims, perm)
     end
 
     # cons → primitive (pressure) on the pre-update state
@@ -248,15 +258,12 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
     _ppml_correct_k!(be)(ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
                          rho, un, ut1, ut2, pr, sρ, su, sv, sw, sp, na, nfi, ng, g; ndrange = (active, ntr))
 
-    # scatter conserved + the updated face pair back to the original layout
+    # scatter the CONSERVED set back to the original layout (the corrector wrote the
+    # face pair in place, in its persistent transposed frame — nothing to untranspose).
     if axis != 1
         _untranspose_into!(D, Dx, dims, perm);    _untranspose_into!(Tau, Taux, dims, perm)
         _untranspose_into!(Sn, Snx, dims, perm);  _untranspose_into!(St1, St1x, dims, perm); _untranspose_into!(St2, St2x, dims, perm)
         dual && _untranspose_into!(ge, Gex, dims, perm)
-        _untranspose_into!(ρLs, ρLx, dims, perm); _untranspose_into!(uLs, uLx, dims, perm); _untranspose_into!(vLs, vLx, dims, perm)
-        _untranspose_into!(wLs, wLx, dims, perm); _untranspose_into!(pLs, pLx, dims, perm)
-        _untranspose_into!(ρRs, ρRx, dims, perm); _untranspose_into!(uRs, uRx, dims, perm); _untranspose_into!(vRs, vRx, dims, perm)
-        _untranspose_into!(wRs, wRx, dims, perm); _untranspose_into!(pRs, pRx, dims, perm)
     end
     return nothing
 end
