@@ -281,6 +281,28 @@ end
                             max(ρb, small_rho), eb, ub, vb, wb, gm1, cpred, small_rho)
 end
 
+# PPM faces with a CHARACTERISTIC-TRACE time-update (instead of the Hancock half-step):
+# reconstruct the (ρ,p,u,v,w) monotonized parabola per primitive (same certified
+# `_iv_recon_cell`), then time-centre each face by `_ppml_face_left/right` — which
+# integrates the WHOLE parabola over each wave's departure region (keeping the curvature
+# term the Hancock step drops), exactly the PPM time-averaging DirectEuler does. Needs
+# the PRESSURE line `pr` (the trace works in p); converts the traced face p→eint for the
+# Riemann flux. Returns the same (minus-face | plus-face) 10-tuple as `_ppm_hancock_faces`.
+@inline function _ppm_trace_faces(rho, pr, vx, vy, vz, c1, c2, c3, c4, c5, c6,
+                                  idx::Int, ci::Int, g::T, gm1::T, dt_dx::T, small_rho::T) where {T}
+    pmin = gm1 * small_rho
+    (ρL, ρR, _, _) = _iv_recon_cell(rho, c1, c2, c3, c4, c5, c6, rho, rho, idx, ci, 0, 0)
+    (pL, pR, _, _) = _iv_recon_cell(pr,  c1, c2, c3, c4, c5, c6, pr,  pr,  idx, ci, 0, 0)
+    (uL, uR, _, _) = _iv_recon_cell(vx,  c1, c2, c3, c4, c5, c6, vx,  vx,  idx, ci, 0, 0)
+    (vL, vR, _, _) = _iv_recon_cell(vy,  c1, c2, c3, c4, c5, c6, vy,  vy,  idx, ci, 0, 0)
+    (wL, wR, _, _) = _iv_recon_cell(vz,  c1, c2, c3, c4, c5, c6, vz,  vz,  idx, ci, 0, 0)
+    ρLf = max(ρL, small_rho); ρRf = max(ρR, small_rho); pLf = max(pL, pmin); pRf = max(pR, pmin)
+    ρa = max(rho[idx], small_rho); pa = max(pr[idx], pmin); ua = vx[idx]; va = vy[idx]; wa = vz[idx]
+    (Lρ, Lu, Lv, Lw, Lp) = _ppml_face_left(ρLf, uL, vL, wL, pLf, ρa, ua, va, wa, pa, ρRf, uR, vR, wR, pRf, dt_dx, g)
+    (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(ρLf, uL, vL, wL, pLf, ρa, ua, va, wa, pa, ρRf, uR, vR, wR, pRf, dt_dx, g)
+    return (Lρ, Lp/(gm1*Lρ), Lu, Lv, Lw, Rρ, Rp/(gm1*Rρ), Ru, Rv, Rw)   # p→eint for the flux
+end
+
 @kernel function _muscl_hancock_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                         @Const(rho), @Const(eint), @Const(vx),
                                         @Const(vy), @Const(vz),
@@ -333,6 +355,30 @@ end
     end
 end
 
+# PPM-TRACE per-interface kernel: like `_ppm_hancock_kernel!` but the characteristic-trace
+# time-update (`_ppm_trace_faces`, needs the PRESSURE line `pr` + `dt_dx` instead of cpred).
+@kernel function _ppm_trace_kernel!(fd, fs1, fs2, fs3, fe, fge,
+                                    @Const(rho), @Const(pr), @Const(vx), @Const(vy), @Const(vz),
+                                    @Const(c1), @Const(c2), @Const(c3), @Const(c4), @Const(c5), @Const(c6),
+                                    ncells::Int, nfi::Int, nghost::Int, j1::Int,
+                                    gamma, dt_dx, small_rho, idual::Int, rie::Int)
+    gi, gj = @index(Global, NTuple)
+    j = j1 + gj - 1
+    cl = (j - 1) * ncells + nghost + gi - 1
+    cil = nghost + gi - 1
+    fo = (j - 1) * nfi + gi
+    T = eltype(fd); g = gamma; gm1 = g - one(T); dd = dt_dx; sr = small_rho
+    @inbounds begin
+        Lf = _ppm_trace_faces(rho, pr, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     g, gm1, dd, sr)
+        Rf = _ppm_trace_faces(rho, pr, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, g, gm1, dd, sr)
+        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+                       _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
+        fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+        idual == 1 && (fge[fo] = F[6])
+    end
+end
+
 """
     muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                              ncells, nghost, jdim=1, gamma, theta=1.5, cpred,
@@ -349,13 +395,20 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   ncells::Integer, nghost::Integer, jdim::Integer = 1,
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
                                   small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing,
-                                  fge = nothing, riemann::Symbol = :hll)
+                                  fge = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock, pr = nothing)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
     gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
     rc = riemann === :twoshock ? 2 : riemann === :hllc ? 1 : 0
-    if recon === :ppm
+    if recon === :ppm && predictor === :trace
+        (coeffs === nothing || pr === nothing) && error("muscl_hancock_flux_line!: predictor=:trace needs coeffs + pr")
+        c1, c2, c3, c4, c5, c6 = coeffs
+        _ppm_trace_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, pr, vx, vy, vz,
+                               c1, c2, c3, c4, c5, c6,
+                               ncells, nfi, nghost, 1, T(gamma), T(2 * cpred), T(small_rho), idu, rc;
+                               ndrange = (nfi, Int(jdim)))
+    elseif recon === :ppm
         coeffs === nothing && error("muscl_hancock_flux_line!: recon=:ppm needs coeffs=(c1,…,c6)")
         c1, c2, c3, c4, c5, c6 = coeffs
         _ppm_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, eint, vx, vy, vz,

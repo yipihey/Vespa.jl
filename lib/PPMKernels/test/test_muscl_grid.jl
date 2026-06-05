@@ -441,6 +441,54 @@ end
             @check("hancock.hllc.metal≡cpu", run_d(:metal), run_d(:cpu), RTOL_B)
         end
     end
+
+    # ── E. characteristic-trace predictor (predictor=:trace): conserves + differs ──
+    @testset "predictor=:trace conserves + differs from :hancock" begin
+        m = 26; cdims = (m, m, m); N = m^3; ci3(i, j, k) = i + m * (j - 1) + m * m * (k - 1)
+        rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+        for k in 1:m, j in 1:m, i in 1:m
+            x = (i - 13.5) / 2.2; y = (j - 13.5) / 2.2; z = (k - 13.5) / 2.2
+            b = exp(-(x^2 + y^2 + z^2)); q = ci3(i, j, k)
+            rho[q] = 1.0 + 0.4b; pr = 0.6 + 0.3b
+            vx[q] = 0.1x * b; vy[q] = 0.08y * b; vz[q] = -0.06z * b
+            etot[q] = pr / ((gamma - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+        end
+        be = PPMKernels.backend(:cpu); dev(a) = PPMKernels.to_device(be, a, Float64)
+        stage() = begin
+            D = dev(rho); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
+            PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(rho), dev(vx), dev(vy), dev(vz), dev(etot))
+            (D, S1, S2, S3, Tau)
+        end
+        tot(f) = PPMKernels.total_field(f, cdims, ng, dx)
+        st = stage(); m0 = tot(st[1]); e0 = tot(st[5])
+        for s in 1:3
+            PPMKernels.muscl_hancock_step_3d!(st..., cdims, ng; dt = dt, gamma = gamma, dx = dx,
+                                              order = isodd(s) ? (1, 2, 3) : (3, 2, 1), recon = :ppm, predictor = :trace)
+        end
+        @test abs(tot(st[1]) - m0) / abs(m0) < 1e-12          # trace conserves mass
+        @test abs(tot(st[5]) - e0) / abs(e0) < 1e-12          # …and energy
+        # trace ≠ hancock (keeps the parabola-curvature term the half-step drops)
+        han = stage(); tr = stage()
+        PPMKernels.muscl_hancock_step_3d!(han..., cdims, ng; dt = dt, gamma = gamma, dx = dx, recon = :ppm, predictor = :hancock)
+        PPMKernels.muscl_hancock_step_3d!(tr...,  cdims, ng; dt = dt, gamma = gamma, dx = dx, recon = :ppm, predictor = :trace)
+        @test PPMKernels.to_host(han[1]) != PPMKernels.to_host(tr[1])
+        # metal-f32 ≡ cpu-f32 on the trace path
+        if metal_ready()
+            run_d(nm) = begin
+                bk = PPMKernels.backend(nm); d2(a) = PPMKernels.to_device(bk, a, Float32)
+                D = d2(rho); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
+                PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, d2(rho), d2(vx), d2(vy), d2(vz), d2(etot))
+                PPMKernels.with_pool() do
+                    for s in 1:2
+                        PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, cdims, ng; dt = dt, gamma = gamma, dx = dx,
+                                                          order = isodd(s) ? (1, 2, 3) : (3, 2, 1), recon = :ppm, predictor = :trace)
+                    end
+                end
+                PPMKernels.to_host(D)
+            end
+            @check("hancock.trace.metal≡cpu", run_d(:metal), run_d(:cpu), RTOL_B)
+        end
+    end
 end
 
 @testset "Dual-energy formalism (Enzo hydro_rk style)" begin

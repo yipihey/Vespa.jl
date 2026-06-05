@@ -75,7 +75,7 @@ function wave_metrics(prof_f, prof_0)
     (; amp, phase, harm)
 end
 
-const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "Hancock-PPM-HLLC", "Hancock-PPM-2shk", "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
+const SOLVERS = ["Hancock-PPM", "Hancock-PPM-2shk", "Hancock-PPM-trace", "Hancock-PPM-tr-2shk", "PPM-DirectEuler", "PPML-trace"]
 
 function run_solver(name, ic, dt, nsteps)
     dims = ic.dims; dx = ic.dx; N = ic.N
@@ -105,6 +105,10 @@ function run_solver(name, ic, dt, nsteps)
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, riemann = :hllc)
     elseif name == "Hancock-PPM-2shk"
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, riemann = :twoshock)
+    elseif name == "Hancock-PPM-trace"
+        (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace)
+    elseif name == "Hancock-PPM-tr-2shk"
+        (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace, riemann = :twoshock)
     elseif name == "PPML-trace"
         (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, face_periodic = true, predictor = :trace)
     else

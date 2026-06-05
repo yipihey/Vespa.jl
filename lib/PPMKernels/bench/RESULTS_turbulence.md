@@ -124,34 +124,50 @@ Amplitude is the PEAK-TO-PEAK ratio (the honest amplitude). NOTE: the Fourier-fu
 4/π≈1.27× a sine of the same peak-to-peak, so PPML's squaring read as a spurious "amp 1.16–
 1.21 > 1" / "anti-dissipation" in an earlier draft; it never grew (see `bench/plot_soundwave.jl`).
 
-| Solver | amp (p2p) | phase err (λ) | distortion (→□) |
-|---|--:|--:|--:|
-| RK2 (PLM)       | 0.41 | −0.075 | 0.13 |
-| Hancock-PLM     | 0.60 | −0.021 | 0.12 |
-| Hancock-PPM     | **0.68** | **+0.024** | **0.09** |
-| PPM-DirectEuler | 0.79 | −0.017 | 0.21 |
-| PPML-trace      | 0.94 | −0.010 | 0.27 |
-| PPML-Hancock    | 0.97 | −0.010 | 0.31 |
+| Solver | amp (p2p) | phase err (λ) | distortion (→□) | wall (s) |
+|---|--:|--:|--:|--:|
+| RK2 (PLM)            | 0.41 | −0.075 | 0.13 | — |
+| Hancock-PLM         | 0.60 | −0.021 | 0.12 | — |
+| Hancock-PPM         | 0.674 | +0.024 | 0.095 | 23 |
+| Hancock-PPM-2shk    | 0.676 | +0.023 | 0.090 | 24 |
+| **Hancock-PPM-trace** | **0.821** | **−0.014** | **0.172** | **21** |
+| Hancock-PPM-tr-2shk | 0.859 | −0.013 | 0.133 | 25 |
+| PPM-DirectEuler     | 0.790 | −0.017 | 0.206 | 93 |
+| PPML-trace          | 0.945 | −0.010 | 0.270 | 42 |
 
 - **The amplitude ranking INVERTS vs supersonic turbulence.** On a SMOOTH wave the
   high-order reconstructions keep peak-to-peak far better: PLM is most dissipative
-  (amp 0.41–0.60), PPM/PPML least (0.79–0.97). Expected — PPM/PPML are *built* for smooth
+  (amp 0.41–0.60), PPM/PPML least (0.79–0.95). Expected — PPM/PPML are *built* for smooth
   accuracy; their aggressive limiter only dominates in shock-dominated flow.
-- **BUT PPML pays for that retention by DISTORTING the wave into a SQUARE wave** — the
-  smooth sine peaks get clipped flat and the sides steepen (distortion 0.27–0.31, far above
-  the others; visible already at 2 crossings in `plot_soundwave.jl`). So its high amplitude
-  is a flat-topped, harmonic-rich waveform, NOT a faithful sine. This is a limiter pathology
-  (the WENO5 smooth-extremum fallback is not fully preventing the extremum clipping on a
-  long advected wave) — a real defect to fix, not a virtue.
-- **Hancock-PPM is the genuine sweet spot on smooth flow**: good retention (0.68), the
-  LOWEST distortion (0.09 — the cleanest waveform), and the smallest phase error (+0.024).
-  PPM-DirectEuler keeps more amplitude (0.79) with modest distortion (0.21).
-- **Phase error (dispersion) shrinks with order**: PLM −0.075 → Hancock-PLM −0.021 → PPML
-  −0.010 λ.
-- **Together with the turbulence test** these bracket the methods honestly: PPML is robust
-  but over-dissipative at shocks, and on smooth advected waves it *keeps* amplitude only by
-  squaring the waveform; PLM is plainly diffusive; **Hancock-PPM is the most faithful on
-  both** (clean sine here, low dissipation in turbulence).
+- **The characteristic-trace predictor is the decisive lever — and it is TIME INTEGRATION,
+  not reconstruction.** Holding reconstruction (`:ppm`) AND Riemann fixed and swapping ONLY
+  the half-step predictor (`:hancock`→`:trace`) lifts amplitude retention 0.674→0.821 and
+  flips/shrinks the phase error (+0.024→−0.014). The trace integrates the parabola's
+  curvature over each wave's departure region; the Hancock half-step uses only the two
+  endpoint faces and *drops* that curvature term — which is exactly the dissipation seen in
+  the over-damped Hancock panels. With the trace, the entire Hancock-vs-DirectEuler gap
+  closes (and overshoots).
+- **Trace BEATS the full DirectEuler pipeline here, at ~4.5× lower cost**: 0.821 amp vs
+  0.790, *lower* distortion (0.172 vs 0.206 — a cleaner, less flat-topped sine; see the
+  panels in `plot_soundwave.jl`), and 21 s vs 93 s wall. The full PPM characteristic
+  time-averaging buys nothing over the parabola-trace half-step on this smooth wave.
+- **DON'T be misled by the Hancock panel's low distortion (0.095).** It is low only because
+  the wave is so damped (amp 0.67) that it cannot steepen — a tiny wave can't square. At
+  *matched* amplitude retention the trace is the cleaner waveform. The fair read is
+  trace (0.821 / 0.172) vs DirectEuler (0.790 / 0.206), not trace vs the over-damped Hancock.
+- **Two-shock Riemann barely moves the smooth wave** (0.674→0.676 on Hancock; 0.821→0.859
+  with trace) — expected, an isentropic acoustic mode has no contact/strong shock for the
+  exact Riemann solver to resolve better than HLL. Its small amplitude gain comes with a
+  matching distortion change; not worth the cost here (worth it in shocks, see turbulence).
+- **PPML still pays its retention by SQUARING the wave** — highest amplitude (0.945) but the
+  MOST distortion (0.270), flat-topped peaks (clearest in the bottom-right panel). This is a
+  limiter pathology (WENO5 smooth-extremum fallback not fully preventing extremum clipping on
+  a long advected wave), a real defect to fix, not a virtue.
+- **Phase error (dispersion) shrinks with order**: PLM −0.075 → Hancock-PLM −0.021 →
+  trace −0.014 → PPML −0.010 λ.
+- **Verdict on smooth flow**: `Hancock-PPM-trace` is the new sweet spot — DirectEuler-class
+  (better) accuracy with the cheap eigen-free Hancock skeleton plus only the parabola-trace
+  curvature term. `recon=:ppm, predictor=:trace` is the recommended faithful-accuracy default.
 
 ## Predictor study — characteristic trace vs Hancock half-step (PPML)
 

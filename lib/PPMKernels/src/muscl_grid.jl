@@ -344,10 +344,11 @@ end
 function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
                               dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
                               recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3,
-                              frec = nothing, riemann::Symbol = :hll)
+                              frec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
     dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx)); dual = ge !== nothing
+    trace = recon === :ppm && predictor === :trace; gm1 = T(gamma) - one(T)
     perm = _axis_perm(axis)
     # conserved momenta in cyclic (normal, t1, t2) role for this axis
     Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
@@ -367,17 +368,21 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
     end
     rho = _scratch(D, N; zero = false); eint = _scratch(D, N; zero = false)
     vx = _scratch(D, N; zero = false); vy = _scratch(D, N; zero = false); vz = _scratch(D, N; zero = false)
+    pr = trace ? _scratch(D, N; zero = false) : nothing      # pressure line for the trace predictor
     fd = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
     fs3 = _scratch(D, nfi * ntr); fe = _scratch(D, nfi * ntr)
     fge = dual ? _scratch(D, nfi * ntr) : nothing
     c2p(r, e, x, y, z, d_, sn, st1, st2, tau, g_) = dual ?
         _cons2prim_dual_k!(be)(r, e, x, y, z, d_, sn, st1, st2, tau, g_, T(gamma), T(eta1), T(small_rho); ndrange = N) :
         _cons2prim_k!(be)(r, e, x, y, z, d_, sn, st1, st2, tau, T(small_rho); ndrange = N)
-    fl(rho, eint, vx, vy, vz) =
+    fl(rho, eint, vx, vy, vz) = begin
+        trace && (@. pr = gm1 * rho * eint)                  # pressure for the characteristic trace
         muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                  ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
                                  theta = theta, cpred = cpred, small_rho = small_rho,
-                                 recon = recon, coeffs = coeffs, fge = fge, riemann = riemann)
+                                 recon = recon, coeffs = coeffs, fge = fge, riemann = riemann,
+                                 predictor = predictor, pr = pr)
+    end
 
     if axis == 1                                   # contiguous — work in place
         c2p(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau, ge)
@@ -434,7 +439,7 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
                                 order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
                                 bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3,
-                                fluxrec = nothing, riemann::Symbol = :hll)
+                                fluxrec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock)
     be = KA.get_backend(D); T = eltype(D)
     recon === :ppm && ng < 3 && error("muscl_hancock_step_3d!: recon=:ppm needs ng ≥ 3 (got $ng)")
     # uniform-grid PPM coefficients (the dx-independent limit of _ie_geom1!/_ie_geom2!:
@@ -456,7 +461,8 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         bcfill!()
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
-                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec, riemann = riemann)
+                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec,
+                             riemann = riemann, predictor = predictor)
     end
     # DEF reset: re-sync the gas energy and total energy once per step.
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)

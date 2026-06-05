@@ -29,7 +29,7 @@ function wave_ic()
 end
 vxline(hvx, ic) = (jc = NG + NY ÷ 2; [Float64(hvx[i + ic.nbx*(jc-1) + ic.nbx*ic.nby*(jc-1)]) for i in (NG+1):(ic.nbx-NG)])
 
-const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
+const SOLVERS = ["Hancock-PPM", "Hancock-PPM-trace", "Hancock-PPM-2shk", "Hancock-PPM-tr-2shk", "PPM-DirectEuler", "PPML-trace"]
 
 # returns the final vx LINE (length nx) for one solver
 function run_vx(name, ic, dt, nsteps)
@@ -49,9 +49,10 @@ function run_vx(name, ic, dt, nsteps)
     D = dev(ic.d); S1 = dev(ic.d .* ic.u); S2 = dev(zeros(N)); S3 = dev(zeros(N)); Tau = dev(ic.d .* ic.etot)
     st = startswith(name, "PPML") ? _P.ppml_alloc_state(D, dims, NG) : nothing
     st === nothing || _P.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = GAMMA)
-    step! = name == "RK2 (PLM)" ? (o) -> _P.muscl_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, bc! = pbc5) :
-            name == "Hancock-PLM" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :plm) :
-            name == "Hancock-PPM" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm) :
+    step! = name == "Hancock-PPM" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm) :
+            name == "Hancock-PPM-trace" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace) :
+            name == "Hancock-PPM-2shk" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, riemann = :twoshock) :
+            name == "Hancock-PPM-tr-2shk" ? (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace, riemann = :twoshock) :
             name == "PPML-trace"  ? (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, face_periodic = true, predictor = :trace) :
                                     (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, face_periodic = true, predictor = :hancock)
     _P.with_pool() do
