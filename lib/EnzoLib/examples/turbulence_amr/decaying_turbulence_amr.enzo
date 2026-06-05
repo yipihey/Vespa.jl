@@ -1,0 +1,41 @@
+# Decaying turbulence (ProblemType 106, HD_RK) with OVERDENSITY AMR.
+ProblemType                = 106
+TopGridRank                = 3
+TopGridDimensions          = 32 32 32
+SelfGravity                = 0
+LeftFaceBoundaryCondition  = 3 3 3
+RightFaceBoundaryCondition = 3 3 3
+StopTime                   = 0.3
+StopCycle                  = 100000
+Gamma                      = 1.4
+CourantSafetyNumber        = 0.3
+HydroMethod                = 3
+DualEnergyFormalism        = 1
+RiemannSolver              = 1
+Theta_Limiter              = 1.5
+RKOrder                    = 2
+EOSType                    = 0
+UsePhysicalUnit            = 0
+SmallRho                   = 1e-10
+SmallP                     = 1e-10
+SmallT                     = 1e-10
+# decaying turbulence IC (no driving)
+SetTurbulence              = 0
+UseDrivingField            = 0
+Density                    = 1.0
+SoundVelocity              = 1.0
+MachNumber                 = 5.0
+CloudType                  = 0
+RandomSeed                 = 271
+# overdensity AMR
+StaticHierarchy            = 0
+MaximumRefinementLevel     = 2
+RefineBy                   = 2
+CellFlaggingMethod         = 2
+MinimumOverDensityForRefinement = 2.0
+RefineAtStart              = 0
+FluxCorrection             = 1
+MinimumEfficiency          = 0.3
+NumberOfBufferZones        = 1
+InterpolationMethod        = 1
+ConservativeInterpolation  = 1
