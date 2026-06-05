@@ -63,18 +63,19 @@ function diagnostics(D, S1, S2, S3, Tau, dims, ng, dx, gamma)
     nx, ny, nz = dims
     hD = PPMKernels.to_host(D); h1 = PPMKernels.to_host(S1); h2 = PPMKernels.to_host(S2)
     h3 = PPMKernels.to_host(S3); hT = PPMKernels.to_host(Tau)
-    dV = dx^3; mass = 0.0; KE = 0.0; IE = 0.0; TE = 0.0; v2 = 0.0; cs2 = 0.0; dmin = Inf; dmax = -Inf
+    dV = dx^3; mass = 0.0; KE = 0.0; IE = 0.0; TE = 0.0; v2 = 0.0; cs2 = 0.0
+    dmin = Inf; dmax = -Inf; eimin = Inf                   # min SPECIFIC internal energy
     @inbounds for k in (ng+1):(nz-ng), j in (ng+1):(ny-ng), i in (ng+1):(nx-ng)
         q = i + nx * (j - 1) + nx * ny * (k - 1)
         d = hD[q]; ke = 0.5 * (h1[q]^2 + h2[q]^2 + h3[q]^2) / d
         ie = hT[q] - ke                                    # ρ·eint = τ − ½ρ|v|²
         p = (gamma - 1) * ie
         mass += d; KE += ke; IE += ie; TE += hT[q]
-        v2 += (h1[q]^2 + h2[q]^2 + h3[q]^2) / d^2; cs2 += gamma * p / d
-        dmin = min(dmin, d); dmax = max(dmax, d)
+        v2 += (h1[q]^2 + h2[q]^2 + h3[q]^2) / d^2; cs2 += gamma * max(p, 0.0) / d
+        dmin = min(dmin, d); dmax = max(dmax, d); eimin = min(eimin, ie / d)
     end
     (; mass = mass * dV, KE = KE * dV, IE = IE * dV, TE = TE * dV,
-       mach = sqrt(v2 / cs2), dmin, dmax)
+       mach = sqrt(v2 / cs2), dmin, dmax, eimin)
 end
 
 # ── density mid-plane slice → PNG (jet-ish colormap, via PPM + macOS `sips`) ───
@@ -148,8 +149,8 @@ PPMKernels.with_pool() do
         if s % 25 == 0 || t >= tfinal - 1e-9
             d = diagnostics(D, S1, S2, S3, Tau, dims, NG, dx, GAMMA)
             push!(hist, (t, d.KE, d.IE, d.TE, d.mass, d.mach))
-            @printf("%-6d %-9.4f %-9.2e %-11.5g %-11.5g %-11.5g %-9.4f %.3f/%.3f\n",
-                    s, t, dt, d.KE, d.IE, d.TE, d.mach, d.dmin, d.dmax)
+            @printf("%-6d %-9.4f %-9.2e %-11.5g %-11.5g %-9.4f %.3f/%.3f  eimin=%+.3g\n",
+                    s, t, dt, d.KE, d.IE, d.mach, d.dmin, d.dmax, d.eimin)
             (isnan(d.KE) || isinf(d.KE)) && (println("  NaN/Inf — aborting"); break)
         end
     end
@@ -159,6 +160,7 @@ PPMKernels.with_pool() do
     @printf("mass conservation:  Δ/M = %.2e\n", abs(df.mass - d0.mass) / d0.mass)
     @printf("total-energy cons:  Δ/E = %.2e   (KE→IE: ΔIE=%.4g, −ΔKE=%.4g)\n",
             abs(df.TE - d0.TE) / d0.TE, df.IE - d0.IE, KE0 - df.KE)
+    @printf("min specific eint:  %.4g  (τ/ρ−½v²; <0 ⇒ unphysical, DEF keeps it >0)\n", df.eimin)
 end
 
 save_density_png(D, dims, NG, joinpath(outdir, "rho_$(tag)_tf.png"))
