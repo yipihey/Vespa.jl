@@ -418,9 +418,11 @@ sweeps/step instead of 6**, to match the PPM grid driver's cost on the GPU.
 `recon` selects the spatial reconstruction: `:plm` (default, minmod-θ piecewise
 linear) or `:ppm` (monotonized piecewise-parabolic, via the certified
 `_iv_recon_cell`; sharper, needs `ng ≥ 3`). `riemann` selects the flux: `:hll`
-(default, the certified Enzo-`hydro_rk` solver) or `:hllc` (contact-resolving — less
-diffusive where there are entropy/shear discontinuities, e.g. supersonic turbulence;
-no benefit on a pure acoustic wave, which carries no contact perturbation).
+(default, the certified Enzo-`hydro_rk` solver), `:hllc` (contact-resolving — helps where
+there are entropy/shear discontinuities, e.g. supersonic turbulence), or `:twoshock` (the
+van Leer solver Enzo's PPM-DirectEuler uses, resolving both acoustic waves). Empirically
+the Riemann choice barely moves a smooth advected acoustic wave — the dissipation there is
+set by the time integration (the Hancock half-step), not the flux.
 
 Passing `ge` (the gas-energy conserved field, `ρ·eint`) turns on the DUAL-ENERGY
 FORMALISM (Enzo hydro_rk style): `ge` is advected alongside the state and the

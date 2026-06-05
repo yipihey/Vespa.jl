@@ -108,6 +108,53 @@ end
     end
 end
 
+# Two-shock (van Leer 1979) Riemann flux, inline per-interface — the SAME solver Enzo's
+# PPM-DirectEuler uses (`twoshock.F` + `flux_twoshock.F`), extracted to a scalar function
+# with the `(ρ,eint,u,v,w)` interface of `_hll6`. It Newton-iterates for the contact
+# (pbar,ubar) and resolves the time-averaged x/t=0 state, so it captures the ACOUSTIC wave
+# structure (not just the contact) — the least diffusive of the three for smooth flow.
+@inline function _twoshock6(ρl::T, el::T, ul::T, vl::T, wl::T,
+                            ρr::T, er::T, ur::T, vr::T, wr::T, g::T, gm1::T) where {T}
+    tn = T(1e-20)
+    pl = max(gm1*ρl*el, tn); pr = max(gm1*ρr*er, tn)
+    qa = (g + one(T))/(T(2)*g); gp1 = g + one(T)
+    cl = sqrt(g*pl*ρl); cr = sqrt(g*pr*ρr)
+    ps = max((cr*pl + cl*pr + cr*cl*(ul - ur))/(cr + cl), tn)
+    old_ps = ps; ubl = zero(T); ubr = zero(T); dpdul = zero(T); dpdur = zero(T)
+    tol = T === Float64 ? T(1e-14) : T(1e-7); conv = false
+    for _n in 2:8
+        if !conv
+            zl = cl*sqrt(one(T) + qa*(ps/pl - one(T)))
+            zr = cr*sqrt(one(T) + qa*(ps/pr - one(T)))
+            ubl = ul - (ps - pl)/zl; ubr = ur + (ps - pr)/zr
+            dpdul = -T(4)*zl^3/ρl/(T(4)*zl^2/ρl - gp1*(ps - pl))
+            dpdur =  T(4)*zr^3/ρr/(T(4)*zr^2/ρr - gp1*(ps - pr))
+            ps = max(ps + (ubr - ubl)*dpdur*dpdul/(dpdur - dpdul), tn)
+            delta = ps - old_ps; old_ps = ps
+            abs(delta/ps) < tol && (conv = true)
+        end
+    end
+    ps < tn && (ps = min(pl, pr))
+    pbar = ps; ubar = ubl + (ubr - ubl)*dpdur/(dpdur - dpdul)
+    # resolve the time-averaged (bar) state at x/t=0 (Colella RAREFACTION2 branch)
+    sn = (-ubar >= zero(T)) ? one(T) : -one(T)
+    u0, p0, d0 = sn < zero(T) ? (ul, pl, ρl) : (ur, pr, ρr)
+    c0 = sqrt(max(g*p0/d0, tn))
+    z0 = c0*d0*sqrt(max(one(T) + qa*(pbar/p0 - one(T)), tn))
+    dbar = one(T)/(one(T)/d0 - (pbar - p0)/max(z0*z0, tn))
+    cbar = sqrt(max(g*pbar/dbar, tn))
+    l0, lbar = pbar < p0 ? (u0*sn + c0, sn*ubar + cbar) : (u0*sn + z0/d0, u0*sn + z0/d0)
+    frac = l0 - lbar; frac = frac < tn ? tn : frac
+    frac = min(max((zero(T) - lbar)/frac, zero(T)), one(T))
+    pbv = p0*frac + pbar*(one(T) - frac); dbv = d0*frac + dbar*(one(T) - frac); ubv = u0*frac + ubar*(one(T) - frac)
+    lbar >= zero(T) && (pbv = pbar; dbv = dbar; ubv = ubar)
+    l0 < zero(T) && (pbv = p0; dbv = d0; ubv = u0)
+    vbv, wbv, gebv = ubv > zero(T) ? (vl, wl, el) : (vr, wr, er)   # transverse + gas energy upwind on ub
+    ebv = pbv/(gm1*dbv) + T(0.5)*(ubv*ubv + vbv*vbv + wbv*wbv)
+    dub = ubv*dbv
+    return (dub, dub*ubv + pbv, dub*vbv, dub*wbv, dub*ebv + pbv*ubv, dub*gebv)
+end
+
 # `idual==1` ⇒ also write the gas-energy flux `fge` (the dual-energy 6th flux); the
 # branch is uniform across threads. Non-dual callers pass idual=0 + a dummy fge.
 @kernel function _muscl_hll_kernel!(fd, fs1, fs2, fs3, fe, fge,
@@ -238,7 +285,7 @@ end
                                         @Const(rho), @Const(eint), @Const(vx),
                                         @Const(vy), @Const(vz),
                                         ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                        gamma, theta, cpred, small_rho, idual::Int, hllc::Int)
+                                        gamma, theta, cpred, small_rho, idual::Int, rie::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi
@@ -252,9 +299,9 @@ end
         Rf = _hancock_faces(rho[cl], rho[cl+1], rho[cl+2], eint[cl], eint[cl+1], eint[cl+2],
                             vx[cl], vx[cl+1], vx[cl+2], vy[cl], vy[cl+1], vy[cl+2],
                             vz[cl], vz[cl+1], vz[cl+2], θ, gm1, cp, sr)
-        F = hllc == 1 ?
-            _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
-            _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
+        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+                       _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
         idual == 1 && (fge[fo] = F[6])
     end
@@ -268,7 +315,7 @@ end
                                       @Const(rho), @Const(eint), @Const(vx), @Const(vy), @Const(vz),
                                       @Const(c1), @Const(c2), @Const(c3), @Const(c4), @Const(c5), @Const(c6),
                                       ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                      gamma, cpred, small_rho, idual::Int, hllc::Int)
+                                      gamma, cpred, small_rho, idual::Int, rie::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi (flat index)
@@ -278,9 +325,9 @@ end
     @inbounds begin
         Lf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     gm1, cp, sr)
         Rf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, gm1, cp, sr)
-        F = hllc == 1 ?
-            _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
-            _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
+        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+                       _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
         idual == 1 && (fge[fo] = F[6])
     end
@@ -306,7 +353,8 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
-    gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1; rc = riemann === :hllc ? 1 : 0
+    gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
+    rc = riemann === :twoshock ? 2 : riemann === :hllc ? 1 : 0
     if recon === :ppm
         coeffs === nothing && error("muscl_hancock_flux_line!: recon=:ppm needs coeffs=(c1,…,c6)")
         c1, c2, c3, c4, c5, c6 = coeffs
