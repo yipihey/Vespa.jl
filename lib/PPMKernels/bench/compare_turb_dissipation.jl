@@ -81,7 +81,7 @@ function vmax_ic(ic)
     vm
 end
 
-const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
+const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "Hancock-PPM-HLLC", "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
 
 # evolve one solver `nsteps` of fixed `dt`; return (final-diag, walltime, mcell/s, nan)
 function run_solver(name, ic, dt, nsteps)
@@ -116,6 +116,8 @@ function run_solver(name, ic, dt, nsteps)
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, recon = :plm)
     elseif name == "Hancock-PPM"
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, recon = :ppm)
+    elseif name == "Hancock-PPM-HLLC"
+        (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, recon = :ppm, riemann = :hllc)
     elseif name == "PPML-trace"
         (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, ge = Ge, face_periodic = true, predictor = :trace)
     else  # PPML-Hancock

@@ -74,6 +74,40 @@ end
             _hll(ap, am, FlG,  FrG,  UlG,  UrG))
 end
 
+# HLLC flux 6-vector (Toro, Davis wave speeds) — contact-RESOLVING twin of `_hll6`,
+# same (ρ,eint,u,v,w) L/R interface signature. Resolves the entropy/contact wave that
+# rides on a background advection (which plain HLL smears badly), so an advected smooth
+# wave keeps its amplitude + shape far better. Falls back to HLL on a non-positive star.
+@inline function _hllc6(ρl::T, el::T, ul::T, vl::T, wl::T,
+                        ρr::T, er::T, ur::T, vr::T, wr::T, g::T, gm1::T) where {T}
+    h = T(0.5); pl = gm1*ρl*el; pr = gm1*ρr*er
+    csl = sqrt(g*pl/ρl); csr = sqrt(g*pr/ρr)
+    El = ρl*(el + h*(ul*ul + vl*vl + wl*wl)); Er = ρr*(er + h*(ur*ur + vr*vr + wr*wr))
+    UlD=ρl; UlS1=ρl*ul; UlS2=ρl*vl; UlS3=ρl*wl; UlG=ρl*el
+    FlD=ρl*ul; FlS1=UlS1*ul+pl; FlS2=UlS2*ul; FlS3=UlS3*ul; FlE=(El+pl)*ul; FlG=UlG*ul
+    UrD=ρr; UrS1=ρr*ur; UrS2=ρr*vr; UrS3=ρr*wr; UrG=ρr*er
+    FrD=ρr*ur; FrS1=UrS1*ur+pr; FrS2=UrS2*ur; FrS3=UrS3*ur; FrE=(Er+pr)*ur; FrG=UrG*ur
+    SL = min(ul - csl, ur - csr); SR = max(ul + csl, ur + csr)
+    Sstar = (pr - pl + ρl*ul*(SL - ul) - ρr*ur*(SR - ur)) / (ρl*(SL - ul) - ρr*(SR - ur))
+    SL >= zero(T) && return (FlD, FlS1, FlS2, FlS3, FlE, FlG)
+    SR <= zero(T) && return (FrD, FrS1, FrS2, FrS3, FrE, FrG)
+    pstar = pl + ρl*(SL - ul)*(Sstar - ul)
+    pstar <= zero(T) && return _hll6(ρl, el, ul, vl, wl, ρr, er, ur, vr, wr, g, gm1)
+    if Sstar >= zero(T)
+        ρs = ρl*(SL - ul)/(SL - Sstar)
+        UsD=ρs; UsS1=ρs*Sstar; UsS2=ρs*vl; UsS3=ρs*wl
+        UsE = ρs*(El/ρl + (Sstar - ul)*(Sstar + pl/(ρl*(SL - ul)))); UsG = ρs*el
+        return (FlD + SL*(UsD-UlD), FlS1 + SL*(UsS1-UlS1), FlS2 + SL*(UsS2-UlS2),
+                FlS3 + SL*(UsS3-UlS3), FlE + SL*(UsE-El), FlG + SL*(UsG-UlG))
+    else
+        ρs = ρr*(SR - ur)/(SR - Sstar)
+        UsD=ρs; UsS1=ρs*Sstar; UsS2=ρs*vr; UsS3=ρs*wr
+        UsE = ρs*(Er/ρr + (Sstar - ur)*(Sstar + pr/(ρr*(SR - ur)))); UsG = ρs*er
+        return (FrD + SR*(UsD-UrD), FrS1 + SR*(UsS1-UrS1), FrS2 + SR*(UsS2-UrS2),
+                FrS3 + SR*(UsS3-UrS3), FrE + SR*(UsE-Er), FrG + SR*(UsG-UrG))
+    end
+end
+
 # `idual==1` ⇒ also write the gas-energy flux `fge` (the dual-energy 6th flux); the
 # branch is uniform across threads. Non-dual callers pass idual=0 + a dummy fge.
 @kernel function _muscl_hll_kernel!(fd, fs1, fs2, fs3, fe, fge,
@@ -204,7 +238,7 @@ end
                                         @Const(rho), @Const(eint), @Const(vx),
                                         @Const(vy), @Const(vz),
                                         ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                        gamma, theta, cpred, small_rho, idual::Int)
+                                        gamma, theta, cpred, small_rho, idual::Int, hllc::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi
@@ -218,9 +252,9 @@ end
         Rf = _hancock_faces(rho[cl], rho[cl+1], rho[cl+2], eint[cl], eint[cl+1], eint[cl+2],
                             vx[cl], vx[cl+1], vx[cl+2], vy[cl], vy[cl+1], vy[cl+2],
                             vz[cl], vz[cl+1], vz[cl+2], θ, gm1, cp, sr)
-        F = _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
-                  Rf[1], Rf[2], Rf[3], Rf[4], Rf[5],    # minus face of cl+1
-                  g, gm1)
+        F = hllc == 1 ?
+            _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
         idual == 1 && (fge[fo] = F[6])
     end
@@ -234,7 +268,7 @@ end
                                       @Const(rho), @Const(eint), @Const(vx), @Const(vy), @Const(vz),
                                       @Const(c1), @Const(c2), @Const(c3), @Const(c4), @Const(c5), @Const(c6),
                                       ncells::Int, nfi::Int, nghost::Int, j1::Int,
-                                      gamma, cpred, small_rho, idual::Int)
+                                      gamma, cpred, small_rho, idual::Int, hllc::Int)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1      # left cell of interface gi (flat index)
@@ -244,9 +278,9 @@ end
     @inbounds begin
         Lf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     gm1, cp, sr)
         Rf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, gm1, cp, sr)
-        F = _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10],   # plus face of cl
-                  Rf[1], Rf[2], Rf[3], Rf[4], Rf[5],    # minus face of cl+1
-                  g, gm1)
+        F = hllc == 1 ?
+            _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
         idual == 1 && (fge[fo] = F[6])
     end
@@ -268,21 +302,21 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   ncells::Integer, nghost::Integer, jdim::Integer = 1,
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
                                   small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing,
-                                  fge = nothing)
+                                  fge = nothing, riemann::Symbol = :hll)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
-    gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
+    gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1; rc = riemann === :hllc ? 1 : 0
     if recon === :ppm
         coeffs === nothing && error("muscl_hancock_flux_line!: recon=:ppm needs coeffs=(c1,…,c6)")
         c1, c2, c3, c4, c5, c6 = coeffs
         _ppm_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, eint, vx, vy, vz,
                                  c1, c2, c3, c4, c5, c6,
-                                 ncells, nfi, nghost, 1, T(gamma), T(cpred), T(small_rho), idu;
+                                 ncells, nfi, nghost, 1, T(gamma), T(cpred), T(small_rho), idu, rc;
                                  ndrange = (nfi, Int(jdim)))
     else
         _muscl_hancock_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, eint, vx, vy, vz,
-                                   ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho), idu;
+                                   ncells, nfi, nghost, 1, T(gamma), T(theta), T(cpred), T(small_rho), idu, rc;
                                    ndrange = (nfi, Int(jdim)))
     end
     KA.synchronize(be)
