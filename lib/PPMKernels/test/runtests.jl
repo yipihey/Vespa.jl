@@ -52,5 +52,6 @@ include("harness.jl")
     include("test_euler.jl")            # Phase 2.6 ✓
     include("test_sweep.jl")            # Phase 3 ✓
     include("test_ppm_grid.jl")         # Phase 4 ✓
+    include("test_muscl.jl")            # MUSCL PLM+HLL vs live Enzo hydro_rk ✓
     # include("test_sweep.jl")          # Phase 3
 end

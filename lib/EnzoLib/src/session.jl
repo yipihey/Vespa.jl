@@ -102,6 +102,40 @@ macro xcall(sym, ret, argtypes, args...)
     end
 end
 
+# ── hydro_rk (MUSCL) line solver — the golden reference for the Metal MUSCL port ──
+"""
+    hydro_rk_line(prim; riemann=1, gamma, theta=1.0, nghost, small_rho=1e-10, small_p=1e-10)
+        -> flux::Matrix  (neq × (active+1))
+
+One MUSCL line through Enzo's **live** hydro_rk solver (PLM reconstruction +
+Riemann flux, `HydroLine`), via the grid dylib. `prim` is `neq×ncells` with rows
+`[ρ, e_int, vx, vy, vz]` (neq=5) including `nghost` ghosts each side. `riemann`:
+HLL=1, LLF=3, HLLC=4. Returns the `neq × (active+1)` interface fluxes
+(`active = ncells − 2·nghost`). Requires the grid dylib (`grid_available()`).
+"""
+function hydro_rk_line(prim::AbstractMatrix{<:Real}; riemann::Integer = 1, gamma::Real,
+                       theta::Real = 1.0, nghost::Integer, small_rho::Real = 1e-10,
+                       small_p::Real = 1e-10)
+    neq, ncells = size(prim)
+    active = ncells - 2 * nghost
+    flat = Vector{Float64}(undef, neq * ncells)        # row-major [field*ncells + cell]
+    @inbounds for f in 1:neq, c in 1:ncells
+        flat[(f - 1) * ncells + c] = prim[f, c]
+    end
+    flux = zeros(Float64, neq * (active + 1))
+    rc = ccall(_gsym(:enzomodules_hydro_rk_line), Cint,
+               (Cint, Cdouble, Cdouble, Cint, Cdouble, Cdouble,
+                Ptr{Cdouble}, Cint, Cint, Cint, Ptr{Cdouble}),
+               riemann, gamma, theta, nghost, small_rho, small_p,
+               flat, neq, ncells, active, flux)
+    rc == 0 || error("enzomodules_hydro_rk_line returned $rc")
+    out = Matrix{Float64}(undef, neq, active + 1)
+    @inbounds for f in 1:neq, i in 1:(active + 1)
+        out[f, i] = flux[(f - 1) * (active + 1) + i]
+    end
+    return out
+end
+
 # ── low-level Session / problem entry points (signatures per problems.py) ─────
 const Handle = Ptr{Cvoid}
 

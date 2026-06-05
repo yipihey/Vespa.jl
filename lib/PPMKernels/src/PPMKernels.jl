@@ -155,5 +155,6 @@ include("flux_twoshock.jl")    # physical fluxes                  (Phase 2.5) �
 include("euler.jl")            # conservative update              (Phase 2.6) ✓
 include("sweep.jl")            # composed 1-D directional sweep   (Phase 3) ✓
 include("ppm_grid.jl")         # 3-D Strang-split sweeps          (Phase 4) ✓
+include("muscl.jl")            # PLM + HLL (Enzo HydroMethod=3, HD_RK)
 
 end # module
