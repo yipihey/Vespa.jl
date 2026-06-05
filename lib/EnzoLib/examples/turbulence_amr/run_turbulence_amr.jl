@@ -16,7 +16,7 @@
 
 using EnzoLib, Random, LinearAlgebra, Printf
 const NG  = 3                                                   # HD_RK ghost zones
-const PFSRC = joinpath(@__DIR__, "decaying_turbulence_amr.enzo")
+const PFSRC = get(ENV, "TURB_PARAM", joinpath(@__DIR__, "decaying_turbulence_amr.enzo"))
 
 # Inject a uniform-density solenoidal turbulence IC into the live top grid (overwrites
 # Density / Velocity1-3 / TotalEnergy / InternalEnergy). Σ_k A_k ê⊥(k) cos(2π k·x+φ),
