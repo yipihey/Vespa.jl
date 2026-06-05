@@ -175,5 +175,26 @@ using EnzoLib
             m_after = PPMKernels.total_mass(d, cdims, ng, dx)
             @test abs(m_after - m_before) / m_before < 1e-9
         end
+
+        # ── scratch pool must be bitwise-identical to fresh allocation ──────────
+        @testset "with_pool ≡ no pool (bitwise)" begin
+            be = PPMKernels.backend(:cpu)
+            run3(pooled::Bool) = begin
+                dev(a) = PPMKernels.to_device(be, a, Float64)
+                st = (dev(d0), dev(e0), dev(ge0), dev(vx0), dev(vy0), dev(vz0))
+                zc() = PPMKernels.device_zeros(be, Float64, (N,))
+                go() = for s in 1:2
+                    PPMKernels.ppm_step_3d!(st..., zc(), zc(), zc(), dims, ng;
+                        dt = dt, gamma = gamma, order = iseven(s) ? (3, 2, 1) : (1, 2, 3),
+                        idual = 1, iflatten = 3, eta2 = 0.1)
+                end
+                pooled ? PPMKernels.with_pool(go) : go()
+                map(PPMKernels.to_host, st)
+            end
+            ref = run3(false); got = run3(true)
+            for (r, g) in zip(ref, got)
+                @test g == r                                # exact — pool only changes storage
+            end
+        end
     end
 end

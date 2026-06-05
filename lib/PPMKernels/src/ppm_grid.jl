@@ -29,7 +29,7 @@ _invperm3(p::NTuple{3,Int}) = ntuple(q -> findfirst(==(q), p), 3)
 function transpose3(src, dims::NTuple{3,Int}, perm::NTuple{3,Int})
     str = (1, dims[1], dims[1] * dims[2])
     m = (dims[perm[1]], dims[perm[2]], dims[perm[3]])
-    dst = similar(src, prod(m))
+    dst = _scratch(src, prod(m); zero = false)        # fully written by the gather
     be = KA.get_backend(src)
     _gather3!(be)(dst, src, m[1], m[2], str[perm[1]], str[perm[2]], str[perm[3]];
                   ndrange = prod(m))
@@ -84,7 +84,7 @@ end
 
 # length-`na` uniform cell-width vector on the same backend as `proto`
 function _axisdxi(proto, na::Int, dx::Real)
-    a = similar(proto, na); fill!(a, eltype(proto)(dx)); a
+    a = _scratch(proto, na; zero = false); fill!(a, eltype(proto)(dx)); a
 end
 
 # recompute pressure over the WHOLE grid (purely local EOS), into `p`
@@ -110,6 +110,7 @@ function ppm_step_3d!(d, e, ge, vx, vy, vz, grx, gry, grz, dims::NTuple{3,Int}, 
     p = similar(d)
     gr = (grx, gry, grz)
     for axis in order
+        _pool_reset!()                    # recycle the previous sweep's scratch
         _recompute_pressure!(p, d, e, vx, vy, vz, gamma)
         sweep_axis!(d, e, ge, vx, vy, vz, p, gr[axis], dims, ng, axis; dt = dt, gamma = gamma, kw...)
     end

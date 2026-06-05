@@ -163,8 +163,8 @@ function calcdiss!(diffcoef, flatten, dslice, eslice, uslice, pslice;
     end
 
     if iflatten == 1 || iflatten == 3
-        wflag    = similar(diffcoef); fill!(wflag, zero(T))
-        flattemp = similar(diffcoef); fill!(flattemp, zero(T))
+        wflag    = _scratch(diffcoef, length(diffcoef); zero = true)
+        flattemp = _scratch(diffcoef, length(diffcoef); zero = true)
         _calcdiss_wflag!(be)(wflag, pslice, uslice, idim, i1 - 2, j1;
                              ndrange = (i2 - i1 + 5, nj))
         if iflatten == 1

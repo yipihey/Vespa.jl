@@ -76,6 +76,68 @@ end
 "`to_host(a)` — a plain host `Array` copy of a device array (no-op-ish on CPU)."
 to_host(a::AbstractArray) = Array(a)
 
+# ── scratch pool ──────────────────────────────────────────────────────────────
+# Profiling the 3-D sweep showed ALLOCATION (not synchronization) is the GPU
+# bottleneck — each step churns ~90 full-grid scratch arrays per sweep. When a
+# pool is active (`with_pool`), hot-path scratch is recycled across sweeps/steps
+# instead of reallocated; when inactive (the default — all tests), `_scratch`
+# falls back to a fresh allocation, so behaviour is identical. The per-kernel
+# syncs are kept (they let buffers complete before reuse).
+export with_pool, clear_pool!
+
+mutable struct ScratchPool
+    free::Dict{Tuple{DataType,Int},Vector{Any}}   # available buffers by (type, length)
+    used::Vector{Any}                              # checked out since the last reset
+end
+ScratchPool() = ScratchPool(Dict{Tuple{DataType,Int},Vector{Any}}(), Any[])
+const _POOL = Ref{Union{Nothing,ScratchPool}}(nothing)
+
+"Acquire a length-`len` scratch array shaped like `proto` (pooled when active)."
+function _scratch(proto, len::Int; zero::Bool = true)
+    pool = _POOL[]
+    if pool === nothing
+        a = similar(proto, len)
+        zero && fill!(a, Base.zero(eltype(proto)))
+        return a
+    end
+    bucket = get(pool.free, (typeof(proto), len), nothing)
+    a = (bucket !== nothing && !isempty(bucket)) ? pop!(bucket) : similar(proto, len)
+    push!(pool.used, a)
+    zero && fill!(a, Base.zero(eltype(proto)))
+    return a
+end
+
+"Return all checked-out scratch to the free list (call between independent sweeps)."
+function _pool_reset!()
+    pool = _POOL[]
+    pool === nothing && return
+    for a in pool.used
+        push!(get!(() -> Any[], pool.free, (typeof(a), length(a))), a)
+    end
+    empty!(pool.used)
+    return
+end
+
+"""
+    with_pool(f)
+
+Run `f` with the scratch pool active so repeated `ppm_step_3d!`/`ppm_sweep_1d!`
+calls recycle buffers instead of reallocating. The pool is discarded on exit.
+Wrap a benchmark/evolution loop in it for the GPU-allocation win.
+"""
+function with_pool(f)
+    prev = _POOL[]
+    _POOL[] = ScratchPool()
+    try
+        return f()
+    finally
+        _POOL[] = prev
+    end
+end
+
+"Drop any cached scratch buffers held by the active pool."
+clear_pool!() = (p = _POOL[]; p === nothing || (empty!(p.free); empty!(p.used)); nothing)
+
 # ── compute kernels (added as each component is ported + certified) ──────────
 include("eos.jl")              # pgas2d / pgas2d_dual            (Phase 2.1) ✓
 include("calcdiss.jl")         # diffusion + flattening          (Phase 2.2) ✓

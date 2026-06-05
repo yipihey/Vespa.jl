@@ -263,8 +263,8 @@ end
     end
 end
 
-# small helper: a zeroed device array shaped like `proto`
-_zlike(proto) = (a = similar(proto); fill!(a, zero(eltype(proto))); a)
+# small helper: a zeroed scratch array shaped like `proto` (pooled when active)
+_zlike(proto) = _scratch(proto, length(proto); zero = true)
 
 """
     inteuler!(out, dslice, pslice, uslice, vslice, wslice, geslice, grslice, dxi, flatten;
