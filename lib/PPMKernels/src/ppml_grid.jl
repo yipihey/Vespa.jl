@@ -100,7 +100,7 @@ end
                                   @Const(rho), @Const(un), @Const(ut1), @Const(ut2), @Const(pr),
                                   na::Int, nghost::Int, g, dt_dx, mode::Int)
     ic, gj = @index(Global, NTuple); T = eltype(rfρ)
-    gdegen = mode & 1; flat3 = (mode >> 1) & 1; weno5 = (mode >> 2) & 1   # packed flags (Metal cap)
+    gdegen = mode & 1; flat3 = (mode >> 1) & 1; weno5 = (mode >> 2) & 1; htime = (mode >> 3) & 1  # packed flags
     nf2 = na - 2 * nghost + 2                         # = active + 2
     cl = (gj - 1) * na + nghost + ic - 1
     fo = (gj - 1) * nf2 + ic
@@ -138,9 +138,21 @@ end
                 (dl, dr) = _ppml_extremum_fix(dl, dr, ut2[cl-2], ut2[cl-1], sw, ut2[cl+1], ut2[cl+2])
                 (el, er) = _ppml_exfix_pos(el, er, pr[cl-2],  pr[cl-1],  sp, pr[cl+1],  pr[cl+2])
             end
-            # characteristic trace to t+dt/2 at the +axis (right) and −axis (left) faces
-            (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
-            (Lρ, Lu, Lv, Lw, Lp) = _ppml_face_left(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
+            # time-centre the limited face pair to t+dt/2 — characteristic trace (full
+            # PPML, uses the whole parabola) OR the Hancock half-step (flux difference of
+            # the two endpoint faces; cheaper, system-agnostic, drops the curvature term).
+            local Lρ, Lu, Lv, Lw, Lp, Rρ, Ru, Rv, Rw, Rp
+            if htime == 1
+                gm1 = g - one(T); cpred = dt_dx * T(0.5)
+                eL = el / (gm1 * al); eR = er / (gm1 * ar)        # pressure → eint for the predictor
+                (ρas, eas, uas, vas, was, ρbs, ebs, ubs, vbs, wbs) =
+                    _hancock_predict(al, eL, bl, cl_, dl, ar, eR, br, cr, dr, gm1, cpred, T(1e-10))
+                Lρ = ρas; Lu = uas; Lv = vas; Lw = was; Lp = gm1 * ρas * eas
+                Rρ = ρbs; Ru = ubs; Rv = vbs; Rw = wbs; Rp = gm1 * ρbs * ebs
+            else
+                (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
+                (Lρ, Lu, Lv, Lw, Lp) = _ppml_face_left(al, bl, cl_, dl, el, sρ, su, sv, sw, sp, ar, br, cr, dr, er, dt_dx, g)
+            end
             rfρ[fo] = Rρ; rfu[fo] = Ru; rfv[fo] = Rv; rfw[fo] = Rw; rfp[fo] = Rp
             lfρ[fo] = Lρ; lfu[fo] = Lu; lfv[fo] = Lv; lfw[fo] = Lw; lfp[fo] = Lp
         end
@@ -210,7 +222,7 @@ end
 function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int}, ng::Int, axis::Int;
                            dt::Real, gamma::Real, dx::Real, small_rho::Real,
                            ge = nothing, eta1::Real = 1e-3, frec = nothing, face_periodic::Bool = false,
-                           hllc::Bool = true, flat3::Bool = false, weno5::Bool = true)
+                           hllc::Bool = true, flat3::Bool = false, weno5::Bool = true, htime::Bool = false)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1; nf2 = active + 2
     dtdx = T(dt) / T(dx); g = T(gamma); gm1 = g - one(T); dual = ge !== nothing
@@ -252,7 +264,7 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
         _ppml_c2p_k!(be)(rho, un, ut1, ut2, pr, Dx, Snx, St1x, St2x, Taux, gm1, T(small_rho); ndrange = N)
     end
     # predictor + trace, Riemann flux + star
-    mode = (face_periodic ? 0 : 1) | (flat3 ? 2 : 0) | (weno5 ? 4 : 0)   # bits: degen|3pt-flat|weno5
+    mode = (face_periodic ? 0 : 1) | (flat3 ? 2 : 0) | (weno5 ? 4 : 0) | (htime ? 8 : 0)  # degen|3pt|weno5|hancock
     _ppml_predict_k!(be)(rfρ, rfu, rfv, rfw, rfp, lfρ, lfu, lfv, lfw, lfp,
                          ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
                          rho, un, ut1, ut2, pr, na, ng, g, dtdx, mode; ndrange = (nf2, ntr))
@@ -314,6 +326,10 @@ shock flatten + the §6 **WENO5 smooth-extremum fallback** (`weno5`, on by defau
 `riemann` ∈ `:hllc` (default, contact-resolving — sharper) | `:hll` (more diffusive).
 `flatten` ∈ `:cw5` (default, 5-point CW84 ramp) | `:cw3` (3-point narrow variant).
 `weno5`  smooth-extremum fallback on/off (default = `flatten===:cw5`).
+`predictor` ∈ `:trace` (default, characteristic tracing — the full-parabola time update)
+  | `:hancock` (the MUSCL-Hancock half-step on the same limited face pair — uses only the
+  endpoint faces, so it drops the parabola-curvature term; cheaper eigen-free predictor,
+  system-agnostic. The reconstruction/limiter/corrector are identical either way).
 
 GHOST ZONES: the reconstruction core (RGK limiter + trace) is 1-ghost-LOCAL; the wider
 pieces are the flattener and the WENO5 fallback (both `i±2`). Minimum `ng = ((weno5 ||
@@ -329,8 +345,8 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                        order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
                        bc! = nothing, ge = nothing, eta1::Real = 1e-3, fluxrec = nothing,
                        face_periodic::Bool = false, riemann::Symbol = :hllc, flatten::Symbol = :cw5,
-                       weno5::Bool = (flatten === :cw5))
-    be = KA.get_backend(D); hllc = riemann === :hllc; flat3 = flatten === :cw3
+                       weno5::Bool = (flatten === :cw5), predictor::Symbol = :trace)
+    be = KA.get_backend(D); hllc = riemann === :hllc; flat3 = flatten === :cw3; htime = predictor === :hancock
     # PPML's reconstruction is LOCAL: the RGK limiter + trace are 3-point (1 ghost). The
     # wider pieces are the flattener (:cw5 reads i±2, :cw3 reads i±1) and the WENO5
     # smooth-extremum fallback (reads i±2). Plus 1 ghost when a periodic seam is
@@ -353,7 +369,7 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
         _ppml_sweep_axis!(D, S1, S2, S3, Tau, state, dims, ng, axis;
                           dt = dt, gamma = gamma, dx = dx, small_rho = small_rho,
                           ge = ge, eta1 = eta1, frec = fluxrec, face_periodic = face_periodic,
-                          hllc = hllc, flat3 = flat3, weno5 = weno5)
+                          hllc = hllc, flat3 = flat3, weno5 = weno5, htime = htime)
     end
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)
     KA.synchronize(be)

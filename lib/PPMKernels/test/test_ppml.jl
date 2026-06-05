@@ -149,6 +149,43 @@ const _P = PPMKernels
         @test a_on > 0.97 * 2A                            # both preserve the wave well
     end
 
+    # ── C3. Hancock time update (predictor=:hancock) ────────────────────────────
+    # PPML's stateful reconstruction is separable from the predictor: the carried face
+    # pair can be time-centred by the Hancock half-step instead of the characteristic
+    # trace. Both conserve to round-off; they differ by O(Δt²) (genuinely different time
+    # updates); the Hancock path is CPU≡Metal bit-parity-clean.
+    @testset "predictor=:hancock (Hancock time update on PPML recon)" begin
+        ng = 3; n = 20; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3; dx = 1.0 / n; dt = 0.01
+        nx, ny, nz = dims; idx(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+        rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+        for k in 1:nz, j in 1:ny, i in 1:nx
+            x = (i - ng - 0.5) / n; y = (j - ng - 0.5) / n; z = (k - ng - 0.5) / n; q = idx(i, j, k)
+            rho[q] = 1.0 + 0.3sinpi(2x) * cospi(2y); pr = 0.6 + 0.2cospi(2z)
+            vx[q] = 0.2sinpi(2y); vy[q] = 0.15cospi(2z); vz[q] = -0.1sinpi(2x)
+            etot[q] = rho[q] * (pr / ((g - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2))
+        end
+        run(bk, ::Type{T}, pred) where {T} = begin
+            be = _P.backend(bk); dev(a) = _P.to_device(be, a, T)
+            D = dev(rho); S1 = dev(rho .* vx); S2 = dev(rho .* vy); S3 = dev(rho .* vz); Tau = dev(etot)
+            st = _P.ppml_alloc_state(D, dims, ng); _P.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = g)
+            tot(f) = _P.total_field(f, dims, ng, dx); m0 = tot(D)
+            _P.with_pool() do
+                for s in 1:5
+                    _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, ng; state = st, dt = dt, gamma = g, dx = dx,
+                                     order = isodd(s) ? (1, 2, 3) : (3, 2, 1), face_periodic = true, predictor = pred)
+                end
+            end
+            (abs(tot(D) - m0) / abs(m0), _P.to_host(D))
+        end
+        dr, dh = run(:cpu, Float64, :hancock); dtr, dtt = run(:cpu, Float64, :trace)
+        @test dr < 1e-12 && dtr < 1e-12                  # both conserve to round-off
+        @test maximum(abs.(dh .- dtt)) > 1e-6            # genuinely different time update (O(Δt²))
+        if metal_ready()
+            (_, dc) = run(:cpu, Float32, :hancock); (_, dm) = run(:metal, Float32, :hancock)
+            @check("ppml.hancock.density", dm, dc, RTOL_B)
+        end
+    end
+
     # ── D. with_pool ≡ no pool (bitwise) ────────────────────────────────────────
     @testset "with_pool ≡ no pool (bitwise)" begin
         ng = 3; n = 16; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3; dx = 1.0 / n; dt = 0.01
