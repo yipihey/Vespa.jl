@@ -19,7 +19,25 @@
 using EnzoLib, PPMKernels, Random, LinearAlgebra, Printf
 const NG = 3; const GAMMA = 1.4
 const CONSERVATIVE = get(ENV, "PPM_AMR_CONS", "1") != "0"   # write real fluxes (vs zeros)
+const SOLVER = Symbol(get(ENV, "SOLVER", "hancock"))        # :hancock | :ppml
 const PF = joinpath(@__DIR__, "decaying_turbulence_amr.enzo")
+
+# ── PPML persistent-state registry (Enzo persists only cell averages between hook
+# re-entries; the stateful face pair must live here, keyed by the grid's identity).
+# Newly-created / refined grids initialise DEGENERATE (wL=wR=⟨w⟩ ⇒ one first-order
+# step), faithful to the Rust `initialize_ppml_face_states`; vanished grids are pruned.
+const PPML_REG = Dict{NTuple{7,Int},Any}()
+function ppml_state_for(h, level, g, dims, D, S1, S2, S3, Tau, Ge)
+    gs = EnzoLib.problem_grid_global_start(h, g)
+    key = (Int(level), gs[1], gs[2], gs[3], dims[1], dims[2], dims[3])
+    st = get(PPML_REG, key, nothing)
+    if st === nothing                                       # new / refined grid ⇒ degenerate
+        st = PPMKernels.ppml_alloc_state(D, dims, NG)
+        PPMKernels.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = GAMMA, ge = Ge)
+        PPML_REG[key] = st
+    end
+    return key, st
+end
 # Enzo BaryonField positional indices (field order [Density,Vel1,Vel2,Vel3,TotalE,GasE])
 const iD, iV1, iV2, iV3, iTE, iGE = 0, 1, 2, 3, 4, 5
 
@@ -87,6 +105,7 @@ end
 # ── the :julia hydro hook: one PPMKernels MUSCL-Hancock step per grid on `level` ──
 function ppm_hydro!(h, level, dt)
     ng = EnzoLib.session_num_grids_on_level(h, level)
+    seen = Set{NTuple{7,Int}}()                                  # PPML keys touched this call
     for gi in 0:ng-1
         g = EnzoLib.problem_grid_index_on_level(h, level, gi)
         dims = Tuple(Int.(EnzoLib.problem_grid_dims(h, g)))          # incl ghosts
@@ -98,11 +117,22 @@ function ppm_hydro!(h, level, dt)
         v3 = EnzoLib.problem_get_field(h, iV3, g)
         TE = EnzoLib.problem_get_field(h, iTE, g); GE = EnzoLib.problem_get_field(h, iGE, g)
         S1 = D .* v1; S2 = D .* v2; S3 = D .* v3; Tau = D .* TE; Ge = D .* GE
-        # one dim-split MUSCL-Hancock step (dual energy), recording interface fluxes so
-        # the coarse↔fine boundaries can be flux-corrected to conservation below.
+        # one dim-split step (dual energy), recording interface fluxes so the coarse↔fine
+        # boundaries can be flux-corrected to conservation below. SOLVER selects the
+        # Hancock (PLM) or the stateful PPML (char-traced) per-grid hydro.
         frec = CONSERVATIVE ? ntuple(_ -> ntuple(_ -> zeros(Float64, length(D)), 6), 3) : nothing
-        PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG;
-                                          dt = dt, gamma = GAMMA, dx = dxd[1], ge = Ge, fluxrec = frec)
+        if SOLVER === :ppml
+            key, st = ppml_state_for(h, level, g, dims, D, S1, S2, S3, Tau, Ge); push!(seen, key)
+            # the periodic ROOT grid (level 0) wraps its face pair periodically so the
+            # domain seam flux is single-valued (Enzo wraps only the conserved ghosts);
+            # finer grids keep degenerate coarse–fine boundary faces (reflux corrects them).
+            PPMKernels.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st,
+                                     dt = dt, gamma = GAMMA, dx = dxd[1], ge = Ge, fluxrec = frec,
+                                     face_periodic = Int(level) == 0)
+        else
+            PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG;
+                                              dt = dt, gamma = GAMMA, dx = dxd[1], ge = Ge, fluxrec = frec)
+        end
         # conserved → primitive, write back into the live Enzo grid (grid is a KEYWORD!)
         EnzoLib.problem_set_field(h, iD,  D;        grid = g)
         EnzoLib.problem_set_field(h, iV1, S1 ./ D;  grid = g); EnzoLib.problem_set_field(h, iV2, S2 ./ D; grid = g)
@@ -129,6 +159,10 @@ function ppm_hydro!(h, level, dt)
             end
         end
     end
+    # prune PPML state for grids on THIS level that no longer exist (post-regrid)
+    SOLVER === :ppml && for k in collect(keys(PPML_REG))
+        k[1] == Int(level) && !(k in seen) && delete!(PPML_REG, k)
+    end
     return nothing
 end
 
@@ -144,7 +178,8 @@ function main()
         h = EnzoLib.session_init(pf); h == C_NULL && error("session_init failed")
         try
             inject_turbulence!(h; mach = mach, gamma = GAMMA, ng = NG)
-            @printf("\nPPMKernels MUSCL as :julia hydro UNDER Enzo AMR — Mach0=%.1f  ρ>%.1f flags\n", mach, overd)
+            @printf("\nPPMKernels %s as :julia hydro UNDER Enzo AMR — Mach0=%.1f  ρ>%.1f flags (cons=%s)\n",
+                    uppercase(String(SOLVER)), mach, overd, CONSERVATIVE)
             # :julia hydro = PPMKernels, with reflux=true so Enzo CREATES the flux
             # registers (update_from_finer needs them); we leave them zero for now ⇒
             # projection-only AMR (runs under the hierarchy, coarse↔fine NOT yet
