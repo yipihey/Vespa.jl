@@ -54,6 +54,18 @@ end
     return clamp((η - T(0.1)) / (T(1) / T(3) - T(0.1)), zero(T), one(T))
 end
 
+# 3-point flatten ω (Rust ppml_flatten_omega_3pt): the NARROW-stencil flattener that
+# drops the 5-point concentration test, reading only i−1,i,i+1 — so the whole
+# reconstruction is 1-ghost-local (the only thing that made it wider was the 5-pt
+# variant). Binary (more dissipative on smooth-but-steep gradients than the 5-pt ramp);
+# the Rust uses it at refinement edges where the wide stencil isn't available.
+@inline function _ppml_flatten_omega_3pt(pm::T, um::T, p0::T, u0::T, pp::T, up::T) where {T}
+    um <= up && return zero(T)                              # convergent-flow gate
+    pmin = min(pm, pp); dp3 = pp - pm
+    (pmin <= zero(T) || abs(dp3) / pmin <= one(T) / T(3)) && return zero(T)
+    return one(T)
+end
+
 # blend a face pair toward the cell average by ω (0=full PPM, 1=constant).
 @inline _ppml_flat1(q::T, qa::T, f::T) where {T} = (one(T) - f) * q + f * qa
 
@@ -219,4 +231,51 @@ end
     ρs = UsD; us = UsS1/UsD; vs = UsS2/UsD; ws = UsS3/UsD
     ps = gm1 * (UsE - h*ρs*(us*us + vs*vs + ws*ws))
     return (F1, F2, F3, F4, F5, F6, ρs, us, vs, ws, ps)
+end
+
+# ── HLLC flux + contact face state (Toro, Davis wave speeds) ───────────────────
+# Contact-resolving Riemann solver: the same (ρ,u,v,w,p)-in / (6 fluxes + contact
+# face state)-out interface as `_ppml_hll`, but it resolves the entropy/contact wave
+# (sharper contacts ⇒ much less dissipation than HLL). The "star" returned is the
+# resolved state at x/t=0 (the single agreed-on interface state — the PPML corrector
+# seed). Falls back to HLL if a star state would be non-positive (Rust convention).
+@inline function _ppml_hllc(ρl::T, ul::T, vl::T, wl::T, pl::T,
+                            ρr::T, ur::T, vr::T, wr::T, pr::T, g::T, gm1::T) where {T}
+    h = T(0.5)
+    csl = sqrt(g*pl/ρl); csr = sqrt(g*pr/ρr)
+    el = pl/(gm1*ρl); er = pr/(gm1*ρr)
+    El = ρl*(el + h*(ul*ul + vl*vl + wl*wl)); Er = ρr*(er + h*(ur*ur + vr*vr + wr*wr))
+    # L/R conserved (D,S1,S2,S3,E,G=ρe) + physical fluxes
+    UlD=ρl; UlS1=ρl*ul; UlS2=ρl*vl; UlS3=ρl*wl; UlE=El; UlG=ρl*el
+    FlD=ρl*ul; FlS1=UlS1*ul+pl; FlS2=UlS2*ul; FlS3=UlS3*ul; FlE=(El+pl)*ul; FlG=UlG*ul
+    UrD=ρr; UrS1=ρr*ur; UrS2=ρr*vr; UrS3=ρr*wr; UrE=Er; UrG=ρr*er
+    FrD=ρr*ur; FrS1=UrS1*ur+pr; FrS2=UrS2*ur; FrS3=UrS3*ur; FrE=(Er+pr)*ur; FrG=UrG*ur
+    # Davis wave-speed estimates + the contact (star) speed
+    SL = min(ul - csl, ur - csr); SR = max(ul + csl, ur + csr)
+    den = ρl*(SL - ul) - ρr*(SR - ur)
+    Sstar = (pr - pl + ρl*ul*(SL - ul) - ρr*ur*(SR - ur)) / den
+    if SL >= zero(T)                                     # fully right-going ⇒ all-L
+        return (FlD, FlS1, FlS2, FlS3, FlE, FlG, ρl, ul, vl, wl, pl)
+    elseif SR <= zero(T)                                 # fully left-going ⇒ all-R
+        return (FrD, FrS1, FrS2, FrS3, FrE, FrG, ρr, ur, vr, wr, pr)
+    end
+    pstar = pl + ρl*(SL - ul)*(Sstar - ul)               # = pr + ρr(SR−ur)(S*−ur)
+    if pstar <= zero(T)                                  # star unphysical ⇒ HLL fallback
+        return _ppml_hll(ρl, ul, vl, wl, pl, ρr, ur, vr, wr, pr, g, gm1)
+    end
+    if Sstar >= zero(T)                                  # contact on the right ⇒ left star
+        ρs = ρl*(SL - ul)/(SL - Sstar)
+        UsD=ρs; UsS1=ρs*Sstar; UsS2=ρs*vl; UsS3=ρs*wl
+        UsE = ρs*(El/ρl + (Sstar - ul)*(Sstar + pl/(ρl*(SL - ul)))); UsG = ρs*el
+        return (FlD + SL*(UsD-UlD), FlS1 + SL*(UsS1-UlS1), FlS2 + SL*(UsS2-UlS2),
+                FlS3 + SL*(UsS3-UlS3), FlE + SL*(UsE-UlE), FlG + SL*(UsG-UlG),
+                ρs, Sstar, vl, wl, pstar)
+    else                                                 # contact on the left ⇒ right star
+        ρs = ρr*(SR - ur)/(SR - Sstar)
+        UsD=ρs; UsS1=ρs*Sstar; UsS2=ρs*vr; UsS3=ρs*wr
+        UsE = ρs*(Er/ρr + (Sstar - ur)*(Sstar + pr/(ρr*(SR - ur)))); UsG = ρs*er
+        return (FrD + SR*(UsD-UrD), FrS1 + SR*(UsS1-UrS1), FrS2 + SR*(UsS2-UrS2),
+                FrS3 + SR*(UsS3-UrS3), FrE + SR*(UsE-UrE), FrG + SR*(UsG-UrG),
+                ρs, Sstar, vr, wr, pstar)
+    end
 end

@@ -154,6 +154,53 @@ const _P = PPMKernels
         layerB!("ppml.density", run)
     end
 
+    # ── E2. reduced ghost zones (:cw3 flatten) + HLL/HLLC both conserve ─────────
+    # PPML's reconstruction is 1-ghost-local; the 3-point flattener drops the ng
+    # requirement to 2 (periodic). Both Riemann solvers conserve to round-off, and the
+    # reduced-ghost f32 path stays CPU≡Metal.
+    @testset "reduced ghosts (:cw3, ng=2) + riemann ∈ {hll,hllc}" begin
+        ng = 2; n = 18; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3; dx = 1.0 / n; dt = 0.01
+        nx, ny, nz = dims; idx(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+        rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+        for k in 1:nz, j in 1:ny, i in 1:nx
+            x = (i - ng - 0.5) / n; y = (j - ng - 0.5) / n; z = (k - ng - 0.5) / n; q = idx(i, j, k)
+            rho[q] = 1.0 + 0.3sinpi(2x) * cospi(2y); pr = 0.6 + 0.2cospi(2z)
+            vx[q] = 0.2sinpi(2y); vy[q] = 0.15cospi(2z); vz[q] = -0.1sinpi(2x)
+            etot[q] = rho[q] * (pr / ((g - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2))
+        end
+        run(bk, ::Type{T}, rie) where {T} = begin
+            be = _P.backend(bk); dev(a) = _P.to_device(be, a, T)
+            D = dev(rho); S1 = dev(rho .* vx); S2 = dev(rho .* vy); S3 = dev(rho .* vz); Tau = dev(etot)
+            st = _P.ppml_alloc_state(D, dims, ng); _P.ppml_init_state!(st, D, S1, S2, S3, Tau; gamma = g)
+            tot(f) = _P.total_field(f, dims, ng, dx); m0 = tot(D)
+            _P.with_pool() do
+                for s in 1:5
+                    _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, ng; state = st, dt = dt, gamma = g, dx = dx,
+                                     order = isodd(s) ? (1, 2, 3) : (3, 2, 1), face_periodic = true,
+                                     flatten = :cw3, riemann = rie)
+                end
+                (abs(tot(D) - m0) / abs(m0), _P.to_host(D))
+            end
+        end
+        for rie in (:hllc, :hll)
+            drift, d = run(:cpu, Float64, rie)
+            @test drift < 1e-12                              # cw3 ng=2 conserves to round-off
+            @test !any(isnan, d)
+        end
+        # ng below the requirement is rejected (cw3 + periodic needs ng ≥ 2)
+        @test_throws ErrorException _P.ppml_step_3d!(
+            _P.to_device(_P.backend(:cpu), rho, Float64), _P.to_device(_P.backend(:cpu), rho .* vx, Float64),
+            _P.to_device(_P.backend(:cpu), rho .* vy, Float64), _P.to_device(_P.backend(:cpu), rho .* vz, Float64),
+            _P.to_device(_P.backend(:cpu), etot, Float64), dims, 1;
+            state = _P.ppml_alloc_state(_P.to_device(_P.backend(:cpu), rho, Float64), dims, 1),
+            dt = dt, gamma = g, dx = dx, face_periodic = true, flatten = :cw3)
+        # metal-f32 ≡ cpu-f32 on the reduced-ghost HLLC path
+        if metal_ready()
+            (_, dc) = run(:cpu, Float32, :hllc); (_, dm) = run(:metal, Float32, :hllc)
+            @check("ppml.cw3.density", dm, dc, RTOL_B)
+        end
+    end
+
     # ── F. fluxrec reproduces the conservative update (AMR reflux enabler) ──────
     @testset "flux recording reproduces the update" begin
         ng = 3; n = 16; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3; dx = 1.0 / n; dt = 0.01

@@ -98,8 +98,9 @@ end
                                   @Const(ρL), @Const(uL), @Const(vL), @Const(wL), @Const(pL),
                                   @Const(ρR), @Const(uR), @Const(vR), @Const(wR), @Const(pR),
                                   @Const(rho), @Const(un), @Const(ut1), @Const(ut2), @Const(pr),
-                                  na::Int, nghost::Int, g, dt_dx, gdegen::Int)
+                                  na::Int, nghost::Int, g, dt_dx, mode::Int)
     ic, gj = @index(Global, NTuple); T = eltype(rfρ)
+    gdegen = mode & 1; flat3 = (mode >> 1) & 1        # packed flags (Metal arg-count cap)
     nf2 = na - 2 * nghost + 2                         # = active + 2
     cl = (gj - 1) * na + nghost + ic - 1
     fo = (gj - 1) * nf2 + ic
@@ -116,8 +117,10 @@ end
                 rho[cl+1], un[cl+1], ut1[cl+1], ut2[cl+1], pr[cl+1],
                 ρL[cl], uL[cl], vL[cl], wL[cl], pL[cl],
                 ρR[cl], uR[cl], vR[cl], wR[cl], pR[cl], g)
-            # CW84 shock flatten (5-pt: pressure + axial velocity)
-            ω = _ppml_flatten_omega(pr[cl-2], un[cl-2], pr[cl-1], un[cl-1], sp, su,
+            # CW84 shock flatten — 5-pt (i±2, wider/less-dissipative) or 3-pt (i±1, the
+            # 1-ghost-local variant). `un` = axial velocity, `pr` = pressure.
+            ω = flat3 == 1 ? _ppml_flatten_omega_3pt(pr[cl-1], un[cl-1], sp, su, pr[cl+1], un[cl+1]) :
+                _ppml_flatten_omega(pr[cl-2], un[cl-2], pr[cl-1], un[cl-1], sp, su,
                                     pr[cl+1], un[cl+1], pr[cl+2], un[cl+2])
             al = _ppml_flat1(al, sρ, ω); bl = _ppml_flat1(bl, su, ω); cl_ = _ppml_flat1(cl_, sv, ω)
             dl = _ppml_flat1(dl, sw, ω); el = _ppml_flat1(el, sp, ω)
@@ -139,15 +142,17 @@ end
 @kernel function _ppml_riemann_k!(fd, fs1, fs2, fs3, fe, fge, sρ, su, sv, sw, sp,
                                   @Const(rfρ), @Const(rfu), @Const(rfv), @Const(rfw), @Const(rfp),
                                   @Const(lfρ), @Const(lfu), @Const(lfv), @Const(lfw), @Const(lfp),
-                                  nfi::Int, nf2::Int, g, gm1, idual::Int)
+                                  nfi::Int, nf2::Int, g, gm1, idual::Int, hllc::Int)
     gi, gj = @index(Global, NTuple)
     fo = (gj - 1) * nfi + gi
     foL = (gj - 1) * nf2 + gi          # +face of the left cell (ic = gi)
     foR = foL + 1                      # −face of the right cell (ic = gi+1)
     @inbounds begin
-        (F1, F2, F3, F4, F5, F6, ρs, us, vs, ws, ps) = _ppml_hll(
-            rfρ[foL], rfu[foL], rfv[foL], rfw[foL], rfp[foL],
-            lfρ[foR], lfu[foR], lfv[foR], lfw[foR], lfp[foR], g, gm1)
+        (F1, F2, F3, F4, F5, F6, ρs, us, vs, ws, ps) = hllc == 1 ?
+            _ppml_hllc(rfρ[foL], rfu[foL], rfv[foL], rfw[foL], rfp[foL],
+                       lfρ[foR], lfu[foR], lfv[foR], lfw[foR], lfp[foR], g, gm1) :
+            _ppml_hll(rfρ[foL], rfu[foL], rfv[foL], rfw[foL], rfp[foL],
+                      lfρ[foR], lfu[foR], lfv[foR], lfw[foR], lfp[foR], g, gm1)
         fd[fo] = F1; fs1[fo] = F2; fs2[fo] = F3; fs3[fo] = F4; fe[fo] = F5
         idual == 1 && (fge[fo] = F6)
         sρ[fo] = ρs; su[fo] = us; sv[fo] = vs; sw[fo] = ws; sp[fo] = ps
@@ -160,7 +165,7 @@ end
 @kernel function _ppml_correct_k!(ρL, uL, vL, wL, pL, ρR, uR, vR, wR, pR,
                                   @Const(rho), @Const(un), @Const(ut1), @Const(ut2), @Const(pr),
                                   @Const(sρ), @Const(su), @Const(sv), @Const(sw), @Const(sp),
-                                  na::Int, nfi::Int, nghost::Int, g)
+                                  na::Int, nfi::Int, nghost::Int, g, flat3::Int)
     ica, gj = @index(Global, NTuple); T = eltype(ρL)
     cl = (gj - 1) * na + nghost + ica
     foM = (gj - 1) * nfi + ica          # −axis interface (between cl-1, cl)
@@ -173,7 +178,8 @@ end
             rho[cl+1], un[cl+1], ut1[cl+1], ut2[cl+1], pr[cl+1],
             sρ[foM], su[foM], sv[foM], sw[foM], sp[foM],
             sρ[foP], su[foP], sv[foP], sw[foP], sp[foP], g)
-        ω = _ppml_flatten_omega(pr[cl-2], un[cl-2], pr[cl-1], un[cl-1], sc_p, sc_u,
+        ω = flat3 == 1 ? _ppml_flatten_omega_3pt(pr[cl-1], un[cl-1], sc_p, sc_u, pr[cl+1], un[cl+1]) :
+            _ppml_flatten_omega(pr[cl-2], un[cl-2], pr[cl-1], un[cl-1], sc_p, sc_u,
                                 pr[cl+1], un[cl+1], pr[cl+2], un[cl+2])
         ρL[cl] = _ppml_flat1(al, sc_ρ, ω); uL[cl] = _ppml_flat1(bl, sc_u, ω)
         vL[cl] = _ppml_flat1(cl_, sc_v, ω); wL[cl] = _ppml_flat1(dl, sc_w, ω); pL[cl] = _ppml_flat1(el, sc_p, ω)
@@ -185,7 +191,8 @@ end
 # one PPML sweep along `axis`, mutating the conserved state + the axis's face pair.
 function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int}, ng::Int, axis::Int;
                            dt::Real, gamma::Real, dx::Real, small_rho::Real,
-                           ge = nothing, eta1::Real = 1e-3, frec = nothing, face_periodic::Bool = false)
+                           ge = nothing, eta1::Real = 1e-3, frec = nothing, face_periodic::Bool = false,
+                           hllc::Bool = true, flat3::Bool = false)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1; nf2 = active + 2
     dtdx = T(dt) / T(dx); g = T(gamma); gm1 = g - one(T); dual = ge !== nothing
@@ -227,13 +234,13 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
         _ppml_c2p_k!(be)(rho, un, ut1, ut2, pr, Dx, Snx, St1x, St2x, Taux, gm1, T(small_rho); ndrange = N)
     end
     # predictor + trace, Riemann flux + star
+    mode = (face_periodic ? 0 : 1) | (flat3 ? 2 : 0)     # bit0=degenerate-ghost, bit1=3-pt flatten
     _ppml_predict_k!(be)(rfρ, rfu, rfv, rfw, rfp, lfρ, lfu, lfv, lfw, lfp,
                          ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
-                         rho, un, ut1, ut2, pr, na, ng, g, dtdx,
-                         face_periodic ? 0 : 1; ndrange = (nf2, ntr))
+                         rho, un, ut1, ut2, pr, na, ng, g, dtdx, mode; ndrange = (nf2, ntr))
     _ppml_riemann_k!(be)(fd, fs1, fs2, fs3, fe, dual ? fge : fd, sρ, su, sv, sw, sp,
                          rfρ, rfu, rfv, rfw, rfp, lfρ, lfu, lfv, lfw, lfp,
-                         nfi, nf2, g, gm1, dual ? 1 : 0; ndrange = (nfi, ntr))
+                         nfi, nf2, g, gm1, dual ? 1 : 0, hllc ? 1 : 0; ndrange = (nfi, ntr))
     # reflux recording (grid-frame face fluxes) — mirrors the Hancock path
     if frec !== nothing
         fa = frec[axis]; nrm = axis; t1 = axis % 3 + 1; t2 = t1 % 3 + 1
@@ -256,7 +263,8 @@ function _ppml_sweep_axis!(D, S1, S2, S3, Tau, st::PpmlState, dims::NTuple{3,Int
         _ppml_c2p_k!(be)(rho, un, ut1, ut2, pr, Dx, Snx, St1x, St2x, Taux, gm1, T(small_rho); ndrange = N)
     end
     _ppml_correct_k!(be)(ρLx, uLx, vLx, wLx, pLx, ρRx, uRx, vRx, wRx, pRx,
-                         rho, un, ut1, ut2, pr, sρ, su, sv, sw, sp, na, nfi, ng, g; ndrange = (active, ntr))
+                         rho, un, ut1, ut2, pr, sρ, su, sv, sw, sp, na, nfi, ng, g,
+                         flat3 ? 1 : 0; ndrange = (active, ntr))
 
     # scatter the CONSERVED set back to the original layout (the corrector wrote the
     # face pair in place, in its persistent transposed frame — nothing to untranspose).
@@ -271,18 +279,23 @@ end
 """
     ppml_step_3d!(D, S1, S2, S3, Tau, dims, ng; state, dt, gamma, dx=1.0,
                   order=(1,2,3), small_rho=1e-10, bc!=nothing, ge=nothing,
-                  eta1=1e-3, fluxrec=nothing)
+                  eta1=1e-3, fluxrec=nothing, riemann=:hllc, flatten=:cw5)
 
 One PPML (Piecewise-Parabolic Method on a Local stencil, Ustyugov+ 2009) timestep on
 the conserved state, dimensionally split: three in-place directional sweeps in `order`.
 Each sweep reads the persistent face pair in `state` (a [`PpmlState`](@ref), allocate
 with [`ppml_alloc_state`](@ref) + initialise with [`ppml_init_state!`](@ref)), applies
 the RGK characteristic limiter + CW84 monotonize + shock flatten + the
-characteristic-traced half-step predictor, solves HLL with a star state, updates the
-conserved set, and re-derives the pair from the Riemann stars.
+characteristic-traced half-step predictor, solves the Riemann problem with a star
+state, updates the conserved set, and re-derives the pair from the Riemann stars.
 
-`recon`-free (the parabola is anchored on the stored pair). Needs **`ng ≥ 3`** (5-point
-flatten stencil). `ge` (ρ·eint) turns on the dual-energy formalism; `fluxrec` records
+`riemann` ∈ `:hllc` (default, contact-resolving — sharper) | `:hll` (more diffusive).
+`flatten` ∈ `:cw5` (default, 5-point CW84 ramp) | `:cw3` (3-point narrow variant).
+
+GHOST ZONES: the reconstruction core (RGK limiter + trace) is 1-ghost-LOCAL; the only
+wider piece is the flattener. Minimum `ng = (flatten==:cw5 ? 2 : 1) + (face_periodic ?
+1 : 0)` — e.g. `:cw3` runs at `ng=1` (degenerate boundary / Enzo) or `ng=2` (periodic).
+`ge` (ρ·eint) turns on the dual-energy formalism; `fluxrec` records
 grid-frame interface fluxes for the AMR reflux (same convention as
 [`muscl_hancock_step_3d!`](@ref)). Mutates the state, `ge`, and `state` in place.
 """
@@ -290,9 +303,14 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                        state::PpmlState, dt::Real, gamma::Real, dx::Real = 1.0,
                        order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
                        bc! = nothing, ge = nothing, eta1::Real = 1e-3, fluxrec = nothing,
-                       face_periodic::Bool = false)
-    be = KA.get_backend(D)
-    ng < 3 && error("ppml_step_3d!: needs ng ≥ 3 (5-point flatten stencil), got $ng")
+                       face_periodic::Bool = false, riemann::Symbol = :hllc, flatten::Symbol = :cw5)
+    be = KA.get_backend(D); hllc = riemann === :hllc; flat3 = flatten === :cw3
+    # PPML's reconstruction is LOCAL: the RGK limiter + trace are 3-point (1 ghost). The
+    # only wider piece is the flattener — :cw5 reads i±2, :cw3 (the Rust narrow variant)
+    # reads i±1. Plus 1 ghost when a periodic seam is reconstructed in-place. So the
+    # minimum ghost count is (flatten halfwidth) + (periodic ? 1 : 0).
+    need = (flat3 ? 1 : 2) + (face_periodic ? 1 : 0)
+    ng < need && error("ppml_step_3d!: flatten=$flatten, face_periodic=$face_periodic need ng ≥ $need, got $ng")
     # `face_periodic` = periodic standalone mode: with no explicit `bc!`, also wrap the
     # CONSERVED ghosts each sweep (the seam flux is single-valued only when both the
     # cell averages AND the stored face pair are periodic-consistent ⇒ conservation).
@@ -307,7 +325,8 @@ function ppml_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
         bcfill!()
         _ppml_sweep_axis!(D, S1, S2, S3, Tau, state, dims, ng, axis;
                           dt = dt, gamma = gamma, dx = dx, small_rho = small_rho,
-                          ge = ge, eta1 = eta1, frec = fluxrec, face_periodic = face_periodic)
+                          ge = ge, eta1 = eta1, frec = fluxrec, face_periodic = face_periodic,
+                          hllc = hllc, flat3 = flat3)
     end
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)
     KA.synchronize(be)
