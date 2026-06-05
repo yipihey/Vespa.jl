@@ -450,3 +450,55 @@ end
         @check("dual.metal≡cpu", run_d(:metal), run_d(:cpu), RTOL_B)
     end
 end
+
+# Flux RECORDING for the AMR reflux (`fluxrec=` on muscl_hancock_step_3d!): the
+# recorded grid-frame interface fluxes must EXACTLY reproduce the conservative
+# update they drove — i.e. ΔU[c] = −Σ_a (F_a[c+ê_a] − F_a[c])·(dt/dx) per cell, per
+# conserved field, to round-off. This is what lets the :julia-under-AMR slot fill
+# Enzo's flux registers with PPMKernels' own fluxes (ADR-0003 part B).
+@testset "flux recording reproduces the conservative update (reflux enabler)" begin
+    ng = 3; n = 16; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3
+    gamma = 1.4; dx = 1.0 / n; dt = 0.01
+    nx, ny, nz = dims; idx(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+    rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        x = (i - ng - 0.5) / n; y = (j - ng - 0.5) / n; z = (k - ng - 0.5) / n; q = idx(i, j, k)
+        rho[q] = 1.0 + 0.3 * sinpi(2x) * cospi(2y); pr = 0.6 + 0.2 * cospi(2z)
+        vx[q] = 0.2 * sinpi(2y); vy[q] = 0.15 * cospi(2z); vz[q] = -0.1 * sinpi(2x)
+        etot[q] = pr / ((gamma - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+    end
+    ea = (1, nx, nx * ny)                       # column-major neighbour stride per axis
+    # frec[axis][field][c] = flux through the −axis face of cell c (6 fields in GRID
+    # order D,S1,S2,S3,E,Ge). The +ê_a neighbour holds the +axis face of the same cell.
+    @testset "$rc reconstruction" for rc in (:plm, :ppm)
+        D = copy(rho); S1 = rho .* vx; S2 = rho .* vy; S3 = rho .* vz; Tau = rho .* etot
+        U0 = (copy(D), copy(S1), copy(S2), copy(S3), copy(Tau))
+        frec = ntuple(_ -> ntuple(_ -> zeros(N), 6), 3)
+        PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, ng;
+                                          dt = dt, gamma = gamma, dx = dx, recon = rc, fluxrec = frec)
+        U1 = (D, S1, S2, S3, Tau); dtdx = dt / dx
+        for fld in 1:5
+            maxres = 0.0
+            for k in ng+1:nz-ng, j in ng+1:ny-ng, i in ng+1:nx-ng
+                c = idx(i, j, k)
+                div = 0.0
+                for a in 1:3
+                    div += (frec[a][fld][c+ea[a]] - frec[a][fld][c]) * dtdx
+                end
+                maxres = max(maxres, abs((U1[fld][c] - U0[fld][c]) + div))
+            end
+            @test maxres < 1e-13                # round-off ⇒ recorded fluxes ARE the update
+        end
+    end
+
+    # the default (fluxrec=nothing) path is inert: stepping with/without recording
+    # gives a bit-identical state (recording is a pure read-out, no feedback).
+    @testset "fluxrec=nothing is bit-identical" begin
+        s0 = (copy(rho), rho .* vx, rho .* vy, rho .* vz, rho .* etot)
+        s1 = (copy(rho), rho .* vx, rho .* vy, rho .* vz, rho .* etot)
+        PPMKernels.muscl_hancock_step_3d!(s0..., dims, ng; dt = dt, gamma = gamma, dx = dx)
+        frec = ntuple(_ -> ntuple(_ -> zeros(N), 6), 3)
+        PPMKernels.muscl_hancock_step_3d!(s1..., dims, ng; dt = dt, gamma = gamma, dx = dx, fluxrec = frec)
+        @test all(s0[f] == s1[f] for f in 1:5)
+    end
+end

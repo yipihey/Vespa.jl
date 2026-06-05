@@ -328,18 +328,43 @@ export muscl_hancock_step_3d!
     end
 end
 
+# flux RECORDING (for the AMR reflux): scatter a sweep's interface-flux line into a
+# transposed slab — Gt[axis-cell ng+gi] = F[interface gi] (the flux through that
+# cell's −axis face) — which `_untranspose_into!` then lands in the grid frame. The
+# slab must be pre-zeroed (cells outside ng+1 … ng+nfi carry no recorded face).
+@kernel function _flux_to_slab!(Gt, @Const(f), na::Int, nfi::Int, nghost::Int)
+    gi, gj = @index(Global, NTuple)
+    @inbounds Gt[(gj - 1) * na + nghost + gi] = f[(gj - 1) * nfi + gi]
+end
+
 # one Hancock sweep along `axis`, mutating the conserved state in place. Mirrors
 # the PPM `sweep_axis!`: x is contiguous; y/z transpose the swept axis to the lead
 # (conserved momenta rotated to (normal,t1,t2) order, like the velocities), solve,
 # update in place, untranspose back.
 function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
                               dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
-                              recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3)
+                              recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3,
+                              frec = nothing)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
     dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx)); dual = ge !== nothing
+    perm = _axis_perm(axis)
     # conserved momenta in cyclic (normal, t1, t2) role for this axis
     Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
+    # record this sweep's grid-frame face fluxes into frec[axis] (6 fields D,S1,S2,S3,
+    # E,Ge in GRID order): the momentum fluxes rotate back like the momenta.
+    function record_fluxes!()
+        frec === nothing && return
+        fa = frec[axis]; nrm = axis; t1 = axis % 3 + 1; t2 = t1 % 3 + 1
+        slab = _scratch(D, N)
+        rec(comp, tgt) = begin
+            fill!(slab, zero(T))
+            _flux_to_slab!(be)(slab, comp, na, nfi, ng; ndrange = (nfi, ntr))
+            _untranspose_into!(tgt, slab, dims, perm)
+        end
+        rec(fd, fa[1]); rec(fs1, fa[1+nrm]); rec(fs2, fa[1+t1]); rec(fs3, fa[1+t2]); rec(fe, fa[5])
+        dual && rec(fge, fa[6])
+    end
     rho = _scratch(D, N; zero = false); eint = _scratch(D, N; zero = false)
     vx = _scratch(D, N; zero = false); vy = _scratch(D, N; zero = false); vz = _scratch(D, N; zero = false)
     fd = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
@@ -357,16 +382,17 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
     if axis == 1                                   # contiguous — work in place
         c2p(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau, ge)
         fl(rho, eint, vx, vy, vz)
+        record_fluxes!()
         _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         dual && _ge_update_k!(be)(ge, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
     else
-        perm = _axis_perm(axis)
         DT = transpose3(D, dims, perm); TauT = transpose3(Tau, dims, perm)
         SnT = transpose3(Sn, dims, perm); St1T = transpose3(St1, dims, perm); St2T = transpose3(St2, dims, perm)
         GeT = dual ? transpose3(ge, dims, perm) : nothing
         c2p(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT, GeT)
         fl(rho, eint, vx, vy, vz)
+        record_fluxes!()
         _cons_update_k!(be)(DT, SnT, St1T, St2T, TauT, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         dual && _ge_update_k!(be)(GeT, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
@@ -402,7 +428,8 @@ place; wrap a loop in [`with_pool`](@ref) for the allocation win.
 function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
                                 order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
-                                bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3)
+                                bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3,
+                                fluxrec = nothing)
     be = KA.get_backend(D); T = eltype(D)
     recon === :ppm && ng < 3 && error("muscl_hancock_step_3d!: recon=:ppm needs ng ≥ 3 (got $ng)")
     # uniform-grid PPM coefficients (the dx-independent limit of _ie_geom1!/_ie_geom2!:
@@ -424,7 +451,7 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         bcfill!()
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
-                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1)
+                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec)
     end
     # DEF reset: re-sync the gas energy and total energy once per step.
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)
