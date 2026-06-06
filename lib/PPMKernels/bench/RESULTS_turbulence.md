@@ -73,16 +73,20 @@ pair + extremum-preserving reconstruction), not raw low-Mach sharpness.
 `bench/compare_turb_dissipation.jl 128 5 0.5` — solenoidal Mach₀=5 IC, evolved to
 0.5·t_cross (t_cross = L/v_rms), 128³, Metal f32, dual energy on, a SINGLE fixed dt
 shared by all solvers. Metric = FINAL state; a less-dissipative solver keeps a higher
-final RMS Mach / v_rms. **Whole sweep (6 solvers) ran in 194 s (~3.2 min).**
+final RMS Mach / v_rms. Now sweeps **9 solvers** (the two Riemann variants HLLC/two-shock
+and the trace predictor added), ~280 s of GPU stepping for ~900 steps each.
 
-| Solver | Mach_f | v_rms_f | KE diss % | Δmass/M | wall(s) |
+| Solver | Mach_f | v_rms_f | KE diss % | Δmass/M | Mcell/s |
 |---|--:|--:|--:|--:|--:|
-| Hancock-PPM    | 1.427 | **3.198** | **63.5** | 1.4e-9  | 19.8 |
-| PPM-DirectEuler| 1.420 | 3.195 | 63.5 | 2.7e-4† | 40.0 |
-| RK2 (PLM)      | 1.378 | 3.121 | 65.3 | 3.2e-9  | 28.2 |
-| Hancock-PLM    | 1.380 | 3.124 | 65.3 | 5.3e-10 | 17.5 |
-| PPML-trace     | 1.254 | 2.937 | 69.0 | 4.6e-11 | 40.1 |
-| PPML-Hancock   | 1.242 | 2.918 | 69.4 | 5.7e-10 | 39.3 |
+| **Hancock-PPM-tr-2shk** | **1.452** | **3.244** | **62.4** | 4.6e-10 | 69.1 |
+| Hancock-PPM-HLLC    | 1.443 | 3.234 | 62.6 | 1.7e-9  | 79.1 |
+| Hancock-PPM-trace   | 1.430 | 3.200 | 63.5 | 7.4e-10 | 76.6 |
+| Hancock-PPM         | 1.427 | 3.198 | 63.5 | 1.4e-9  | 79.5 |
+| PPM-DirectEuler     | 1.420 | 3.195 | 63.5 | 2.7e-4† | 40.5 |
+| Hancock-PLM         | 1.380 | 3.124 | 65.3 | 5.3e-10 | 90.4 |
+| RK2 (PLM)           | 1.378 | 3.121 | 65.3 | 3.2e-9  | 67.4 |
+| PPML-trace          | 1.254 | 2.937 | 69.0 | 4.6e-11 | 43.5 |
+| PPML-Hancock        | 1.242 | 2.918 | 69.4 | 5.7e-10 | 47.8 |
 
 †DirectEuler now uses the `bc!` inter-sweep periodic refill (added to `ppm_step_3d!`) and
 the diagnostic reads internal energy from the conserved TOTAL energy (etot−½v²) — the same
@@ -90,6 +94,21 @@ footing as the others — so its Mach_f (1.420) now matches Hancock-PPM (1.427) 
 small ~2.7e-4 mass drift remains (its wide PPM stencil + flattener are not perfectly
 periodic-consistent at the seam, unlike the simple flux-form solvers' round-off
 conservation); it does not affect the dissipation conclusion.
+
+- **In shocks the Riemann solver is the lever, NOT the predictor — the exact mirror of the
+  smooth wave.** Holding reconstruction (`:ppm`) fixed: swapping the predictor
+  `:hancock`→`:trace` does *nothing* here (1.427/63.5 % → 1.430/63.5 %, identical), because
+  the limiter clips the parabola so hard at Mach 5 that the trace's curvature term never
+  survives. But upgrading the Riemann solver moves the needle: HLLC 1.443/62.6 % and
+  two-shock 1.452/62.4 % are the two LEAST-dissipative solvers in the table — the contact/
+  shock resolution is what retains turbulent KE. This is the precise inverse of the advected
+  sound wave (predictor = decisive lever there, Riemann inert); the two levers cleanly
+  separate by regime.
+- **HLLC ≈ two-shock at a fraction of the cost.** HLLC (62.6 %, 79.1 Mcell/s) captures ~90 %
+  of two-shock's accuracy gain (62.4 %) at near-zero overhead vs plain HLL (79.5), whereas
+  the iterative two-shock star-state solve costs ~13 % throughput (69.1 Mcell/s). For
+  shock-dominated flow HLLC is the better throughput/accuracy point; two-shock is the
+  accuracy ceiling of the Hancock-PPM branch.
 
 - **The ranking is robust at developed Mach-5 turbulence** (and matches the earlier,
   doubted Mach-1 result — it is NOT a startup artifact): **PPM-reconstruction (Hancock-PPM,
@@ -106,8 +125,9 @@ conservation); it does not affect the dissipation conclusion.
   high-order machinery (parabola, WENO5) pays off in smooth flow, not at the shocks that
   dominate here. PPML trades supersonic sharpness for robustness; the predictor choice
   (trace vs Hancock) barely moves it (69.0 vs 69.4 %).
-- **Affordable on the GPU**: 17–39 s per solver at 128³ for ~900 steps (50–107 Mcell/s
-  incl. the periodic BC fills + dual energy + host diagnostics).
+- **Affordable on the GPU**: ~21–47 s per solver at 128³ for ~900 steps (40–90 Mcell/s
+  incl. the periodic BC fills + dual energy + host diagnostics; Hancock-PLM fastest at 90,
+  the full PPM-DirectEuler/PPML pipelines slowest at ~40–48).
 
 ## Advected sound wave — smooth-flow accuracy + asymmetry (GPU)
 
