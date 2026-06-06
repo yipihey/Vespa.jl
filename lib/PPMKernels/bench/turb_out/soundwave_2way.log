@@ -1,0 +1,8 @@
+/Users/tabel/Projects/enzo-dev/EnzoNG.jl/lib/PPMKernels/bench/turb_out/soundwave_2way.ppm
+  /Users/tabel/Projects/enzo-dev/EnzoNG.jl/lib/PPMKernels/bench/turb_out/soundwave_2way_10x.png
+sound wave 128×8²  k=4 (32 c/λ)  A=1e-03  10 crossings (4269 steps) [metal]
+  Hancock-PPM-trace    amp(p2p)=0.820  distort(→□)=0.171
+  Hancock-PPM-tr-2shk  amp(p2p)=0.858  distort(→□)=0.133
+wrote /Users/tabel/Projects/enzo-dev/EnzoNG.jl/lib/PPMKernels/bench/turb_out/soundwave_2way_10x.png
+panels L→R: trace+HLL (red) | trace+2shk (blue) | overlay (gray=exact) — predictor=:trace FIXED, only Riemann differs ; y-scale ±1.1·A
+===== EXIT 0 =====

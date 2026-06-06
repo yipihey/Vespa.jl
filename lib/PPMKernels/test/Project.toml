@@ -5,6 +5,7 @@
 # golden fixtures; Metal (when present) enables the f32 CPU↔GPU parity layers.
 [deps]
 PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
+PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
 EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
@@ -14,5 +15,6 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 PPMKernels = {path = ".."}
+PoissonKernels = {path = "../../PoissonKernels"}
 EnzoFixtures = {path = "../../EnzoFixtures"}
 EnzoLib = {path = "../../EnzoLib"}

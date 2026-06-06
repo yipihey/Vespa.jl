@@ -136,6 +136,93 @@ function hydro_rk_line(prim::AbstractMatrix{<:Real}; riemann::Integer = 1, gamma
     return out
 end
 
+# ── multigrid Poisson kernels — the golden reference for the PoissonKernels port ──
+# Thin ccall wrappers around Enzo's live mg_* Fortran kernels (via the grid dylib's
+# enzomodules_mg_bridge.C).  Arrays are Float64, 3-D, column-major — passed straight
+# to Fortran (shared layout, no transpose).  The bridge links the p8_b8 library, so
+# these run in double precision (bit-tight f64 oracles).  Requires `grid_available()`.
+
+"""
+    mg_relax_ref(sol, rhs; ndim=3) -> Array{Float64,3}
+
+One Enzo `mg_relax` Gauss-Seidel relaxation (out-of-place: returns a relaxed copy
+of `sol`). `sol`,`rhs` are 3-D `Float64` arrays `(dim1,dim2,dim3)`.
+"""
+function mg_relax_ref(sol::Array{Float64,3}, rhs::Array{Float64,3}; ndim::Integer = 3)
+    out = copy(sol)
+    rc = ccall(_gsym(:enzomodules_mg_relax), Cint,
+               (Cint, Cint, Cint, Cint, Ptr{Cdouble}, Ptr{Cdouble}),
+               ndim, size(sol, 1), size(sol, 2), size(sol, 3), out, rhs)
+    rc == 0 || error("enzomodules_mg_relax returned $rc")
+    return out
+end
+
+"""
+    mg_calc_defect_ref(sol, rhs; ndim=3) -> (defect::Array{Float64,3}, norm::Float64)
+
+Enzo `mg_calc_defect`: the negative residual `-(L·sol - rhs)` and its L2 norm.
+"""
+function mg_calc_defect_ref(sol::Array{Float64,3}, rhs::Array{Float64,3}; ndim::Integer = 3)
+    defect = zeros(Float64, size(sol))
+    norm = Ref{Cdouble}(0.0)
+    rc = ccall(_gsym(:enzomodules_mg_calc_defect), Cint,
+               (Cint, Cint, Cint, Cint, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
+               ndim, size(sol, 1), size(sol, 2), size(sol, 3), sol, rhs, defect, norm)
+    rc == 0 || error("enzomodules_mg_calc_defect returned $rc")
+    return defect, norm[]
+end
+
+"""
+    mg_restrict_ref(src, ddims; ndim=3) -> Array{Float64,3}
+
+Enzo `mg_restrict`: restrict the fine field `src` onto a coarse field of shape `ddims`.
+"""
+function mg_restrict_ref(src::Array{Float64,3}, ddims::NTuple{3,<:Integer}; ndim::Integer = 3)
+    dest = zeros(Float64, ddims)
+    rc = ccall(_gsym(:enzomodules_mg_restrict), Cint,
+               (Cint, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}, Ptr{Cdouble}),
+               ndim, size(src, 1), size(src, 2), size(src, 3),
+               ddims[1], ddims[2], ddims[3], src, dest)
+    rc == 0 || error("enzomodules_mg_restrict returned $rc")
+    return dest
+end
+
+"""
+    mg_prolong_ref(src, ddims; ndim=3) -> Array{Float64,3}
+
+Enzo `mg_prolong`: prolong the coarse field `src` onto a fine field of shape `ddims`.
+"""
+function mg_prolong_ref(src::Array{Float64,3}, ddims::NTuple{3,<:Integer}; ndim::Integer = 3)
+    dest = zeros(Float64, ddims)
+    rc = ccall(_gsym(:enzomodules_mg_prolong), Cint,
+               (Cint, Cint, Cint, Cint, Cint, Cint, Cint, Ptr{Cdouble}, Ptr{Cdouble}),
+               ndim, size(src, 1), size(src, 2), size(src, 3),
+               ddims[1], ddims[2], ddims[3], src, dest)
+    rc == 0 || error("enzomodules_mg_prolong returned $rc")
+    return dest
+end
+
+"""
+    comp_accel_ref(src, ddims; iflag, start, del, ndim=3) -> (a1, a2, a3)
+
+Enzo `comp_accel`: difference the potential `src` into three acceleration fields of
+shape `ddims`. `start=(s1,s2,s3)` is the dest→source offset, `del=(dx,dy,dz)` the
+cell sizes, `iflag` ∈ {0,1} the staggering.
+"""
+function comp_accel_ref(src::Array{Float64,3}, ddims::NTuple{3,<:Integer};
+                        iflag::Integer, start, del, ndim::Integer = 3)
+    a1 = zeros(Float64, ddims); a2 = zeros(Float64, ddims); a3 = zeros(Float64, ddims)
+    rc = ccall(_gsym(:enzomodules_comp_accel), Cint,
+               (Cint, Cint, Cint, Cint, Cint, Cint, Cint, Cint,
+                Cint, Cint, Cint, Cdouble, Cdouble, Cdouble,
+                Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
+               ndim, iflag, size(src, 1), size(src, 2), size(src, 3),
+               ddims[1], ddims[2], ddims[3], start[1], start[2], start[3],
+               del[1], del[2], del[3], src, a1, a2, a3)
+    rc == 0 || error("enzomodules_comp_accel returned $rc")
+    return a1, a2, a3
+end
+
 # ── low-level Session / problem entry points (signatures per problems.py) ─────
 const Handle = Ptr{Cvoid}
 
@@ -149,6 +236,12 @@ evolve_problem(paramfile::AbstractString, stop_time::Real = 0.0, stop_cycle::Int
 free_problem(h::Handle) = @xcall(:enzomodules_free_problem, Cvoid, (Handle,), h)
 
 session_time(h::Handle)      = @xcall(:enzomodules_session_time, Cdouble, (Handle,), h)
+"Expansion factor `a` (a=1 at the initial redshift) and redshift `z`; (1.0,0.0) if non-comoving."
+function session_cosmology(h::Handle)
+    a = Ref{Cdouble}(1.0); z = Ref{Cdouble}(0.0)
+    @xcall(:enzomodules_session_cosmology, Cint, (Handle, Ptr{Cdouble}, Ptr{Cdouble}), h, a, z)
+    (a[], z[])
+end
 session_stop_time(h::Handle) = @xcall(:enzomodules_session_stop_time, Cdouble, (Handle,), h)
 session_cycle(h::Handle)     = @xcall(:enzomodules_session_cycle, Cint, (Handle,), h)
 session_compute_dt(h::Handle, level::Integer = 0) =
@@ -194,6 +287,9 @@ session_num_grids_on_level(h::Handle, level::Integer) =
 # Optional physics steps (no-ops when their physics is off) — for non-hydro problems.
 session_gravity(h::Handle, level::Integer = 0) =
     @xcall(:enzomodules_session_gravity, Cint, (Handle, Cint), h, level)
+"Deposit-only: populate GravitatingMassField (no SolveForPotential) — for GPU gravity on Enzo's source."
+session_prepare_density(h::Handle, level::Integer = 0) =
+    @xcall(:enzomodules_session_prepare_density, Cint, (Handle, Cint), h, level)
 session_solve_cooling(h::Handle, level::Integer = 0) =
     @xcall(:enzomodules_session_solve_cooling, Cint, (Handle, Cint), h, level)
 session_star_particles(h::Handle, level::Integer = 0) =
@@ -250,6 +346,25 @@ function problem_set_field(h::Handle, fi::Integer, data::Vector{Float64}; grid::
 end
 
 """
+    deposit_particle_density(h; grid=0, periodic=true) -> Vector{Float64}
+
+CIC-deposit grid `grid`'s particles onto its baryon mesh (flat, incl. ghost zones)
+as a DM mass density, in one in-process C++ pass — the DM source a `:julia` gravity
+slot needs WITHOUT marshalling every particle position to the host + a host CIC
+(the gravity-slot bottleneck). `periodic=true` wraps the active region (the periodic
+ROOT, where this mirrors the host CIC exactly — parity-neutral); `periodic=false`
+clamps out-of-range deposits (a non-periodic SUBGRID — wrapping there scatters edge
+particles to the opposite edge and corrupts the source). Local-only (in-process
+`ccall`); requires `grid_available()`.
+"""
+function deposit_particle_density(h::Handle; grid::Integer = 0, periodic::Bool = true)
+    out = zeros(Float64, problem_grid_size(h, grid))
+    ccall(_gsym(:enzomodules_problem_deposit_particle_density), Cvoid,
+          (Handle, Cint, Ptr{Cdouble}, Cint), h, grid, out, periodic ? 1 : 0)
+    return out
+end
+
+"""
     problem_set_acceleration(h, dim, data; grid=0)
     problem_get_acceleration(h, dim, data; grid=0)
 
@@ -271,6 +386,25 @@ function problem_get_acceleration(h::Handle, dim::Integer, grid::Integer = 0)
     @xcall(:enzomodules_problem_get_acceleration, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, dim, out)
     return out
+end
+
+"Dimensions of grid `grid`'s GravitatingMassField (gravity source/potential mesh)."
+function problem_gmf_dims(h::Handle, grid::Integer = 0)
+    d = Vector{Cint}(undef, 3)
+    @xcall(:enzomodules_problem_gmf_dims, Cvoid, (Handle, Cint, Ptr{Cint}), h, grid, d)
+    Tuple(Int.(d))
+end
+"Enzo's actual Poisson SOURCE (GravitatingMassField) on `grid` — for testing gravity kernels."
+function problem_get_gravitating_mass(h::Handle, grid::Integer = 0)
+    dims = problem_gmf_dims(h, grid); out = zeros(Float64, prod(dims))
+    @xcall(:enzomodules_problem_get_gravitating_mass, Cvoid, (Handle, Cint, Ptr{Cdouble}), h, grid, out)
+    reshape(out, dims)
+end
+"Enzo's solved gravitational PotentialField on `grid` — for testing gravity kernels."
+function problem_get_potential(h::Handle, grid::Integer = 0)
+    dims = problem_gmf_dims(h, grid); out = zeros(Float64, prod(dims))
+    @xcall(:enzomodules_problem_get_potential, Cvoid, (Handle, Cint, Ptr{Cdouble}), h, grid, out)
+    reshape(out, dims)
 end
 
 # ── ADR-0003 part B: BoundaryFluxes bridge (conservative :julia hydro under AMR) ──
@@ -404,6 +538,47 @@ function problem_get_particle_pos(h::Handle, dim::Integer, grid::Integer = 0)
     @xcall(:enzomodules_problem_get_particle_pos, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
           h, grid, dim, out)
     return out
+end
+
+"Particle velocities along axis `dim` (0-based) on `grid`, in code units."
+function problem_get_particle_vel(h::Handle, dim::Integer, grid::Integer = 0)
+    np = problem_num_particles(h, grid)
+    out = zeros(Float64, np)
+    np == 0 && return out
+    @xcall(:enzomodules_problem_get_particle_vel, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, out)
+    return out
+end
+
+"Particle masses on `grid` (code units)."
+function problem_get_particle_mass(h::Handle, grid::Integer = 0)
+    np = problem_num_particles(h, grid); out = zeros(Float64, np); np == 0 && return out
+    @xcall(:enzomodules_problem_get_particle_mass, Cvoid, (Handle, Cint, Ptr{Cdouble}), h, grid, out)
+    return out
+end
+"All particle masses (concatenated over grids), mirrors read_particles ordering."
+function read_particle_masses(h::Handle)
+    ng = problem_num_grids(h); blocks = Vector{Float64}[]
+    for g in 0:ng-1
+        np = problem_num_particles(h, g); np == 0 && continue
+        push!(blocks, problem_get_particle_mass(h, g))
+    end
+    isempty(blocks) && return Float64[]
+    return reduce(vcat, blocks)
+end
+
+"All particle velocities, Nparticles × rank (mirrors read_particles)."
+function read_particle_velocities(h::Handle)
+    ng = problem_num_grids(h); rank = ng > 0 ? problem_grid_rank(h, 0) : 3
+    blocks = Matrix{Float64}[]
+    for g in 0:ng-1
+        np = problem_num_particles(h, g); np == 0 && continue
+        M = Matrix{Float64}(undef, np, rank)
+        for d in 0:rank-1; M[:, d+1] = problem_get_particle_vel(h, d, g); end
+        push!(blocks, M)
+    end
+    isempty(blocks) && return Matrix{Float64}(undef, 0, rank)
+    return reduce(vcat, blocks)
 end
 
 """

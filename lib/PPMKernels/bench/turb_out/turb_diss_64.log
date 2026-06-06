@@ -1,0 +1,17 @@
+
+Supersonic decaying turbulence — 64³  Mach0=5.00  → 0.50 t_cross (t=0.1000)  [metal/Float32]
+IC: v_rms=5.000  Mach_rms=5.000  KE=12.5 ;  fixed dt=2.22e-04 ⇒ 450 steps (vmax=14.05)
+
+solver            Mach_f     v_rms_f    KE diss%  Δmass/M    wall(s)   Mcell/s 
+----------------------------------------------------------------------------
+RK2 (PLM)         1.246      2.906      69.8      1.8e-09    7.4       15.9    
+Hancock-PLM       1.247      2.909      69.8      3.2e-09    2.9       41.1    
+Hancock-PPM       1.312      3.013      67.6      3.1e-09    4.8       24.4    
+Hancock-PPM-HLLC  1.345      3.076      66.1      5.8e-09    3.4       34.5    
+Hancock-PPM-trace 1.313      3.014      67.6      1.9e-09    3.3       35.8    
+Hancock-PPM-tr-2shk 1.354      3.088      65.9      6.2e-09    3.6       32.4    
+PPM-DirectEuler   1.314      3.026      67.3      6.4e-04    8.5       13.9    
+PPML-trace        1.120      2.710      73.3      4.6e-09    4.4       26.7    
+PPML-Hancock      1.107      2.689      73.7      1.5e-09    4.8       24.6    
+
+===== EXIT 0 =====

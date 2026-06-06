@@ -1,0 +1,14 @@
+[deps]
+PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
+EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
+EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+PoissonKernels = {path = ".."}
+EnzoFixtures = {path = "../../EnzoFixtures"}
+EnzoLib = {path = "../../EnzoLib"}
