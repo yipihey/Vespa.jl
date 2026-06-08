@@ -73,8 +73,8 @@ pair + extremum-preserving reconstruction), not raw low-Mach sharpness.
 `bench/compare_turb_dissipation.jl 128 5 0.5` — solenoidal Mach₀=5 IC, evolved to
 0.5·t_cross (t_cross = L/v_rms), 128³, Metal f32, dual energy on, a SINGLE fixed dt
 shared by all solvers. Metric = FINAL state; a less-dissipative solver keeps a higher
-final RMS Mach / v_rms. Now sweeps **9 solvers** (the two Riemann variants HLLC/two-shock
-and the trace predictor added), ~280 s of GPU stepping for ~900 steps each.
+final RMS Mach / v_rms. The harness now also includes the one-ghost
+`Local-PPM-tr-2shk` prototype (`recon=:ppm_local`).
 
 | Solver | Mach_f | v_rms_f | KE diss % | Δmass/M | Mcell/s |
 |---|--:|--:|--:|--:|--:|
@@ -83,6 +83,7 @@ and the trace predictor added), ~280 s of GPU stepping for ~900 steps each.
 | Hancock-PPM-trace   | 1.430 | 3.200 | 63.5 | 7.4e-10 | 76.6 |
 | Hancock-PPM         | 1.427 | 3.198 | 63.5 | 1.4e-9  | 79.5 |
 | PPM-DirectEuler     | 1.420 | 3.195 | 63.5 | 2.7e-4† | 40.5 |
+| **Local-PPM-tr-2shk (1 ghost)** | **1.447** | **3.238** | **62.5** | **7.9e-10** | **78.7** |
 | Hancock-PLM         | 1.380 | 3.124 | 65.3 | 5.3e-10 | 90.4 |
 | RK2 (PLM)           | 1.378 | 3.121 | 65.3 | 3.2e-9  | 67.4 |
 | PPML-trace          | 1.254 | 2.937 | 69.0 | 4.6e-11 | 43.5 |
@@ -109,6 +110,21 @@ conservation); it does not affect the dissipation conclusion.
   the iterative two-shock star-state solve costs ~13 % throughput (69.1 Mcell/s). For
   shock-dominated flow HLLC is the better throughput/accuracy point; two-shock is the
   accuracy ceiling of the Hancock-PPM branch.
+- **The one-ghost local prototype is a viable portability compromise.**
+  `Local-PPM-tr-2shk` builds a quadratic from only `(i-1,i,i+1)`, uses the full
+  characteristic trace, and falls back to minmod-θ PLM in locally compressive/troubled
+  cells. The fallback is a continuous blend rather than a binary switch: mild
+  compression retains most PPM curvature and strong shocks reach the TVD MC endpoint.
+  It is stateless (unlike PPML) and needs one ghost. At 128³ it reaches 78.7 Mcell/s —
+  14% faster than wide `tr-2shk` — while losing 62.5% of KE, effectively identical to
+  wide `tr-2shk` (62.4%) and HLLC (62.6%). This is the candidate architecture for
+  RAMSES/AREPO.
+
+- **Recommended strong default: `HydroMethod = 10`.** This selects the stateless
+  `Local-PPM-tr-2shk` method through `EnzoLib.run_amr`: one ghost zone, compact
+  parabolic reconstruction, characteristic tracing, two-shock fluxes, and
+  conservative AMR refluxing. Keep the wide-stencil DirectEuler PPM as the
+  reference method and use PLM when maximum robustness or minimum cost dominates.
 
 - **The ranking is robust at developed Mach-5 turbulence** (and matches the earlier,
   doubted Mach-1 result — it is NOT a startup artifact): **PPM-reconstruction (Hancock-PPM,
@@ -152,6 +168,7 @@ Amplitude is the PEAK-TO-PEAK ratio (the honest amplitude). NOTE: the Fourier-fu
 | Hancock-PPM-2shk    | 0.676 | +0.023 | 0.090 | 24 |
 | **Hancock-PPM-trace** | **0.821** | **−0.014** | **0.172** | **21** |
 | Hancock-PPM-tr-2shk | 0.859 | −0.013 | 0.133 | 25 |
+| **Local-PPM-tr-2shk (1 ghost)** | **0.883** | **−0.014** | **0.032** | **15** |
 | PPM-DirectEuler     | 0.790 | −0.017 | 0.206 | 93 |
 | PPML-trace          | 0.945 | −0.010 | 0.270 | 42 |
 
@@ -159,6 +176,10 @@ Amplitude is the PEAK-TO-PEAK ratio (the honest amplitude). NOTE: the Fourier-fu
   high-order reconstructions keep peak-to-peak far better: PLM is most dissipative
   (amp 0.41–0.60), PPM/PPML least (0.79–0.95). Expected — PPM/PPML are *built* for smooth
   accuracy; their aggressive limiter only dominates in shock-dominated flow.
+- **The local three-cell parabola is exceptionally clean on this wave.** It retains
+  0.883 peak-to-peak (slightly above wide `tr-2shk` at 0.859) while reducing harmonic
+  distortion from 0.133 to 0.032. Its PLM troubled-cell fallback stays dormant at
+  A=1e-3, so this measures the compact quadratic + trace directly.
 - **The characteristic-trace predictor is the decisive lever — and it is TIME INTEGRATION,
   not reconstruction.** Holding reconstruction (`:ppm`) AND Riemann fixed and swapping ONLY
   the half-step predictor (`:hancock`→`:trace`) lifts amplitude retention 0.674→0.821 and

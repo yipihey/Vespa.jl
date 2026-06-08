@@ -303,6 +303,86 @@ end
     return (Lρ, Lp/(gm1*Lρ), Lu, Lv, Lw, Rρ, Rp/(gm1*Rρ), Ru, Rv, Rw)   # p→eint for the flux
 end
 
+# Three-cell, one-ghost-local PPM reconstruction.  The unlimited edges are the
+# unique quadratic consistent with the cell averages (q_{i-1},q_i,q_{i+1}):
+# qL/R = q_i ∓ (q_{i+1}-q_{i-1})/4 + Δ²q_i/12.  Smooth cells use CW84
+# monotonization; compression/pressure-jump sensors continuously blend toward a
+# monotonized-central PLM profile, reaching the robust TVD endpoint at shocks.
+# Unlike PPML this is stateless: no carried face pair or star-state corrector.
+@inline function _ppm_local_edges_unlimited(qm::T, q0::T, qp::T) where {T}
+    slope = (qp - qm) * T(0.25)
+    curve = (qm - T(2)*q0 + qp) / T(12)
+    return (q0 - slope + curve, q0 + slope + curve)
+end
+
+@inline function _ppm_local_edges(qm::T, q0::T, qp::T) where {T}
+    qL, qR = _ppm_local_edges_unlimited(qm, q0, qp)
+    return _ppml_monotonize(qL, q0, qR)
+end
+
+@inline function _ppm_local_trace_faces(rho, pr, vx, vy, vz, idx::Int,
+                                        g::T, gm1::T, dt_dx::T, small_rho::T) where {T}
+    pmin = gm1 * small_rho
+    ρm = rho[idx-1]; ρa0 = rho[idx]; ρp = rho[idx+1]
+    um = vx[idx-1]; ua0 = vx[idx]; up = vx[idx+1]
+    vm = vy[idx-1]; va0 = vy[idx]; vp = vy[idx+1]
+    wm = vz[idx-1]; wa0 = vz[idx]; wp = vz[idx+1]
+    pm = pr[idx-1]; pa0 = pr[idx]; pp = pr[idx+1]
+    (ρL0, ρR0) = _ppm_local_edges_unlimited(ρm, ρa0, ρp)
+    (pL0, pR0) = _ppm_local_edges_unlimited(pm, pa0, pp)
+    (uL0, uR0) = _ppm_local_edges_unlimited(um, ua0, up)
+    (vL0, vR0) = _ppm_local_edges_unlimited(vm, va0, vp)
+    (wL0, wR0) = _ppm_local_edges_unlimited(wm, wa0, wp)
+    pbase = min(pm, pp)
+    ηp = pbase > zero(T) ? abs(pp - pm) / pbase : one(T)
+    cs = sqrt(g * max(pa0, pmin) / max(ρa0, small_rho))
+    comp = um > up ? (um-up)/cs : zero(T)
+    # Smoothly blend PPM -> monotonized-central PLM instead of switching the whole compressive
+    # region to PLM at one threshold. Mild compression keeps most curvature;
+    # strong shocks reach the same robust PLM endpoint as before.
+    αp = clamp((ηp - T(0.05)) / T(0.45), zero(T), one(T))
+    αu = clamp((comp - T(0.1)) / T(0.9), zero(T), one(T))
+    α = um > up ? max(αp, αu) : zero(T)
+    (ρLq, ρRq) = _ppml_monotonize(ρL0, ρa0, ρR0)
+    (uLq, uRq) = _ppml_monotonize(uL0, ua0, uR0)
+    (vLq, vRq) = _ppml_monotonize(vL0, va0, vR0)
+    (wLq, wRq) = _ppml_monotonize(wL0, wa0, wR0)
+    (pLq, pRq) = _ppml_monotonize(pL0, pa0, pR0)
+    h = T(0.5); θ = T(2)
+    sρ = _slope(ρm, ρa0, ρp, θ); su = _slope(um, ua0, up, θ)
+    sv = _slope(vm, va0, vp, θ); sw = _slope(wm, wa0, wp, θ)
+    sp = _slope(pm, pa0, pp, θ)
+    ρLp = ρa0 - h*sρ; ρRp = ρa0 + h*sρ
+    uLp = ua0 - h*su; uRp = ua0 + h*su
+    vLp = va0 - h*sv; vRp = va0 + h*sv
+    wLp = wa0 - h*sw; wRp = wa0 + h*sw
+    pLp = pa0 - h*sp; pRp = pa0 + h*sp
+    blend(q, r) = (one(T)-α)*q + α*r
+    ρL=blend(ρLq,ρLp); ρR=blend(ρRq,ρRp); uL=blend(uLq,uLp); uR=blend(uRq,uRp)
+    vL=blend(vLq,vLp); vR=blend(vRq,vRp); wL=blend(wLq,wLp); wR=blend(wRq,wRp)
+    pL=blend(pLq,pLp); pR=blend(pRq,pRp)
+    # The MC endpoint is already TVD; do not add PPML's piecewise-constant shock
+    # flattening on top. Positivity and the final CW84 guard remain below.
+    (ρL, uL, vL, wL, pL, ρR, uR, vR, wR, pR) =
+        _ppml_monotonize_all(ρL, uL, vL, wL, pL, ρa0, ua0, va0, wa0, pa0,
+                            ρR, uR, vR, wR, pR)
+    ρLf = max(ρL, small_rho); ρRf = max(ρR, small_rho)
+    pLf = max(pL, pmin); pRf = max(pR, pmin)
+    ρa = max(ρa0, small_rho); pa = max(pa0, pmin)
+    ua = ua0; va = va0; wa = wa0
+    (Lρ, Lu, Lv, Lw, Lp) = _ppml_face_left(
+        ρLf, uL, vL, wL, pLf, ρa, ua, va, wa, pa, ρRf, uR, vR, wR, pRf, dt_dx, g)
+    (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(
+        ρLf, uL, vL, wL, pLf, ρa, ua, va, wa, pa, ρRf, uR, vR, wR, pRf, dt_dx, g)
+    return (Lρ, Lp/(gm1*Lρ), Lu, Lv, Lw, Rρ, Rp/(gm1*Rρ), Ru, Rv, Rw)
+end
+
+@inline function _constant_faces(rho, pr, vx, vy, vz, idx::Int, gm1::T, small_rho::T) where {T}
+    ρ = max(rho[idx], small_rho); p = max(pr[idx], gm1*small_rho)
+    e = p / (gm1*ρ); u = vx[idx]; v = vy[idx]; w = vz[idx]
+    return (ρ, e, u, v, w, ρ, e, u, v, w)
+end
+
 @kernel function _muscl_hancock_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                         @Const(rho), @Const(eint), @Const(vx),
                                         @Const(vy), @Const(vz),
@@ -379,6 +459,39 @@ end
     end
 end
 
+# One-ghost-local PPM-trace kernel.  Active cells use the three-cell quadratic;
+# the boundary-adjacent ghost contributes a degenerate constant state because a
+# second ghost is unavailable.  A host code should compute each inter-block face
+# flux once (or reflux it), as usual for a one-ghost AMR/Godunov update.
+@kernel function _ppm_local_trace_kernel!(fd, fs1, fs2, fs3, fe, fge,
+                                          @Const(rho), @Const(pr), @Const(vx),
+                                          @Const(vy), @Const(vz),
+                                          ncells::Int, nfi::Int, nghost::Int, j1::Int,
+                                          gamma, dt_dx, small_rho, idual::Int, rie::Int,
+                                          periodic::Int)
+    gi, gj = @index(Global, NTuple)
+    j = j1 + gj - 1
+    cl = (j - 1) * ncells + nghost + gi - 1
+    fo = (j - 1) * nfi + gi
+    T = eltype(fd); g = gamma; gm1 = g - one(T); dd = dt_dx; sr = small_rho
+    @inbounds begin
+        base = (j - 1) * ncells
+        li = periodic == 1 && gi == 1 ? base + ncells - nghost : cl
+        ri = periodic == 1 && gi == nfi ? base + nghost + 1 : cl + 1
+        Lf = periodic == 0 && gi == 1 ?
+             _constant_faces(rho, pr, vx, vy, vz, li, gm1, sr) :
+             _ppm_local_trace_faces(rho, pr, vx, vy, vz, li, g, gm1, dd, sr)
+        Rf = periodic == 0 && gi == nfi ?
+             _constant_faces(rho, pr, vx, vy, vz, ri, gm1, sr) :
+             _ppm_local_trace_faces(rho, pr, vx, vy, vz, ri, g, gm1, dd, sr)
+        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+                       _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
+        fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
+        idual == 1 && (fge[fo] = F[6])
+    end
+end
+
 """
     muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                              ncells, nghost, jdim=1, gamma, theta=1.5, cpred,
@@ -395,13 +508,21 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   ncells::Integer, nghost::Integer, jdim::Integer = 1,
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
                                   small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing,
-                                  fge = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock, pr = nothing)
+                                  fge = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
+                                  pr = nothing, face_periodic::Bool = false)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
     gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
     rc = riemann === :twoshock ? 2 : riemann === :hllc ? 1 : 0
-    if recon === :ppm && predictor === :trace
+    if recon === :ppm_local
+        (predictor !== :trace || pr === nothing) &&
+            error("muscl_hancock_flux_line!: recon=:ppm_local requires predictor=:trace and pr")
+        _ppm_local_trace_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, pr, vx, vy, vz,
+                                     ncells, nfi, nghost, 1, T(gamma), T(2 * cpred),
+                                     T(small_rho), idu, rc, face_periodic ? 1 : 0;
+                                     ndrange = (nfi, Int(jdim)))
+    elseif recon === :ppm && predictor === :trace
         (coeffs === nothing || pr === nothing) && error("muscl_hancock_flux_line!: predictor=:trace needs coeffs + pr")
         c1, c2, c3, c4, c5, c6 = coeffs
         _ppm_trace_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, pr, vx, vy, vz,

@@ -344,11 +344,12 @@ end
 function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
                               dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
                               recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3,
-                              frec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock)
+                              frec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
+                              face_periodic::Bool = false)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
     dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx)); dual = ge !== nothing
-    trace = recon === :ppm && predictor === :trace; gm1 = T(gamma) - one(T)
+    trace = recon in (:ppm, :ppm_local) && predictor === :trace; gm1 = T(gamma) - one(T)
     perm = _axis_perm(axis)
     # conserved momenta in cyclic (normal, t1, t2) role for this axis
     Sn, St1, St2 = axis == 1 ? (S1, S2, S3) : axis == 2 ? (S2, S3, S1) : (S3, S1, S2)
@@ -381,7 +382,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
                                  ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
                                  theta = theta, cpred = cpred, small_rho = small_rho,
                                  recon = recon, coeffs = coeffs, fge = fge, riemann = riemann,
-                                 predictor = predictor, pr = pr)
+                                 predictor = predictor, pr = pr, face_periodic = face_periodic)
     end
 
     if axis == 1                                   # contiguous — work in place
@@ -421,8 +422,11 @@ predictor. Same physics class as [`muscl_step_3d!`](@ref) (PLM+HLL) but **3
 sweeps/step instead of 6**, to match the PPM grid driver's cost on the GPU.
 
 `recon` selects the spatial reconstruction: `:plm` (default, minmod-θ piecewise
-linear) or `:ppm` (monotonized piecewise-parabolic, via the certified
-`_iv_recon_cell`; sharper, needs `ng ≥ 3`). `riemann` selects the flux: `:hll`
+linear), `:ppm` (monotonized piecewise-parabolic, via the certified
+`_iv_recon_cell`; sharper, needs `ng ≥ 3`), or `:ppm_local` (a stateless three-cell
+quadratic with a PLM troubled-cell fallback; requires `predictor=:trace` and only
+`ng ≥ 1`).
+`riemann` selects the flux: `:hll`
 (default, the certified Enzo-`hydro_rk` solver), `:hllc` (contact-resolving — helps where
 there are entropy/shear discontinuities, e.g. supersonic turbulence), or `:twoshock` (the
 van Leer solver Enzo's PPM-DirectEuler uses, resolving both acoustic waves). Empirically
@@ -439,9 +443,13 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
                                 order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
                                 bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3,
-                                fluxrec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock)
+                                fluxrec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
+                                face_periodic::Bool = false)
     be = KA.get_backend(D); T = eltype(D)
     recon === :ppm && ng < 3 && error("muscl_hancock_step_3d!: recon=:ppm needs ng ≥ 3 (got $ng)")
+    recon === :ppm_local && ng < 1 && error("muscl_hancock_step_3d!: recon=:ppm_local needs ng ≥ 1 (got $ng)")
+    recon === :ppm_local && predictor !== :trace &&
+        error("muscl_hancock_step_3d!: recon=:ppm_local requires predictor=:trace")
     # uniform-grid PPM coefficients (the dx-independent limit of _ie_geom1!/_ie_geom2!:
     # c1=c2=c3=c4=½, c5=1/6, c6=−1/6); constant ⇒ one set reused for all axes/steps.
     # NON-pooled (they must survive the per-sweep _pool_reset!).
@@ -462,7 +470,7 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
                              recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec,
-                             riemann = riemann, predictor = predictor)
+                             riemann = riemann, predictor = predictor, face_periodic = face_periodic)
     end
     # DEF reset: re-sync the gas energy and total energy once per step.
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)

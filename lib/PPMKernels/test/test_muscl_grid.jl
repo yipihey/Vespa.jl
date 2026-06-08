@@ -489,6 +489,47 @@ end
             @check("hancock.trace.metal≡cpu", run_d(:metal), run_d(:cpu), RTOL_B)
         end
     end
+
+    @testset "ppm_local trace + two-shock runs with one ghost" begin
+        lng = 1; m = 14; cdims = (m, m, m); N = m^3
+        ci3(i, j, k) = i + m * (j - 1) + m * m * (k - 1)
+        rho = ones(N); vx = zeros(N); vy = zeros(N); vz = zeros(N)
+        etot = fill(0.7 / (gamma - 1), N)
+        # Keep a uniform collar while exercising the one-ghost periodic seam.
+        for k in 4:m-3, j in 4:m-3, i in 4:m-3
+            x = (i - 7.5) / 1.3; y = (j - 7.5) / 1.3; z = (k - 7.5) / 1.3
+            b = exp(-(x^2 + y^2 + z^2)); q = ci3(i, j, k)
+            rho[q] = 1.0 + 0.2b; pr = 0.7 + 0.1b
+            vx[q] = 0.03x*b; vy[q] = -0.02y*b; vz[q] = 0.01z*b
+            etot[q] = pr / ((gamma - 1) * rho[q]) +
+                      0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+        end
+        be = PPMKernels.backend(:cpu); dev(a) = PPMKernels.to_device(be, a, Float64)
+        D = dev(rho); S1 = similar(D); S2 = similar(D); S3 = similar(D); Tau = similar(D)
+        PPMKernels.prim_to_cons!(D, S1, S2, S3, Tau, dev(rho), dev(vx), dev(vy), dev(vz), dev(etot))
+        tot(f) = PPMKernels.total_field(f, cdims, lng, dx)
+        m0 = tot(D); e0 = tot(Tau)
+        for s in 1:3
+            PPMKernels.muscl_hancock_step_3d!(
+                D, S1, S2, S3, Tau, cdims, lng;
+                dt = dt, gamma = gamma, dx = dx,
+                order = isodd(s) ? (1, 2, 3) : (3, 2, 1),
+                bc! = (fs...) -> PPMKernels.fill_periodic!(cdims, lng, fs...),
+                face_periodic = true,
+                recon = :ppm_local, predictor = :trace, riemann = :twoshock)
+        end
+        hD = PPMKernels.to_host(D); hT = PPMKernels.to_host(Tau)
+        @test all(isfinite, hD) && all(>(0), hD)
+        @test all(isfinite, hT)
+        @test abs(tot(D) - m0) / abs(m0) < 1e-12
+        @test abs(tot(Tau) - e0) / abs(e0) < 1e-12
+
+        # The local formula and limiter preserve a linear profile exactly.
+        qbar(i) = 2.0 + 3.0i
+        qL, qR = PPMKernels._ppm_local_edges(qbar(-1), qbar(0), qbar(1))
+        @test qL ≈ 0.5
+        @test qR ≈ 3.5
+    end
 end
 
 @testset "Dual-energy formalism (Enzo hydro_rk style)" begin

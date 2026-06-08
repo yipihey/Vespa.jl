@@ -6,6 +6,10 @@ version = "0.1.0"
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
+
+[sources]
+PPMKernels = {path = "../PPMKernels"}
 
 [compat]
 julia = "1.10"

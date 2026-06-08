@@ -717,6 +717,15 @@ function _stop_cycle(paramfile::AbstractString)
     return 100000
 end
 
+function _integer_parameter(paramfile::AbstractString, name::AbstractString, default::Integer)
+    rx = Regex("^\\s*" * name * "\\s*=\\s*([-+]?[0-9]+)")
+    for ln in eachline(paramfile)
+        m = match(rx, ln)
+        m === nothing || return parse(Int, m.captures[1])
+    end
+    return Int(default)
+end
+
 # ── method-slot registry (ADR-0002) ──────────────────────────────────────────
 # Each physics step in the EvolveLevel skeleton is a SLOT resolving to
 # :off (skip), :enzo (the certified legacy bridge step), or :julia (an injected
@@ -918,14 +927,21 @@ function run_amr(paramfile::AbstractString; reader = read_density,
                  radiation::Bool = false, star_sources::Bool = false,
                  star_formation::Bool = false, cosmology::Bool = false,
                  mhdct::Bool = false, maxcycle::Int = 100000)
-    eng = engine !== nothing ? engine :
-          engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
-                            gravity = gravity, cooling = cooling, radiation = radiation,
-                            star_sources = star_sources, star_formation = star_formation,
-                            cosmology = cosmology, mhdct = mhdct,
-                            hooks = hydro! === nothing ? Dict{Symbol,Function}() :
-                                    Dict{Symbol,Function}(:hydro => hydro!))
     pf = abspath(paramfile)
+    eng = if engine !== nothing
+        engine
+    elseif hydro! === nothing && _integer_parameter(pf, "HydroMethod", 0) == 10
+        local_ppm_engine(pf; gravity = gravity, cooling = cooling, radiation = radiation,
+                         star_sources = star_sources, star_formation = star_formation,
+                         cosmology = cosmology, mhdct = mhdct)
+    else
+        engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
+                          gravity = gravity, cooling = cooling, radiation = radiation,
+                          star_sources = star_sources, star_formation = star_formation,
+                          cosmology = cosmology, mhdct = mhdct,
+                          hooks = hydro! === nothing ? Dict{Symbol,Function}() :
+                                  Dict{Symbol,Function}(:hydro => hydro!))
+    end
     maxcycle = min(maxcycle, _stop_cycle(pf))    # honor the param file's StopCycle (as EvolveHierarchy does)
     cd(_workdir(pf)) do
         h = session_init(pf)

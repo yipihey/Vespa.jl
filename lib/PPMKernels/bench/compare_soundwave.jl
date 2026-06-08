@@ -24,6 +24,7 @@ nx       = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 128
 KW       = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 4             # wavelengths in the box
 NPER     = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 10.0      # box translations to run
 AMP      = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 1e-3
+ONLY     = length(ARGS) >= 5 ? ARGS[5] : ""
 const NY = 8                                                       # thin transverse (1-D wave)
 bkname = _P.has_backend(:metal) ? :metal : :cpu
 be = _P.backend(bkname); const T = Float32
@@ -75,7 +76,9 @@ function wave_metrics(prof_f, prof_0)
     (; amp, phase, harm)
 end
 
-const SOLVERS = ["Hancock-PPM", "Hancock-PPM-2shk", "Hancock-PPM-trace", "Hancock-PPM-tr-2shk", "PPM-DirectEuler", "PPML-trace"]
+const SOLVERS = ["Hancock-PPM", "Hancock-PPM-2shk", "Hancock-PPM-trace",
+                 "Hancock-PPM-tr-2shk", "Local-PPM-tr-2shk",
+                 "PPM-DirectEuler", "PPML-trace"]
 
 function run_solver(name, ic, dt, nsteps)
     dims = ic.dims; dx = ic.dx; N = ic.N
@@ -109,6 +112,8 @@ function run_solver(name, ic, dt, nsteps)
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace)
     elseif name == "Hancock-PPM-tr-2shk"
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, recon = :ppm, predictor = :trace, riemann = :twoshock)
+    elseif name == "Local-PPM-tr-2shk"
+        (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc5, face_periodic = true, recon = :ppm_local, predictor = :trace, riemann = :twoshock)
     elseif name == "PPML-trace"
         (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, face_periodic = true, predictor = :trace)
     else
@@ -134,6 +139,7 @@ ppw = nx / KW
 @printf("\n%-17s %-11s %-13s %-13s %-8s\n", "solver", "amp(p2p)", "phase err(λ)", "distort(→□)", "wall(s)")
 println("-"^66)
 for name in SOLVERS
+    !isempty(ONLY) && name != ONLY && continue
     try
         hρ, tw = run_solver(name, ic, dt, nsteps)
         any(isnan, hρ) && (@printf("%-17s  NaN\n", name); continue)

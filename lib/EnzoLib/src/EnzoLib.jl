@@ -20,6 +20,7 @@ Build the library with `EnzoModules/deps/build_pilot.sh` (needs gfortran + g++).
 module EnzoLib
 
 using Libdl
+using PPMKernels
 
 # ── library location + lazy handle ───────────────────────────────────────────
 # The library path is runtime-determined (env / build location), so we cannot
@@ -433,6 +434,7 @@ function ppm_sweep_1d_full!(dslice::Vector{Float64}, eslice::Vector{Float64},
 end
 
 include("session.jl")   # live-Session C-ABI (full-replication via the Enzo grid lib)
+include("local_ppm.jl") # HydroMethod=10: conservative one-ghost local PPM
 include("rpc.jl")       # ADR-0005 #2: :remote transport (subprocess worker + shm)
 
 end # module

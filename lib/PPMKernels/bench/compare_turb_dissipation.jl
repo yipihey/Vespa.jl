@@ -17,6 +17,7 @@ const NG = 4; const GAMMA = 1.4; const CS0 = 1.0
 n     = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 128
 MACH  = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 5.0
 TFRAC = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 0.5
+ONLY  = length(ARGS) >= 4 ? ARGS[4] : ""
 bkname = _P.has_backend(:metal) ? :metal : :cpu
 be = _P.backend(bkname); const T = Float32
 dev(a) = _P.to_device(be, a, T)
@@ -81,7 +82,9 @@ function vmax_ic(ic)
     vm
 end
 
-const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "Hancock-PPM-HLLC", "Hancock-PPM-trace", "Hancock-PPM-tr-2shk", "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
+const SOLVERS = ["RK2 (PLM)", "Hancock-PLM", "Hancock-PPM", "Hancock-PPM-HLLC",
+                 "Hancock-PPM-trace", "Hancock-PPM-tr-2shk", "Local-PPM-tr-2shk",
+                 "PPM-DirectEuler", "PPML-trace", "PPML-Hancock"]
 
 # evolve one solver `nsteps` of fixed `dt`; return (final-diag, walltime, mcell/s, nan)
 function run_solver(name, ic, dt, nsteps)
@@ -122,6 +125,8 @@ function run_solver(name, ic, dt, nsteps)
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, recon = :ppm, predictor = :trace)
     elseif name == "Hancock-PPM-tr-2shk"
         (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, recon = :ppm, predictor = :trace, riemann = :twoshock)
+    elseif name == "Local-PPM-tr-2shk"
+        (o) -> _P.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims, NG; dt = dt, gamma = GAMMA, dx = dx, order = o, bc! = pbc, ge = Ge, face_periodic = true, recon = :ppm_local, predictor = :trace, riemann = :twoshock)
     elseif name == "PPML-trace"
         (o) -> _P.ppml_step_3d!(D, S1, S2, S3, Tau, dims, NG; state = st, dt = dt, gamma = GAMMA, dx = dx, order = o, ge = Ge, face_periodic = true, predictor = :trace)
     else  # PPML-Hancock
@@ -150,6 +155,7 @@ vm = vmax_ic(ic); dt = 0.2 * ic.dx / vm; nsteps = ceil(Int, tfinal / dt)
         "solver", "Mach_f", "v_rms_f", "KE diss%", "Δmass/M", "wall(s)", "Mcell/s")
 println("-"^76)
 for name in SOLVERS
+    !isempty(ONLY) && name != ONLY && continue
     try
         (df, tw, mcs, nan) = run_solver(name, ic, dt, nsteps)
         @printf("%-17s %-10.3f %-10.3f %-9.1f %-10.1e %-9.1f %-8.1f%s\n",
