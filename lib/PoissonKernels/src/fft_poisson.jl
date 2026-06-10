@@ -35,6 +35,30 @@ function _greens_periodic(::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}) whe
     return Gk
 end
 
+# Green's function of the DISCRETE 7-point Laplacian: eigenvalues
+# λ(m) = -Σ_d (4/h_d²)·sin²(π m_d / N_d), h_d = L_d/N_d.  An FFT solve with this
+# kernel is the EXACT solution of the same linear system a finite-difference
+# relaxation solver (RAMSES's multigrid/CG, Enzo's subgrid MG) iterates on — so
+# it certifies those solvers to their convergence tolerance, with no O(h²)
+# spectral-vs-discrete gap.  DC mode 0 (RHS must be zero-mean), like :spectral.
+function _greens_discrete7(::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}) where {T}
+    n1 = N[1] ÷ 2 + 1
+    Gk = Array{T}(undef, n1, N[2], N[3])
+    c = ntuple(d -> T(4) * (T(N[d]) / T(L[d]))^2, 3)     # 4/h_d²
+    @inbounds for k in 0:N[3]-1
+        sz = c[3] * sin(T(π) * T(k) / T(N[3]))^2
+        for j in 0:N[2]-1
+            sy = c[2] * sin(T(π) * T(j) / T(N[2]))^2
+            for i in 0:n1-1
+                sx = c[1] * sin(T(π) * T(i) / T(N[1]))^2
+                lam = sx + sy + sz
+                Gk[i+1, j+1, k+1] = lam == zero(T) ? zero(T) : -one(T) / lam
+            end
+        end
+    end
+    return Gk
+end
+
 _host(a::AbstractArray) = a isa Array ? a : to_host(a)
 
 # ── per-(T,N,L) plan + Green's-function + scratch cache ───────────────────────
@@ -49,20 +73,23 @@ struct _FFTPlan{T,PF,PI}
     inv::PI                       # plan_irfft (applied with `*`)
     rbuf::Array{T,3}              # real scratch (decouples caller's ρ from FFTW)
 end
-const _FFT_CACHE = Dict{Tuple{DataType,NTuple{3,Int},NTuple{3,Float64}},Any}()
+const _FFT_CACHE = Dict{Tuple{DataType,NTuple{3,Int},NTuple{3,Float64},Symbol},Any}()
 
-function _fft_plan(::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}) where {T}
-    get!(_FFT_CACHE, (T, N, L)) do
+function _fft_plan(::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}, greens::Symbol) where {T}
+    get!(_FFT_CACHE, (T, N, L, greens)) do
         rbuf = zeros(T, N)
         fwd  = plan_rfft(rbuf)
         chat = fwd * rbuf                      # probe the rfft shape for the inverse plan
         inv  = plan_irfft(chat, N[1])
-        _FFTPlan{T,typeof(fwd),typeof(inv)}(_greens_periodic(T, N, L), fwd, inv, rbuf)
+        Gk = greens === :spectral ? _greens_periodic(T, N, L) :
+             greens === :discrete7 ? _greens_discrete7(T, N, L) :
+             error("fft_poisson_root!: greens must be :spectral or :discrete7 (got $greens)")
+        _FFTPlan{T,typeof(fwd),typeof(inv)}(Gk, fwd, inv, rbuf)
     end::_FFTPlan
 end
 
 """
-    fft_poisson_root!(phi, rho; G=1.0, a=1.0, boxsize=1.0) -> phi
+    fft_poisson_root!(phi, rho; G=1.0, a=1.0, boxsize=1.0, greens=:spectral) -> phi
 
 Solve the periodic Poisson equation `∇²φ = (G/a)·ρ` on a uniform grid by the
 spectral (FFT) method — Enzo's root-grid gravity solver. `phi`, `rho` are 3-D
@@ -70,17 +97,24 @@ arrays (CPU or Metal; staged to the host for the FFT). `boxsize` is the per-axis
 domain size in code units (scalar for a cubic box). `rho` should be zero-mean
 (periodic solvability); the DC mode is dropped. Returns `phi` (filled in place).
 
-The Green's function and FFTW plans are cached per `(eltype, dims, boxsize)`
-(see `_fft_plan`), so repeated calls on the same root grid pay only the two
-transforms + the spectral multiply.  For the lowest latency (no device↔host
+`greens` selects the kernel: `:spectral` (default, the continuum −1/k² — Enzo's
+root convention, exact for resolved modes) or `:discrete7` (the discrete 7-point
+Laplacian's eigenvalues — the EXACT solution of the linear system RAMSES's
+multigrid/CG or any finite-difference relaxation solver converges to, the choice
+for bit-level cross-certification against those solvers).
+
+The Green's function and FFTW plans are cached per `(eltype, dims, boxsize,
+greens)` (see `_fft_plan`), so repeated calls on the same root grid pay only the
+two transforms + the spectral multiply.  For the lowest latency (no device↔host
 staging) pass a **host** `rho`/`phi`; device arrays are accepted and staged.
 """
 function fft_poisson_root!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
-                           G::Real = 1.0, a::Real = 1.0, boxsize = 1.0) where {T}
+                           G::Real = 1.0, a::Real = 1.0, boxsize = 1.0,
+                           greens::Symbol = :spectral) where {T}
     N = size(rho)
     L = boxsize isa Number ? ntuple(_ -> Float64(boxsize), 3) :
         ntuple(d -> Float64(boxsize[d]), 3)
-    P = _fft_plan(T, N, L)
+    P = _fft_plan(T, N, L, greens)
     copyto!(P.rbuf, _host(rho))                # host (or staged-from-device) ρ
     chat = P.fwd * P.rbuf                      # ρ̂ = rfft(ρ)
     coef = T(G) / T(a)

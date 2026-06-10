@@ -30,6 +30,7 @@ using EnzoLib
 using RamsesLib
 using ArepoLib
 using PPMKernels
+import PoissonKernels
 import R3D
 
 export CellSet, ledger, ledger_drift, ncells, exact_sod, SodSpec
@@ -47,6 +48,8 @@ export SedovCompareSpec, sedov_bomb, sedov_radius, sedov_profile
 export run_enzo_sedov, run_ramses_sedov, sedov_report
 export ZeldovichSpec, zeldovich_particles, zeldovich_growth, zeldovich_measure
 export run_enzo_zeldovich, run_ramses_zeldovich
+export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
+export run_ramses_gravity_compare
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -60,5 +63,6 @@ include("ramsesrt.jl")
 include("enzo_rt_guest.jl")
 include("sedov_compare.jl")
 include("zeldovich.jl")
+include("gravity_slot.jl")
 
 end # module

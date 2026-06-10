@@ -543,5 +543,25 @@ never forks of their cores.
   coarse-fine face a leaf, so one register level per level pair suffices.
   Per-level subcycling and a Metal variant are the remaining optimization
   track (the registers and masks currently live host-side).
-- **Next:** KA re-expression of the mini-ramses kernels (start with
-  multigrid), dfmm as an EquationSet, extension-ifying MultiCode.
+- **Next-4 (first slice) — the gravity guest slot: KA Poisson inside RAMSES
+  (done):** the start of the mini-ramses-kernel KA re-expression, as a SLOT
+  rather than a line-by-line port: RAMSES keeps its deposit (`rho_fine`) and
+  force differencing (`force_fine`, the 4th-order 5-point gradient); the
+  guest (`ramses_ka_poisson!`, `gravity_slot.jl`) replaces
+  `multigrid`/`phi_fine_cg` with PoissonKernels' FFT solve using a NEW
+  `greens=:discrete7` kernel — the discrete 7-point Laplacian's
+  eigenvalues, i.e. the EXACT solution of the very linear system RAMSES's
+  MG iterates on (no O(h²) spectral-vs-discrete gap).  Certification
+  (`test_gravity_slot.jl`): one injected density mode, host-deposited; at
+  RAMSES ε=1e-12 (namelist `epsilon_base` — levelmin uses it, NOT
+  `epsilon`) the two potentials agree to **6.7e-13** and the `force_fine`
+  accelerations likewise — and at a loose ε=1e-3 the diff is ~1e-3, so the
+  gate tracks the oracle's convergence.  An analytic anchor closes the
+  loop: the injected single mode is a discrete eigenfunction, and φ(KA)
+  matches the closed-form discrete solution to **9.4e-15** — independent
+  of both solvers.  Remaining in this track: the Dirichlet refined-level
+  solve (vcycle_solve! dirichlet=true on the bbox raster, the Next-3
+  machinery), and the oct-native KA port of the MG smoother for the
+  tree-irregular case.
+- **Next:** finish the mini-ramses KA track (refined-level Dirichlet solve,
+  oct-native smoother), dfmm as an EquationSet, extension-ifying MultiCode.
