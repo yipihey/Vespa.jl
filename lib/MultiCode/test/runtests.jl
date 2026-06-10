@@ -22,6 +22,7 @@ haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] = RAMSES_HYDRO_LIB)
 # in a quiet process it is rock solid.  The durable fix is the D2 one: MUSIC in
 # its own CodeBridge worker; recorded in the ADR polish track.
 include("test_music_crosscheck.jl")
+include("test_discodj_growth.jl")   # Next-10: DISCO-DJ ICs vs the exact growth (also boot-sensitive)
 
 const spec = SodSpec()
 const ref = MultiCode.sod_reference_ledger(spec)

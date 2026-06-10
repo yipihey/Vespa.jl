@@ -98,6 +98,29 @@ const ENZO_DMONLY_DIR = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
                                           "run", "CosmologySimulation", "dm_only"))
 
 """
+    cic_density(xp, n) -> Array{Float64,3}
+
+Periodic CIC deposit of particles (positions in [0,1)³, one row each) onto an
+n³ grid, normalized to mean density 1.  The shared measurement operator for
+the particle-injection gates (MUSIC, DISCO-DJ, Zel'dovich cross-checks).
+"""
+function cic_density(xp::AbstractMatrix, n::Integer)
+    d = zeros(Float64, n, n, n)
+    np = size(xp, 1)
+    for p in 1:np
+        gx = xp[p, 1] * n - 0.5; gy = xp[p, 2] * n - 0.5; gz = xp[p, 3] * n - 0.5
+        i0 = floor(Int, gx); j0 = floor(Int, gy); k0 = floor(Int, gz)
+        fx = gx - i0; fy = gy - j0; fz = gz - k0
+        for dk in 0:1, dj in 0:1, di in 0:1
+            w = (di == 0 ? 1 - fx : fx) * (dj == 0 ? 1 - fy : fy) * (dk == 0 ? 1 - fz : fz)
+            d[mod(i0 + di, n) + 1, mod(j0 + dj, n) + 1, mod(k0 + dk, n) + 1] += w
+        end
+    end
+    d .*= n^3 / np
+    return d
+end
+
+"""
     run_enzo_zeldovich(spec=ZeldovichSpec()) -> (; xp, a, steps, seconds)
 
 Enzo's CosmologySimulation (the dm_only setup, cosmology patched to EdS and

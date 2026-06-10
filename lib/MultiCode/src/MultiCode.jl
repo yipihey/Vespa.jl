@@ -51,7 +51,7 @@ export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
-export run_dfmm_sod, run_athena_sod, run_music_crosscheck
+export run_dfmm_sod, run_athena_sod, run_music_crosscheck, run_discodj_growth
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -99,5 +99,17 @@ grafic2 level directory, the two codes' INITIAL CIC density fields correlated.
 Implemented in `MultiCodeMusicExt` — `using MusicLib` activates it.
 """
 function run_music_crosscheck end
+
+"""
+    run_discodj_growth(; res=32, z_init=49.0, a_ratio=4.0, box_mpch=32.0, seed=42)
+
+DISCO-DJ's differentiable 1LPT (≡ Zel'dovich) displacement field, turned into
+ZERO-velocity particles (no velocity-unit convention enters) and evolved
+through BOTH Enzo and RAMSES in EdS — the whole linear field follows the
+closed-form mixed-mode growth b(x) = ⅗x + ⅖x^{−3/2}, gating shape, amplitude,
+and Enzo↔RAMSES agreement.  Implemented in `MultiCodeDiscoDJExt` — `using
+DiscoDJLib` activates it (set JULIA_PYTHONCALL_EXE before loading).
+"""
+function run_discodj_growth end
 
 end # module

@@ -15,23 +15,6 @@ using MultiCode
 using MultiCode: EnzoLib, RamsesLib, CodeBridge
 using MusicLib
 
-"Periodic CIC deposit of n³ particles (positions in [0,1)³) onto an n³ grid."
-function _cic_density(xp::AbstractMatrix, n::Integer)
-    d = zeros(Float64, n, n, n)
-    np = size(xp, 1)
-    for p in 1:np
-        gx = xp[p, 1] * n - 0.5; gy = xp[p, 2] * n - 0.5; gz = xp[p, 3] * n - 0.5
-        i0 = floor(Int, gx); j0 = floor(Int, gy); k0 = floor(Int, gz)
-        fx = gx - i0; fy = gy - j0; fz = gz - k0
-        for dk in 0:1, dj in 0:1, di in 0:1
-            w = (di == 0 ? 1 - fx : fx) * (dj == 0 ? 1 - fy : fy) * (dk == 0 ? 1 - fz : fz)
-            d[mod(i0 + di, n) + 1, mod(j0 + dj, n) + 1, mod(k0 + dk, n) + 1] += w
-        end
-    end
-    d .*= n^3 / np                                  # mean density 1
-    return d
-end
-
 function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real = 50.0,
                                         level::Integer = 5)
     MusicLib.available() || error("libmusic_capi not found")
@@ -79,8 +62,8 @@ function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real =
     size(xp_e, 1) == n^3 || error("Enzo read $(size(xp_e,1)) particles, expected $(n^3)")
     size(xp_r, 1) == n^3 || error("RAMSES read $(size(xp_r,1)) particles, expected $(n^3)")
     # ── the gate: CIC density fields of the SAME realization ─────────────────
-    de = _cic_density(xp_e, n) .- 1.0
-    dr = _cic_density(xp_r, n) .- 1.0
+    de = MultiCode.cic_density(xp_e, n) .- 1.0
+    dr = MultiCode.cic_density(xp_r, n) .- 1.0
     se = sqrt(sum(abs2, de) / n^3); sr = sqrt(sum(abs2, dr) / n^3)
     corr = sum(de .* dr) / (n^3 * se * sr)
     rms = sqrt(sum(abs2, de .- dr) / n^3) / se

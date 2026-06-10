@@ -661,6 +661,22 @@ never forks of their cores.
   chars — symlink long grafic paths short.  Remaining on-ramps: Gadget4 IC/halo gates,
   DiscoDJ LPT cross-check (NGenIC-phase work already landed in the
   shared-phases session).
+- **Next-10 — DISCO-DJ ICs through both codes vs the exact growth
+  (done):** the differentiable-IC flagship (`run_discodj_growth`,
+  `MultiCodeDiscoDJExt`, the fourth package extension): DISCO-DJ's JAX
+  1LPT (≡ Zel'dovich) displacement field becomes ZERO-velocity particles
+  (the Next-2 trick — no velocity-unit convention can enter) injected
+  into Enzo AND RAMSES and evolved aᵢ → 4aᵢ in EdS; the WHOLE linear
+  field follows b(x) = ⅗x + ⅖x^{−3/2} mode-independently.  Gates: the
+  large-scale (res/4-deposit) growth tracks b at each engine's measured
+  epoch to 0.963 (Enzo) / 0.977 (RAMSES) — the few-% deficit is the
+  shared 32³ PM resolution, while the full-field rms is
+  Nyquist-suppressed as expected; the field keeps its shape (corr vs ICs
+  ≈ 0.97); and the two codes land on the SAME field, Enzo↔RAMSES
+  correlation **0.998**.  Report `reports/multicode/discodj_growth.md`.
+  `cic_density` promoted to MultiCode core (the shared measurement
+  operator of the injection gates).  Remaining on-ramp: Gadget4 IC/halo
+  gates; then MUSIC-in-a-worker (the durable D2 fix).
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
