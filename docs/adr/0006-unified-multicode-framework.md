@@ -717,6 +717,22 @@ never forks of their cores.
   static sized at first init) — run higher-dimensional cases first.
   Athena++ now has the full Phase-2 treatment: engine row, canonical
   state, ledger, profile.
+- **Phase C (slice 1) — the SUBGRID gravity solve certified on live Enzo
+  (done):** the recorded "wire the level>0 hook" step.  Enzo's own
+  subgrid chain (PrepareDensityField interpolates the parent potential
+  into the subgrid PotentialField = the Dirichlet BC + initial guess;
+  SolveForPotential iterates MG) is replicated through the bridge on the
+  GravityTest fixture (32³ root + nested subgrid + 5000 particles,
+  PotentialIterations raised to 30 so the oracle converges deeply).
+  Gates (`test_gravity_subgrid_slot.jl` in the EnzoLib suite): the
+  scalar α in (Σφ−6φ) = α·GMF fitted from Enzo's OWN solution leaves a
+  4.6e-8 residual (system replication certified solver-free), and
+  `vcycle_solve!(dirichlet = true)` from the same BC + rhs lands on
+  Enzo's φ at **1.6e-15** — machine precision: the BC and rhs determine
+  the solution and both solvers reach the same fixed point.  Remaining
+  Phase C: the production gravity=:julia hook for all levels (root FFT
+  + this subgrid solve) in a full AMR evolve vs gravity=:enzo, then the
+  Santa Barbara CPU-vs-GPU run.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
