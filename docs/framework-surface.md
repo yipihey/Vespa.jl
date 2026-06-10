@@ -22,7 +22,7 @@ and the Music/Athena/Gadget4/DiscoDJ wrapper integration audit.
 | `RamsesNG.jl` / RamsesLib | mini-ramses | in-process, flavors `:cpu` `:metal` `:rt` `:cosmo` | hydro/gravity/RT step drivers, field+particle access, `interpol_phi` pure kernel; host for the hydro+gravity guest slots |
 | `Arepo.jl` / ArepoLib | Arepo (moving mesh) | in-process (worker for re-init; per-process singleton) | Sod, Voronoi 3-D export (`libarepo3d`), Moray-inside-Arepo |
 | `Music.jl` / MusicLib | MUSIC (music20) | in-process (`libmusic_capi`) | one `MusicSpec` → Enzo/RAMSES/Arepo zoom ICs; injector validated live via `MultiCodeMusicExt` (Enzo↔RAMSES initial fields corr 1−4e-15) |
-| `Athena.jl` / AthenaLib | Athena++ | in-process, re-entrant; flavor-per-dylib (pgen/coord/flux/eos, GR spacetimes) | Sod-harness engine via `MultiCodeAthenaExt` (L1(ρ)=0.0019, exact conservation, 0.02 s); 3-D → `CellSet` via legacy-VTK readback (ledger at the f32 floor, scatter ≡ 0); future per-stage solver slots |
+| `Athena.jl` / AthenaLib | Athena++ | in-process, re-entrant; flavor-per-dylib (pgen/coord/flux/eos, GR spacetimes) | Sod-harness engine via `MultiCodeAthenaExt` (L1(ρ)=0.0019, exact conservation, 0.02 s); 3-D → `CellSet` via legacy-VTK readback (ledger at the f32 floor, scatter ≡ 0); `:gr` flavor — the first GR engine (Schwarzschild Bondi stationary to 0.1% over t=100); future per-stage solver slots |
 | `Gadget4.jl` / Gadget4Lib | GADGET-4 | child process (G4 owns exit()/MPI) | NGenIC 2LPT ICs, TreePM runs, FOF/SUBFIND halo-finder-as-a-service — live in the harness via `MultiCodeGadget4Ext` (planted clumps → exactly 3 groups; RAMSES dump → 0) |
 | `DiscoDJ.jl` / DiscoDJLib | DISCO-DJ (JAX) | in-process PythonCall (NOT CodeBridge) | differentiable LPT ICs + lightcones, gradients preserved; growth-gated live via `MultiCodeDiscoDJExt` (1LPT → Enzo+RAMSES, cross-corr 0.998, large scales ≥0.96·b(a)) |
 | `dfmm` (sibling) | dual-frame moment method | native Julia, `MultiCodeDfmmExt` | the Sod harness engine: L1(ρ)=0.042, mass bit-exact, momentum 1e-16 |
@@ -56,7 +56,7 @@ sibling arepo + dfmm checkouts; gates skip cleanly where a library is absent).
 
 ## Status ledger
 
-ADR-0006 phases 0–7 and Next-1…13 complete; the per-phase implementation record
+ADR-0006 phases 0–7, Next-1…14, and Phase C complete; the per-phase implementation record
 (numbers, traps, commit references) is the status appendix of
 [`docs/adr/0006-unified-multicode-framework.md`](adr/0006-unified-multicode-framework.md).
 Remaining recorded polish: extension-ifying the legacy wrappers in MultiCode

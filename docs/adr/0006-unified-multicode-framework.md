@@ -756,6 +756,15 @@ never forks of their cores.
   trajectories IDENTICAL to the printed digits, mass drift 2e-10,
   Metal 21.7 s vs CPU 27.4 s (startup-dominated; kernel speedups are
   the recorded 31×/12×).
+- **Next-14 — the Athena++ :gr flavor: the first general-relativistic
+  engine (done):** one `build_flavor` table line upstream (gr_bondi +
+  hlle + kerr-schild, `configure -g`), a `:gr` LazyLib flavor in
+  AthenaLib (env ATHENA_LIB_GR), and a `read_vtk` fix (singleton
+  dimensions write one node plane — clamp).  Gate: Schwarzschild Bondi
+  accretion STATIONARITY — the problem generator initializes the exact
+  stationary flow; evolving to t = 100 preserves it to 0.107%
+  (vl2+PLM at 100 radial cells), gated at 2e-3.  AthenaLib 20/20.
+  GR spacetimes are now one flavor line away for the whole harness.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
