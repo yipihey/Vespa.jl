@@ -446,8 +446,59 @@ never forks of their cores.
     multi-worker 14/14, RamsesLib 10/10, ArepoLib 21/21, CodeBridge 29/29.
   - *Docs:* CLAUDE.md now carries the CodeBridge/MultiCode section (packages,
     run commands, the cross-repo `[sources]` coupling, the hard-won gotchas).
-- **Next (Phase 6):** the R3D exact Voronoi↔AMR operator (3-D cell-geometry
-  export in the Arepo bridge — task chip filed with full instructions), KA
-  re-expression of the mini-ramses kernels, dfmm as an EquationSet,
-  extension-ifying MultiCode's wrapper deps, upstream mini-ramses RT
-  injection fixes (chip filed).
+- **Phase 6 (partial) — the EXACT exchange + upstream fixes; all committed:**
+  - *3-D Voronoi export:* `arepo_get_voronoi_3d` in the Arepo bridge (the
+    voronoi_3d.c edge-ring traversal: every face as its ordered circumcenter
+    ring + the outward generator direction), a 3-D library flavor
+    (`Config_3d.sh`, `make shared CONFIG=Config_3d.sh BUILD_DIR=build3d
+    LIBRARY=arepo3d`) selected per-WORKER via the `AREPO_LIB` env — the
+    LazyLib override makes the flavor switch zero-code. The mesh must be
+    live (after init / between steps; a completed `run!` frees it).
+  - *`MultiCode.deposit_exact`:* signed fan tetrahedra over outward-oriented
+    rings (divergence theorem — exact even for the wandering rings of a
+    degenerate lattice Delaunay, where unsigned fans overlap by 100×), each
+    tet clipped by the grid's axis-aligned planes via R3D. Numerical lesson
+    encoded: clip the TET by the BOX — a sliver tet's face planes (crosses of
+    nearly parallel edges) are pure noise, and the lattice Delaunay produces
+    swarms of slivers. Gate: on the live 27000-cell noh_3d mesh (199423
+    faces, 1.02M ring vertices), every cell's clipped volume reproduces
+    Arepo's own `SphP.Volume`; the box tiles exactly; ledgers conserved.
+    Suite: 108/108 across eight gates.
+  - *Upstream mini-ramses RT injection fixed* (was a chip): point-source CIC
+    y/z weights used the x-center variable, and boundary sources clipped
+    their CIC cloud (a corner source emitted 1/8 of rt_n_source) — now
+    minimum-periodic-image weights; a corner source reproduces the analytic
+    Strömgren front (0.88 at t=3 Myr level 5, the documented M1 lag) where
+    it gave 0.50 before.
+- **Phase 7 — the science-grade run + the guest under AMR (done):**
+  - *One Sedov IC, four engines* (`sedov_compare.jl`, report at
+    `reports/multicode/sedov_comparison.md`): the SAME discrete thermal-bomb
+    IC injected through each code's live-field bridge (apples-to-apples at
+    the cell level, no per-code initializer quirks) into Enzo PPM, RAMSES
+    unsplit MUSCL+HLLC, and the PPMKernels guest on RAMSES's mesh (CPU f64 +
+    Metal f32), 64³, with the Sedov–Taylor R(t) computed from each run's
+    MEASURED injected energy. Result: Enzo and RAMSES land on the same
+    R/Rₐ = 0.886 to 4 digits; the two guest runs land on 0.866 to 4 digits
+    (f32 ≡ f64); the common deficit from 1 is the 3-cell bomb at 64³, shared
+    by all engines — the cross-code agreement is the measurement. Wall-clock
+    on identical meshes: RAMSES 7.8 s, guest-Metal 16.5 s, guest-CPU 20.8 s,
+    Enzo-through-the-bridge 67 s. Conservation 1e-12…1e-8(f32).
+  - *The guest slot under AMR* (`ramses_composite_raster/_deraster!`,
+    `ramses_ppmk_hydro_step_amr!`, `test_amr_guest.jl`): correctness-first
+    COMPOSITE coupling — the live multi-level hierarchy rasters onto the
+    uniform finest grid (leaf injection, coverage asserted), the guest
+    advances it, and the result restricts back to every level. The host
+    keeps owning refinement (its flag/refine runs between steps; the refined
+    region follows the blast). Gate: a 2-level Sedov with live regridding is
+    **bit-identical** to the guest-on-uniform-fine run (R to 17 digits) with
+    coarse ≡ restricted-fine exactly — conservation by construction. Two
+    lessons encoded: RAMSES's `newdt_fine` returns 0 on a level whose time
+    state the guest manages, so the guest owns its CFL
+    (`courant·dx/max_wavespeed` on the composite); and ghosts must be filled
+    before the wavespeed scan (ρ = 0 ⇒ NaN). The per-level fast path (raster
+    each level with coarse-interpolated ghosts + flux registers) remains the
+    optimization track.
+- **Next:** cosmological Enzo-vs-RAMSES from shared grafic ICs, persistent
+  device residency for the Metal slot (the raster round-trip dominates),
+  per-level AMR fast path, KA re-expression of the mini-ramses kernels,
+  dfmm as an EquationSet, extension-ifying MultiCode.

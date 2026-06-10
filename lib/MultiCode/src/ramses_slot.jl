@@ -115,6 +115,170 @@ function ramses_ppmk_hydro_step!(h::RamsesLib.Handle; lev::Integer, dt::Real, ga
     return nothing
 end
 
+# ── the guest slot under AMR: the COMPOSITE raster (ADR-0006 Phase 6) ─────────
+#
+# Correctness-first composite coupling (the AMReX-composite philosophy): the
+# whole RAMSES hierarchy [levmin..levmax] is rastered onto the UNIFORM finest
+# grid (leaf cells inject into their 2^(levmax-ℓ)³ footprints), the guest
+# advances that composite, and the result is written back to EVERY level
+# (fine leaves directly; coarser cells as the conservative average of their
+# footprint — the restriction the native upload would do).  Conservation is
+# exact by construction; the per-level optimization (raster each level with
+# coarse-interpolated ghosts + flux registers) is the future fast path.
+
+"Per-level leaf masks: cell (o,c) at level ℓ is refined iff its coordinate is a level-(ℓ+1) oct ckey."
+function _ramses_leafmask(cks::Vector{Matrix{Int32}})
+    nlev = length(cks)
+    masks = Vector{Matrix{Bool}}(undef, nlev)
+    for l in 1:nlev
+        noct = size(cks[l], 1)
+        m = trues(noct, 8)
+        if l < nlev
+            children = Set{NTuple{3,Int32}}((cks[l + 1][o, 1], cks[l + 1][o, 2], cks[l + 1][o, 3])
+                                            for o in 1:size(cks[l + 1], 1))
+            @inbounds for o in 1:noct, c in 1:8
+                key = (Int32(2 * cks[l][o, 1] + ((c - 1) & 1)),
+                       Int32(2 * cks[l][o, 2] + ((c - 1) >> 1 & 1)),
+                       Int32(2 * cks[l][o, 3] + ((c - 1) >> 2 & 1)))
+                key in children && (m[o, c] = false)
+            end
+        end
+        masks[l] = m
+    end
+    return masks
+end
+
+"""
+    ramses_composite_raster(h; levmin, levmax, ng=2, lib=:cpu)
+
+Raster the hierarchy onto the uniform level-`levmax` grid (ghosted, PPMKernels
+layout): every LEAF cell fills its footprint by injection.  Returns the
+conserved fields plus the per-level keys/masks `ramses_composite_deraster!`
+needs.
+"""
+function ramses_composite_raster(h::RamsesLib.Handle; levmin::Integer, levmax::Integer,
+                                 ng::Integer = 2, lib::Symbol = :cpu)
+    nlev = levmax - levmin + 1
+    cks = Vector{Matrix{Int32}}(undef, nlev)
+    Us = Vector{Array{Float64,3}}(undef, nlev)
+    for (li, l) in enumerate(levmin:levmax)
+        cks[li], Us[li] = RamsesLib.get_hydro_all(h, :uold, l; lib = lib)
+    end
+    masks = _ramses_leafmask(cks)
+    n1d = 2^levmax
+    nx = n1d + 2ng
+    flat() = zeros(Float64, nx^3)
+    D = flat(); S1 = flat(); S2 = flat(); S3 = flat(); Tau = flat()
+    fields = (D, S1, S2, S3, Tau)
+    covered = 0
+    for (li, l) in enumerate(levmin:levmax)
+        scale = 2^(levmax - l)
+        @inbounds for o in 1:size(cks[li], 1), c in 1:8
+            masks[li][o, c] || continue
+            i0 = (2 * cks[li][o, 1] + ((c - 1) & 1)) * scale
+            j0 = (2 * cks[li][o, 2] + ((c - 1) >> 1 & 1)) * scale
+            k0 = (2 * cks[li][o, 3] + ((c - 1) >> 2 & 1)) * scale
+            for dk in 1:scale, dj in 1:scale, di in 1:scale
+                g = (i0 + di + ng) + nx * (j0 + dj + ng - 1) + nx * nx * (k0 + dk + ng - 1)
+                for (v, f) in enumerate(fields)
+                    f[g] = Us[li][o, c, v]
+                end
+            end
+            covered += scale^3
+        end
+    end
+    covered == n1d^3 ||
+        error("ramses_composite_raster: leaves cover $covered of $(n1d^3) fine cells")
+    return (D = D, S1 = S1, S2 = S2, S3 = S3, Tau = Tau,
+            dims = (nx, nx, nx), ng = Int(ng), n1d = n1d,
+            cks = cks, levmin = Int(levmin), levmax = Int(levmax))
+end
+
+"Write the composite interior back to EVERY level (fine direct, coarse = footprint average)."
+function ramses_composite_deraster!(h::RamsesLib.Handle, r; lib::Symbol = :cpu)
+    nx = r.dims[1]; ng = r.ng
+    fields = (r.D, r.S1, r.S2, r.S3, r.Tau)
+    for (li, l) in enumerate(r.levmin:r.levmax)
+        ck = r.cks[li]
+        noct = size(ck, 1)
+        scale = 2^(r.levmax - l)
+        vals = [Matrix{Float64}(undef, noct, 8) for _ in 1:5]
+        @inbounds for o in 1:noct, c in 1:8
+            i0 = (2 * ck[o, 1] + ((c - 1) & 1)) * scale
+            j0 = (2 * ck[o, 2] + ((c - 1) >> 1 & 1)) * scale
+            k0 = (2 * ck[o, 3] + ((c - 1) >> 2 & 1)) * scale
+            for v in 1:5
+                s = 0.0
+                f = fields[v]
+                for dk in 1:scale, dj in 1:scale, di in 1:scale
+                    s += f[(i0 + di + ng) + nx * (j0 + dj + ng - 1) + nx * nx * (k0 + dk + ng - 1)]
+                end
+                vals[v][o, c] = s / scale^3                # conservative restriction
+            end
+        end
+        for v in 1:5
+            RamsesLib.set_hydro!(h, :uold, v, l, ck, vals[v]; lib = lib)
+        end
+    end
+    return nothing
+end
+
+"""
+    ramses_ppmk_hydro_step_amr!(h; levmin, levmax, gamma, boxlen, dt=nothing,
+                                courant=0.4, recon=:plm, riemann=:hllc,
+                                device=:cpu) -> dt_used
+
+THE guest slot on a LIVE MULTI-LEVEL hierarchy: composite raster → one
+PPMKernels step at the finest resolution → conservative write-back to every
+level.  The host keeps owning refinement (call its flag/refine between steps)
+and sees a hierarchy whose levels are mutually consistent (coarse = restricted
+fine) — exactly the state its own upload machinery would produce.
+
+With `dt = nothing` the GUEST computes its own CFL from the composite
+(`courant·dx/max wavespeed`) — the scheme-consistent bound, and the safe
+choice: RAMSES's `newdt_fine` returns 0 on a level whose time state the guest
+manages.  Pass `dt_max` to cap (e.g. to land on a snapshot).  Returns the dt
+actually taken.
+"""
+function ramses_ppmk_hydro_step_amr!(h::RamsesLib.Handle; levmin::Integer, levmax::Integer,
+                                     gamma::Real, boxlen::Real, dt::Union{Nothing,Real} = nothing,
+                                     dt_max::Real = Inf, courant::Real = 0.4, ng::Integer = 2,
+                                     recon::Symbol = :plm, riemann::Symbol = :hllc,
+                                     lib::Symbol = :cpu, device::Symbol = :cpu)
+    r = ramses_composite_raster(h; levmin = levmin, levmax = levmax, ng = ng, lib = lib)
+    dx = boxlen / r.n1d
+    if dt === nothing
+        # ghosts are zero straight out of the raster — fill them first or the
+        # wavespeed scan divides by ρ = 0
+        PPMKernels.fill_periodic!(r.dims, r.ng, r.D, r.S1, r.S2, r.S3, r.Tau)
+        scratch = similar(r.D)
+        smax = PPMKernels.max_wavespeed(scratch, r.D, r.S1, r.S2, r.S3, r.Tau; gamma = gamma)
+        (isfinite(smax) && smax > 0) || error("ramses_ppmk_hydro_step_amr!: bad wavespeed $smax")
+        dt = min(courant * dx / smax, dt_max)
+    end
+    if device === :cpu
+        bc!(fields...) = PPMKernels.fill_periodic!(r.dims, r.ng, fields...)
+        PPMKernels.muscl_hancock_step_3d!(r.D, r.S1, r.S2, r.S3, r.Tau, r.dims, r.ng;
+                                          dt = dt, gamma = gamma, dx = dx,
+                                          recon = recon, riemann = riemann, bc! = bc!)
+    else
+        be = PPMKernels.backend(device)
+        T = Float32
+        D = PPMKernels.to_device(be, r.D, T); S1 = PPMKernels.to_device(be, r.S1, T)
+        S2 = PPMKernels.to_device(be, r.S2, T); S3 = PPMKernels.to_device(be, r.S3, T)
+        Tau = PPMKernels.to_device(be, r.Tau, T)
+        dbc!(fields...) = PPMKernels.fill_periodic!(r.dims, r.ng, fields...)
+        PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, r.dims, r.ng;
+                                          dt = T(dt), gamma = T(gamma), dx = T(dx),
+                                          recon = recon, riemann = riemann, bc! = dbc!)
+        r.D .= Float64.(PPMKernels.to_host(D)); r.S1 .= Float64.(PPMKernels.to_host(S1))
+        r.S2 .= Float64.(PPMKernels.to_host(S2)); r.S3 .= Float64.(PPMKernels.to_host(S3))
+        r.Tau .= Float64.(PPMKernels.to_host(Tau))
+    end
+    ramses_composite_deraster!(h, r; lib = lib)
+    return Float64(dt)
+end
+
 """
     run_ramses_sod_guest(spec=SodSpec(); level=6, recon=:plm, riemann=:hllc)
         -> (; cs, t, profile, diag)
