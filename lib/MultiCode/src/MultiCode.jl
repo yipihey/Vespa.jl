@@ -51,7 +51,7 @@ export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
-export run_dfmm_sod, run_athena_sod, run_music_crosscheck, run_discodj_growth
+export run_dfmm_sod, run_athena_sod, run_athena_sod3d, run_music_crosscheck, run_discodj_growth
 export run_gadget4_halos
 
 include("canonical.jl")
@@ -90,6 +90,9 @@ from the `.hst` history — gated against the same exact-Riemann oracle.
 Implemented in `MultiCodeAthenaExt` — `using AthenaLib` activates it.
 """
 function run_athena_sod end
+
+"`run_athena_sod3d(spec; n=32)` — 3-D Athena++ Sod → `CellSet` (VTK readback); see `MultiCodeAthenaExt`."
+function run_athena_sod3d end
 
 """
     run_music_crosscheck(; boxlength=20.0, zstart=50.0, level=5) -> (; corr, rms, …)

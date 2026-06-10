@@ -16,6 +16,24 @@ using AthenaLib                  # activates MultiCodeAthenaExt
         @test_skip false
     else
         spec = SodSpec()                                   # γ=1.4, t̂=0.1, x0=0.5
+        # ── Next-13: 3-D Sod → the CANONICAL state (VTK readback) ─────────────
+        # RUNS FIRST: Athena++ re-entrancy survives same-or-lower dimensionality
+        # (3D→1D fine, re-run fine) but a 1D→3D sequence in one process
+        # SEGFAULTS (a static sized at first init) — so 3-D before 1-D.
+        # The stock problem extruded to 32³, one MeshBlock → one legacy-VTK
+        # file → CellSet.  Ledgers gate at the float32 VTK floor; the problem
+        # is 1-D physics in a 3-D box, so the transverse scatter must be ZERO.
+        r3 = run_athena_sod3d(spec)
+        lg = MultiCode.ledger(r3.cs)
+        ref = MultiCode.sod_reference_ledger(spec)
+        l13 = MultiCode.sod_l1(r3.profile, spec, r3.t)
+        @test abs(lg.mass - ref.mass) / ref.mass < 1e-6       # f32 VTK floor
+        @test abs(lg.energy - ref.energy) / ref.energy < 1e-6
+        @test r3.profile.scatter == 0.0                       # bit-identical columns
+        @test l13.rho < 0.05
+        @test MultiCode.ncells(r3.cs) == 32^3
+        @info "Athena 3-D → CellSet" mass_err = abs(lg.mass - ref.mass) / ref.mass l1_rho = l13.rho seconds = round(r3.seconds; digits = 2)
+
         r = run_athena_sod(spec)
         l1 = MultiCode.sod_l1(r.profile, spec, r.t)
         @test r.t_end ≈ spec.t atol = 1e-6                 # reached the epoch
@@ -39,5 +57,6 @@ using AthenaLib                  # activates MultiCodeAthenaExt
         end
         @test isfile(md)
         @info "Athena engine report" path = md
+
     end
 end

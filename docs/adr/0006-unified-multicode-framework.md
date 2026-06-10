@@ -703,6 +703,20 @@ never forks of their cores.
   to the last digit) — the @xcall transport seam doing exactly what D1/D2
   promised: one call site, two transports, same answer.  The suite gate
   now runs in worker mode.
+- **Next-13 — Athena++ 3-D → the canonical state (done):** `read_vtk`
+  in AthenaLib (legacy BINARY RECTILINEAR_GRID, big-endian float32, one
+  MeshBlock = whole domain in one file — no HDF5 anywhere, dodging the
+  libhdf5∥libenzo conflict by construction) + `run_athena_sod3d`: the
+  stock Sod extruded to 32³ (a derived athinput appends the `<output3>`
+  vtk block — command-line overrides cannot ADD blocks), read back into
+  a `CellSet`.  Gates: ledger mass 8.3e-10 / energy 1.3e-9 vs the
+  analytic reference (the f32 VTK floor), transverse scatter EXACTLY 0.0
+  (bit-identical columns — 1-D physics in a 3-D box), L1(ρ) = 0.0129,
+  0.04 s wall-clock.  TRAP: Athena++ re-entrancy survives same-or-lower
+  dimensionality (3D→1D, re-runs) but 1D→3D in one process SEGFAULTS (a
+  static sized at first init) — run higher-dimensional cases first.
+  Athena++ now has the full Phase-2 treatment: engine row, canonical
+  state, ledger, profile.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
