@@ -176,7 +176,9 @@ function arepo_extract(h::ArepoLib.Handle; boxlen::Real)
     mom = rho .* vel
     etot = rho .* (uth .+ 0.5 .* vec(sum(abs2, vel; dims = 2)))
     return CellSet(:arepo, pos, v̂, rho, mom, etot,
-                   (length = L, time = L, density = 1.0),
+                   # `volume` = the PHYSICAL domain volume (Arepo's 1-D boxes are
+                   # L×1×1, not L³) — exact-deposit geometry needs the true scale
+                   (length = L, time = L, density = 1.0, volume = sum(vol)),
                    (handle = h, numgas = ng))
 end
 

@@ -5,6 +5,7 @@ EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 MultiCode = "1a2b3c4d-0011-4000-8000-000000000011"
 PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
 RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
@@ -14,4 +15,5 @@ CodeBridge = {path = "../../CodeBridge"}
 EnzoLib = {path = "../../EnzoLib"}
 MultiCode = {path = ".."}
 PPMKernels = {path = "../../PPMKernels"}
+R3D = {path = "../../../../../r3djl/R3D.jl"}
 RamsesLib = {path = "../../../../../RamsesNG.jl/lib/RamsesLib"}

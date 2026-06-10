@@ -7,8 +7,10 @@ version = "0.1.0"
 ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
 CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
 RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
 
 [sources]
@@ -16,6 +18,7 @@ ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}
+R3D = {path = "../../../../r3djl/R3D.jl"}
 RamsesLib = {path = "../../../../RamsesNG.jl/lib/RamsesLib"}
 
 [compat]

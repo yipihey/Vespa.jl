@@ -24,11 +24,13 @@ per-code modules.
 module MultiCode
 
 using Printf
+using LinearAlgebra: dot, cross
 using CodeBridge
 using EnzoLib
 using RamsesLib
 using ArepoLib
 using PPMKernels
+import R3D
 
 export CellSet, ledger, ledger_drift, ncells, exact_sod, SodSpec
 export enzo_extract, ramses_extract, arepo_extract
@@ -36,7 +38,7 @@ export run_enzo_sod, run_ramses_sod, run_arepo_sod
 export profile_x, sod_l1, sod_report
 export ramses_ppmk_hydro_step!, run_ramses_sod_guest
 export run_moray_stromgren, moray_ifront_radius, stromgren_radius, stromgren_scales
-export deposit_to_grid, sample_at_points
+export deposit_to_grid, deposit_exact, sample_at_points
 export run_ramsesrt_stromgren, ramsesrt_ifront_radius
 export ramsesrt_set_density!, ramsesrt_xhii_grid, run_enzo_host_ramsesrt
 

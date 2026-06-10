@@ -238,7 +238,8 @@ ADR-0006 D2) — Arepo keeps its state in C globals and cannot re-`init` cleanly
 in one process, so every run after the first in a session must be a worker.
 The `r.free()` closure disconnects the worker.
 """
-function run_arepo_sod(spec::SodSpec = SodSpec(); worker::Bool = false)
+function run_arepo_sod(spec::SodSpec = SodSpec(); worker::Bool = false,
+                       evolve::Bool = true)
     ArepoLib.available() || error("Arepo library not built")
     (spec.rhoL, spec.uL, spec.pL, spec.rhoR, spec.uR, spec.pR, spec.gamma, spec.x0) ==
         (1.0, 0.0, 1.0, 0.125, 0.0, 0.1, 1.4, 0.5) ||
@@ -273,8 +274,11 @@ function run_arepo_sod(spec::SodSpec = SodSpec(); worker::Bool = false)
 
     return cd(dir) do
         h = ArepoLib.init("param.txt")
-        status = ArepoLib.run!(h)
-        status == :done || error("Arepo run ended with $status")
+        # evolve=false stops at the INITIAL state — the window in which Arepo's
+        # tessellation (Mesh/DTC) is live for geometry export (get_voronoi_3d);
+        # a completed run! frees the mesh.
+        status = evolve ? ArepoLib.run!(h) : :init
+        evolve && (status == :done || error("Arepo run ended with $status"))
         L = ArepoLib.box_size(h)
         cs = arepo_extract(h; boxlen = L)
         t = ArepoLib.sim_time(h) / L                 # normalized

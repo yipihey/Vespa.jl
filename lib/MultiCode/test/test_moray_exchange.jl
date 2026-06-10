@@ -10,7 +10,7 @@
 
 using Test
 using MultiCode
-using EnzoLib, ArepoLib
+using EnzoLib, ArepoLib, CodeBridge
 
 @testset "Phase 4.1: Moray ≈ Strömgren (Iliev-1)" begin
     if !(EnzoLib.grid_available() && isfile(MultiCode.ENZO_PHOTONTEST_PF))
@@ -132,11 +132,63 @@ end
                 u2 = ArepoLib.get_cell_field(a.handle, :utherm)
                 @test all(isfinite, u2) && all(u2 .> 0)
                 @info "flagship 3 (Moray inside Arepo)" cells = ng heated = count(>(0), gamma_heat) max_xHII = maximum(r.fields.xHII)
+
             finally
                 r.free()
             end
         finally
             a.free()
+        end
+    end
+end
+
+@testset "Phase 5: the EXACT exchange — Arepo Voronoi geometry through R3D" begin
+    arepo_dir = ArepoLib.available() ? normpath(dirname(ArepoLib.libpath())) : ""
+    lib3d = joinpath(arepo_dir, "libarepo3d.dylib")
+    py = ArepoLib.available() ? MultiCode._arepo_python(arepo_dir) : nothing
+    if !(py !== nothing && isfile(lib3d))
+        @warn "exact-exchange gate skipped (needs libarepo3d: make shared CONFIG=Config_3d.sh BUILD_DIR=build3d LIBRARY=arepo3d)"
+        @test_skip false
+    else
+        # A genuinely 3-D Voronoi donor: the noh_3d example, INIT ONLY (the
+        # tessellation is live right after init; a completed run! frees it),
+        # in a worker whose env selects the 3-D library flavor — the same
+        # wrapper, a different dylib, zero code changes (LazyLib env override).
+        example = joinpath(arepo_dir, "examples", "noh_3d")
+        dir = mktempdir()
+        cp(joinpath(example, "param.txt"), joinpath(dir, "param.txt"))
+        mkpath(joinpath(dir, "output"))
+        run(pipeline(`$py $(joinpath(example, "create.py")) $dir`; stdout = devnull))
+        shm = tempname()
+        wfile = joinpath(dir, "arepo3d_worker.jl")
+        write(wfile, "using ArepoLib; ArepoLib.serve(; shm = ARGS[1])\n")
+        jl = Base.julia_cmd()
+        cmd = addenv(setenv(`$jl --startup-file=no --project=$(pkgdir(ArepoLib)) $wfile $shm`;
+                            dir = dir), "AREPO_LIB" => lib3d)
+        CodeBridge.connect_worker!(ArepoLib.BRIDGE, cmd; shm = shm)
+        try
+            @test ArepoLib.precision_bytes().ndim == 3        # the 3-D flavor is live
+            h = cd(() -> ArepoLib.init("param.txt"), dir)
+            ng = ArepoLib.info(h).numgas
+            cs = arepo_extract(h; boxlen = ArepoLib.box_size(h))
+            geo = ArepoLib.get_voronoi_3d(h)
+            @test length(geo.nv) > 3 * ng                 # cells have many faces in 3-D
+            @test size(geo.verts, 1) == sum(geo.nv)
+            @test all(>=(3), geo.nv)                      # rings are polygons
+            # deposit_exact's INTERNAL assertions are the hard gates: each
+            # cell's clipped volume equals its SphP volume, and the total
+            # mass is conserved — exact geometry, not interpolation.
+            ge = deposit_exact(cs, geo, 32)
+            volscale = cs.units.volume / cs.units.length^3
+            @test abs(volscale - 1.0) < 1e-12             # cubic domain
+            @test abs(sum(ge.vol) / 32^3 - 1.0) < 1e-9    # the box is tiled exactly
+            gc = deposit_to_grid(cs, 32; method = :cic)
+            @test abs(sum(ge.rho) - sum(gc.rho)) / sum(gc.rho) < 1e-9   # same totals
+            @info "exact R3D exchange" cells = ng faces = length(geo.nv) verts = size(geo.verts, 1)
+            ArepoLib.finalize(h)
+        finally
+            CodeBridge.disconnect_worker!(ArepoLib.BRIDGE)
+            rm(shm; force = true)
         end
     end
 end
