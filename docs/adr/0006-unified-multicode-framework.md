@@ -594,9 +594,22 @@ never forks of their cores.
   integrator is variational), so it enters as an ENGINE; an EquationSet
   facade would misrepresent the seam.  Revisit when dfmm-2d's Eulerian
   remap lands.
-- **Next:** oct-native KA smoother for irregular refined regions;
-  extension-ifying the LEGACY wrappers (EnzoLib/RamsesLib/ArepoLib) in
-  MultiCode remains deliberate deferred polish — they are lazy pure-Julia
-  bindings (no dlopen until first use, no load-time burden), so the
-  weak-dep conversion buys little until a registry release forces it;
-  the dfmm extension documents the pattern to follow.
+- **Next-6 — the IRREGULAR refined region (done):** the fine-level solve
+  generalized beyond cuboids (`ramses_ka_poisson_fine!`): masked bbox
+  raster of an arbitrary blob region, `interpol_phi` ghosts on every
+  region-adjacent missing-oct cell (mask-driven, same kernel), and
+  matrix-free conjugate gradients on the masked SPD system
+  `6φ − Σφ_nbr = −4π·dx²·(ρ−ρ̄) + Σ ghosts`.  Certification on a
+  SPHERICAL blob (840 octs in a 24³ bbox — genuinely non-cuboid,
+  asserted): the oracle's converged `phi_fine_cg` solution satisfies OUR
+  masked system at **4.3e-15**, and the masked CG lands on the oracle at
+  **7.3e-13** in 62 iterations.  The gravity guest now solves ANY
+  refined-region shape RAMSES hands it; a KA-kernelized masked smoother
+  (GPU execution of the same system) is the performance follow-up.
+- **Next (performance/polish track):** KA-kernelize the masked
+  irregular-region smoother for GPU execution; extension-ifying the
+  LEGACY wrappers (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains
+  deliberate deferred polish — they are lazy pure-Julia bindings (no
+  dlopen until first use, no load-time burden), so the weak-dep
+  conversion buys little until a registry release forces it; the dfmm
+  extension documents the pattern to follow.

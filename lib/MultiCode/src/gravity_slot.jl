@@ -228,6 +228,168 @@ function _fine_dirichlet_ghosts!(sol::Array{Float64,3}, fb, phic::Array{Float64,
     return sol
 end
 
+# ── the IRREGULAR refined region (Next-6): the masked fine-level solve ────────
+#
+# Beyond cuboids: an arbitrary (blob) refined region is an irregular-domain
+# Dirichlet problem — same 7-point system, same interpol_phi ghosts at every
+# region-adjacent cell of a missing oct, but the unknowns live on a MASK, not
+# a box.  Solved matrix-free with conjugate gradients (the operator is SPD on
+# the masked cells; ghost contributions move to the RHS).  This is the
+# oct-irregular capability; a KA-kernelized masked smoother is the
+# performance follow-up.
+
+"Masked bbox raster of one mesh field on a partial level (no cuboid assumption)."
+function _ramses_field_bbox_masked(h::RamsesLib.Handle, which::Symbol, lev::Integer;
+                                   lib::Symbol = :cpu)
+    ck, val = RamsesLib.get_field(h, which, lev; lib = lib)
+    noct = size(ck, 1)
+    noct > 0 || error("_ramses_field_bbox_masked: level $lev is empty")
+    lo = (typemax(Int), typemax(Int), typemax(Int))
+    hi = (typemin(Int), typemin(Int), typemin(Int))
+    @inbounds for o in 1:noct
+        b = (2 * Int(ck[o, 1]), 2 * Int(ck[o, 2]), 2 * Int(ck[o, 3]))
+        lo = min.(lo, b); hi = max.(hi, b .+ 1)
+    end
+    nloc = hi .- lo .+ 1
+    A = zeros(Float64, (nloc .+ 2)...)               # 1-cell halo (ghost ring lives here)
+    covered = falses((nloc .+ 2)...)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - lo[1] + 2
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - lo[2] + 2
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - lo[3] + 2
+        A[i, j, k] = val[o, c]
+        covered[i, j, k] = true
+    end
+    return (ck = ck, A = A, covered = covered, off = lo, nloc = nloc, n1d = 2^lev)
+end
+
+"Write the covered cells of a haloed masked array back into the level's field."
+function _ramses_field_masked_set!(h::RamsesLib.Handle, which::Symbol, lev::Integer,
+                                   fb, A::Array{Float64,3}; lib::Symbol = :cpu)
+    ck = fb.ck; noct = size(ck, 1)
+    val = Matrix{Float64}(undef, noct, 8)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - fb.off[1] + 2
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - fb.off[2] + 2
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - fb.off[3] + 2
+        val[o, c] = A[i, j, k]
+    end
+    RamsesLib.set_field!(h, which, lev, ck, val; lib = lib)
+    return nothing
+end
+
+"""
+Fill every NON-covered cell that is face-adjacent to a covered cell with its
+interpol_phi value (the virtual-oct ghost RAMSES's fine solver sees) — the
+mask-driven generalization of the cuboid face ring.
+"""
+function _fine_dirichlet_ghosts_masked!(A::Array{Float64,3}, fb, phic::Array{Float64,3};
+                                        tfrac::Real = 0.0, lib::Symbol = :cpu)
+    n1dc = size(phic, 1); n1df = fb.n1d
+    nx, ny, nz = size(A)
+    phi27 = Vector{Float64}(undef, 27)
+    cache = Dict{NTuple{3,Int},Vector{Float64}}()
+    cov = fb.covered
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
+        cov[i, j, k] && continue
+        adj = (i > 1 && cov[i-1, j, k]) || (i < nx && cov[i+1, j, k]) ||
+              (j > 1 && cov[i, j-1, k]) || (j < ny && cov[i, j+1, k]) ||
+              (k > 1 && cov[i, j, k-1]) || (k < nz && cov[i, j, k+1])
+        adj || continue
+        g = (mod(fb.off[1] + (i - 2), n1df), mod(fb.off[2] + (j - 2), n1df),
+             mod(fb.off[3] + (k - 2), n1df))
+        oct = g .>> 1
+        out = get!(cache, oct) do
+            for dk in 0:2, dj in 0:2, di in 0:2
+                phi27[1 + di + 3dj + 9dk] =
+                    phic[mod(oct[1] - 1 + di, n1dc) + 1,
+                         mod(oct[2] - 1 + dj, n1dc) + 1,
+                         mod(oct[3] - 1 + dk, n1dc) + 1]
+            end
+            RamsesLib.interpol_phi(phi27, phi27, tfrac; lib = lib)
+        end
+        A[i, j, k] = out[1 + (g[1] & 1) + 2 * (g[2] & 1) + 4 * (g[3] & 1)]
+    end
+    return A
+end
+
+# the masked 7-point operator  (A·x)[c] = 6x[c] − Σ_covered-nbr x[nbr]  (SPD)
+function _masked_apply!(out::Array{Float64,3}, x::Array{Float64,3}, cov)
+    nx, ny, nz = size(x)
+    @inbounds for k in 2:nz-1, j in 2:ny-1, i in 2:nx-1
+        cov[i, j, k] || continue
+        s = 6.0 * x[i, j, k]
+        cov[i-1, j, k] && (s -= x[i-1, j, k]); cov[i+1, j, k] && (s -= x[i+1, j, k])
+        cov[i, j-1, k] && (s -= x[i, j-1, k]); cov[i, j+1, k] && (s -= x[i, j+1, k])
+        cov[i, j, k-1] && (s -= x[i, j, k-1]); cov[i, j, k+1] && (s -= x[i, j, k+1])
+        out[i, j, k] = s
+    end
+    return out
+end
+
+_masked_dot(a, b, cov) = (s = 0.0; @inbounds for q in eachindex(a)
+                              cov[q] && (s += a[q] * b[q])
+                          end; s)
+
+"""
+    ramses_ka_poisson_fine!(h; levc, levf, boxlen=1.0, fourpi=4π,
+                            rtol=1e-12, maxiter=2000, lib=:cpu) -> (; ...)
+
+The IRREGULAR-region fine-level Poisson solve: masked bbox raster, interpol_phi
+ghosts on every region-adjacent missing-oct cell, matrix-free CG on
+`6φ − Σφ_nbr = −4π·dx²·(ρ−ρ̄) + Σ ghosts`, write-back into the live `phi`.
+Replaces `phi_fine_cg`/`multigrid` for ANY refined-region shape (the cuboid
+fast path remains `vcycle_solve!(dirichlet=true)`).
+"""
+function ramses_ka_poisson_fine!(h::RamsesLib.Handle; levc::Integer, levf::Integer,
+                                 boxlen::Real = 1.0, fourpi::Real = 4π,
+                                 rtol::Real = 1e-12, maxiter::Integer = 2000,
+                                 lib::Symbol = :cpu)
+    _, phic = ramses_grid_field(h, :phi, levc; lib = lib)
+    _, rhoc = ramses_grid_field(h, :rho, levc; lib = lib)
+    rho_tot = sum(rhoc) / length(rhoc)
+    rb = _ramses_field_bbox_masked(h, :rho, levf; lib = lib)
+    cov = rb.covered
+    dxf = Float64(boxlen) / rb.n1d
+    # ghosts live in a zero x with ONLY boundary values set; their stencil
+    # contribution moves to the RHS:  b = −fact·(ρ−ρ̄) + Σ_ghost-nbr g
+    gh = zeros(Float64, size(rb.A))
+    _fine_dirichlet_ghosts_masked!(gh, rb, phic; lib = lib)
+    fact = Float64(fourpi) * dxf^2
+    b = zeros(Float64, size(rb.A))
+    nx, ny, nz = size(rb.A)
+    @inbounds for k in 2:nz-1, j in 2:ny-1, i in 2:nx-1
+        cov[i, j, k] || continue
+        s = -fact * (rb.A[i, j, k] - rho_tot)
+        cov[i-1, j, k] || (s += gh[i-1, j, k]); cov[i+1, j, k] || (s += gh[i+1, j, k])
+        cov[i, j-1, k] || (s += gh[i, j-1, k]); cov[i, j+1, k] || (s += gh[i, j+1, k])
+        cov[i, j, k-1] || (s += gh[i, j, k-1]); cov[i, j, k+1] || (s += gh[i, j, k+1])
+        b[i, j, k] = s
+    end
+    # conjugate gradients, matrix-free on the mask
+    x = zeros(Float64, size(rb.A))
+    r = copy(b); p = copy(b); Ap = zeros(Float64, size(rb.A))
+    rr = _masked_dot(r, r, cov)
+    rr0 = rr
+    iters = 0
+    while rr > rtol^2 * rr0 && iters < maxiter
+        _masked_apply!(Ap, p, cov)
+        alpha = rr / _masked_dot(p, Ap, cov)
+        @inbounds for q in eachindex(x)
+            cov[q] || continue
+            x[q] += alpha * p[q]; r[q] -= alpha * Ap[q]
+        end
+        rr2 = _masked_dot(r, r, cov)
+        beta = rr2 / rr; rr = rr2; iters += 1
+        @inbounds for q in eachindex(p)
+            cov[q] && (p[q] = r[q] + beta * p[q])
+        end
+    end
+    _ramses_field_masked_set!(h, :phi, levf, rb, x; lib = lib)
+    return (phi = x, ghosts = gh, covered = cov, rb = rb, b = b,
+            iters = iters, relres = sqrt(rr / rr0), rho_tot = rho_tot, fact = fact)
+end
+
 """
     run_ramses_gravity_amr_compare(; levc=5, half=4, amp=0.05, eps=1e-12)
 
@@ -312,6 +474,70 @@ function run_ramses_gravity_amr_compare(; levc::Integer = 5, half::Integer = 4,
                 nf = nf, n_fine_octs = RamsesLib.level_noct(h, levf; lib = lib),
                 handle = h, fb = fb, sol = sol,
                 free = () -> RamsesLib.finalize(h; lib = lib))
+    end
+end
+
+"""
+    run_ramses_gravity_blob_compare(; levc=5, radius=0.18, amp=0.05, eps=1e-12)
+
+The IRREGULAR-region certification: a SPHERICAL blob of refined coarse cells
+(genuinely non-cuboid — asserted), host deposits + coarse solve, then the fine
+level solved by (a) RAMSES's `phi_fine_cg` at `eps` — the ORACLE — and (b) the
+masked CG guest (`ramses_ka_poisson_fine!`).  Returns the oracle's residual
+under OUR masked system (certifies the irregular-domain replication
+solver-free) and the φ parity.
+"""
+function run_ramses_gravity_blob_compare(; levc::Integer = 5, radius::Real = 0.18,
+                                         amp::Real = 0.05, eps::Real = 1e-12,
+                                         lib::Symbol = :cpu)
+    RamsesLib.available() || error("RAMSES library not found (set RAMSES_LIB to the bin64h build)")
+    nc = 2^levc
+    levf = levc + 1
+    dir = mktempdir()
+    nml = _ramses_gravity_namelist(level = levc)
+    nml = replace(nml, "levelmax=$(levc)" => "levelmax=$(levf)")
+    write(joinpath(dir, "gravity_blob.nml"), nml)
+    return cd(dir) do
+        h = RamsesLib.init("gravity_blob.nml"; lib = lib)
+        RamsesLib.set_epsilon!(h, eps; lib = lib)
+        ck, _ = RamsesLib.get_hydro_all(h, :uold, levc; lib = lib)
+        noct = size(ck, 1)
+        rho_in = Matrix{Float64}(undef, noct, 8)
+        flag = Matrix{Float64}(undef, noct, 8)
+        @inbounds for o in 1:noct, c in 1:8
+            ix = 2 * ck[o, 1] + ((c - 1) & 1)
+            iy = 2 * ck[o, 2] + ((c - 1) >> 1 & 1)
+            iz = 2 * ck[o, 3] + ((c - 1) >> 2 & 1)
+            x = (ix + 0.5) / nc; y = (iy + 0.5) / nc; z = (iz + 0.5) / nc
+            rho_in[o, c] = 1.0 + amp * sin(2π * x) * sin(4π * y) * cos(2π * z)
+            flag[o, c] = ((x - 0.5)^2 + (y - 0.5)^2 + (z - 0.5)^2 < radius^2) ? 1.0 : 0.0
+        end
+        RamsesLib.set_hydro!(h, :uold, 1, levc, ck, rho_in; lib = lib)
+        RamsesLib.set_field!(h, :flag1, levc, ck, flag; lib = lib)
+        RamsesLib.refine_fine!(h, levc; lib = lib)
+        nfo = RamsesLib.level_noct(h, levf; lib = lib)
+        nfo > 0 || error("blob refinement produced no fine octs")
+        RamsesLib.rho_fine!(h, levc, 0; lib = lib)
+        RamsesLib.rho_fine!(h, levf, 0; lib = lib)
+        RamsesLib.multigrid!(h, levc, 1; lib = lib)
+        # ── ORACLE fine solve, captured on the masked bbox ────────────────────
+        RamsesLib.phi_fine_cg!(h, levf, 1; lib = lib)
+        po = _ramses_field_bbox_masked(h, :phi, levf; lib = lib)
+        is_cuboid = (8 * nfo == prod(po.nloc))
+        # ── GUEST: the masked CG (overwrites the live phi) ────────────────────
+        g = ramses_ka_poisson_fine!(h; levc = levc, levf = levf, lib = lib)
+        # oracle residual under OUR masked system (φ_or with zeros outside the
+        # mask — the ghost contributions live in g.b)
+        phio = ifelse.(po.covered, po.A, 0.0)
+        Ap = zeros(Float64, size(phio))
+        _masked_apply!(Ap, phio, po.covered)
+        resid_oracle = maximum(abs.(ifelse.(po.covered, Ap .- g.b, 0.0)))
+        scale = maximum(abs, ifelse.(po.covered, po.A, 0.0))
+        dphi = maximum(abs.(ifelse.(po.covered, g.phi .- po.A, 0.0))) / scale
+        return (dphi = dphi, resid_oracle = resid_oracle / (g.fact * 1.0),
+                phi_scale = scale, is_cuboid = is_cuboid, n_fine_octs = nfo,
+                nloc = po.nloc, cg_iters = g.iters, cg_relres = g.relres,
+                handle = h, free = () -> RamsesLib.finalize(h; lib = lib))
     end
 end
 

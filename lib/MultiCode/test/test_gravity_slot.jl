@@ -71,5 +71,19 @@ haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] =
         finally
             ra.free()
         end
+
+        # ── the IRREGULAR refined region (Next-6): masked CG on a blob ────────
+        # A spherical blob of refined cells (genuinely non-cuboid — asserted):
+        # same two independent gates as the cuboid case, on the masked system.
+        rb = run_ramses_gravity_blob_compare(levc = 5, radius = 0.18, eps = 1e-12)
+        try
+            @test !rb.is_cuboid                          # the region is irregular
+            @test rb.n_fine_octs > 0
+            @test rb.resid_oracle < 1e-13                # masked-system replication ≡ ε
+            @test rb.dphi < 1e-10                        # masked CG ≡ RAMSES CG
+            @info "irregular-region (blob) solve" dphi = rb.dphi resid_oracle = rb.resid_oracle octs = rb.n_fine_octs bbox = rb.nloc cg_iters = rb.cg_iters
+        finally
+            rb.free()
+        end
     end
 end
