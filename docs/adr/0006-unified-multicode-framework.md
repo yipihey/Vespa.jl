@@ -765,9 +765,15 @@ never forks of their cores.
   stationary flow; evolving to t = 100 preserves it to 0.107%
   (vl2+PLM at 100 radial cells), gated at 2e-3.  AthenaLib 20/20.
   GR spacetimes are now one flavor line away for the whole harness.
-- **Next (polish track):** extension-ifying the LEGACY wrappers
-  (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
-  polish — they are lazy pure-Julia bindings (no dlopen until first
-  use, no load-time burden), so the weak-dep conversion buys little
-  until a registry release forces it; the dfmm extension documents the
-  pattern to follow.
+- **Planned next steps (`docs/roadmap.md`):** the already-scoped
+  directions beyond this program, each grounded in completed work with a
+  concrete on-ramp — Athena++ per-stage solver slots on Enzo/HG grids;
+  more GR spacetimes (Kerr, Fishbone–Moncrief torus, GR shock tube — one
+  flavor line each now); the MUSIC noise-file writer + the `ka_poisson`
+  plugin seam for fixed-and-paired cross-generator ICs; the Santa
+  Barbara run to refinement onset + a GPU production campaign + the
+  f32-reference structure-formation gate; and (deferred polish)
+  extension-ifying the LEGACY wrappers (EnzoLib/RamsesLib/ArepoLib) in
+  MultiCode — lazy pure-Julia bindings, so the weak-dep conversion buys
+  little until a registry release forces it; the dfmm extension
+  documents the pattern.

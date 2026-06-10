@@ -34,7 +34,9 @@ Moray inside Arepo) certified to solver tolerance. The complete registry of
 wrappers, kernel libraries, and certified capabilities is
 [`docs/framework-surface.md`](docs/framework-surface.md); the architecture and
 per-phase status record is
-[`docs/adr/0006-unified-multicode-framework.md`](docs/adr/0006-unified-multicode-framework.md).
+[`docs/adr/0006-unified-multicode-framework.md`](docs/adr/0006-unified-multicode-framework.md);
+the already-scoped directions beyond it are the
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Architecture
 

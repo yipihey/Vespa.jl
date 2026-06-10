@@ -59,8 +59,12 @@ sibling arepo + dfmm checkouts; gates skip cleanly where a library is absent).
 ADR-0006 phases 0–7, Next-1…14, and Phase C complete; the per-phase implementation record
 (numbers, traps, commit references) is the status appendix of
 [`docs/adr/0006-unified-multicode-framework.md`](adr/0006-unified-multicode-framework.md).
-Remaining recorded polish: extension-ifying the legacy wrappers in MultiCode
-(deferred until a registry release — they are lazy bindings).  The
-wrapper-registry on-ramp is COMPLETE: all seven wrappers carry live
+The wrapper-registry on-ramp is COMPLETE: all seven wrappers carry live
 cross-code gates, and MUSIC generates through its own CodeBridge worker
 (bit-identical to in-process — the D1/D2 transport seam certified once more).
+
+The already-scoped directions beyond this — GR spacetimes, Athena per-stage
+slots, fixed-and-paired cross-generator ICs, the deeper Santa Barbara
+campaign, and the deferred wrapper extension-ification — are the
+**[planned next steps](roadmap.md)**, each grounded in completed work with a
+concrete on-ramp.

@@ -164,7 +164,8 @@ and Gadget4Lib (Gadget4.jl) are all clients** — their cross-repo `[sources]`
 point back here, so changes to CodeBridge ripple across SIX sibling repos
 (DiscoDJ.jl is the seventh wrapper but rides PythonCall, not CodeBridge; dfmm
 integrates as a MultiCode package extension). The full registry + capability
-table is `docs/framework-surface.md`.
+table is `docs/framework-surface.md`; the already-scoped directions beyond the
+completed program are `docs/roadmap.md`.
 Wire-protocol invariants live in `lib/CodeBridge/test` (29 tests incl. a
 compiled-C-fixture local≡remote parity oracle; zero-arg calls and `Ref`/Matrix
 buffers are covered — they bit earlier).
