@@ -1,0 +1,12 @@
+[deps]
+ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
+CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
+EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
+RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
+CodeBridge = {path = "../../lib/CodeBridge"}
+EnzoLib = {path = "../../lib/EnzoLib"}
+RamsesLib = {path = "../../../../RamsesNG.jl/lib/RamsesLib"}

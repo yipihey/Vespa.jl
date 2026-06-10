@@ -21,32 +21,26 @@ module EnzoLib
 
 using Libdl
 using PPMKernels
+using CodeBridge
+using CodeBridge: @xcall          # the call sites in session.jl resolve to CodeBridge's macro
 
-# ── library location + lazy handle ───────────────────────────────────────────
+# ── library location + lazy handle (CodeBridge.LazyLib) ──────────────────────
 # The library path is runtime-determined (env / build location), so we cannot
 # name it in a `ccall((:sym, "lib"), …)` literal inside a precompiled module.
-# Instead dlopen once (lazily) and `ccall` through the dlsym function pointer.
+# CodeBridge dlopens once (lazily) and we `ccall` through the dlsym pointer.
+const PILOT_LIB = CodeBridge.LazyLib(
+    env = "ENZOMODULES_LIB",
+    default = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
+                                "EnzoModules", "deps", "libenzomodules_pilot.so")),
+    hint = "Build it with EnzoModules/deps/build_pilot.sh, or set ENV[\"ENZOMODULES_LIB\"].")
+
 "Absolute path to the EnzoModules shared library (env override, else the in-repo build)."
-function libpath()
-    env = get(ENV, "ENZOMODULES_LIB", "")
-    isempty(env) || return abspath(env)
-    return normpath(joinpath(@__DIR__, "..", "..", "..", "..",
-                             "EnzoModules", "deps", "libenzomodules_pilot.so"))
-end
+libpath() = CodeBridge.libpath(PILOT_LIB)
 
 "True when the shared library exists on disk (callers can skip live calls without it)."
-available() = isfile(libpath())
+available() = CodeBridge.available(PILOT_LIB)
 
-const _HANDLE = Ref{Ptr{Cvoid}}(C_NULL)
-function _handle()
-    if _HANDLE[] == C_NULL
-        available() || error("EnzoModules library not found at $(libpath()). " *
-                             "Build it with EnzoModules/deps/build_pilot.sh, or set ENV[\"ENZOMODULES_LIB\"].")
-        _HANDLE[] = Libdl.dlopen(libpath())
-    end
-    return _HANDLE[]
-end
-@inline _sym(name::Symbol) = Libdl.dlsym(_handle(), name)
+@inline _sym(name::Symbol) = CodeBridge.sym(PILOT_LIB, name)
 
 # ── precision contract ───────────────────────────────────────────────────────
 """

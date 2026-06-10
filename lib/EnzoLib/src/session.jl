@@ -52,55 +52,35 @@ function _promote_mpitrampoline()
     return nothing
 end
 
-const _GHANDLE = Ref{Ptr{Cvoid}}(C_NULL)
-function _ghandle()
-    if _GHANDLE[] == C_NULL
-        grid_available() || error("grid/session library not found at $(grid_libpath()). " *
-                                  "Build it: bash EnzoModules/deps/build_grid_darwin.sh")
-        if enzo_mpi_enabled()
-            _promote_mpitrampoline()
-            # RTLD_GLOBAL so the bridge participates in flat MPI_* resolution.
-            _GHANDLE[] = Libdl.dlopen(grid_libpath(), Libdl.RTLD_GLOBAL | Libdl.RTLD_LAZY)
-        else
-            _GHANDLE[] = Libdl.dlopen(grid_libpath())
-        end
-    end
-    return _GHANDLE[]
-end
-@inline _gsym(name::Symbol) = Libdl.dlsym(_ghandle(), name)
+# ── the bridge declaration (CodeBridge, ADR-0006 D1) ─────────────────────────
+# One Bridge bundles the grid library (serial or MPI flavor, resolved at open
+# time), the transport backend, and the wire contract parsed from THIS file's
+# @xcall sites.  The contract seed is unchanged from the pre-CodeBridge rpc.jl,
+# so the canonical serialization — and therefore the contract hash baked into
+# the already-built C++ workers — is byte-identical.
+const BRIDGE = CodeBridge.Bridge(:enzo, @__MODULE__;
+    libs = Dict(:grid => CodeBridge.LazyLib(
+        () -> grid_libpath();
+        # RTLD_GLOBAL so the MPI bridge participates in flat MPI_* resolution.
+        flags = () -> enzo_mpi_enabled() ? (Libdl.RTLD_GLOBAL | Libdl.RTLD_LAZY) : nothing,
+        preopen = () -> (enzo_mpi_enabled() && _promote_mpitrampoline(); nothing),
+        hint = "Build it: bash EnzoModules/deps/build_grid_darwin.sh")),
+    manifest_files = [joinpath(@__DIR__, "session.jl")],
+    contract_seed = "enzong-bridge-contract-v1")
+
+_ghandle() = CodeBridge.handle(CodeBridge.lib(BRIDGE))
+@inline _gsym(name::Symbol) = CodeBridge.sym(BRIDGE, name)
 
 # ── transport seam (ADR-0005) ─────────────────────────────────────────────────
-# Every bridge call goes through `@xcall`, which expands to either the in-process
-# `ccall` (local, the default and the serial-verified path) or a remote RPC to a
-# worker process (remote).  The C symbol + return type + arg types are written
-# ONCE at the call site — there is no second hand-maintained interface to drift,
-# and the same declaration is what a manifest generator (#2) reads to produce the
-# worker dispatch + remote stubs.  Switch with `set_backend!`.
-const _BACKEND = Ref{Symbol}(:local)
+# Every bridge call goes through CodeBridge's `@xcall`, which expands to either
+# the in-process `ccall` (local, the default and the serial-verified path) or a
+# remote RPC to a worker process (remote).  The C symbol + return type + arg
+# types are written ONCE at the call site — there is no second hand-maintained
+# interface to drift, and the same declaration is what the manifest generator
+# reads to produce the worker dispatch + remote stubs.  Switch with `set_backend!`.
 "Select the bridge transport: `:local` (in-process ccall) or `:remote` (worker RPC)."
-set_backend!(b::Symbol) = (b in (:local, :remote) || error("backend must be :local or :remote"); _BACKEND[] = b)
-backend() = _BACKEND[]
-
-# Remote dispatch (`_rpc`) is defined in rpc.jl (ADR-0005 #2): a worker process +
-# shared-memory transport.  It is resolved at call time, so the local path here
-# never depends on it.
-
-"""
-    @xcall(:c_symbol, RetType, (ArgTypes...), args...)
-
-Backend-dispatching bridge call.  Local → `ccall(_gsym(:c_symbol), RetType,
-(ArgTypes...), args...)` (literal types preserved); remote → `_rpc(...)`.
-"""
-macro xcall(sym, ret, argtypes, args...)
-    a = map(esc, args)
-    quote
-        if _BACKEND[] === :local
-            ccall(_gsym($(esc(sym))), $(esc(ret)), $(esc(argtypes)), $(a...))
-        else
-            _rpc($(esc(sym)), $(esc(ret)), $(esc(argtypes)), ($(a...),))
-        end
-    end
-end
+set_backend!(b::Symbol) = (CodeBridge.set_backend!(BRIDGE, b); b)
+backend() = CodeBridge.backend(BRIDGE)
 
 # ── hydro_rk (MUSCL) line solver — the golden reference for the Metal MUSCL port ──
 """

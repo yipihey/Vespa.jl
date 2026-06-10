@@ -1,4 +1,5 @@
 [deps]
+CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 EnzoBackend = "1a2b3c4d-0006-4000-8000-000000000006"
 EnzoFixtures = "1a2b3c4d-0005-4000-8000-000000000005"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
@@ -11,6 +12,7 @@ RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
+CodeBridge = {path = "../../CodeBridge"}
 EnzoBackend = {path = "../../EnzoBackend"}
 EnzoFixtures = {path = "../../EnzoFixtures"}
 EnzoLib = {path = ".."}

@@ -1,0 +1,6 @@
+[deps]
+CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+CodeBridge = {path = ".."}

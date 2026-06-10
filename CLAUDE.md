@@ -153,6 +153,47 @@ total to round-off). The serial `:local`≡`:remote` parity oracle is
 (subprocess boundary) and `docs/adr/0004-…` (Enzo-substrate MPI). The conservative
 `:julia`-under-AMR path is `docs/adr/0003-…`.**
 
+## CodeBridge + MultiCode (the multi-code framework, ADR-0006)
+
+`lib/CodeBridge` is the shared legacy-wrapper substrate (extracted from EnzoLib,
+hash-invariant — the prebuilt C++ workers still handshake): `LazyLib` multi-flavor
+loading, `Bridge`, the `@xcall` macro (resolves the calling module's `const
+BRIDGE`), manifest/contract-hash, and the worker RPC. **EnzoLib, RamsesLib
+(RamsesNG.jl), and ArepoLib (Arepo.jl) are all clients** — their cross-repo
+`[sources]` point back here, so changes to CodeBridge affect three repos.
+Wire-protocol invariants live in `lib/CodeBridge/test` (29 tests incl. a
+compiled-C-fixture local≡remote parity oracle; zero-arg calls and `Ref`/Matrix
+buffers are covered — they bit earlier).
+
+`lib/MultiCode` is the cross-code layer: `CellSet` canonical state + per-code
+`extract`/`inject!` adapters (Phase 2), the PPMKernels-in-RAMSES guest slot
+(Phase 3; `device=:metal` for f32 GPU), Moray-as-a-service + the conservative
+deposit/sample exchange + Moray-inside-Arepo (Phase 4), RAMSES-RT wrapped +
+the Moray-vs-RAMSES-RT cross-check + RAMSES-RT-inside-Enzo (Phases 4–5).
+Run: `<julia> --project=lib/MultiCode/test lib/MultiCode/test/runtests.jl`
+(~5 min; needs the Enzo grid dylib, mini-ramses `bin64h` AND `bin64hrt` libs,
+and the sibling arepo `libarepo.dylib`). Reports land in `reports/multicode/`.
+Multi-worker (N codes at once): `test/multicode/test_multicode_workers.jl`
+(own Project.toml).
+
+Hard-won gotchas:
+- **RAMSES lib flavors:** `bin64s` = gravity-only (no hydro symbols), `bin64h` =
+  hydro (`RAMSES_LIB` must point here for Sod), `bin64hrt` = hydro+RT
+  (`RAMSES_LIB_RT`; build `make NDIM=3 HYDRO=1 GRAV=1 RT=1 NRTGRP=1 NION=1
+  libramses`, and `make clean` first when flags change — stale `.mod` files).
+- **RAMSES-RT driving:** call `rt_neq_updates!` once after `init` (fills the σ·c
+  chemistry tables; without it photons stream but nothing ionizes). Ion
+  fractions are density-weighted: `xHII = uold₆/uold₁`. Keep RT point sources at
+  a cell center — a corner source's CIC cloud clips to 1/8 (upstream bug).
+- **Arepo is a per-process singleton:** a second `init` in one process crashes
+  its allocator. Any run after the first must use a worker
+  (`run_arepo_sod(worker=true)` / `CodeBridge.connect_worker!`).
+- **Periodic step ICs carry a mirror Riemann problem at the wrap seam** — the
+  Sod comparison uses t̂=0.1, a double-length RAMSES domain, windowed profiles.
+- **Moray/chemistry outer dt:** photons subcycle internally but the chemistry
+  advances once per outer cycle — cap the outer dt (0.25 Myr) or the
+  ionization lags the radiation.
+
 ## HierarchicalGrids.jl (the substrate) gotchas
 
 - Local at `/Users/tabel/Projects/HierarchicalGrids.jl`; pulled in via
