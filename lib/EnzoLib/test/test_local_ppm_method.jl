@@ -4,7 +4,7 @@
             HydroMethod = 10
             NumberOfGhostZones = 1
             Gamma = 1.4
-            LeftFaceBoundaryCondition = 3 3 3
+            LeftFaceBoundaryCondition = 3 3 3 // periodic
             RightFaceBoundaryCondition = 3 3 3
             """)
         close(io)
@@ -21,5 +21,15 @@
         @test haskey(cfg.hooks, :hydro)
         @test cfg.gravity === :off
         @test cfg.mhd_ct === :off
+    end
+
+    mktemp() do path, io
+        write(io, """
+            HydroMethod = 10
+            NumberOfGhostZones = 1
+            MaximumRefinementLevel = 2
+            """)
+        close(io)
+        @test_throws ErrorException EnzoLib.local_ppm_engine(path)
     end
 end

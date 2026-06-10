@@ -12,7 +12,8 @@ end
 function _integer_vector_parameter(paramfile::AbstractString, name::AbstractString)
     rx = Regex("^\\s*" * name * "\\s*=\\s*(.*)")
     for ln in eachline(paramfile)
-        m = match(rx, split(ln, '#'; limit = 2)[1])
+        value = split(split(ln, "//"; limit = 2)[1], '#'; limit = 2)[1]
+        m = match(rx, value)
         m === nothing || return parse.(Int, split(strip(m.captures[1])))
     end
     return Int[]
@@ -35,14 +36,15 @@ end
     return 0
 end
 
-function _local_ppm_flux_plane(frec, slot, dims, ng, dim, m, st, en, g0, dtdx)
+function _local_ppm_flux_plane(frec, slot, dims, rank, ng, dim, m, st, en, g0, dtdx)
     nx, ny, _ = dims
-    plane_dims = ntuple(d -> en[d] - st[d] + 1, 3)
+    plane_dims = ntuple(d -> d <= rank ? en[d] - st[d] + 1 : 1, 3)
     out = Vector{Float64}(undef, prod(plane_dims))
     flux = slot == 0 ? nothing : frec[dim + 1][slot]
     @inbounds for lin in 0:length(out)-1
         rem = lin
         idx = ntuple(3) do d
+            d > rank && return 1
             offset = rem % plane_dims[d]
             rem ÷= plane_dims[d]
             global_i = st[d] + offset
@@ -54,7 +56,7 @@ function _local_ppm_flux_plane(frec, slot, dims, ng, dim, m, st, en, g0, dtdx)
     return out
 end
 
-function _write_local_ppm_fluxes!(h, level, gi, grid, dims, ng, frec, dt, widths)
+function _write_local_ppm_fluxes!(h, level, gi, grid, dims, rank, ng, frec, dt, widths)
     g0 = problem_grid_global_start(h, grid)
     field_types = problem_field_types(h, grid)
     nsub = problem_num_subgrids(h, level, gi)
@@ -62,18 +64,18 @@ function _write_local_ppm_fluxes!(h, level, gi, grid, dims, ng, frec, dt, widths
     function set_plane(sub, dim, side, m, st, en)
         for (field, field_type) in enumerate(field_types)
             plane = _local_ppm_flux_plane(
-                frec, _local_ppm_flux_slot(field_type), dims, ng, dim, m,
+                frec, _local_ppm_flux_slot(field_type), dims, rank, ng, dim, m,
                 st, en, g0, dt / widths[dim + 1],
             )
             problem_set_subgrid_flux(h, level, gi, sub, field - 1, dim, side, plane)
         end
     end
-    for sub in 0:nsub-2, dim in 0:2, side in 0:1
+    for sub in 0:nsub-2, dim in 0:rank-1, side in 0:1
         st, en = problem_subgrid_flux_extent(h, level, gi, sub, dim, side)
         set_plane(sub, dim, side, (st[dim + 1] - g0[dim + 1]) + side + 1, st, en)
     end
     own = nsub - 1
-    for dim in 0:2, side in 0:1
+    for dim in 0:rank-1, side in 0:1
         st, en = problem_subgrid_flux_extent(h, level, gi, own, dim, side)
         set_plane(own, dim, side, side == 0 ? 1 : active[dim + 1] + 1, st, en)
     end
@@ -86,26 +88,32 @@ end
 Build the conservative EnzoLib hydro hook for `HydroMethod = 10`. The hook uses
 the tuned one-ghost local PPM reconstruction, characteristic tracing, and the
 two-shock Riemann solver. Enzo continues to own ghost filling, AMR subcycling,
-projection, and coarse-fine refluxing.
+projection, and coarse-fine refluxing. The kernel itself needs one ghost zone;
+Enzo's legacy dynamic-AMR interpolation currently needs three allocated hierarchy
+ghost zones, so use `NumberOfGhostZones = 3` for AMR runs.
 """
 function local_ppm_hydro(; gamma::Real = 1.4, nghost::Integer = 1,
                          periodic_root::Bool = false)
     nghost >= 1 || error("HydroMethod=10 requires at least one ghost zone")
+    level_steps = Dict{Int,Int}()
     function hydro!(h, level, dt)
+        step = get(level_steps, Int(level), 0) + 1
+        level_steps[Int(level)] = step
         count = session_num_grids_on_level(h, level)
         rank = session_my_rank(h)
         for gi in 0:count-1
             grid = problem_grid_index_on_level(h, level, gi)
             problem_grid_processor(h, grid) == rank || continue
-            problem_grid_rank(h, grid) == 3 ||
-                error("HydroMethod=10 currently supports 3-D grids only")
+            grid_rank = problem_grid_rank(h, grid)
+            grid_rank in 1:3 ||
+                error("HydroMethod=10 supports grid ranks 1, 2, and 3; got $grid_rank")
             dims = Tuple(problem_grid_dims(h, grid))
-            active = ntuple(d -> dims[d] - 2nghost, 3)
-            all(>(0), active) ||
+            active = ntuple(d -> d <= grid_rank ? dims[d] - 2nghost : 1, 3)
+            all(active[d] > 0 for d in 1:grid_rank) ||
                 error("HydroMethod=10: grid $grid dimensions $dims are incompatible with nghost=$nghost")
             left, right = problem_grid_edge(h, grid)
-            widths = ntuple(d -> (right[d] - left[d]) / active[d], 3)
-            all(isapprox(widths[d], widths[1]; rtol = 32eps(Float64)) for d in 2:3) ||
+            widths = ntuple(d -> d <= grid_rank ? (right[d] - left[d]) / active[d] : 1.0, 3)
+            all(isapprox(widths[d], widths[1]; rtol = 32eps(Float64)) for d in 2:grid_rank) ||
                 error("HydroMethod=10 currently requires cubic cells; got widths $widths")
 
             iD = field_index(h, 0; grid = grid)
@@ -130,6 +138,7 @@ function local_ppm_hydro(; gamma::Real = 1.4, nghost::Integer = 1,
             PPMKernels.muscl_hancock_step_3d!(
                 D, S1, S2, S3, Tau, dims, Int(nghost);
                 dt = dt, gamma = gamma, dx = widths[1], ge = Ge, fluxrec = frec,
+                order = isodd(step) ? Tuple(1:grid_rank) : Tuple(grid_rank:-1:1),
                 recon = :ppm_local, predictor = :trace, riemann = :twoshock,
                 face_periodic = periodic_root && level == 0,
             )
@@ -140,7 +149,9 @@ function local_ppm_hydro(; gamma::Real = 1.4, nghost::Integer = 1,
             problem_set_field(h, iV3, S3 ./ D; grid = grid)
             problem_set_field(h, iTE, Tau ./ D; grid = grid)
             iGE === nothing || problem_set_field(h, iGE, Ge ./ D; grid = grid)
-            _write_local_ppm_fluxes!(h, level, gi, grid, dims, Int(nghost), frec, dt, widths)
+            _write_local_ppm_fluxes!(
+                h, level, gi, grid, dims, grid_rank, Int(nghost), frec, dt, widths
+            )
         end
         return nothing
     end
@@ -152,9 +163,14 @@ function local_ppm_engine(paramfile::AbstractString; gravity::Bool = false,
                           star_sources::Bool = false, star_formation::Bool = false,
                           cosmology::Bool = false, mhdct::Bool = false)
     mhdct && error("HydroMethod=10 is a hydrodynamics solver and does not support CT-MHD")
+    nghost = _integer_parameter(paramfile, "NumberOfGhostZones", 3)
+    max_level = _integer_parameter(paramfile, "MaximumRefinementLevel", 0)
+    nghost < 3 && max_level > 0 &&
+        error("HydroMethod=10 uses a one-ghost hydro stencil, but Enzo's legacy " *
+              "dynamic-AMR interpolation requires NumberOfGhostZones >= 3")
     hook = local_ppm_hydro(
         gamma = _real_parameter(paramfile, "Gamma", 5 / 3),
-        nghost = _integer_parameter(paramfile, "NumberOfGhostZones", 3),
+        nghost = nghost,
         periodic_root = _periodic_root(paramfile),
     )
     cfg = engine_from_flags(
