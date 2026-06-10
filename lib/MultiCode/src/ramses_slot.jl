@@ -115,6 +115,53 @@ function ramses_ppmk_hydro_step!(h::RamsesLib.Handle; lev::Integer, dt::Real, ga
     return nothing
 end
 
+# ── device residency: raster once, run resident, deraster once ────────────────
+
+"""
+    _guest_resident_run!(h, t_end; lev, gamma, boxlen, courant=0.4,
+                         recon=:plm, riemann=:hllc, device=:cpu, lib=:cpu)
+        -> (t, steps)
+
+Advance a uniform RAMSES level to `t_end` with the guest state RESIDENT on the
+compute device: one raster in, all steps on-device (the guest owns its CFL via
+`max_wavespeed`; PPMKernels' `with_pool` recycles the per-sweep scratch), one
+deraster out.  This removes the per-step host↔device round-trip that dominates
+the non-resident guest's wall-clock.
+"""
+function _guest_resident_run!(h::RamsesLib.Handle, t_end::Real; lev::Integer, gamma::Real,
+                              boxlen::Real, courant::Real = 0.4, ng::Integer = 2,
+                              recon::Symbol = :plm, riemann::Symbol = :hllc,
+                              device::Symbol = :cpu, lib::Symbol = :cpu)
+    r = ramses_raster(h; lev = lev, ng = ng, lib = lib)
+    dx = boxlen / r.n1d
+    be = PPMKernels.backend(device)
+    T = device === :cpu ? Float64 : Float32
+    D = PPMKernels.to_device(be, r.D, T); S1 = PPMKernels.to_device(be, r.S1, T)
+    S2 = PPMKernels.to_device(be, r.S2, T); S3 = PPMKernels.to_device(be, r.S3, T)
+    Tau = PPMKernels.to_device(be, r.Tau, T)
+    bc!(fields...) = PPMKernels.fill_periodic!(r.dims, r.ng, fields...)
+    scratch = similar(D)
+    t = 0.0; steps = 0
+    PPMKernels.with_pool() do
+        while t < t_end * (1 - 1e-12)
+            steps < 100_000 || error("_guest_resident_run!: did not reach t_end (t=$t)")
+            bc!(D, S1, S2, S3, Tau)
+            smax = PPMKernels.max_wavespeed(scratch, D, S1, S2, S3, Tau; gamma = T(gamma))
+            (isfinite(smax) && smax > 0) || error("_guest_resident_run!: bad wavespeed $smax")
+            dt = min(courant * dx / Float64(smax), t_end - t)
+            PPMKernels.muscl_hancock_step_3d!(D, S1, S2, S3, Tau, r.dims, r.ng;
+                                              dt = T(dt), gamma = T(gamma), dx = T(dx),
+                                              recon = recon, riemann = riemann, bc! = bc!)
+            t += dt; steps += 1
+        end
+    end
+    r.D .= Float64.(PPMKernels.to_host(D)); r.S1 .= Float64.(PPMKernels.to_host(S1))
+    r.S2 .= Float64.(PPMKernels.to_host(S2)); r.S3 .= Float64.(PPMKernels.to_host(S3))
+    r.Tau .= Float64.(PPMKernels.to_host(Tau))
+    ramses_deraster!(h, r; lev = lev, lib = lib)
+    return (t, steps)
+end
+
 # ── the guest slot under AMR: the COMPOSITE raster (ADR-0006 Phase 6) ─────────
 #
 # Correctness-first composite coupling (the AMReX-composite philosophy): the

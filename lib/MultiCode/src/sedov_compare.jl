@@ -190,17 +190,25 @@ function _ramses_uniform_namelist(spec::SedovCompareSpec; level::Integer)
 end
 
 """
-    run_ramses_sedov(spec=SedovCompareSpec(); level=6, engine=:native, device=:cpu)
+    run_ramses_sedov(spec=SedovCompareSpec(); level=6, engine=:native, device=:cpu,
+                     resident=false)
         -> (; cs, t, E_in, seconds, steps)
 
 RAMSES on the injected Sedov IC.  `engine = :native` runs `godunov_fine!`
 (unsplit MUSCL + HLLC); `engine = :guest` runs the PPMKernels slot
 (`device = :cpu` or `:metal`).  Identical IC, identical host CFL clock —
 the timing column is scheme-vs-scheme on the same mesh.
+
+`resident = true` (guest only): the state RASTERS ONCE, lives on the compute
+device for the whole run (the guest owns its CFL via `max_wavespeed`), and
+derasters once at the end — the per-step raster→device→host→deraster
+round-trip, which dominates the guest's wall-clock, disappears.  The host's
+`uold` is stale between the end-points (fine for a pure-hydro stretch; a
+COUPLED slot keeps per-step sync — that is its data contract).
 """
 function run_ramses_sedov(spec::SedovCompareSpec = SedovCompareSpec(); level::Integer = 6,
                           engine::Symbol = :native, device::Symbol = :cpu,
-                          lib::Symbol = :cpu)
+                          resident::Bool = false, lib::Symbol = :cpu)
     RamsesLib.available() || error("RAMSES library not found (set RAMSES_LIB to the bin64h hydro build)")
     n = 2^level
     bomb = sedov_bomb(spec, n)
@@ -221,17 +229,24 @@ function run_ramses_sedov(spec::SedovCompareSpec = SedovCompareSpec(); level::In
         end
         RamsesLib.set_hydro!(h, :uold, 5, lev, ck, Enew; lib = lib)
         t = 0.0; steps = 0
-        seconds = @elapsed while t < spec.t * (1 - 1e-12) && steps < 100_000
-            RamsesLib.newdt_fine!(h, lev; lib = lib)
-            dt = min(RamsesLib.get_dt(h, lev; lib = lib).dtnew, spec.t - t)
-            RamsesLib.set_dt!(h, lev, dt; lib = lib)
-            if engine === :native
-                RamsesLib.hydro_step!(h, lev; dt = dt, lib = lib)
-            else
-                ramses_ppmk_hydro_step!(h; lev = lev, dt = dt, gamma = spec.gamma,
-                                        boxlen = 1.0, lib = lib, device = device)
+        seconds = if engine === :guest && resident
+            @elapsed begin
+                t, steps = _guest_resident_run!(h, spec.t; lev = lev, gamma = spec.gamma,
+                                                boxlen = 1.0, device = device, lib = lib)
             end
-            t += dt; steps += 1
+        else
+            @elapsed while t < spec.t * (1 - 1e-12) && steps < 100_000
+                RamsesLib.newdt_fine!(h, lev; lib = lib)
+                dt = min(RamsesLib.get_dt(h, lev; lib = lib).dtnew, spec.t - t)
+                RamsesLib.set_dt!(h, lev, dt; lib = lib)
+                if engine === :native
+                    RamsesLib.hydro_step!(h, lev; dt = dt, lib = lib)
+                else
+                    ramses_ppmk_hydro_step!(h; lev = lev, dt = dt, gamma = spec.gamma,
+                                            boxlen = 1.0, lib = lib, device = device)
+                end
+                t += dt; steps += 1
+            end
         end
         cs = ramses_extract(h; lev = lev, boxlen = 1.0, lib = lib)
         return (cs = cs, t = t, E_in = bomb.E_in, seconds = seconds, steps = steps,

@@ -31,7 +31,7 @@ const SEDOV_N = 64            # 64³: the bomb spans ~3 cells; R(t) ≈ 0.35
             Ra = sedov_radius(spec, r.t, r.E_in)
             lg = ledger(r.cs)
             E0 = spec.p0 / (spec.gamma - 1) + r.E_in
-            f32 = label == "guest-metal"
+            f32 = startswith(label, "guest-metal")
             @test abs(lg.mass - spec.rho0) / spec.rho0 < (f32 ? 1e-6 : 1e-8)   # periodic box
             @test abs(lg.energy - E0) / E0 < (f32 ? 1e-3 : 1e-8)
             @test 0.85 < prof.R_shock / Ra < 1.05                      # the similarity solution
@@ -45,6 +45,8 @@ const SEDOV_N = 64            # 64³: the bomb spans ~3 cells; R(t) ≈ 0.35
         R_enzo = gate!("enzo-ppm", run_enzo_sedov(spec; n = SEDOV_N))
         R_nat = gate!("ramses-muscl", run_ramses_sedov(spec; level = 6))
         R_gst = gate!("guest-cpu", run_ramses_sedov(spec; level = 6, engine = :guest))
+        R_res = gate!("guest-cpu-resident",
+                      run_ramses_sedov(spec; level = 6, engine = :guest, resident = true))
         metal_ok = try
             @eval using Metal
             @eval using PPMKernels
@@ -55,12 +57,18 @@ const SEDOV_N = 64            # 64³: the bomb spans ~3 cells; R(t) ≈ 0.35
         R_mtl = metal_ok ?
             gate!("guest-metal", run_ramses_sedov(spec; level = 6, engine = :guest, device = :metal)) :
             nothing
+        R_mtlr = metal_ok ?
+            gate!("guest-metal-resident",
+                  run_ramses_sedov(spec; level = 6, engine = :guest, device = :metal, resident = true)) :
+            nothing
 
         # cross-engine agreement on the shock position
         for (a, b) in ((R_enzo, R_nat), (R_nat, R_gst))
             @test abs(a - b) / ((a + b) / 2) < 0.05
         end
+        @test abs(R_res - R_gst) / R_gst < 0.01                        # residency = plumbing only
         metal_ok && @test abs(R_mtl - R_gst) / R_gst < 0.02            # f32 ≈ f64
+        metal_ok && @test abs(R_mtlr - R_gst) / R_gst < 0.02
 
         dir = normpath(joinpath(@__DIR__, "..", "..", "..", "reports", "multicode"))
         md = sedov_report(rows, spec; dir = dir)
