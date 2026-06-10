@@ -606,10 +606,22 @@ never forks of their cores.
   **7.3e-13** in 62 iterations.  The gravity guest now solves ANY
   refined-region shape RAMSES hands it; a KA-kernelized masked smoother
   (GPU execution of the same system) is the performance follow-up.
-- **Next (performance/polish track):** KA-kernelize the masked
-  irregular-region smoother for GPU execution; extension-ifying the
-  LEGACY wrappers (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains
-  deliberate deferred polish — they are lazy pure-Julia bindings (no
-  dlopen until first use, no load-time burden), so the weak-dep
-  conversion buys little until a registry release forces it; the dfmm
-  extension documents the pattern to follow.
+- **Next-7 — the KA-kernelized masked CG (done):**
+  `PoissonKernels.masked_cg!` — the masked 7-point apply as a single
+  branch-free `@kernel` (the covered mask travels as a FIELD, 1/0, so
+  the stencil multiplies instead of branching) + a device CG driver
+  whose vectors stay zero outside the mask by construction (plain
+  `dot`/broadcast reductions, no masked-reduction kernel needed), with
+  the `vcycle_solve!`-style stagnation guard catching the f32 floor.
+  `ramses_ka_poisson_fine!` now runs on it with a `device` kwarg: CPU
+  f64 reproduces the host CG's blob certification at **7.3e-13**;
+  Metal f32 solves the SAME blob system on the GPU to **4.5e-7** (the
+  f32 residual floor) in 39 iterations — one source, two devices, the
+  D5 contract applied to the irregular-domain solver.  Gravity-slot
+  gate now 14/14 (root, cuboid Dirichlet, blob CPU, blob Metal).
+- **Next (polish track):** extension-ifying the LEGACY wrappers
+  (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
+  polish — they are lazy pure-Julia bindings (no dlopen until first
+  use, no load-time burden), so the weak-dep conversion buys little
+  until a registry release forces it; the dfmm extension documents the
+  pattern to follow.

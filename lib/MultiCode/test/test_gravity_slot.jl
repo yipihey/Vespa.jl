@@ -17,6 +17,8 @@
 using Test
 using MultiCode
 using RamsesLib
+import PoissonKernels
+using Metal                       # enables the :metal backend (Apple Silicon)
 
 haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] =
     normpath(joinpath(@__DIR__, "..", "..", "..", "..", "..",
@@ -84,6 +86,21 @@ haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] =
             @info "irregular-region (blob) solve" dphi = rb.dphi resid_oracle = rb.resid_oracle octs = rb.n_fine_octs bbox = rb.nloc cg_iters = rb.cg_iters
         finally
             rb.free()
+        end
+
+        # ── the KA masked CG on Metal (Next-7): same source, f32, GPU ─────────
+        if PoissonKernels.has_backend(:metal)
+            rm_ = run_ramses_gravity_blob_compare(levc = 5, radius = 0.18,
+                                                  eps = 1e-12, device = :metal)
+            try
+                @test !rm_.is_cuboid
+                @test rm_.dphi < 1e-4                # the f32 residual floor
+                @info "irregular-region solve on Metal (f32)" dphi = rm_.dphi cg_iters = rm_.cg_iters relres = rm_.cg_relres
+            finally
+                rm_.free()
+            end
+        else
+            @test_skip false
         end
     end
 end

@@ -39,6 +39,7 @@ export backend, has_backend, device_zeros, to_device, to_host
 export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!
 export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
+export masked_cg!
 
 # ── backend registry ─────────────────────────────────────────────────────────
 # `:cpu` is always present; the Metal extension registers `:metal` on load.
@@ -104,5 +105,6 @@ include("vcycle.jl")       # MultigridSolver V-cycle host driver
 include("fft_poisson.jl")  # root-grid FFT Poisson solve (CPU-host FFTW + Green's -1/k²)
 include("gpu_fft.jl")      # GPU-resident radix-2 FFT + fft_poisson_root_gpu! (device root solve)
 include("mg_batched.jl")   # batched multigrid: NB same-size subgrids per kernel launch
+include("masked_cg.jl")    # masked 7-point CG — the irregular-region Dirichlet solve
 
 end # module

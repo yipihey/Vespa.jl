@@ -344,7 +344,7 @@ fast path remains `vcycle_solve!(dirichlet=true)`).
 function ramses_ka_poisson_fine!(h::RamsesLib.Handle; levc::Integer, levf::Integer,
                                  boxlen::Real = 1.0, fourpi::Real = 4π,
                                  rtol::Real = 1e-12, maxiter::Integer = 2000,
-                                 lib::Symbol = :cpu)
+                                 device::Symbol = :cpu, lib::Symbol = :cpu)
     _, phic = ramses_grid_field(h, :phi, levc; lib = lib)
     _, rhoc = ramses_grid_field(h, :rho, levc; lib = lib)
     rho_tot = sum(rhoc) / length(rhoc)
@@ -366,28 +366,21 @@ function ramses_ka_poisson_fine!(h::RamsesLib.Handle; levc::Integer, levf::Integ
         cov[i, j, k-1] || (s += gh[i, j, k-1]); cov[i, j, k+1] || (s += gh[i, j, k+1])
         b[i, j, k] = s
     end
-    # conjugate gradients, matrix-free on the mask
-    x = zeros(Float64, size(rb.A))
-    r = copy(b); p = copy(b); Ap = zeros(Float64, size(rb.A))
-    rr = _masked_dot(r, r, cov)
-    rr0 = rr
-    iters = 0
-    while rr > rtol^2 * rr0 && iters < maxiter
-        _masked_apply!(Ap, p, cov)
-        alpha = rr / _masked_dot(p, Ap, cov)
-        @inbounds for q in eachindex(x)
-            cov[q] || continue
-            x[q] += alpha * p[q]; r[q] -= alpha * Ap[q]
-        end
-        rr2 = _masked_dot(r, r, cov)
-        beta = rr2 / rr; rr = rr2; iters += 1
-        @inbounds for q in eachindex(p)
-            cov[q] && (p[q] = r[q] + beta * p[q])
-        end
-    end
+    # the KA masked CG (PoissonKernels.masked_cg!): one source, CPU f64 or
+    # Metal f32 — the mask travels as a FIELD so the kernel is branch-free
+    mfield = Float64.(cov)
+    be = PoissonKernels.backend(device)
+    T = device === :cpu ? Float64 : Float32
+    xd = PoissonKernels.device_zeros(be, T, size(rb.A))
+    bd = PoissonKernels.to_device(be, b, T)
+    md = PoissonKernels.to_device(be, mfield, T)
+    _, iters, relres = PoissonKernels.masked_cg!(xd, bd, md;
+                                                 rtol = device === :cpu ? rtol : 1e-7,
+                                                 maxiter = maxiter)
+    x = Float64.(PoissonKernels.to_host(xd))
     _ramses_field_masked_set!(h, :phi, levf, rb, x; lib = lib)
     return (phi = x, ghosts = gh, covered = cov, rb = rb, b = b,
-            iters = iters, relres = sqrt(rr / rr0), rho_tot = rho_tot, fact = fact)
+            iters = iters, relres = Float64(relres), rho_tot = rho_tot, fact = fact)
 end
 
 """
@@ -489,7 +482,7 @@ solver-free) and the φ parity.
 """
 function run_ramses_gravity_blob_compare(; levc::Integer = 5, radius::Real = 0.18,
                                          amp::Real = 0.05, eps::Real = 1e-12,
-                                         lib::Symbol = :cpu)
+                                         device::Symbol = :cpu, lib::Symbol = :cpu)
     RamsesLib.available() || error("RAMSES library not found (set RAMSES_LIB to the bin64h build)")
     nc = 2^levc
     levf = levc + 1
@@ -525,7 +518,8 @@ function run_ramses_gravity_blob_compare(; levc::Integer = 5, radius::Real = 0.1
         po = _ramses_field_bbox_masked(h, :phi, levf; lib = lib)
         is_cuboid = (8 * nfo == prod(po.nloc))
         # ── GUEST: the masked CG (overwrites the live phi) ────────────────────
-        g = ramses_ka_poisson_fine!(h; levc = levc, levf = levf, lib = lib)
+        g = ramses_ka_poisson_fine!(h; levc = levc, levf = levf,
+                                    device = device, lib = lib)
         # oracle residual under OUR masked system (φ_or with zeros outside the
         # mask — the ghost contributions live in g.b)
         phio = ifelse.(po.covered, po.A, 0.0)
