@@ -498,7 +498,33 @@ never forks of their cores.
     before the wavespeed scan (ρ = 0 ⇒ NaN). The per-level fast path (raster
     each level with coarse-interpolated ghosts + flux registers) remains the
     optimization track.
-- **Next:** cosmological Enzo-vs-RAMSES from shared grafic ICs, persistent
-  device residency for the Metal slot (the raster round-trip dominates),
-  per-level AMR fast path, KA re-expression of the mini-ramses kernels,
-  dfmm as an EquationSet, extension-ifying MultiCode.
+- **Next-1 — persistent Metal device residency (done):**
+  `run_ramses_sedov(resident = true)` rasters ONCE, advances the whole run
+  on-device inside `PPMKernels.with_pool()` (the guest owning its CFL via
+  `max_wavespeed` on the composite), and derasters ONCE at the end.
+  Six-engine Sedov: guest-metal-resident 1.68 s vs RAMSES native 7.2 s
+  (4.3× faster than the host's own solver on the identical mesh) vs
+  guest-metal round-tripping 15.0 s — the raster round-trip WAS the cost.
+  CPU-resident 8.4 s vs 20.3 s round-tripping. Same R/Rₐ to f32 round-off.
+- **Next-2 — the cosmology gate: one particle set, Enzo + RAMSES vs the
+  exact trajectory (done):** a Zel'dovich plane wave with ZERO initial
+  velocities (no velocity-unit convention can enter), the SAME
+  Julia-generated 32³ lattice + sinusoidal displacement injected through
+  both codes' particle bridges, evolved a_i → 4a_i in EdS, measured against
+  the closed-form mixed-mode growth b(x) = (3/5)x + (2/5)x^{-3/2}
+  (`zeldovich.jl`, `test_zeldovich.jl`, report
+  `reports/multicode/zeldovich_comparison.md`). Enzo runs its real
+  CosmologySimulation machinery (new bridge particle setters
+  `enzomodules_problem_set_particle_pos/vel` — a contract-hash change, all
+  workers rebuilt; EdS-patched `dm_only` parameter file; certified
+  EvolveLevel slots with gravity+cosmology): growth ratio 0.9893, shape
+  residual 0.024·A, 71 steps, 0.8 s. RAMSES runs its production `amr_step`
+  on a new `UNITS=COSMO` build (`bin64sc`, the `:cosmo` LazyLib flavor)
+  with grafic headers written from Julia (zero-content velocity planes —
+  particles injected directly): ratio 0.9942, residual 0.030·A, 14 steps,
+  0.3 s. Cross-code growth-normalized displacement amplitudes agree to
+  0.5%·A. Two engines, zero shared code, one analytic answer.
+- **Next:** per-level AMR fast path (raster each level with
+  coarse-interpolated ghosts + flux registers), KA re-expression of the
+  mini-ramses kernels (start with multigrid), dfmm as an EquationSet,
+  extension-ifying MultiCode.

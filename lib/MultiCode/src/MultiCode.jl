@@ -44,6 +44,8 @@ export run_ramsesrt_stromgren, ramsesrt_ifront_radius
 export ramsesrt_set_density!, ramsesrt_xhii_grid, run_enzo_host_ramsesrt
 export SedovCompareSpec, sedov_bomb, sedov_radius, sedov_profile
 export run_enzo_sedov, run_ramses_sedov, sedov_report
+export ZeldovichSpec, zeldovich_particles, zeldovich_growth, zeldovich_measure
+export run_enzo_zeldovich, run_ramses_zeldovich
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -56,5 +58,6 @@ include("exchange.jl")
 include("ramsesrt.jl")
 include("enzo_rt_guest.jl")
 include("sedov_compare.jl")
+include("zeldovich.jl")
 
 end # module
