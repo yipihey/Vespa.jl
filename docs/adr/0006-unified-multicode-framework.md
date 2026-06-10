@@ -632,6 +632,17 @@ never forks of their cores.
   touches six sibling repos).  Their MultiCode cross-code gates
   (injectors, comparison rows) are the recorded on-ramp work, following
   the Phase-2 pattern.
+- **Next-8 — Athena++ in the Sod harness (the first registry on-ramp,
+  done):** `run_athena_sod` via `MultiCodeAthenaExt` (the second package
+  extension — `using AthenaLib` activates it): the stock `athinput.sod`
+  (γ = 1.4, interface recentred to the harness frame) run IN-PROCESS,
+  profile from the final `.tab`, conservation from the `.hst`.  Gates:
+  **L1(ρ) = 0.0019** / L1(u) = 0.0034 vs the shared exact-Riemann oracle
+  — the sharpest engine in the harness — with **exact** mass
+  conservation, in 0.02 s wall-clock (in-process, 256 cells).  Report:
+  `reports/multicode/athena_sod.md`.  Remaining on-ramps: MUSIC injector
+  validation (one MusicSpec → Enzo+RAMSES live comparison), Gadget4
+  ICs/halo gates, DiscoDJ LPT cross-check vs the Zel'dovich machinery.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first

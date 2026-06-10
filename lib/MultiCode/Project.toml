@@ -15,15 +15,19 @@ R3D = "6888587b-6711-4ff3-8558-83329515e735"
 RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
 
 [weakdeps]
+AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 
 [extras]
+AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 
 [extensions]
+MultiCodeAthenaExt = "AthenaLib"
 MultiCodeDfmmExt = "dfmm"
 
 [sources]
+AthenaLib = {path = "../../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../../dfmm"}
 ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
 CodeBridge = {path = "../CodeBridge"}

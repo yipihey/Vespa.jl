@@ -51,7 +51,7 @@ export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
-export run_dfmm_sod
+export run_dfmm_sod, run_athena_sod
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -79,5 +79,15 @@ shapes (`profile` → `sod_l1` vs the same exact solution).  Implemented in the
 errors otherwise.  γ = 5/3 (the dfmm closure's adiabatic index).
 """
 function run_dfmm_sod end
+
+"""
+    run_athena_sod(spec = SodSpec(); nx1 = 256) -> (; profile, t, seconds, …)
+
+Athena++ as the fourth legacy engine in the Sod harness: the stock
+`athinput.sod` run IN-PROCESS, profile from the final `.tab`, conservation
+from the `.hst` history — gated against the same exact-Riemann oracle.
+Implemented in `MultiCodeAthenaExt` — `using AthenaLib` activates it.
+"""
+function run_athena_sod end
 
 end # module
