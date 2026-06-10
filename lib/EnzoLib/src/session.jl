@@ -520,6 +520,32 @@ function problem_get_particle_pos(h::Handle, dim::Integer, grid::Integer = 0)
     return out
 end
 
+"""
+    problem_set_particle_pos(h, dim, data; grid=0)
+    problem_set_particle_vel(h, dim, data; grid=0)
+
+Overwrite the live particle positions/velocities along axis `dim` (0-based) —
+the injection direction for cross-code SHARED ICs (ADR-0006: the same
+particle set into Enzo and RAMSES).  `data` must have exactly the grid's
+particle count; the problem's own init fixes that count.
+"""
+function problem_set_particle_pos(h::Handle, dim::Integer, data::Vector{Float64};
+                                  grid::Integer = 0)
+    length(data) == problem_num_particles(h, grid) ||
+        throw(DimensionMismatch("particle count $(length(data)) ≠ $(problem_num_particles(h, grid))"))
+    @xcall(:enzomodules_problem_set_particle_pos, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, data)
+    return nothing
+end
+function problem_set_particle_vel(h::Handle, dim::Integer, data::Vector{Float64};
+                                  grid::Integer = 0)
+    length(data) == problem_num_particles(h, grid) ||
+        throw(DimensionMismatch("particle count $(length(data)) ≠ $(problem_num_particles(h, grid))"))
+    @xcall(:enzomodules_problem_set_particle_vel, Cvoid, (Handle, Cint, Cint, Ptr{Cdouble}),
+          h, grid, dim, data)
+    return nothing
+end
+
 "Particle velocities along axis `dim` (0-based) on `grid`, in code units."
 function problem_get_particle_vel(h::Handle, dim::Integer, grid::Integer = 0)
     np = problem_num_particles(h, grid)
