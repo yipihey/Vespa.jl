@@ -559,9 +559,44 @@ never forks of their cores.
   gate tracks the oracle's convergence.  An analytic anchor closes the
   loop: the injected single mode is a discrete eigenfunction, and φ(KA)
   matches the closed-form discrete solution to **9.4e-15** — independent
-  of both solvers.  Remaining in this track: the Dirichlet refined-level
-  solve (vcycle_solve! dirichlet=true on the bbox raster, the Next-3
-  machinery), and the oct-native KA port of the MG smoother for the
-  tree-irregular case.
-- **Next:** finish the mini-ramses KA track (refined-level Dirichlet solve,
-  oct-native smoother), dfmm as an EquationSet, extension-ifying MultiCode.
+  of both solvers.- **Next-4 (slice 2) — the refined-level Dirichlet solve (done):**
+  RAMSES's fine-level system (`cmp_residual_cg`) is, for a CUBOID refined
+  region, exactly a Dirichlet box problem: the 7-point Laplacian over the
+  level's cells with ghosts fixed at `interpol_phi` of the 27 coarse
+  parents around each missing oct (tfrac=0 outside subcycling).  The
+  guest assembles that system on the bbox raster — the ghost ring
+  reconstructed through the SAME `interpol_phi` kernel the host runs
+  (RamsesLib wraps it pure) — and solves with `vcycle_solve!(dirichlet =
+  true)`.  Two independent gates: the ORACLE's converged `phi_fine_cg`
+  solution satisfies OUR assembled system at **1.3e-16** (replication
+  certified without the KA solver), and the KA Dirichlet W-cycle from
+  scratch lands on the oracle at **2.4e-12**.  The cuboid hierarchy is
+  built by writing `flag1` through the bridge (new capi setter case) and
+  calling the host's own `refine_fine` — `m_flag_fine` RESETS flag1, so
+  drive refine directly.  Remaining in this track: the oct-native KA
+  smoother for tree-irregular (non-cuboid) levels.
+- **Next-5 — dfmm as a harness engine, via MultiCode's first package
+  extension (done):** dfmm (the dual-frame moment method — variational,
+  symplectic, Lagrangian segments on HierarchicalGrids; the first solver
+  born inside the ecosystem) runs the harness's Sod spec (γ = 5/3, its
+  closure's index; the [0,1] problem mirrored onto a [0,2] periodic
+  domain so neither seam carries a jump) and is gated against the SAME
+  exact-Riemann oracle as the legacy engines: L1(ρ) = 0.042 (inside its
+  documented Tier-A.1 band), mass conserved BIT-exactly, total momentum
+  at 1e-16 — the variational exactness claims reproduced in the
+  harness's own terms (`reports/multicode/dfmm_sod.md`).  The seam is
+  `MultiCodeDfmmExt` (weakdep + `[extras]` for the `[sources]` path
+  rule): `using dfmm` activates `run_dfmm_sod`; dfmm's heavy dependency
+  tree (Makie, Enzyme) never burdens a legacy-only user — this IS the
+  extension-ifying pattern for MultiCode.  The full EquationSet
+  embedding in EnzoNG's FV driver is deliberately NOT claimed: dfmm is
+  not a flux-form method (its state is per-segment moments and its
+  integrator is variational), so it enters as an ENGINE; an EquationSet
+  facade would misrepresent the seam.  Revisit when dfmm-2d's Eulerian
+  remap lands.
+- **Next:** oct-native KA smoother for irregular refined regions;
+  extension-ifying the LEGACY wrappers (EnzoLib/RamsesLib/ArepoLib) in
+  MultiCode remains deliberate deferred polish — they are lazy pure-Julia
+  bindings (no dlopen until first use, no load-time burden), so the
+  weak-dep conversion buys little until a registry release forces it;
+  the dfmm extension documents the pattern to follow.

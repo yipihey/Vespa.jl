@@ -171,9 +171,14 @@ buffers are covered — they bit earlier).
 deposit/sample exchange + Moray-inside-Arepo (Phase 4), RAMSES-RT wrapped +
 the Moray-vs-RAMSES-RT cross-check + RAMSES-RT-inside-Enzo (Phases 4–5), the
 guest under AMR (composite raster, Phase 7; per-level fast path with frozen-
-parent ghosts + flux registers — bit-exact conservation, 2.3× — Next-3), and
+parent ghosts + flux registers — bit-exact conservation, 2.3× — Next-3),
 the Zel'dovich cosmology gate (one particle set into Enzo + RAMSES vs the
-exact mixed-mode growth, Next-2; needs `bin64sc` UNITS=COSMO).
+exact mixed-mode growth, Next-2; needs `bin64sc` UNITS=COSMO), the gravity
+guest slot (KA Poisson inside RAMSES via `greens=:discrete7` + the
+refined-level Dirichlet solve, Next-4 — RAMSES's levelmin MG gates on
+namelist `epsilon_base`, NOT the `epsilon` the capi setter writes), and the
+dfmm engine (Next-5, the `MultiCodeDfmmExt` package extension — needs the
+sibling `dfmm` checkout; `using dfmm` activates `run_dfmm_sod`).
 Run: `<julia> --project=lib/MultiCode/test lib/MultiCode/test/runtests.jl`
 (~5 min; needs the Enzo grid dylib, mini-ramses `bin64h` AND `bin64hrt` libs,
 and the sibling arepo `libarepo.dylib`). Reports land in `reports/multicode/`.

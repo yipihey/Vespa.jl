@@ -50,6 +50,7 @@ export ZeldovichSpec, zeldovich_particles, zeldovich_growth, zeldovich_measure
 export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
+export run_dfmm_sod
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -64,5 +65,18 @@ include("enzo_rt_guest.jl")
 include("sedov_compare.jl")
 include("zeldovich.jl")
 include("gravity_slot.jl")
+
+"""
+    run_dfmm_sod(spec = SodSpec(gamma = 5/3, t = 0.2); N = 200, tau = 1e-3,
+                 cfl = 0.3, sigma_x0 = 0.02) -> (; profile, t, steps, seconds, …)
+
+The dfmm engine in the Sod harness (ADR-0006 Phase 5, library convergence):
+the dual-frame moment method advances the SAME Riemann problem the legacy
+engines run, on its own Lagrangian segments, and reports in the harness's
+shapes (`profile` → `sod_l1` vs the same exact solution).  Implemented in the
+`MultiCodeDfmmExt` package extension — `using dfmm` activates it; this stub
+errors otherwise.  γ = 5/3 (the dfmm closure's adiabatic index).
+"""
+function run_dfmm_sod end
 
 end # module
