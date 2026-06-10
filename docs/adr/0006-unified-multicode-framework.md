@@ -749,8 +749,13 @@ never forks of their cores.
   UpdateParticlePositions.C) — are **BIT-IDENTICAL** (max Δv = 0.0 at
   vmax = 0.041) between gravity=:julia and gravity=:enzo: the two
   potentials agree at the f64 ulp, so the differenced forces coincide
-  exactly.  Remaining Phase C: the Santa Barbara CPU-vs-GPU production
-  run on this hook.
+  exactly.  Phase C closed with the SB run: the example's
+  subgrid TODO replaced by this hook (root φ additionally written to
+  PotentialField so child BCs read OUR solution); 8 cycles from z=63
+  with hydro(PPM)+gravity(FFT) as :julia slots — CPU-f32 and Metal-f32
+  trajectories IDENTICAL to the printed digits, mass drift 2e-10,
+  Metal 21.7 s vs CPU 27.4 s (startup-dominated; kernel speedups are
+  the recorded 31×/12×).
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
