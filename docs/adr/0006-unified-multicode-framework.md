@@ -693,6 +693,16 @@ never forks of their cores.
   philosophy applied to tests; HDF5_DISABLE_VERSION_CHECK does NOT
   help), and the live-code half uses RAMSES (plain Fortran I/O).
   EVERY wrapper in the registry now has a live cross-code gate.
+- **Next-12 — MUSIC in a CodeBridge worker (done):** the durable D2 fix
+  replacing the run-first ordering workaround: `run_music_crosscheck(
+  worker = true)` spawns MusicLib's Julia reference worker
+  (`CodeBridge.connect_worker!` around the two `generate` calls) so
+  MUSIC's white-noise generation runs in its OWN process, immune to the
+  OpenMP/FFTW runtime pollution of a many-code host.  The worker path
+  reproduces the in-process result BIT-identically (corr and rms equal
+  to the last digit) — the @xcall transport seam doing exactly what D1/D2
+  promised: one call site, two transports, same answer.  The suite gate
+  now runs in worker mode.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first

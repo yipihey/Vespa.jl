@@ -16,8 +16,16 @@ using MultiCode: EnzoLib, RamsesLib, CodeBridge
 using MusicLib
 
 function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real = 50.0,
-                                        level::Integer = 5)
+                                        level::Integer = 5, worker::Bool = false)
     MusicLib.available() || error("libmusic_capi not found")
+    # worker=true: MUSIC generates in its OWN process (CodeBridge's Julia
+    # reference worker) — immune to the OpenMP/FFTW runtime pollution that
+    # makes in-process generation segfault once many live codes share the
+    # host (the D2 fix; the gate then needs no suite-ordering care).
+    if worker
+        wcmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e "using MusicLib; MusicLib.serve()" $(tempname())`
+        CodeBridge.connect_worker!(MusicLib.BRIDGE, wcmd)
+    end
     EnzoLib.grid_available() || error("Enzo grid bridge not built")
     CodeBridge.available(RamsesLib.BRIDGE, :cosmo) ||
         error("RAMSES cosmo library not found (bin64sc)")
@@ -25,8 +33,13 @@ function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real =
     mk(format, fname) = MusicSpec(boxlength = boxlength, zstart = zstart,
                                   levelmin = level, levelmax = level,
                                   format = format, filename = fname)
-    re = MusicLib.generate(mk(:enzo, "ic_enzo"); workdir = mktempdir())
-    rr = MusicLib.generate(mk(:ramses, "ics_ramses"); workdir = mktempdir())
+    re, rr = try
+        a = MusicLib.generate(mk(:enzo, "ic_enzo"); workdir = mktempdir())
+        b = MusicLib.generate(mk(:ramses, "ics_ramses"); workdir = mktempdir())
+        (a, b)
+    finally
+        worker && CodeBridge.disconnect_worker!(MusicLib.BRIDGE)
+    end
     re.rc == 0 && rr.rc == 0 || error("MUSIC generation failed")
     # ── Enzo boots on MUSIC's own parameter file + particle ICs ───────────────
     par = read(joinpath(re.output, "parameter_file.txt"), String)

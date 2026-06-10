@@ -16,11 +16,9 @@ const RAMSES_HYDRO_LIB = get(ENV, "RAMSES_HYDRO_LIB",
                       "mini-ramses", "bin64h", "libramses3d.dylib")))
 haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] = RAMSES_HYDRO_LIB)
 
-# Next-9 (MUSIC injector) runs FIRST: MUSIC's in-process white-noise generation
-# segfaults once a dozen live codes (Arepo, Metal, dfmm/Enzyme, Athena++, the
-# RAMSES flavors) have polluted the process (competing OpenMP/FFTW runtimes) —
-# in a quiet process it is rock solid.  The durable fix is the D2 one: MUSIC in
-# its own CodeBridge worker; recorded in the ADR polish track.
+# Next-9 (MUSIC injector): generation runs in MUSIC's own CodeBridge worker
+# (worker = true) — immune to the OpenMP/FFTW runtime pollution that made
+# in-process generation segfault in a many-code host process (the D2 fix).
 include("test_music_crosscheck.jl")
 include("test_discodj_growth.jl")   # Next-10: DISCO-DJ ICs vs the exact growth (also boot-sensitive)
 

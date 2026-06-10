@@ -20,7 +20,7 @@ using EnzoLib, RamsesLib, CodeBridge
         @warn "MUSIC cross-check skipped" music = MusicLib.available() enzo = EnzoLib.grid_available()
         @test_skip false
     else
-        r = run_music_crosscheck(level = 5)
+        r = run_music_crosscheck(level = 5, worker = true)   # own process: pollution-immune
         @test r.corr > 0.999999                      # the same realization
         @test r.rms < 1e-5                           # the f32 grafic floor
         @test abs(r.sigma_enzo / r.sigma_ramses - 1) < 1e-6

@@ -56,11 +56,11 @@ sibling arepo + dfmm checkouts; gates skip cleanly where a library is absent).
 
 ## Status ledger
 
-ADR-0006 phases 0–7 and Next-1…11 complete; the per-phase implementation record
+ADR-0006 phases 0–7 and Next-1…12 complete; the per-phase implementation record
 (numbers, traps, commit references) is the status appendix of
 [`docs/adr/0006-unified-multicode-framework.md`](adr/0006-unified-multicode-framework.md).
 Remaining recorded polish: extension-ifying the legacy wrappers in MultiCode
-(deferred until a registry release — they are lazy bindings) and MUSIC in a
-CodeBridge worker (the durable fix for its in-process runtime-collision
-sensitivity).  The wrapper-registry on-ramp is COMPLETE: all seven wrappers
-carry live cross-code gates.
+(deferred until a registry release — they are lazy bindings).  The
+wrapper-registry on-ramp is COMPLETE: all seven wrappers carry live
+cross-code gates, and MUSIC generates through its own CodeBridge worker
+(bit-identical to in-process — the D1/D2 transport seam certified once more).
