@@ -524,7 +524,24 @@ never forks of their cores.
   particles injected directly): ratio 0.9942, residual 0.030·A, 14 steps,
   0.3 s. Cross-code growth-normalized displacement amplitudes agree to
   0.5%·A. Two engines, zero shared code, one analytic answer.
-- **Next:** per-level AMR fast path (raster each level with
-  coarse-interpolated ghosts + flux registers), KA re-expression of the
-  mini-ramses kernels (start with multigrid), dfmm as an EquationSet,
-  extension-ifying MultiCode.
+- **Next-3 — the per-level AMR fast path (done):**
+  `ramses_ppmk_hydro_step_amr_fast!` advances each level on its own
+  bounding-box raster — coarse at coarse cost, fine only over the refined
+  region — with coarse-injected ghosts (every non-level cell re-injected
+  from the frozen time-t parent before each directional sweep) and FLUX
+  REGISTERS: the guest records per-axis face fluxes (`fluxrec`), and every
+  leaf cell facing a refined cell replaces its face flux with the area mean
+  of the 4 child-face fluxes (ΔU = ±dt/dx·(F − F̄)), after which the
+  composite flux telescopes — every physical face crossed by exactly one
+  flux.  Refined cells restrict bottom-up (coarse ≡ average of children).
+  Gate (`test_amr_fastpath.jl`): one isolated step conserves the composite
+  mass BIT-EXACTLY (Δm = 0.0, ΔE = 4.4e-16); the full 77-step Sedov run
+  with live host regridding conserves to 1e-10 with upload error 0.0 and
+  lands the shock radius in the identical bin as the composite path —
+  at **2.34×** the composite's speed (2.6 s vs 6.2 s, two-level 32³/64³).
+  2:1 grading (RAMSES enforces it) keeps the child side of every
+  coarse-fine face a leaf, so one register level per level pair suffices.
+  Per-level subcycling and a Metal variant are the remaining optimization
+  track (the registers and masks currently live host-side).
+- **Next:** KA re-expression of the mini-ramses kernels (start with
+  multigrid), dfmm as an EquationSet, extension-ifying MultiCode.

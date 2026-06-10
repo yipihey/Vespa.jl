@@ -169,7 +169,11 @@ buffers are covered — they bit earlier).
 `extract`/`inject!` adapters (Phase 2), the PPMKernels-in-RAMSES guest slot
 (Phase 3; `device=:metal` for f32 GPU), Moray-as-a-service + the conservative
 deposit/sample exchange + Moray-inside-Arepo (Phase 4), RAMSES-RT wrapped +
-the Moray-vs-RAMSES-RT cross-check + RAMSES-RT-inside-Enzo (Phases 4–5).
+the Moray-vs-RAMSES-RT cross-check + RAMSES-RT-inside-Enzo (Phases 4–5), the
+guest under AMR (composite raster, Phase 7; per-level fast path with frozen-
+parent ghosts + flux registers — bit-exact conservation, 2.3× — Next-3), and
+the Zel'dovich cosmology gate (one particle set into Enzo + RAMSES vs the
+exact mixed-mode growth, Next-2; needs `bin64sc` UNITS=COSMO).
 Run: `<julia> --project=lib/MultiCode/test lib/MultiCode/test/runtests.jl`
 (~5 min; needs the Enzo grid dylib, mini-ramses `bin64h` AND `bin64hrt` libs,
 and the sibling arepo `libarepo.dylib`). Reports land in `reports/multicode/`.

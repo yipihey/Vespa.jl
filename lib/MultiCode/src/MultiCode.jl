@@ -38,6 +38,7 @@ export run_enzo_sod, run_ramses_sod, run_arepo_sod
 export profile_x, sod_l1, sod_report
 export ramses_ppmk_hydro_step!, run_ramses_sod_guest
 export ramses_composite_raster, ramses_composite_deraster!, ramses_ppmk_hydro_step_amr!
+export ramses_ppmk_hydro_step_amr_fast!
 export run_moray_stromgren, moray_ifront_radius, stromgren_radius, stromgren_scales
 export deposit_to_grid, deposit_exact, sample_at_points
 export run_ramsesrt_stromgren, ramsesrt_ifront_radius

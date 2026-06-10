@@ -326,6 +326,286 @@ function ramses_ppmk_hydro_step_amr!(h::RamsesLib.Handle; levmin::Integer, levma
     return Float64(dt)
 end
 
+# ── the per-level AMR fast path (ADR-0006 "Next"): ghosts + flux registers ────
+#
+# The composite raster advances the WHOLE domain at the finest resolution; the
+# fast path advances each level on its own bounding-box raster — the coarse
+# level at coarse cost, the fine level only over the refined region — and
+# restores the composite update's exact conservation with FLUX REGISTERS:
+#
+#   1. raster every level (bbox + in-level mask); fill every non-level cell
+#      (ghost band included) top-down by parent injection — the
+#      coarse-interpolated ghosts;
+#   2. one global dt (the finest CFL across levels); advance each level with
+#      the guest RECORDING per-axis face fluxes (`fluxrec`); a child level's
+#      bc! re-injects the frozen time-t parent state into every non-level
+#      cell before each directional sweep;
+#   3. reflux: every leaf cell facing a refined cell replaces its own face
+#      flux with the area mean of the 4 child-face fluxes (ΔU = ±dt/dx·(F−F̄)),
+#      after which the composite flux telescopes — every physical face is
+#      crossed by exactly one flux — and conservation is exact by construction;
+#   4. restrict refined cells bottom-up (coarse = average of its children)
+#      and write every level back.
+#
+# 2:1 grading (RAMSES enforces it) guarantees the child cells on a coarse-fine
+# face are leaves, so one register level per level pair suffices.
+
+"Per-level bbox raster: fields over the level's bounding box (+ng ghosts) with an in-level mask."
+function _lr_raster(h::RamsesLib.Handle, lev::Integer; ng::Integer = 2, lib::Symbol = :cpu)
+    ck, U = RamsesLib.get_hydro_all(h, :uold, lev; lib = lib)
+    noct = size(ck, 1)
+    noct > 0 || return nothing
+    n1d = 2^lev
+    lo = (typemax(Int), typemax(Int), typemax(Int))
+    hi = (typemin(Int), typemin(Int), typemin(Int))
+    @inbounds for o in 1:noct
+        b = (2 * Int(ck[o, 1]), 2 * Int(ck[o, 2]), 2 * Int(ck[o, 3]))
+        lo = min.(lo, b); hi = max.(hi, b .+ 1)
+    end
+    nloc = hi .- lo .+ 1
+    dims = nloc .+ 2ng
+    nx, ny, nz = dims
+    flat() = zeros(Float64, nx * ny * nz)
+    D = flat(); S1 = flat(); S2 = flat(); S3 = flat(); Tau = flat()
+    covered = falses(dims...); refined = falses(dims...)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - lo[1] + ng + 1
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - lo[2] + ng + 1
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - lo[3] + ng + 1
+        g = i + nx * (j - 1) + nx * ny * (k - 1)
+        D[g] = U[o, c, 1]; S1[g] = U[o, c, 2]; S2[g] = U[o, c, 3]
+        S3[g] = U[o, c, 4]; Tau[g] = U[o, c, 5]
+        covered[i, j, k] = true
+    end
+    return (D = D, S1 = S1, S2 = S2, S3 = S3, Tau = Tau,
+            dims = dims, ng = Int(ng), lev = Int(lev), n1d = n1d,
+            off = lo, nloc = nloc, ck = ck, covered = covered, refined = refined)
+end
+
+_lr_fields(r) = (r.D, r.S1, r.S2, r.S3, r.Tau)
+
+"Mark the parent raster's refined cells (a child oct's ckey IS its parent cell's coordinate)."
+function _lr_mark_refined!(p, ck_child::Matrix{Int32})
+    ng = p.ng
+    @inbounds for o in 1:size(ck_child, 1)
+        i = Int(ck_child[o, 1]) - p.off[1] + ng + 1
+        j = Int(ck_child[o, 2]) - p.off[2] + ng + 1
+        k = Int(ck_child[o, 3]) - p.off[3] + ng + 1
+        p.covered[i, j, k] || error("_lr_mark_refined!: child oct over an uncovered parent cell")
+        p.refined[i, j, k] = true
+    end
+    return nothing
+end
+
+"""
+Precompute (child linear, parent linear) injection pairs for every NON-level
+cell of the child raster (ghost band included): the coarse ghost fill, applied
+once at raster time and re-applied (frozen at time t) before every sweep.
+"""
+function _lr_fill_pairs(c, p)
+    pairs = NTuple{2,Int}[]
+    ngc = c.ng; nxc, nyc, nzc = c.dims
+    ngp = p.ng; nxp, nyp, _ = p.dims
+    for k in 1:nzc, j in 1:nyc, i in 1:nxc
+        c.covered[i, j, k] && continue
+        gx = mod(c.off[1] + (i - ngc - 1), c.n1d)     # periodic global child coords
+        gy = mod(c.off[2] + (j - ngc - 1), c.n1d)
+        gz = mod(c.off[3] + (k - ngc - 1), c.n1d)
+        pi = (gx >> 1) - p.off[1] + ngp + 1
+        pj = (gy >> 1) - p.off[2] + ngp + 1
+        pk = (gz >> 1) - p.off[3] + ngp + 1
+        (ngp + 1 <= pi <= ngp + p.nloc[1] && ngp + 1 <= pj <= ngp + p.nloc[2] &&
+         ngp + 1 <= pk <= ngp + p.nloc[3]) ||
+            error("per-level fast path: level-$(c.lev) ghost ($gx,$gy,$gz) maps outside " *
+                  "the level-$(p.lev) raster — nesting too tight for ng=$ngc")
+        push!(pairs, (i + nxc * (j - 1) + nxc * nyc * (k - 1),
+                      pi + nxp * (pj - 1) + nxp * nyp * (pk - 1)))
+    end
+    return pairs
+end
+
+"Inject parent values into the child's non-level cells (the precomputed pairs)."
+function _lr_inject!(cf, pf, pairs::Vector{NTuple{2,Int}})
+    @inbounds for (gc, gp) in pairs
+        cf[1][gc] = pf[1][gp]; cf[2][gc] = pf[2][gp]; cf[3][gc] = pf[3][gp]
+        cf[4][gc] = pf[4][gp]; cf[5][gc] = pf[5][gp]
+    end
+    return nothing
+end
+
+# face-axis child-local index with a periodic wrap into the recorded flux range
+@inline function _lr_clocal_wrap(cg::Int, off::Int, ng::Int, nact::Int, n1d::Int)
+    cl = cg - off + ng + 1
+    cl < ng + 1 && (cl += n1d)
+    cl > ng + nact + 1 && (cl -= n1d)
+    return cl
+end
+
+"""
+The flux register: for every leaf parent cell with a refined face neighbor,
+replace the parent's recorded face flux with the area mean of the 4 child-face
+fluxes.  `frec[axis][v][g]` is the flux through cell `g`'s −axis face (the
+guest's `fluxrec` convention), so the correction for the face on side `s` of
+the cell is `ΔU = s · dt/dx_parent · (F_parent − F̄_child)`.
+"""
+function _lr_reflux!(p, frec_p, c, frec_c, dtdx_p::Float64)
+    ng = p.ng; nx, ny, _ = p.dims
+    ngc = c.ng; nxc, nyc, _ = c.dims
+    pf = _lr_fields(p)
+    @inbounds for k in ng+1:ng+p.nloc[3], j in ng+1:ng+p.nloc[2], i in ng+1:ng+p.nloc[1]
+        (p.covered[i, j, k] && !p.refined[i, j, k]) || continue
+        gP = (p.off[1] + (i - ng - 1), p.off[2] + (j - ng - 1), p.off[3] + (k - ng - 1))
+        for axis in 1:3, side in (-1, 1)
+            gN = ntuple(d -> d == axis ? mod(gP[d] + side, p.n1d) : gP[d], 3)
+            nix = gN[1] - p.off[1] + ng + 1
+            njy = gN[2] - p.off[2] + ng + 1
+            nkz = gN[3] - p.off[3] + ng + 1
+            (1 <= nix <= nx && 1 <= njy <= ny && 1 <= nkz <= p.dims[3]) || continue
+            p.refined[nix, njy, nkz] || continue
+            # the +axis-side parent cell owns the face (the flux lives at its −axis face)
+            gplus = side == 1 ? gN : gP
+            gp_lin = (side == 1 ? nix : i) + nx * ((side == 1 ? njy : j) - 1) +
+                     nx * ny * ((side == 1 ? nkz : k) - 1)
+            t1 = axis % 3 + 1; t2 = t1 % 3 + 1
+            # the 4 child flux carriers: child cells whose −axis face IS the coarse face
+            ca = _lr_clocal_wrap(2 * gplus[axis], c.off[axis], ngc, c.nloc[axis], c.n1d)
+            (ngc + 1 <= ca <= ngc + c.nloc[axis] + 1) ||
+                error("_lr_reflux!: face carrier outside the child raster's recorded range")
+            P_lin = i + nx * (j - 1) + nx * ny * (k - 1)
+            carriers = ntuple(4) do q
+                b1 = (q - 1) & 1; b2 = (q - 1) >> 1
+                ct1 = 2 * gP[t1] + b1 - c.off[t1] + ngc + 1
+                ct2 = 2 * gP[t2] + b2 - c.off[t2] + ngc + 1
+                cidx = ntuple(d -> d == axis ? ca : (d == t1 ? ct1 : ct2), 3)
+                cidx[1] + nxc * (cidx[2] - 1) + nxc * nyc * (cidx[3] - 1)
+            end
+            for v in 1:5
+                Fp = frec_p[axis][v][gp_lin]
+                Fbar = 0.25 * (frec_c[axis][v][carriers[1]] + frec_c[axis][v][carriers[2]] +
+                               frec_c[axis][v][carriers[3]] + frec_c[axis][v][carriers[4]])
+                pf[v][P_lin] += side * dtdx_p * (Fp - Fbar)
+            end
+        end
+    end
+    return nothing
+end
+
+"Restriction: every refined parent cell becomes the average of its 8 children."
+function _lr_restrict!(p, c)
+    ng = p.ng; nx, ny, _ = p.dims
+    ngc = c.ng; nxc, nyc, _ = c.dims
+    pf = _lr_fields(p); cf = _lr_fields(c)
+    @inbounds for k in ng+1:ng+p.nloc[3], j in ng+1:ng+p.nloc[2], i in ng+1:ng+p.nloc[1]
+        p.refined[i, j, k] || continue
+        b = (2 * (p.off[1] + (i - ng - 1)) - c.off[1] + ngc + 1,
+             2 * (p.off[2] + (j - ng - 1)) - c.off[2] + ngc + 1,
+             2 * (p.off[3] + (k - ng - 1)) - c.off[3] + ngc + 1)
+        P_lin = i + nx * (j - 1) + nx * ny * (k - 1)
+        for v in 1:5
+            s = 0.0
+            for dk in 0:1, dj in 0:1, di in 0:1
+                s += cf[v][(b[1] + di) + nxc * (b[2] + dj - 1) + nxc * nyc * (b[3] + dk - 1)]
+            end
+            pf[v][P_lin] = s / 8
+        end
+    end
+    return nothing
+end
+
+"Write a per-level raster's in-level cells back into `uold`."
+function _lr_deraster!(h::RamsesLib.Handle, r; lib::Symbol = :cpu)
+    ck = r.ck; noct = size(ck, 1); ng = r.ng; nx, ny, _ = r.dims
+    vals = [Matrix{Float64}(undef, noct, 8) for _ in 1:5]
+    flds = _lr_fields(r)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - r.off[1] + ng + 1
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - r.off[2] + ng + 1
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - r.off[3] + ng + 1
+        g = i + nx * (j - 1) + nx * ny * (k - 1)
+        for v in 1:5
+            vals[v][o, c] = flds[v][g]
+        end
+    end
+    for v in 1:5
+        RamsesLib.set_hydro!(h, :uold, v, r.lev, ck, vals[v]; lib = lib)
+    end
+    return nothing
+end
+
+"""
+    ramses_ppmk_hydro_step_amr_fast!(h; levmin, levmax, gamma, boxlen,
+                                     dt=nothing, dt_max=Inf, courant=0.4,
+                                     recon=:plm, riemann=:hllc) -> dt_used
+
+The PER-LEVEL fast path of [`ramses_ppmk_hydro_step_amr!`](@ref): each level
+advances on its own bounding-box raster (the coarse level at coarse cost, the
+fine level only over the refined region) with coarse-injected ghosts, and the
+flux registers restore exact conservation at every coarse-fine face.  One
+global dt (the finest CFL) — per-level subcycling is the next optimization.
+Same contract as the composite step: the host keeps owning refinement, and
+every level it sees afterwards is mutually consistent (coarse ≡ restricted
+fine).  CPU only (the registers and masks live host-side).
+"""
+function ramses_ppmk_hydro_step_amr_fast!(h::RamsesLib.Handle; levmin::Integer, levmax::Integer,
+                                          gamma::Real, boxlen::Real,
+                                          dt::Union{Nothing,Real} = nothing,
+                                          dt_max::Real = Inf, courant::Real = 0.4,
+                                          ng::Integer = 2, recon::Symbol = :plm,
+                                          riemann::Symbol = :hllc, lib::Symbol = :cpu)
+    rs = NamedTuple[]
+    for l in levmin:levmax
+        r = _lr_raster(h, l; ng = ng, lib = lib)
+        r === nothing && break                    # no octs ⇒ nothing finer either
+        push!(rs, r)
+    end
+    nlev = length(rs)
+    nlev > 0 || error("ramses_ppmk_hydro_step_amr_fast!: empty hierarchy at level $levmin")
+    # refined masks + top-down coarse-injection fill of every non-level cell
+    pairs = Vector{Vector{NTuple{2,Int}}}(undef, nlev)
+    for li in 2:nlev
+        _lr_mark_refined!(rs[li-1], rs[li].ck)
+        pairs[li] = _lr_fill_pairs(rs[li], rs[li-1])
+        _lr_inject!(_lr_fields(rs[li]), _lr_fields(rs[li-1]), pairs[li])
+    end
+    PPMKernels.fill_periodic!(rs[1].dims, rs[1].ng, _lr_fields(rs[1])...)
+    if dt === nothing
+        dt = dt_max
+        for r in rs
+            scratch = similar(r.D)
+            smax = PPMKernels.max_wavespeed(scratch, r.D, r.S1, r.S2, r.S3, r.Tau; gamma = gamma)
+            (isfinite(smax) && smax > 0) ||
+                error("ramses_ppmk_hydro_step_amr_fast!: bad wavespeed $smax on level $(r.lev)")
+            dt = min(dt, courant * (boxlen / r.n1d) / smax)
+        end
+    end
+    # frozen time-t parent states: the ghost source for every child sweep
+    frozen = [ntuple(v -> copy(_lr_fields(rs[li])[v]), 5) for li in 1:nlev-1]
+    frecs = Vector{Any}(undef, nlev)
+    for (li, r) in enumerate(rs)
+        frec = ntuple(_ -> ntuple(_ -> zeros(Float64, length(r.D)), 5), 3)
+        bc! = li == 1 ?
+            ((flds...) -> PPMKernels.fill_periodic!(r.dims, r.ng, flds...)) :
+            (let pr = frozen[li-1], pp = pairs[li]
+                 (flds...) -> _lr_inject!(flds, pr, pp)
+             end)
+        PPMKernels.muscl_hancock_step_3d!(r.D, r.S1, r.S2, r.S3, r.Tau, r.dims, r.ng;
+                                          dt = dt, gamma = gamma, dx = boxlen / r.n1d,
+                                          recon = recon, riemann = riemann,
+                                          bc! = bc!, fluxrec = frec)
+        frecs[li] = frec
+    end
+    for li in 1:nlev-1
+        _lr_reflux!(rs[li], frecs[li], rs[li+1], frecs[li+1], Float64(dt) / (boxlen / rs[li].n1d))
+    end
+    for li in nlev-1:-1:1
+        _lr_restrict!(rs[li], rs[li+1])
+    end
+    for r in rs
+        _lr_deraster!(h, r; lib = lib)
+    end
+    return Float64(dt)
+end
+
 """
     run_ramses_sod_guest(spec=SodSpec(); level=6, recon=:plm, riemann=:hllc)
         -> (; cs, t, profile, diag)

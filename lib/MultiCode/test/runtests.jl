@@ -150,4 +150,5 @@ include("test_rt_crosscheck.jl")   # Phase 4.4: Moray vs RAMSES-RT (the ADR gate
 include("test_rt_guest.jl")        # Phase 5: flagship 2 — RAMSES-RT inside Enzo
 include("test_sedov_compare.jl")   # the science-grade run: one Sedov IC, four engines
 include("test_amr_guest.jl")       # the guest slot under AMR (composite raster)
+include("test_amr_fastpath.jl")    # Next-3: the per-level fast path (ghosts + flux registers)
 include("test_zeldovich.jl")       # Next-2: cosmology — one particle set, Enzo + RAMSES vs exact
