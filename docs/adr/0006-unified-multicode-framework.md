@@ -677,6 +677,22 @@ never forks of their cores.
   `cic_density` promoted to MultiCode core (the shared measurement
   operator of the injection gates).  Remaining on-ramp: Gadget4 IC/halo
   gates; then MUSIC-in-a-worker (the durable D2 fix).
+- **Next-11 — the GADGET-4 halo service in the harness (done):** the
+  LAST wrapper on-ramp (`run_gadget4_halos`, `MultiCodeGadget4Ext`, the
+  fifth package extension): FOF+SUBFIND as a SERVICE on particles in
+  MultiCode's conventions (N×3 rows, [0,1)³; the particle mass set
+  cosmologically consistently so the linking length is 0.2× the mean
+  spacing — the recorded G4 trap).  Gates: three planted clumps →
+  EXACTLY three groups of ~500; a LIVE RAMSES Zel'dovich dump at
+  a/aᵢ = 4 → zero groups (pre-caustic) — a real foreign-code particle
+  dump through the service.  TWO process-boundary traps closed: an
+  extension sees only its parent's deps + triggers (HDF5 reaches the ext
+  THROUGH Gadget4Lib); and HDF5.jl + Enzo's grid dylib each carry a
+  libhdf5 whose interposed symbols ABORT whichever loads second — the
+  gate therefore runs in its OWN process from runtests (the D2
+  philosophy applied to tests; HDF5_DISABLE_VERSION_CHECK does NOT
+  help), and the live-code half uses RAMSES (plain Fortran I/O).
+  EVERY wrapper in the registry now has a live cross-code gate.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first

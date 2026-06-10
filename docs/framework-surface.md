@@ -9,7 +9,7 @@ and the Music/Athena/Gadget4/DiscoDJ wrapper integration audit.
 | Package | What it is |
 |---|---|
 | `lib/CodeBridge` | The shared legacy-wrapper substrate: `LazyLib` multi-flavor loading, `Bridge`, the `@xcall` macro (in-process ccall OR subprocess worker from ONE call site), source-parsed manifest + FNV-1a contract hash, worker RPC. Every wrapper below is a client. |
-| `lib/MultiCode` | The cross-code layer: `CellSet` canonical state + per-code adapters, conservation ledgers, the comparison harness (one spec → N engines → one report), the guest slots, and the conservative exchange operators (incl. exact R3D Voronoi↔AMR). Package extensions: `MultiCodeDfmmExt`, `MultiCodeAthenaExt`, `MultiCodeMusicExt`, `MultiCodeDiscoDJExt`. |
+| `lib/MultiCode` | The cross-code layer: `CellSet` canonical state + per-code adapters, conservation ledgers, the comparison harness (one spec → N engines → one report), the guest slots, and the conservative exchange operators (incl. exact R3D Voronoi↔AMR). Package extensions: `MultiCodeDfmmExt`, `MultiCodeAthenaExt`, `MultiCodeMusicExt`, `MultiCodeDiscoDJExt`, `MultiCodeGadget4Ext` — every registry wrapper has a live cross-code gate. |
 | `lib/PPMKernels` | KernelAbstractions hydro: Enzo PPM (certified bit-tight vs live Fortran), MUSCL-Hancock (PLM/PPM × HLL/HLLC/two-shock, `fluxrec` flux recording for AMR registers), HD_RK MUSCL, PPML. CPU f64/f32 + Metal f32. |
 | `lib/PoissonKernels` | KernelAbstractions gravity: Enzo multigrid (bit-tight), periodic FFT root solve (`greens = :spectral` Enzo / `:discrete7` — the exact solution of the 7-point system RAMSES MG iterates on), Dirichlet V/W-cycle, and `masked_cg!` (irregular-domain Dirichlet solve, CPU f64 + Metal f32). |
 | `lib/EnzoLib` | Live Enzo through the EnzoModules C-ABI bridge: certified EvolveLevel slots, `:julia` slot swaps, particle injection, flux registers, MPI worker. |
@@ -23,7 +23,7 @@ and the Music/Athena/Gadget4/DiscoDJ wrapper integration audit.
 | `Arepo.jl` / ArepoLib | Arepo (moving mesh) | in-process (worker for re-init; per-process singleton) | Sod, Voronoi 3-D export (`libarepo3d`), Moray-inside-Arepo |
 | `Music.jl` / MusicLib | MUSIC (music20) | in-process (`libmusic_capi`) | one `MusicSpec` → Enzo/RAMSES/Arepo zoom ICs; injector validated live via `MultiCodeMusicExt` (Enzo↔RAMSES initial fields corr 1−4e-15) |
 | `Athena.jl` / AthenaLib | Athena++ | in-process, re-entrant; flavor-per-dylib (pgen/coord/flux/eos, GR spacetimes) | Sod-harness engine via `MultiCodeAthenaExt` (L1(ρ)=0.0019, exact conservation, 0.02 s); `.athdf` reader; future per-stage solver slots |
-| `Gadget4.jl` / Gadget4Lib | GADGET-4 | child process (G4 owns exit()/MPI) | NGenIC 2LPT ICs, TreePM runs, FOF/SUBFIND halo-finder-as-a-service |
+| `Gadget4.jl` / Gadget4Lib | GADGET-4 | child process (G4 owns exit()/MPI) | NGenIC 2LPT ICs, TreePM runs, FOF/SUBFIND halo-finder-as-a-service — live in the harness via `MultiCodeGadget4Ext` (planted clumps → exactly 3 groups; RAMSES dump → 0) |
 | `DiscoDJ.jl` / DiscoDJLib | DISCO-DJ (JAX) | in-process PythonCall (NOT CodeBridge) | differentiable LPT ICs + lightcones, gradients preserved; growth-gated live via `MultiCodeDiscoDJExt` (1LPT → Enzo+RAMSES, cross-corr 0.998, large scales ≥0.96·b(a)) |
 | `dfmm` (sibling) | dual-frame moment method | native Julia, `MultiCodeDfmmExt` | the Sod harness engine: L1(ρ)=0.042, mass bit-exact, momentum 1e-16 |
 
@@ -56,10 +56,11 @@ sibling arepo + dfmm checkouts; gates skip cleanly where a library is absent).
 
 ## Status ledger
 
-ADR-0006 phases 0–7 and Next-1…10 complete; the per-phase implementation record
+ADR-0006 phases 0–7 and Next-1…11 complete; the per-phase implementation record
 (numbers, traps, commit references) is the status appendix of
 [`docs/adr/0006-unified-multicode-framework.md`](adr/0006-unified-multicode-framework.md).
 Remaining recorded polish: extension-ifying the legacy wrappers in MultiCode
-(deferred until a registry release — they are lazy bindings), MultiCode
-validation gates for the Gadget4 wrapper (its
-in-repo suites are green; cross-code gates are the on-ramp pattern of Phase 2).
+(deferred until a registry release — they are lazy bindings) and MUSIC in a
+CodeBridge worker (the durable fix for its in-process runtime-collision
+sensitivity).  The wrapper-registry on-ramp is COMPLETE: all seven wrappers
+carry live cross-code gates.

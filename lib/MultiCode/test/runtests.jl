@@ -162,4 +162,13 @@ include("test_amr_fastpath.jl")    # Next-3: the per-level fast path (ghosts + f
 include("test_gravity_slot.jl")    # Next-4: the gravity guest slot (KA Poisson vs RAMSES MG)
 include("test_dfmm_engine.jl")     # Next-5: dfmm via the MultiCodeDfmmExt package extension
 include("test_athena_engine.jl")   # Next-8: Athena++ via MultiCodeAthenaExt (registry on-ramp)
+# Next-11: the GADGET-4 halo service — in its OWN PROCESS: HDF5.jl (via
+# Gadget4Lib) and Enzo's grid dylib each carry a libhdf5, and the interposed
+# symbols abort whichever loads second.  Process isolation, the D2 way.
+@testset "GADGET-4 halo service (isolated process)" begin
+    tf = joinpath(@__DIR__, "test_gadget4_halos.jl")
+    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $tf`
+    @test success(pipeline(cmd; stdout = stdout, stderr = stderr))
+end
+
 include("test_zeldovich.jl")       # Next-2: cosmology — one particle set, Enzo + RAMSES vs exact

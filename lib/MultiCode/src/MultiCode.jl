@@ -52,6 +52,7 @@ export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
 export run_dfmm_sod, run_athena_sod, run_music_crosscheck, run_discodj_growth
+export run_gadget4_halos
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -111,5 +112,16 @@ and Enzo↔RAMSES agreement.  Implemented in `MultiCodeDiscoDJExt` — `using
 DiscoDJLib` activates it (set JULIA_PYTHONCALL_EXE before loading).
 """
 function run_discodj_growth end
+
+"""
+    run_gadget4_halos(xp; box_mpch=50.0, omega_m=0.308, redshift=0.0) -> (; ngroups, …)
+
+GADGET-4's FOF+SUBFIND as a harness SERVICE: particles in MultiCode's
+conventions (N×3 rows, [0,1)³) become a halo catalogue.  The particle mass is
+cosmologically consistent (m = Ωm·ρ_crit·box³/N) so the linking length is
+0.2× the mean spacing.  Implemented in `MultiCodeGadget4Ext` — `using
+Gadget4Lib` activates it (G4 runs in a child process; the D2 transport).
+"""
+function run_gadget4_halos end
 
 end # module
