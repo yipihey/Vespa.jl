@@ -29,6 +29,7 @@ const GRAV_PF_SRC = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
     else
         dir = mktempdir()
         par = read(GRAV_PF_SRC, String)
+        par = replace(par, r"StopTime\s*=\s*\S+" => "StopTime = 1.0")  # let particles MOVE
         par *= "\nPotentialIterations = 30\n"        # converge the ORACLE deeply
         pf = joinpath(dir, "GravityTest.enzo")
         write(pf, par)
@@ -88,5 +89,43 @@ const GRAV_PF_SRC = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
                 EnzoLib.free_problem(h)
             end
         end
+
+        # ── the PRODUCTION hook: a full AMR evolve, :julia vs :enzo ───────────
+        # Same fixture, two sequential sessions in this (already isolated)
+        # process; the only difference is who solves the subgrid Poisson
+        # problem.  ProblemType 23 deliberately FREEZES particle positions
+        # (UpdateParticlePositions.C: "don't move the particles") — but the
+        # velocities integrate the force field every step, so THEY are the
+        # observable: after N steps the kicked velocities must agree.
+        function evolve_particles(gravity_impl)
+            cd(dir) do
+                h = EnzoLib.session_init(pf)
+                h == C_NULL && error("session_init failed")
+                try
+                    eng = gravity_impl === :enzo ?
+                        EnzoLib.EngineConfig(; hydro = :enzo, gravity = :enzo) :
+                        EnzoLib.EngineConfig(; hydro = :enzo, gravity = :julia,
+                            hooks = Dict{Symbol,Function}(:gravity =>
+                                EnzoLib.poisson_gravity_hook(; rtol = 1e-11)))
+                    for _ in 1:5
+                        EnzoLib.evolve_level!(h, 0, 0.0; engine = eng, regrid = false)
+                    end
+                    ng = EnzoLib.problem_num_grids(h)
+                    return reduce(vcat, [reduce(hcat,
+                        [EnzoLib.problem_get_particle_vel(h, d, g) for d in 0:2])
+                        for g in 0:ng-1])
+                finally
+                    EnzoLib.free_problem(h)
+                end
+            end
+        end
+        v_e = evolve_particles(:enzo)
+        v_j = evolve_particles(:julia)
+        @test size(v_j) == size(v_e)
+        vmax = maximum(abs, v_e)
+        @test vmax > 1e-3                       # the force field genuinely kicked them
+        dv = maximum(abs.(v_j .- v_e))
+        @test dv < 1e-8 * vmax                  # identical integrated forces
+        @info "Phase C full evolve: gravity=:julia vs :enzo" n_particles = size(v_e, 1) vmax = vmax max_dv = dv rel = dv / vmax
     end
 end

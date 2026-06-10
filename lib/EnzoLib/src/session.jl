@@ -380,6 +380,15 @@ function problem_get_gravitating_mass(h::Handle, grid::Integer = 0)
     @xcall(:enzomodules_problem_get_gravitating_mass, Cvoid, (Handle, Cint, Ptr{Cdouble}), h, grid, out)
     reshape(out, dims)
 end
+"Write `grid`'s PotentialField — a :julia gravity slot's solved φ (Enzo differences it)."
+function problem_set_potential(h::Handle, data::Array{Float64}, grid::Integer = 0)
+    length(data) == prod(problem_gmf_dims(h, grid)) || throw(DimensionMismatch("potential size"))
+    @xcall(:enzomodules_problem_set_potential, Cvoid, (Handle, Cint, Ptr{Cdouble}), h, grid, data)
+end
+"Post-solve gravity chain (accelerations from the CURRENT PotentialField) on `level`."
+session_gravity_post(h::Handle, level::Integer) =
+    @xcall(:enzomodules_session_gravity_post, Cint, (Handle, Cint), h, level)
+
 "Enzo's solved gravitational PotentialField on `grid` — for testing gravity kernels."
 function problem_get_potential(h::Handle, grid::Integer = 0)
     dims = problem_gmf_dims(h, grid); out = zeros(Float64, prod(dims))

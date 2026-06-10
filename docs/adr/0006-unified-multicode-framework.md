@@ -733,6 +733,24 @@ never forks of their cores.
   Phase C: the production gravity=:julia hook for all levels (root FFT
   + this subgrid solve) in a full AMR evolve vs gravity=:enzo, then the
   Santa Barbara CPU-vs-GPU run.
+- **Phase C (slice 2) — the production gravity=:julia hook (done):**
+  `EnzoLib.poisson_gravity_hook()` — the slot swaps ONLY the Poisson
+  solve, the RAMSES-slot design replicated on Enzo: level 0 runs Enzo's
+  own chain (PrepareDensityField carries the root FFT internally);
+  level > 0 deposits + interpolates the BC through Enzo, solves every
+  subgrid with the certified Dirichlet W-cycle, writes the potential
+  back through the NEW `set_potential` bridge entry, and Enzo's own
+  differencing (the NEW `session_gravity_post` = ComputeAccelerations +
+  CopyPotentialToBaryonField + external) turns OUR φ into baryon AND
+  particle forces.  Contract hash → 67 symbols, workers rebuilt.
+  Full-evolve gate on GravityTest (5 root steps with subcycling):
+  particle velocities — the integrated force field; ProblemType 23
+  deliberately FREEZES positions ("don't move the particles",
+  UpdateParticlePositions.C) — are **BIT-IDENTICAL** (max Δv = 0.0 at
+  vmax = 0.041) between gravity=:julia and gravity=:enzo: the two
+  potentials agree at the f64 ulp, so the differenced forces coincide
+  exactly.  Remaining Phase C: the Santa Barbara CPU-vs-GPU production
+  run on this hook.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first

@@ -21,6 +21,7 @@ module EnzoLib
 
 using Libdl
 using PPMKernels
+import PoissonKernels
 using CodeBridge
 using CodeBridge: @xcall          # the call sites in session.jl resolve to CodeBridge's macro
 
@@ -429,6 +430,7 @@ end
 
 include("session.jl")   # live-Session C-ABI (full-replication via the Enzo grid lib)
 include("local_ppm.jl") # HydroMethod=10: conservative one-ghost local PPM
+include("poisson_gravity.jl") # Phase C: gravity=:julia subgrid-solve hook
 include("rpc.jl")       # ADR-0005 #2: :remote transport (subprocess worker + shm)
 
 end # module
