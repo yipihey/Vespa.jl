@@ -619,6 +619,19 @@ never forks of their cores.
   f32 residual floor) in 39 iterations — one source, two devices, the
   D5 contract applied to the irregular-domain solver.  Gravity-slot
   gate now 14/14 (root, cuboid Dirichlet, blob CPU, blob Metal).
+- **Wrapper-registry audit (2026-06-10):** the parallel-session wrappers
+  are integrated and verified consistent with the contract: **Music.jl
+  (MusicLib)**, **Athena.jl (AthenaLib)**, **Gadget4.jl (Gadget4Lib)** —
+  all CodeBridge clients with `[sources]` pointing at this repo's
+  `lib/CodeBridge`, each clean on `main` with its own green suite — plus
+  **DiscoDJ.jl (DiscoDJLib)** (PythonCall, deliberately not CodeBridge:
+  JAX must stay in-process and traced for differentiability).  Six
+  CodeBridge clients now ride one substrate; the full registry and
+  capability table is `docs/framework-surface.md` (linked from the
+  README), and CLAUDE.md carries the ripple warning (a CodeBridge change
+  touches six sibling repos).  Their MultiCode cross-code gates
+  (injectors, comparison rows) are the recorded on-ramp work, following
+  the Phase-2 pattern.
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first

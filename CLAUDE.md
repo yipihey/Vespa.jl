@@ -159,8 +159,12 @@ total to round-off). The serial `:local`≡`:remote` parity oracle is
 hash-invariant — the prebuilt C++ workers still handshake): `LazyLib` multi-flavor
 loading, `Bridge`, the `@xcall` macro (resolves the calling module's `const
 BRIDGE`), manifest/contract-hash, and the worker RPC. **EnzoLib, RamsesLib
-(RamsesNG.jl), and ArepoLib (Arepo.jl) are all clients** — their cross-repo
-`[sources]` point back here, so changes to CodeBridge affect three repos.
+(RamsesNG.jl), ArepoLib (Arepo.jl), MusicLib (Music.jl), AthenaLib (Athena.jl),
+and Gadget4Lib (Gadget4.jl) are all clients** — their cross-repo `[sources]`
+point back here, so changes to CodeBridge ripple across SIX sibling repos
+(DiscoDJ.jl is the seventh wrapper but rides PythonCall, not CodeBridge; dfmm
+integrates as a MultiCode package extension). The full registry + capability
+table is `docs/framework-surface.md`.
 Wire-protocol invariants live in `lib/CodeBridge/test` (29 tests incl. a
 compiled-C-fixture local≡remote parity oracle; zero-arg calls and `Ref`/Matrix
 buffers are covered — they bit earlier).
