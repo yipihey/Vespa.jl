@@ -51,7 +51,7 @@ export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
-export run_dfmm_sod, run_athena_sod
+export run_dfmm_sod, run_athena_sod, run_music_crosscheck
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -89,5 +89,15 @@ from the `.hst` history — gated against the same exact-Riemann oracle.
 Implemented in `MultiCodeAthenaExt` — `using AthenaLib` activates it.
 """
 function run_athena_sod end
+
+"""
+    run_music_crosscheck(; boxlength=20.0, zstart=50.0, level=5) -> (; corr, rms, …)
+
+The MUSIC injector validation: ONE MusicSpec realization, Enzo booted on the
+generated `parameter_file.txt` + particle ICs and RAMSES (UNITS=COSMO) on the
+grafic2 level directory, the two codes' INITIAL CIC density fields correlated.
+Implemented in `MultiCodeMusicExt` — `using MusicLib` activates it.
+"""
+function run_music_crosscheck end
 
 end # module

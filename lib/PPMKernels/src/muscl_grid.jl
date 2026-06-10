@@ -173,6 +173,28 @@ end
     @inbounds dFl[cl] = -(fge[fo+1] - fge[fo]) * dtdx
 end
 
+@kernel function _ppm_local_contact_moment_flux_k!(fA1, fA2, @Const(fd),
+                                                   @Const(rho), @Const(A1), @Const(A2),
+                                                   na::Int, nfi::Int, nghost::Int,
+                                                   small_rho, periodic::Int)
+    gi, gj = @index(Global, NTuple)
+    base = (gj - 1) * na
+    cl = base + nghost + gi - 1
+    fo = (gj - 1) * nfi + gi
+    T = eltype(fd); sr = T(small_rho)
+    @inbounds begin
+        li = periodic == 1 && gi == 1 ? base + na - nghost : cl
+        ri = periodic == 1 && gi == nfi ? base + nghost + 1 : cl + 1
+        q1L = periodic == 0 && gi == 1 ? A1[li] / max(rho[li], sr) : _ppm_local_scalar_right(rho, A1, li, sr)
+        q1R = periodic == 0 && gi == nfi ? A1[ri] / max(rho[ri], sr) : _ppm_local_scalar_left(rho, A1, ri, sr)
+        q2L = periodic == 0 && gi == 1 ? A2[li] / max(rho[li], sr) : _ppm_local_scalar_right(rho, A2, li, sr)
+        q2R = periodic == 0 && gi == nfi ? A2[ri] / max(rho[ri], sr) : _ppm_local_scalar_left(rho, A2, ri, sr)
+        fm = fd[fo]
+        fA1[fo] = fm >= zero(T) ? fm * q1L : fm * q1R
+        fA2[fo] = fm >= zero(T) ? fm * q2L : fm * q2R
+    end
+end
+
 function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
                    D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int,
                    dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real;
@@ -345,10 +367,14 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
                               dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
                               recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3,
                               frec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
-                              face_periodic::Bool = false)
+                              face_periodic::Bool = false, contact_label = nothing,
+                              contact_label2 = nothing,
+                              contact_moment1 = nothing, contact_moment2 = nothing,
+                              contact_level1::Real = -1, contact_level2::Real = -1)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     na = dims[axis]; ntr = N ÷ na; active = na - 2 * ng; nfi = active + 1
     dtdx = T(dt) / T(dx); cpred = T(dt) / (2 * T(dx)); dual = ge !== nothing
+    update_moments = contact_moment1 !== nothing && contact_moment2 !== nothing
     trace = recon in (:ppm, :ppm_local) && predictor === :trace; gm1 = T(gamma) - one(T)
     perm = _axis_perm(axis)
     # conserved momenta in cyclic (normal, t1, t2) role for this axis
@@ -373,40 +399,64 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
     fd = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
     fs3 = _scratch(D, nfi * ntr); fe = _scratch(D, nfi * ntr)
     fge = dual ? _scratch(D, nfi * ntr) : nothing
+    fA1 = update_moments ? _scratch(D, nfi * ntr) : nothing
+    fA2 = update_moments ? _scratch(D, nfi * ntr) : nothing
     c2p(r, e, x, y, z, d_, sn, st1, st2, tau, g_) = dual ?
         _cons2prim_dual_k!(be)(r, e, x, y, z, d_, sn, st1, st2, tau, g_, T(gamma), T(eta1), T(small_rho); ndrange = N) :
         _cons2prim_k!(be)(r, e, x, y, z, d_, sn, st1, st2, tau, T(small_rho); ndrange = N)
     fl(rho, eint, vx, vy, vz) = begin
         trace && (@. pr = gm1 * rho * eint)                  # pressure for the characteristic trace
+        lbl = axis == 1 ? contact_label : nothing
+        lbl2 = axis == 1 ? contact_label2 : nothing
         muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                  ncells = na, nghost = ng, jdim = ntr, gamma = gamma,
                                  theta = theta, cpred = cpred, small_rho = small_rho,
                                  recon = recon, coeffs = coeffs, fge = fge, riemann = riemann,
-                                 predictor = predictor, pr = pr, face_periodic = face_periodic)
+                                 predictor = predictor, pr = pr, face_periodic = face_periodic,
+                                 contact_label = lbl, contact_label2 = lbl2,
+                                 contact_level1 = contact_level1, contact_level2 = contact_level2)
+    end
+    moment_flux(rho, A1, A2) = begin
+        update_moments || return
+        recon === :ppm_local || error("contact moment updates currently require recon=:ppm_local")
+        _ppm_local_contact_moment_flux_k!(be)(fA1, fA2, fd, rho, A1, A2,
+                                              na, nfi, ng, T(small_rho),
+                                              face_periodic ? 1 : 0;
+                                              ndrange = (nfi, ntr))
     end
 
     if axis == 1                                   # contiguous — work in place
         c2p(rho, eint, vx, vy, vz, D, Sn, St1, St2, Tau, ge)
         fl(rho, eint, vx, vy, vz)
+        moment_flux(rho, contact_moment1, contact_moment2)
         record_fluxes!()
         _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         dual && _ge_update_k!(be)(ge, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
+        update_moments && _ge_update_k!(be)(contact_moment1, fA1, na, nfi, ng, dtdx; ndrange = (active, ntr))
+        update_moments && _ge_update_k!(be)(contact_moment2, fA2, na, nfi, ng, dtdx; ndrange = (active, ntr))
     else
         DT = transpose3(D, dims, perm); TauT = transpose3(Tau, dims, perm)
         SnT = transpose3(Sn, dims, perm); St1T = transpose3(St1, dims, perm); St2T = transpose3(St2, dims, perm)
         GeT = dual ? transpose3(ge, dims, perm) : nothing
+        A1T = update_moments ? transpose3(contact_moment1, dims, perm) : nothing
+        A2T = update_moments ? transpose3(contact_moment2, dims, perm) : nothing
         c2p(rho, eint, vx, vy, vz, DT, SnT, St1T, St2T, TauT, GeT)
         fl(rho, eint, vx, vy, vz)
+        moment_flux(rho, A1T, A2T)
         record_fluxes!()
         _cons_update_k!(be)(DT, SnT, St1T, St2T, TauT, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         dual && _ge_update_k!(be)(GeT, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
+        update_moments && _ge_update_k!(be)(A1T, fA1, na, nfi, ng, dtdx; ndrange = (active, ntr))
+        update_moments && _ge_update_k!(be)(A2T, fA2, na, nfi, ng, dtdx; ndrange = (active, ntr))
         # scatter the updated slabs back into the original-layout arrays (one pass each)
         _untranspose_into!(D, DT, dims, perm);    _untranspose_into!(Tau, TauT, dims, perm)
         _untranspose_into!(Sn, SnT, dims, perm);  _untranspose_into!(St1, St1T, dims, perm)
         _untranspose_into!(St2, St2T, dims, perm)
         dual && _untranspose_into!(ge, GeT, dims, perm)
+        update_moments && _untranspose_into!(contact_moment1, A1T, dims, perm)
+        update_moments && _untranspose_into!(contact_moment2, A2T, dims, perm)
     end
     return nothing
 end
@@ -441,15 +491,20 @@ place; wrap a loop in [`with_pool`](@ref) for the allocation win.
 """
 function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
-                                order::NTuple{3,Int} = (1, 2, 3), small_rho::Real = 1e-10,
+                                order = (1, 2, 3), small_rho::Real = 1e-10,
                                 bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3,
                                 fluxrec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
-                                face_periodic::Bool = false)
+                                face_periodic::Bool = false, contact_label = nothing,
+                                contact_label2 = nothing,
+                                contact_moment1 = nothing, contact_moment2 = nothing,
+                                contact_level1::Real = -1, contact_level2::Real = -1)
     be = KA.get_backend(D); T = eltype(D)
     recon === :ppm && ng < 3 && error("muscl_hancock_step_3d!: recon=:ppm needs ng ≥ 3 (got $ng)")
     recon === :ppm_local && ng < 1 && error("muscl_hancock_step_3d!: recon=:ppm_local needs ng ≥ 1 (got $ng)")
     recon === :ppm_local && predictor !== :trace &&
         error("muscl_hancock_step_3d!: recon=:ppm_local requires predictor=:trace")
+    all(axis -> axis in 1:3, order) ||
+        error("muscl_hancock_step_3d!: order axes must be in 1:3 (got $order)")
     # uniform-grid PPM coefficients (the dx-independent limit of _ie_geom1!/_ie_geom2!:
     # c1=c2=c3=c4=½, c5=1/6, c6=−1/6); constant ⇒ one set reused for all axes/steps.
     # NON-pooled (they must survive the per-sweep _pool_reset!).
@@ -470,7 +525,10 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
                              recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec,
-                             riemann = riemann, predictor = predictor, face_periodic = face_periodic)
+                             riemann = riemann, predictor = predictor, face_periodic = face_periodic,
+                             contact_label = contact_label, contact_label2 = contact_label2,
+                             contact_moment1 = contact_moment1, contact_moment2 = contact_moment2,
+                             contact_level1 = contact_level1, contact_level2 = contact_level2)
     end
     # DEF reset: re-sync the gas energy and total energy once per step.
     ge === nothing || dual_energy_sync!(D, S1, S2, S3, Tau, ge; gamma = gamma, eta1 = eta1, small_rho = small_rho)

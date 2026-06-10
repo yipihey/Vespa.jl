@@ -529,6 +529,21 @@ end
         qL, qR = PPMKernels._ppm_local_edges(qbar(-1), qbar(0), qbar(1))
         @test qL ≈ 0.5
         @test qR ≈ 3.5
+
+        # Lower-rank Enzo grids retain three momentum fields but have degenerate
+        # inactive dimensions. A subset order must sweep only the physical axes.
+        for (rdims, rorder) in (((m, 1, 1), (1,)), ((m, m, 1), (1, 2)))
+            ncell = prod(rdims)
+            rD = dev(ones(ncell))
+            rS1 = dev(zeros(ncell)); rS2 = dev(zeros(ncell)); rS3 = dev(zeros(ncell))
+            rTau = dev(fill(0.7 / (gamma - 1), ncell))
+            PPMKernels.muscl_hancock_step_3d!(
+                rD, rS1, rS2, rS3, rTau, rdims, lng;
+                dt = dt, gamma = gamma, dx = dx, order = rorder,
+                recon = :ppm_local, predictor = :trace, riemann = :twoshock)
+            @test all(isfinite, PPMKernels.to_host(rD))
+            @test all(isfinite, PPMKernels.to_host(rTau))
+        end
     end
 end
 

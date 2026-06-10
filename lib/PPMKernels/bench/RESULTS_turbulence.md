@@ -123,8 +123,10 @@ conservation); it does not affect the dissipation conclusion.
 - **Recommended strong default: `HydroMethod = 10`.** This selects the stateless
   `Local-PPM-tr-2shk` method through `EnzoLib.run_amr`: one ghost zone, compact
   parabolic reconstruction, characteristic tracing, two-shock fluxes, and
-  conservative AMR refluxing. Keep the wide-stencil DirectEuler PPM as the
-  reference method and use PLM when maximum robustness or minimum cost dominates.
+  conservative AMR refluxing. The hydro stencil itself needs one ghost; Enzo's
+  current dynamic-AMR interpolation still requires `NumberOfGhostZones = 3`.
+  Keep the wide-stencil DirectEuler PPM as the reference method and use PLM when
+  maximum robustness or minimum cost dominates.
 
 - **The ranking is robust at developed Mach-5 turbulence** (and matches the earlier,
   doubted Mach-1 result — it is NOT a startup artifact): **PPM-reconstruction (Hancock-PPM,

@@ -306,8 +306,10 @@ end
 # Three-cell, one-ghost-local PPM reconstruction.  The unlimited edges are the
 # unique quadratic consistent with the cell averages (q_{i-1},q_i,q_{i+1}):
 # qL/R = q_i ∓ (q_{i+1}-q_{i-1})/4 + Δ²q_i/12.  Smooth cells use CW84
-# monotonization; compression/pressure-jump sensors continuously blend toward a
-# monotonized-central PLM profile, reaching the robust TVD endpoint at shocks.
+# monotonization; compression/pressure-jump sensors continuously blend all
+# primitives toward a monotonized-central PLM profile, reaching the robust TVD
+# endpoint at shocks. Pressure-smooth entropy contacts get a density-only
+# steepening pass, so contact control does not flatten pressure/velocity.
 # Unlike PPML this is stateless: no carried face pair or star-state corrector.
 @inline function _ppm_local_edges_unlimited(qm::T, q0::T, qp::T) where {T}
     slope = (qp - qm) * T(0.25)
@@ -320,8 +322,49 @@ end
     return _ppml_monotonize(qL, q0, qR)
 end
 
-@inline function _ppm_local_trace_faces(rho, pr, vx, vy, vz, idx::Int,
-                                        g::T, gm1::T, dt_dx::T, small_rho::T) where {T}
+@inline function _thinc_edges(qm::T, q0::T, qp::T, β::T) where {T}
+    θ = qp > qm ? one(T) : -one(T)
+    qlo = min(qm, qp); qhi = max(qm, qp); dq = qhi - qlo
+    C = clamp((q0 - qlo) / dq, T(1e-6), one(T) - T(1e-6))
+    eb = exp(β * T(0.5))
+    r = exp(β * θ * (T(2) * C - one(T)))
+    z = max((eb - r / eb) / (r * eb - one(T) / eb), T(1e-12))
+    x0 = log(z) / (T(2) * β)
+    qL = qlo + T(0.5) * dq * (one(T) + θ * tanh(β * (-T(0.5) - x0)))
+    qR = qlo + T(0.5) * dq * (one(T) + θ * tanh(β * ( T(0.5) - x0)))
+    return (qL, qR)
+end
+
+@inline function _label_brackets_contact(label, label2, idx::Int, level1::T, level2::T,
+                                         use_moment2::Int) where {T}
+    am = label[idx-1]; ap = label[idx+1]
+    a0 = label[idx]
+    span = max(abs(ap - am), T(1e-6))
+    reach = use_moment2 == 1 ? T(3.0) : T(1.5)
+    w = zero(T)
+    if level1 >= zero(T)
+        d = abs(a0 - level1); d = min(d, one(T) - d)
+        w = max(w, clamp(reach - d / span, zero(T), one(T)))
+    end
+    if level2 >= zero(T)
+        d = abs(a0 - level2); d = min(d, one(T) - d)
+        w = max(w, clamp(reach - d / span, zero(T), one(T)))
+    end
+    if use_moment2 == 1
+        var = max(label2[idx] - a0*a0, zero(T))
+        # A clean material sheet has low carried-label variance. The first
+        # scalar prototype is only upwinded, so keep this penalty deliberately
+        # soft rather than letting numerical label diffusion disable THINC.
+        clean = one(T) - T(0.5) * clamp(var / (T(4)*span*span + T(1e-12)), zero(T), one(T))
+        w *= clean
+    end
+    return w
+end
+
+@inline function _ppm_local_trace_faces(rho, pr, vx, vy, vz, label, label2, idx::Int,
+                                        g::T, gm1::T, dt_dx::T, small_rho::T,
+                                        use_label::Int, use_moment2::Int,
+                                        level1::T, level2::T) where {T}
     pmin = gm1 * small_rho
     ρm = rho[idx-1]; ρa0 = rho[idx]; ρp = rho[idx+1]
     um = vx[idx-1]; ua0 = vx[idx]; up = vx[idx+1]
@@ -334,7 +377,9 @@ end
     (vL0, vR0) = _ppm_local_edges_unlimited(vm, va0, vp)
     (wL0, wR0) = _ppm_local_edges_unlimited(wm, wa0, wp)
     pbase = min(pm, pp)
+    ρbase = min(ρm, ρp)
     ηp = pbase > zero(T) ? abs(pp - pm) / pbase : one(T)
+    ηρ = ρbase > zero(T) ? abs(ρp - ρm) / ρbase : one(T)
     cs = sqrt(g * max(pa0, pmin) / max(ρa0, small_rho))
     comp = um > up ? (um-up)/cs : zero(T)
     # Smoothly blend PPM -> monotonized-central PLM instead of switching the whole compressive
@@ -342,7 +387,16 @@ end
     # strong shocks reach the same robust PLM endpoint as before.
     αp = clamp((ηp - T(0.05)) / T(0.45), zero(T), one(T))
     αu = clamp((comp - T(0.1)) / T(0.9), zero(T), one(T))
-    α = um > up ? max(αp, αu) : zero(T)
+    αshock = um > up ? max(αp, αu) : zero(T)
+    smooth_p = one(T) - clamp(ηp / T(0.05), zero(T), one(T))
+    smooth_u = one(T) - clamp(comp / T(0.1), zero(T), one(T))
+    monotone_ρ = (ρp - ρa0) * (ρa0 - ρm) > zero(T) ? one(T) : zero(T)
+    contact = clamp(ηρ / T(0.005), zero(T), one(T)) * smooth_p * smooth_u * monotone_ρ
+    label_contact = use_label == 1 ?
+        _label_brackets_contact(label, label2, idx, level1, level2, use_moment2) : one(T)
+    σcontact = T(0.02) * contact
+    αρ = max(αshock, contact)
+    α = αshock
     (ρLq, ρRq) = _ppml_monotonize(ρL0, ρa0, ρR0)
     (uLq, uRq) = _ppml_monotonize(uL0, ua0, uR0)
     (vLq, vRq) = _ppml_monotonize(vL0, va0, vR0)
@@ -357,10 +411,24 @@ end
     vLp = va0 - h*sv; vRp = va0 + h*sv
     wLp = wa0 - h*sw; wRp = wa0 + h*sw
     pLp = pa0 - h*sp; pRp = pa0 + h*sp
-    blend(q, r) = (one(T)-α)*q + α*r
-    ρL=blend(ρLq,ρLp); ρR=blend(ρRq,ρRp); uL=blend(uLq,uLp); uR=blend(uRq,uRp)
-    vL=blend(vLq,vLp); vR=blend(vRq,vRp); wL=blend(wLq,wLp); wR=blend(wRq,wRp)
-    pL=blend(pLq,pLp); pR=blend(pRq,pRp)
+    β = one(T) - α
+    βρ = one(T) - αρ
+    ρL=βρ*ρLq + αρ*ρLp; ρR=βρ*ρRq + αρ*ρRp; uL=β*uLq + α*uLp; uR=β*uRq + α*uRp
+    vL=β*vLq + α*vLp; vR=β*vRq + α*vRp; wL=β*wLq + α*wLp; wR=β*wRq + α*wRp
+    pL=β*pLq + α*pLp; pR=β*pRq + α*pRp
+    γc = one(T) - σcontact
+    ρL = γc * ρL + σcontact * ρm
+    ρR = γc * ρR + σcontact * ρp
+    if contact > zero(T) && label_contact > zero(T)
+        ρLt, ρRt = _thinc_edges(ρm, ρa0, ρp, T(1.6))
+        bv0 = abs(ρL - ρm) + abs(ρR - ρp)
+        bvt = abs(ρLt - ρm) + abs(ρRt - ρp)
+        thinc_gain = use_moment2 == 1 ? T(0.05) : use_label == 1 ? T(0.15) : T(0.04)
+        use_t = bvt < bv0 ? thinc_gain * contact * label_contact : zero(T)
+        keep_t = one(T) - use_t
+        ρL = keep_t * ρL + use_t * ρLt
+        ρR = keep_t * ρR + use_t * ρRt
+    end
     # The MC endpoint is already TVD; do not add PPML's piecewise-constant shock
     # flattening on top. Positivity and the final CW84 guard remain below.
     (ρL, uL, vL, wL, pL, ρR, uR, vR, wR, pR) =
@@ -375,6 +443,29 @@ end
     (Rρ, Ru, Rv, Rw, Rp) = _ppml_face_right(
         ρLf, uL, vL, wL, pLf, ρa, ua, va, wa, pa, ρRf, uR, vR, wR, pRf, dt_dx, g)
     return (Lρ, Lp/(gm1*Lρ), Lu, Lv, Lw, Rρ, Rp/(gm1*Rρ), Ru, Rv, Rw)
+end
+
+@inline function _ppm_local_scalar_faces(rho, scalar, idx::Int, small_rho::T) where {T}
+    qm = scalar[idx-1] / max(rho[idx-1], small_rho)
+    q0 = scalar[idx]   / max(rho[idx],   small_rho)
+    qp = scalar[idx+1] / max(rho[idx+1], small_rho)
+    return _ppm_local_edges(qm, q0, qp)
+end
+
+@inline function _ppm_local_scalar_left(rho, scalar, idx::Int, small_rho::T) where {T}
+    qm = scalar[idx-1] / max(rho[idx-1], small_rho)
+    q0 = scalar[idx]   / max(rho[idx],   small_rho)
+    qp = scalar[idx+1] / max(rho[idx+1], small_rho)
+    qL, _ = _ppm_local_edges(qm, q0, qp)
+    return qL
+end
+
+@inline function _ppm_local_scalar_right(rho, scalar, idx::Int, small_rho::T) where {T}
+    qm = scalar[idx-1] / max(rho[idx-1], small_rho)
+    q0 = scalar[idx]   / max(rho[idx],   small_rho)
+    qp = scalar[idx+1] / max(rho[idx+1], small_rho)
+    _, qR = _ppm_local_edges(qm, q0, qp)
+    return qR
 end
 
 @inline function _constant_faces(rho, pr, vx, vy, vz, idx::Int, gm1::T, small_rho::T) where {T}
@@ -465,10 +556,11 @@ end
 # flux once (or reflux it), as usual for a one-ghost AMR/Godunov update.
 @kernel function _ppm_local_trace_kernel!(fd, fs1, fs2, fs3, fe, fge,
                                           @Const(rho), @Const(pr), @Const(vx),
-                                          @Const(vy), @Const(vz),
+                                          @Const(vy), @Const(vz), @Const(label), @Const(label2),
                                           ncells::Int, nfi::Int, nghost::Int, j1::Int,
                                           gamma, dt_dx, small_rho, idual::Int, rie::Int,
-                                          periodic::Int)
+                                          periodic::Int, use_label::Int, use_moment2::Int,
+                                          level1, level2)
     gi, gj = @index(Global, NTuple)
     j = j1 + gj - 1
     cl = (j - 1) * ncells + nghost + gi - 1
@@ -480,10 +572,12 @@ end
         ri = periodic == 1 && gi == nfi ? base + nghost + 1 : cl + 1
         Lf = periodic == 0 && gi == 1 ?
              _constant_faces(rho, pr, vx, vy, vz, li, gm1, sr) :
-             _ppm_local_trace_faces(rho, pr, vx, vy, vz, li, g, gm1, dd, sr)
+             _ppm_local_trace_faces(rho, pr, vx, vy, vz, label, label2, li, g, gm1, dd, sr,
+                                    use_label, use_moment2, T(level1), T(level2))
         Rf = periodic == 0 && gi == nfi ?
              _constant_faces(rho, pr, vx, vy, vz, ri, gm1, sr) :
-             _ppm_local_trace_faces(rho, pr, vx, vy, vz, ri, g, gm1, dd, sr)
+             _ppm_local_trace_faces(rho, pr, vx, vy, vz, label, label2, ri, g, gm1, dd, sr,
+                                    use_label, use_moment2, T(level1), T(level2))
         F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
             rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
                        _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
@@ -509,7 +603,9 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
                                   gamma::Real, theta::Real = 1.5, cpred::Real,
                                   small_rho::Real = 1e-10, recon::Symbol = :plm, coeffs = nothing,
                                   fge = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
-                                  pr = nothing, face_periodic::Bool = false)
+                                  pr = nothing, face_periodic::Bool = false, contact_label = nothing,
+                                  contact_label2 = nothing,
+                                  contact_level1::Real = -1, contact_level2::Real = -1)
     be = KA.get_backend(fd); T = eltype(fd)
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
@@ -518,9 +614,15 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
     if recon === :ppm_local
         (predictor !== :trace || pr === nothing) &&
             error("muscl_hancock_flux_line!: recon=:ppm_local requires predictor=:trace and pr")
-        _ppm_local_trace_kernel!(be)(fd, fs1, fs2, fs3, fe, gef, rho, pr, vx, vy, vz,
+        label = contact_label === nothing ? rho : contact_label
+        label2 = contact_label2 === nothing ? label : contact_label2
+        _ppm_local_trace_kernel!(be)(fd, fs1, fs2, fs3, fe, gef,
+                                     rho, pr, vx, vy, vz, label, label2,
                                      ncells, nfi, nghost, 1, T(gamma), T(2 * cpred),
-                                     T(small_rho), idu, rc, face_periodic ? 1 : 0;
+                                     T(small_rho), idu, rc, face_periodic ? 1 : 0,
+                                     contact_label === nothing ? 0 : 1,
+                                     contact_label2 === nothing ? 0 : 1,
+                                     T(contact_level1), T(contact_level2);
                                      ndrange = (nfi, Int(jdim)))
     elseif recon === :ppm && predictor === :trace
         (coeffs === nothing || pr === nothing) && error("muscl_hancock_flux_line!: predictor=:trace needs coeffs + pr")

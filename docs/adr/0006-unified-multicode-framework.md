@@ -643,6 +643,24 @@ never forks of their cores.
   `reports/multicode/athena_sod.md`.  Remaining on-ramps: MUSIC injector
   validation (one MusicSpec → Enzo+RAMSES live comparison), Gadget4
   ICs/halo gates, DiscoDJ LPT cross-check vs the Zel'dovich machinery.
+- **Next-9 — the MUSIC injector validation (done):** ONE `MusicSpec`
+  realization (deterministic seeds), generated in-process in two formats;
+  Enzo booted on MUSIC's own `parameter_file.txt` + particle ICs, RAMSES
+  (UNITS=COSMO) on the grafic2 level directory (symlinked short — Fortran
+  filename buffers truncate at 80 chars); the INITIAL CIC density fields
+  compared with no evolution (`run_music_crosscheck`, `MultiCodeMusicExt`,
+  the third package extension).  Result: correlation **1 − 4e-15**, rms
+  residual **1.0e-7 of sigma** — exactly the float32 precision of the
+  grafic planes, the only difference between the two injection chains.
+  The IC chain MUSIC → format writers → each code's cosmological init is
+  certified end-to-end.  TRAP: MUSIC's in-process white-noise generation
+  segfaults in a process already hosting a dozen live codes (competing
+  OpenMP/FFTW runtimes) — the gate therefore runs FIRST in the suite;
+  the durable fix (recorded polish) is the D2 one: MUSIC in its own
+  CodeBridge worker.  Also: Fortran filename buffers truncate at 80
+  chars — symlink long grafic paths short.  Remaining on-ramps: Gadget4 IC/halo gates,
+  DiscoDJ LPT cross-check (NGenIC-phase work already landed in the
+  shared-phases session).
 - **Next (polish track):** extension-ifying the LEGACY wrappers
   (EnzoLib/RamsesLib/ArepoLib) in MultiCode remains deliberate deferred
   polish — they are lazy pure-Julia bindings (no dlopen until first
