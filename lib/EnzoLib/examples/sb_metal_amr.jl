@@ -57,9 +57,13 @@ cic!(rho, pos, N) = begin
     end; rho
 end
 
-# ── :gravity slot — root FFT gravity → Enzo AccelerationField ──
+# ── :gravity slot — root FFT gravity → Enzo AccelerationField; subgrids run the
+# CERTIFIED parent-Dirichlet W-cycle (poisson_gravity_hook: prepare_density →
+# vcycle dirichlet → set_potential → Enzo's own differencing; bit-identical
+# orbits vs gravity=:enzo on GravityTest) ──
+const SUBGRID_GRAV! = EnzoLib.poisson_gravity_hook()
 function gravity!(h, level, dt)
-    level == 0 || return nothing                       # subgrids: TODO (parent-Dirichlet MG)
+    level == 0 || return SUBGRID_GRAV!(h, level, dt)
     bep = PoissonKernels.backend(BE)
     n = EnzoLib.session_num_grids_on_level(h, 0)
     for i in 0:n-1
@@ -78,6 +82,14 @@ function gravity!(h, level, dt)
         EnzoLib.problem_set_acceleration(h, 0, place_active(Float64.(PoissonKernels.to_host(a1)), gd); grid=g)
         EnzoLib.problem_set_acceleration(h, 1, place_active(Float64.(PoissonKernels.to_host(a2)), gd); grid=g)
         EnzoLib.problem_set_acceleration(h, 2, place_active(Float64.(PoissonKernels.to_host(a3)), gd); grid=g)
+        # root φ → PotentialField too, so a CHILD's BC interpolation
+        # (PrepareDensityField at level 1) reads OUR root solution
+        gmfd = EnzoLib.problem_gmf_dims(h, g)
+        if gmfd == (N, N, N)
+            EnzoLib.problem_set_potential(h, Float64.(PoissonKernels.to_host(φ)), g)
+        else
+            @warn "root GMF dims ≠ active dims — child BC keeps Enzo's root φ" gmfd N maxlog = 1
+        end
     end
     return nothing
 end
