@@ -51,5 +51,25 @@ haskey(ENV, "RAMSES_LIB") || (ENV["RAMSES_LIB"] =
         finally
             r.free()
         end
+
+        # ── the REFINED-level Dirichlet solve (Next-4 slice 2) ────────────────
+        # A cuboid fine region (flag1 through the bridge → the host's own
+        # refine), host deposits + coarse solve; the fine system is RAMSES's
+        # ghost-interpolated Dirichlet problem.  Two independent gates:
+        # (1) the ORACLE's converged solution satisfies OUR assembled system
+        #     (interpol_phi ghosts + Enzo-MG rhs scaling) at machine precision
+        #     — certifies the replication without involving the KA solver;
+        # (2) the KA vcycle_solve!(dirichlet=true) from scratch lands on the
+        #     oracle to solver tolerance.
+        ra = run_ramses_gravity_amr_compare(levc = 5, half = 4, eps = 1e-12)
+        try
+            @test ra.n_fine_octs == 512                  # the 16³ cuboid exists
+            @test ra.nf == (16, 16, 16)
+            @test ra.resid_oracle < 1e-13                # system replication ≡ ε
+            @test ra.dphi < 1e-10                        # KA Dirichlet ≡ RAMSES CG
+            @info "refined-level Dirichlet solve" dphi = ra.dphi resid_oracle = ra.resid_oracle nf = ra.nf
+        finally
+            ra.free()
+        end
     end
 end

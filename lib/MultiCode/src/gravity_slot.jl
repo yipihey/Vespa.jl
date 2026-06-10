@@ -139,6 +139,182 @@ function _ramses_gravity_namelist(; level::Integer)
     """
 end
 
+# ── the refined-level Dirichlet solve (Next-4 slice 2) ────────────────────────
+#
+# RAMSES's fine-level Poisson system (cmp_residual_cg, phi_fine_cg.f90):
+#
+#   Σ_nbr φ − 6φ = 4π·dx²·(ρ − ρ̄)
+#
+# over the level's cells, where a neighbor in a MISSING oct takes the value
+# `interpol_phi` produces from the 27 coarse parent cells around that oct
+# (CIC weights + tfrac time extrapolation; tfrac = 0 when not subcycling).
+# For a CUBOID refined region this is exactly a Dirichlet box problem: ghost
+# ring = the interpolated virtual-oct values, interior = unknowns — which is
+# `vcycle_solve!(dirichlet = true)` on a (n+2)-padded array, with Enzo's MG
+# rhs scaling  rhs = (d₁−1)(d₂−1)(d₃−1)·4π·dx²·(ρ − ρ̄).
+
+"Raster one mesh field of a (possibly partial) level into its bbox; assert it is a full cuboid."
+function _ramses_field_bbox(h::RamsesLib.Handle, which::Symbol, lev::Integer; lib::Symbol = :cpu)
+    ck, val = RamsesLib.get_field(h, which, lev; lib = lib)
+    noct = size(ck, 1)
+    noct > 0 || error("_ramses_field_bbox: level $lev is empty")
+    lo = (typemax(Int), typemax(Int), typemax(Int))
+    hi = (typemin(Int), typemin(Int), typemin(Int))
+    @inbounds for o in 1:noct
+        b = (2 * Int(ck[o, 1]), 2 * Int(ck[o, 2]), 2 * Int(ck[o, 3]))
+        lo = min.(lo, b); hi = max.(hi, b .+ 1)
+    end
+    nloc = hi .- lo .+ 1
+    8 * noct == prod(nloc) ||
+        error("_ramses_field_bbox: level $lev is not a full cuboid " *
+              "($(8noct) cells in a $(nloc) bbox) — the Dirichlet slot needs one")
+    A = Array{Float64,3}(undef, nloc...)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - lo[1] + 1
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - lo[2] + 1
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - lo[3] + 1
+        A[i, j, k] = val[o, c]
+    end
+    return (ck = ck, A = A, off = lo, nloc = nloc, n1d = 2^lev)
+end
+
+"Write a bbox array back into a partial level's mesh field."
+function _ramses_field_bbox_set!(h::RamsesLib.Handle, which::Symbol, lev::Integer,
+                                 fb, A::Array{Float64,3}; lib::Symbol = :cpu)
+    ck = fb.ck; noct = size(ck, 1)
+    val = Matrix{Float64}(undef, noct, 8)
+    @inbounds for o in 1:noct, c in 1:8
+        i = 2 * Int(ck[o, 1]) + ((c - 1) & 1) - fb.off[1] + 1
+        j = 2 * Int(ck[o, 2]) + ((c - 1) >> 1 & 1) - fb.off[2] + 1
+        k = 2 * Int(ck[o, 3]) + ((c - 1) >> 2 & 1) - fb.off[3] + 1
+        val[o, c] = A[i, j, k]
+    end
+    RamsesLib.set_field!(h, which, lev, ck, val; lib = lib)
+    return nothing
+end
+
+"""
+Reconstruct the Dirichlet ghost ring exactly as RAMSES's fine solver sees it:
+for each ghost cell (one ring around the fine cuboid) the value is
+`interpol_phi` of the 27 coarse cells around the cell's (missing) oct's parent
+cell, evaluated at the cell's child position.  `phic` is the FULL coarse-level
+phi grid (periodic).  Fills the face ring of `sol` (size `fb.nloc .+ 2`).
+"""
+function _fine_dirichlet_ghosts!(sol::Array{Float64,3}, fb, phic::Array{Float64,3};
+                                 tfrac::Real = 0.0, lib::Symbol = :cpu)
+    n1dc = size(phic, 1)
+    n1df = fb.n1d
+    nx, ny, nz = size(sol)
+    phi27 = Vector{Float64}(undef, 27)
+    cache = Dict{NTuple{3,Int},Vector{Float64}}()   # per-virtual-oct interpolation
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        onface = (i == 1 || i == nx || j == 1 || j == ny || k == 1 || k == nz)
+        onface || continue
+        g = (mod(fb.off[1] + (i - 2), n1df), mod(fb.off[2] + (j - 2), n1df),
+             mod(fb.off[3] + (k - 2), n1df))
+        oct = g .>> 1                                   # virtual fine oct == coarse cell
+        out = get!(cache, oct) do
+            for dk in 0:2, dj in 0:2, di in 0:2
+                phi27[1 + di + 3dj + 9dk] =
+                    phic[mod(oct[1] - 1 + di, n1dc) + 1,
+                         mod(oct[2] - 1 + dj, n1dc) + 1,
+                         mod(oct[3] - 1 + dk, n1dc) + 1]
+            end
+            RamsesLib.interpol_phi(phi27, phi27, tfrac; lib = lib)
+        end
+        c = 1 + (g[1] & 1) + 2 * (g[2] & 1) + 4 * (g[3] & 1)
+        sol[i, j, k] = out[c]
+    end
+    return sol
+end
+
+"""
+    run_ramses_gravity_amr_compare(; levc=5, half=4, amp=0.05, eps=1e-12)
+
+The refined-level certification: a CUBOID fine region (flag1 written through
+the bridge, `refine_fine!` consumes it), the host deposits both levels and
+solves the coarse level; then the fine level is solved twice on identical
+inputs — RAMSES's own `phi_fine_cg` at tolerance `eps` (the ORACLE) and the
+KA `vcycle_solve!(dirichlet = true)` with the interpol_phi-reconstructed ghost
+ring — and differenced.  Also returns the residual of the ORACLE solution
+under OUR assembled system (ghosts + rhs): if that is ~ε, the system
+replication itself is certified independently of the KA solver.
+"""
+function run_ramses_gravity_amr_compare(; levc::Integer = 5, half::Integer = 4,
+                                        amp::Real = 0.05, eps::Real = 1e-12,
+                                        lib::Symbol = :cpu)
+    RamsesLib.available() || error("RAMSES library not found (set RAMSES_LIB to the bin64h build)")
+    nc = 2^levc
+    levf = levc + 1
+    dir = mktempdir()
+    nml = _ramses_gravity_namelist(level = levc)
+    nml = replace(nml, "levelmax=$(levc)" => "levelmax=$(levf)")
+    write(joinpath(dir, "gravity_amr.nml"), nml)
+    return cd(dir) do
+        h = RamsesLib.init("gravity_amr.nml"; lib = lib)
+        RamsesLib.set_epsilon!(h, eps; lib = lib)
+        # smooth density mode on the coarse gas
+        ck, _ = RamsesLib.get_hydro_all(h, :uold, levc; lib = lib)
+        noct = size(ck, 1)
+        rho_in = Matrix{Float64}(undef, noct, 8)
+        flag = Matrix{Float64}(undef, noct, 8)
+        c0 = nc ÷ 2
+        @inbounds for o in 1:noct, c in 1:8
+            ix = 2 * ck[o, 1] + ((c - 1) & 1)
+            iy = 2 * ck[o, 2] + ((c - 1) >> 1 & 1)
+            iz = 2 * ck[o, 3] + ((c - 1) >> 2 & 1)
+            x = (ix + 0.5) / nc; y = (iy + 0.5) / nc; z = (iz + 0.5) / nc
+            rho_in[o, c] = 1.0 + amp * sin(2π * x) * sin(4π * y) * cos(2π * z)
+            flag[o, c] = (abs(ix - c0 + 0.5) < half && abs(iy - c0 + 0.5) < half &&
+                          abs(iz - c0 + 0.5) < half) ? 1.0 : 0.0
+        end
+        RamsesLib.set_hydro!(h, :uold, 1, levc, ck, rho_in; lib = lib)
+        # the cuboid hierarchy: explicit flag map → the host's own refine
+        RamsesLib.set_field!(h, :flag1, levc, ck, flag; lib = lib)
+        RamsesLib.refine_fine!(h, levc; lib = lib)
+        RamsesLib.level_noct(h, levf; lib = lib) > 0 ||
+            error("run_ramses_gravity_amr_compare: refinement produced no fine octs")
+        # host deposits + coarse solve (shared by both fine paths)
+        RamsesLib.rho_fine!(h, levc, 0; lib = lib)
+        RamsesLib.rho_fine!(h, levf, 0; lib = lib)
+        RamsesLib.multigrid!(h, levc, 1; lib = lib)
+        _, phic = ramses_grid_field(h, :phi, levc; lib = lib)
+        _, rhoc = ramses_grid_field(h, :rho, levc; lib = lib)
+        rho_tot = sum(rhoc) / length(rhoc)
+        # ── ORACLE: RAMSES's own fine-level CG ────────────────────────────────
+        RamsesLib.phi_fine_cg!(h, levf, 1; lib = lib)
+        fb = _ramses_field_bbox(h, :phi, levf; lib = lib)
+        rb = _ramses_field_bbox(h, :rho, levf; lib = lib)
+        dxf = 1.0 / 2^levf
+        nf = fb.nloc
+        # ── assemble OUR system: ghosts + rhs ─────────────────────────────────
+        sol = zeros(Float64, (nf .+ 2)...)
+        _fine_dirichlet_ghosts!(sol, fb, phic; lib = lib)
+        ghosts = copy(sol)
+        d = nf .+ 2
+        hfac = Float64(d[1] - 1) * Float64(d[2] - 1) * Float64(d[3] - 1)
+        rhs = zeros(Float64, d...)
+        @inbounds for k in 1:nf[3], j in 1:nf[2], i in 1:nf[1]
+            rhs[i+1, j+1, k+1] = hfac * 4π * dxf^2 * (rb.A[i, j, k] - rho_tot)
+        end
+        # replication check: the oracle solution must satisfy OUR system to ~ε
+        sol .= ghosts
+        sol[2:end-1, 2:end-1, 2:end-1] .= fb.A
+        defect = similar(sol)
+        resid_oracle = PoissonKernels.mg_calc_defect!(defect, sol, rhs)
+        # ── GUEST: the KA Dirichlet V-cycle from scratch ──────────────────────
+        sol .= ghosts                                 # faces = BC, interior = 0
+        PoissonKernels.vcycle_solve!(sol, rhs; rtol = 1e-12, maxcycles = 200,
+                                     cycle = :W, dirichlet = true)
+        scale = maximum(abs, fb.A .- sum(fb.A) / length(fb.A))
+        dphi = maximum(abs, sol[2:end-1, 2:end-1, 2:end-1] .- fb.A) / scale
+        return (dphi = dphi, resid_oracle = resid_oracle, phi_scale = scale,
+                nf = nf, n_fine_octs = RamsesLib.level_noct(h, levf; lib = lib),
+                handle = h, fb = fb, sol = sol,
+                free = () -> RamsesLib.finalize(h; lib = lib))
+    end
+end
+
 """
     run_ramses_gravity_compare(; level=5, amp=0.05, eps=1e-12) -> (; ...)
 

@@ -49,7 +49,7 @@ export run_enzo_sedov, run_ramses_sedov, sedov_report
 export ZeldovichSpec, zeldovich_particles, zeldovich_growth, zeldovich_measure
 export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
-export run_ramses_gravity_compare
+export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 
 include("canonical.jl")
 include("exact_sod.jl")
