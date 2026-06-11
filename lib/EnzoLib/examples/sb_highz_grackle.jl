@@ -55,6 +55,7 @@ function write_highz_param(z)
     CaseBRecombination          = 1
     cmb_dissociation            = 1
     equilibrium_h2_intermediates = $(get(ENV, "EQUIL", "0"))
+    neutral_helium              = $(get(ENV, "HE", "0"))
     cmb_recombination           = $(get(ENV, "REC", "0"))
     grackle_data_file           = $(GRACKLE_DATA)
     DualEnergyFormalism         = 1
