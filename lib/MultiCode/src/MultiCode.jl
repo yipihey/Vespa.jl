@@ -25,6 +25,7 @@ module MultiCode
 
 using Printf
 using LinearAlgebra: dot, cross
+using Random
 using CodeBridge
 using EnzoLib
 using RamsesLib
@@ -51,8 +52,10 @@ export run_enzo_zeldovich, run_ramses_zeldovich
 export ramses_grid_field, ramses_set_grid_field!, ramses_ka_poisson!
 export run_ramses_gravity_compare, run_ramses_gravity_amr_compare
 export ramses_ka_poisson_fine!, run_ramses_gravity_blob_compare
-export run_dfmm_sod, run_athena_sod, run_athena_sod3d, run_music_crosscheck, run_discodj_growth
+export run_dfmm_sod, run_athena_sod, run_athena_sod3d, athena_stage_cellset
+export run_music_crosscheck, run_music_discodj_phase_report, run_discodj_growth
 export run_gadget4_halos
+export run_cicass_streaming, write_grafic_streaming, run_cicass_enzo, run_cicass_ramses
 
 include("canonical.jl")
 include("exact_sod.jl")
@@ -67,6 +70,8 @@ include("enzo_rt_guest.jl")
 include("sedov_compare.jl")
 include("zeldovich.jl")
 include("gravity_slot.jl")
+include("grackle_service.jl")     # code-neutral reduced primordial chemistry (HII,H2I)
+include("grackle_slot.jl")        # wire the service onto RAMSES / Arepo hosts
 
 """
     run_dfmm_sod(spec = SodSpec(gamma = 5/3, t = 0.2); N = 200, tau = 1e-3,
@@ -95,6 +100,18 @@ function run_athena_sod end
 function run_athena_sod3d end
 
 """
+    athena_stage_cellset(cs; dims, dt, gamma=5/3, workdir=mktempdir()) -> (; cs, ...)
+
+Raster a uniform Cartesian `CellSet` into Athena++'s staged-binary pgen,
+advance one hydro step, then read the conserved state back as a `CellSet`.
+This is the Athena adapter surface used by hierarchy owners: they rasterize
+their blocks to the canonical layout at the boundary, and this extension owns
+the Athena-specific file/runtime/readback details.  Implemented in
+`MultiCodeAthenaExt` — `using AthenaLib` activates it.
+"""
+function athena_stage_cellset end
+
+"""
     run_music_crosscheck(; boxlength=20.0, zstart=50.0, level=5) -> (; corr, rms, …)
 
 The MUSIC injector validation: ONE MusicSpec realization, Enzo booted on the
@@ -103,6 +120,65 @@ grafic2 level directory, the two codes' INITIAL CIC density fields correlated.
 Implemented in `MultiCodeMusicExt` — `using MusicLib` activates it.
 """
 function run_music_crosscheck end
+
+"""
+    write_grafic_streaming(dir, snap; h0=71.0) -> dir
+
+Write a RAMSES grafic IC directory carrying the baryon–dark-matter **streaming
+velocity** from a CICASS snapshot: `ic_velbx/y/z` (gas velocity grid),
+`ic_velcx/y/z` (CDM velocity grid, CIC-deposited from the DM particles) and
+`ic_deltab` (baryon overdensity).  The streaming offset is, by construction,
+`mean(ic_velb) - mean(ic_velc)` — the thing a single-phase generator cannot
+express.  Implemented in `MultiCodeCICASSExt` — `using CICASSLib` activates it.
+"""
+function write_grafic_streaming end
+
+"""
+    run_cicass_streaming(; vbc=30.0, boxlength=0.2, zstart=100.0, ngrid=128) -> (; ...)
+
+CICASS streaming-IC validation: generate ONE realization with relative velocity
+`vbc`, write the RAMSES-native grafic streaming set, and read it back to confirm
+the coherent gas–DM bulk offset survives into each code's IC format
+(≈ `vbc·(1+z)/1001` km/s along one axis, zero for `vbc=0`).  Implemented in
+`MultiCodeCICASSExt` — `using CICASSLib` activates it.
+"""
+function run_cicass_streaming end
+
+"""
+    run_cicass_enzo(; vbc=30.0, boxlength=0.2, zstart=100.0) -> (; ...)
+
+Inject a CICASS streaming realization into a LIVE Enzo 128³ hydro cosmology grid
+(the SantaBarbaraCluster host, patched to the CICASS cosmology so Enzo's velocity
+units match): the gas velocity field into the BaryonField velocities and the DM
+velocities into the particles, then read both back and confirm the coherent
+gas–DM bulk offset survives into Enzo's data structures (≈ vbc·(1+z)/1001 km/s).
+Implemented in `MultiCodeCICASSExt` — `using CICASSLib` activates it.
+"""
+function run_cicass_enzo end
+
+"""
+    run_cicass_ramses(; vbc=30.0, boxlength=0.2, zstart=100.0) -> (; ...)
+
+Boot a LIVE RAMSES (UNITS=COSMO, hydro on) purely on the CICASS grafic streaming
+set — gas from `ic_deltab`/`ic_velb*`, DM particles from `ic_velc*` — then read
+the mass-weighted gas bulk velocity and the DM particle bulk velocity back and
+confirm the streaming offset survives into RAMSES.  Implemented in
+`MultiCodeCICASSExt` — `using CICASSLib` activates it.
+"""
+function run_cicass_ramses end
+
+"""
+    run_music_discodj_phase_report(; res=32, seed=42, report_path=nothing)
+
+Cross-generator phase audit for the IC roadmap: MUSIC is driven through an
+explicit direct white-noise file and its Angulo-Pontzen mirror, while DISCO-DJ
+is evaluated from its seed-driven NGenIC-compatible phase generator.  The
+report records the fixed/mirror MUSIC control and the same-seed MUSIC↔DISCO-DJ
+phase-proxy correlation, making any remaining white-noise inlet mismatch
+measurable.  Implemented in `MultiCodeMusicDiscoDJExt` — load both `MusicLib`
+and `DiscoDJLib` to activate it.
+"""
+function run_music_discodj_phase_report end
 
 """
     run_discodj_growth(; res=32, z_init=49.0, a_ratio=4.0, box_mpch=32.0, seed=42)
