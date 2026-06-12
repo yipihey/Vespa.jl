@@ -88,16 +88,33 @@ function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
     return (; ncells = length(rho))
 end
 
-# ── Arepo wiring (pending ArepoLib passive-scalar access) ─────────────────────
-# Arepo's SphP carries PScalars[PASSIVE_SCALARS] (primitive) and
-# PConservedScalars[PASSIVE_SCALARS] (rho*x).  ArepoLib does not yet expose them
-# (fields.jl _CFIELD lacks :scalars).  Once a get/set bridge for the passive
-# scalars exists, arepo_chem_step! is the same as the RAMSES path: read rho,
-# utherm (= eint directly), and the two scalars; call chem_step!; write back
-# utherm and the two scalars.  Arepo stores utherm as specific internal energy,
-# so no kinetic subtraction is needed.
+# ── Arepo wiring ──────────────────────────────────────────────────────────────
+# Arepo carries the two species as primitive passive-scalar abundances x (the
+# :scalars field added to ArepoLib; the bridge keeps the conserved
+# PConservedScalars = x*Mass in sync so they advect with the Voronoi flux).
+# Arepo stores utherm as specific internal energy directly, so -- unlike RAMSES
+# -- no kinetic subtraction is needed.  Requires Arepo built with
+# PASSIVE_SCALARS=2 (column 1 = x_HII, column 2 = x_H2I).
+
+"""
+    arepo_chem_step!(h; dt, a_value)
+
+Run one reduced-chemistry step on all Arepo gas cells: read rho, utherm and the
+two passive-scalar abundances, call `chem_step!` (converting to/from the density-
+weighted convention), and write back utherm and the abundances.  `chem_init!`
+must have been called first with Arepo's code units.
+"""
 function arepo_chem_step!(h; dt::Real, a_value::Real)
-    error("arepo_chem_step!: ArepoLib must expose the passive scalars (PScalars) " *
-          "before the reduced-chemistry slot can read/write HII,H2I on Arepo cells. " *
-          "Add a :scalars field to ArepoLib (fields.jl _CFIELD/_CSET + the C bridge).")
+    rho  = Float64.(ArepoLib.get_cell_field(h, :rho))
+    eint = Float64.(ArepoLib.get_cell_field(h, :utherm))      # specific internal energy
+    sc   = ArepoLib.get_cell_field(h, :scalars)               # n×2 abundances [x_HII x_H2I]
+    HII  = rho .* Float64.(@view sc[:, 1])                    # density-weighted rho*x
+    H2I  = rho .* Float64.(@view sc[:, 2])
+
+    chem_step!(rho, eint, HII, H2I; a_value=a_value, dt=dt)
+
+    r = max.(rho, eps())
+    ArepoLib.set_cell_field!(h, :utherm, eint)
+    ArepoLib.set_cell_field!(h, :scalars, hcat(HII ./ r, H2I ./ r))
+    return (; ncells = length(rho))
 end
