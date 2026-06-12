@@ -27,10 +27,12 @@ cd(dir) do
     n = ArepoLib.num_gas(h)
     @printf("Arepo booted: %d gas cells (libarepo3d, PASSIVE_SCALARS)\n", n)
 
-    # --- (1) :scalars bridge round-trip ---
+    # --- (1) :scalars bridge round-trip (count from the build) ---
+    nps = ArepoLib.num_passive_scalars(h)
     sc0 = ArepoLib.get_cell_field(h, :scalars)
-    @printf(":scalars get → size %s (expect %d×2)\n", string(size(sc0)), n)
-    want = hcat(fill(0.047, n), fill(1e-12, n))            # x_HII, x_H2
+    @printf(":scalars get → size %s (PASSIVE_SCALARS=%d)\n", string(size(sc0)), nps)
+    cols = nps >= 3 ? [fill(0.047,n) fill(1e-12,n) fill(1e-20,n)] : [fill(0.047,n) fill(1e-12,n)]
+    want = Matrix{Float64}(cols)                           # x_HII, x_H2, [x_HD]
     ArepoLib.set_cell_field!(h, :scalars, want)
     got = ArepoLib.get_cell_field(h, :scalars)
     rt = maximum(abs.(got .- want))

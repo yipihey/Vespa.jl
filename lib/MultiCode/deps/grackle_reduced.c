@@ -17,20 +17,27 @@ extern "C" {
 static chemistry_data *g_cd = NULL;
 static code_units      g_units;
 static double          g_fh = 0.76;   /* HydrogenFractionByMass */
+static int             g_deut = 0;    /* deuterium (HD) tracking on/off */
 
 /* Initialize the reduced network once.  density/length/time_units are the CGS
    conversion factors for the host's code units (field*density_units = g/cm^3).
-   Returns 1 on success, 0 on failure (Grackle convention). */
+   `deuterium`!=0 turns on the reduced D network (primordial_chemistry=3 +
+   equilibrium_deuterium): the host then also advects HDI (one extra field) and
+   gets the HD abundance + HD line cooling correct.  Returns 1 on success, 0 on
+   failure (Grackle convention). */
 extern "C" int grackle_reduced_init(double hubble_kmsmpc, double Om, double OL,
                                     double a_value, double fh,
                                     double density_units, double length_units,
-                                    double time_units, const char *data_file)
+                                    double time_units, const char *data_file,
+                                    int deuterium)
 {
+  g_deut = deuterium ? 1 : 0;
   g_cd = (chemistry_data *) malloc(sizeof(chemistry_data));
   if (set_default_chemistry_parameters(g_cd) == 0) return 0;
   grackle_data->use_grackle                    = 1;
   grackle_data->with_radiative_cooling         = 1;
-  grackle_data->primordial_chemistry           = 2;   /* H, He, e, H-, H2, H2+ */
+  grackle_data->primordial_chemistry           = g_deut ? 3 : 2;  /* +D,D+,HD if deut */
+  grackle_data->equilibrium_deuterium          = g_deut;          /* advect only HD */
   grackle_data->metal_cooling                  = 0;
   grackle_data->UVbackground                   = 0;
   grackle_data->cmb_dissociation               = 1;   /* CMB H-/H2+ photo-destr. */
@@ -63,14 +70,17 @@ extern "C" int grackle_reduced_init(double hubble_kmsmpc, double Om, double OL,
    Returns 1 on success, 0 on failure. */
 extern "C" int grackle_reduced_step(long n, double a_value, double dt,
                                     double *rho, double *e_int,
-                                    double *HII, double *H2I)
+                                    double *HII, double *H2I, double *HDI)
 {
   if (g_cd == NULL) return 0;
   g_units.a_value = a_value;
 
-  double *sc = (double *) malloc((size_t)7 * n * sizeof(double));
+  /* 7 reconstructed species (+2 deuterium scratch DI,DII when deuterium on). */
+  long nsc = g_deut ? 9 : 7;
+  double *sc = (double *) malloc((size_t)nsc * n * sizeof(double));
   double *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
          *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
+  double *sc_DI = g_deut ? sc+7*n : NULL, *sc_DII = g_deut ? sc+8*n : NULL;
   const double tiny = 1e-20;
   for (long i = 0; i < n; i++) {
     sc_e[i]   = HII[i];                            /* n_e = n_HII */
@@ -78,6 +88,13 @@ extern "C" int grackle_reduced_step(long n, double a_value, double dt,
     sc_HI[i]  = (hi > tiny) ? hi : tiny;           /* X_H*rho - HII - H2I */
     sc_HeI[i] = (1.0 - g_fh)*rho[i];               /* all-neutral helium  */
     sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=tiny;
+    if (g_deut) {
+      /* seed D, D+ at their cosmic partition (DToHRatio is a MASS ratio,
+         2*3.4e-5) so the first subcycle's rates are sane; the solver then keeps
+         D+ in charge-exchange equilibrium and reconstructs D from conservation. */
+      sc_DI[i]  = 6.8e-5 * sc_HI[i];
+      sc_DII[i] = 6.8e-5 * HII[i];
+    }
   }
 
   grackle_field_data f;
@@ -92,7 +109,7 @@ extern "C" int grackle_reduced_step(long n, double a_value, double dt,
   f.HI_density=sc_HI;   f.HII_density=HII;     f.HeI_density=sc_HeI;
   f.HeII_density=sc_HeII; f.HeIII_density=sc_HeIII; f.e_density=sc_e;
   f.HM_density=sc_HM;   f.H2I_density=H2I;     f.H2II_density=sc_H2II;
-  f.DI_density=NULL;    f.DII_density=NULL;    f.HDI_density=NULL;
+  f.DI_density=sc_DI;   f.DII_density=sc_DII;  f.HDI_density=HDI;  /* HDI advected */
   f.metal_density=NULL; f.dust_density=NULL;
   f.volumetric_heating_rate=NULL; f.specific_heating_rate=NULL;
   f.RT_HI_ionization_rate=NULL; f.RT_HeI_ionization_rate=NULL;
@@ -112,14 +129,17 @@ extern "C" int grackle_reduced_temperature(long n, double a_value,
 {
   if (g_cd == NULL) return 0;
   g_units.a_value = a_value;
-  double *sc = (double *) malloc((size_t)7 * n * sizeof(double));
+  long nsc = g_deut ? 10 : 7;   /* +DI,DII,HDI scratch when deuterium on */
+  double *sc = (double *) malloc((size_t)nsc * n * sizeof(double));
   double *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
          *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
+  double *sc_DI=g_deut?sc+7*n:NULL,*sc_DII=g_deut?sc+8*n:NULL,*sc_HDI=g_deut?sc+9*n:NULL;
   const double tiny = 1e-20;
   for (long i = 0; i < n; i++) {
     sc_e[i]=HII[i]; double hi=g_fh*rho[i]-HII[i]-H2I[i];
     sc_HI[i]=(hi>tiny)?hi:tiny; sc_HeI[i]=(1.0-g_fh)*rho[i];
     sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=tiny;
+    if (g_deut) { sc_DI[i]=tiny; sc_DII[i]=tiny; sc_HDI[i]=tiny; }
   }
   grackle_field_data f; int dim[3]={(int)n,1,1},gs[3]={0,0,0},ge[3]={(int)n-1,0,0};
   f.grid_rank=1; f.grid_dimension=dim; f.grid_start=gs; f.grid_end=ge; f.grid_dx=0.0;
@@ -127,7 +147,7 @@ extern "C" int grackle_reduced_temperature(long n, double a_value,
   f.density=rho; f.internal_energy=e_int; f.x_velocity=zero; f.y_velocity=zero; f.z_velocity=zero;
   f.HI_density=sc_HI; f.HII_density=HII; f.HeI_density=sc_HeI; f.HeII_density=sc_HeII;
   f.HeIII_density=sc_HeIII; f.e_density=sc_e; f.HM_density=sc_HM; f.H2I_density=H2I;
-  f.H2II_density=sc_H2II; f.DI_density=NULL; f.DII_density=NULL; f.HDI_density=NULL;
+  f.H2II_density=sc_H2II; f.DI_density=sc_DI; f.DII_density=sc_DII; f.HDI_density=sc_HDI;
   f.metal_density=NULL; f.dust_density=NULL;
   f.volumetric_heating_rate=NULL; f.specific_heating_rate=NULL;
   f.RT_HI_ionization_rate=NULL; f.RT_HeI_ionization_rate=NULL; f.RT_HeII_ionization_rate=NULL;

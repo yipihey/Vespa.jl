@@ -26,10 +26,10 @@ Initialise the reduced primordial-chemistry service for a host's code units
 """
 function chem_init!(; hubble::Real, Om::Real, OL::Real, a_value::Real, fh::Real=0.76,
         density_units::Real, length_units::Real, time_units::Real,
-        data_file::AbstractString=_CHEM_DATA_FILE[])
+        data_file::AbstractString=_CHEM_DATA_FILE[], deuterium::Bool=false)
     GrackleChem.grackle_reduced_init!(; hubble=hubble, Om=Om, OL=OL, a_value=a_value,
         fh=fh, density_units=density_units, length_units=length_units,
-        time_units=time_units, data_file=data_file)
+        time_units=time_units, data_file=data_file, deuterium=deuterium)
 end
 
 """
@@ -39,8 +39,8 @@ Advance the chemistry+cooling one step.  `eint` (specific internal energy),
 `HII`, `H2I` (mass densities rho*x) are updated in place.  This is the code-
 neutral core both RAMSES and Arepo call after extracting their gas state.
 """
-chem_step!(rho, eint, HII, H2I; a_value, dt) =
-    GrackleChem.grackle_reduced_step!(rho, eint, HII, H2I; a_value=a_value, dt=dt)
+chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt) =
+    GrackleChem.grackle_reduced_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt)
 
 # ── RAMSES wiring ─────────────────────────────────────────────────────────────
 # RAMSES stores uold = (rho, rho*u, E_total, [passive scalars rho*x ...]).  The
@@ -59,11 +59,12 @@ energy, call `chem_step!`, and write back E_total and the two species via
 """
 function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
         density_units::Real, length_units::Real, time_units::Real,
-        iHII::Integer=6, iH2I::Integer=7)
+        iHII::Integer=6, iH2I::Integer=7, iHDI::Union{Nothing,Integer}=nothing)
     ck, U = RamsesLib.get_hydro_all(h, :uold, lev)      # U :: noct × 8 × nvar
     nv = size(U, 3)
-    nv >= max(iHII, iH2I) ||
-        error("RAMSES nvar=$nv < $(max(iHII,iH2I)); rebuild with -DNVAR>=$(max(iHII,iH2I)) to carry HII,H2I")
+    need = iHDI === nothing ? max(iHII, iH2I) : max(iHII, iH2I, iHDI)
+    nv >= need ||
+        error("RAMSES nvar=$nv < $need; rebuild with -DNPSCAL>=$(need-5) to carry the species")
 
     rho  = Float64.(vec(@view U[:, :, 1]))
     mx   = Float64.(vec(@view U[:, :, 2]))
@@ -72,12 +73,13 @@ function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
     Etot = Float64.(vec(@view U[:, :, 5]))
     HII  = Float64.(vec(@view U[:, :, iHII]))
     H2I  = Float64.(vec(@view U[:, :, iH2I]))
+    HDI  = iHDI === nothing ? nothing : Float64.(vec(@view U[:, :, iHDI]))
 
     r    = max.(rho, eps())
     kin  = 0.5 .* (mx.^2 .+ my.^2 .+ mz.^2) ./ r          # kinetic energy density
     eint = (Etot .- kin) ./ r                             # specific internal energy
 
-    chem_step!(rho, eint, HII, H2I; a_value=a_value, dt=dt)
+    chem_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt)
 
     Etot_new = eint .* rho .+ kin                         # cooled internal + same kinetic
     noct = size(U, 1)
@@ -85,6 +87,7 @@ function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
     RamsesLib.set_hydro!(h, :uold, 5,    lev, ck, reshape8(Etot_new))
     RamsesLib.set_hydro!(h, :uold, iHII, lev, ck, reshape8(HII))
     RamsesLib.set_hydro!(h, :uold, iH2I, lev, ck, reshape8(H2I))
+    iHDI === nothing || RamsesLib.set_hydro!(h, :uold, iHDI, lev, ck, reshape8(HDI))
     return (; ncells = length(rho))
 end
 
@@ -107,14 +110,17 @@ must have been called first with Arepo's code units.
 function arepo_chem_step!(h; dt::Real, a_value::Real)
     rho  = Float64.(ArepoLib.get_cell_field(h, :rho))
     eint = Float64.(ArepoLib.get_cell_field(h, :utherm))      # specific internal energy
-    sc   = ArepoLib.get_cell_field(h, :scalars)               # n×2 abundances [x_HII x_H2I]
+    sc   = ArepoLib.get_cell_field(h, :scalars)               # n×{2,3} abundances
+    ncol = size(sc, 2)
     HII  = rho .* Float64.(@view sc[:, 1])                    # density-weighted rho*x
     H2I  = rho .* Float64.(@view sc[:, 2])
+    HDI  = ncol >= 3 ? rho .* Float64.(@view sc[:, 3]) : nothing   # HD (deuterium)
 
-    chem_step!(rho, eint, HII, H2I; a_value=a_value, dt=dt)
+    chem_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt)
 
     r = max.(rho, eps())
     ArepoLib.set_cell_field!(h, :utherm, eint)
-    ArepoLib.set_cell_field!(h, :scalars, hcat(HII ./ r, H2I ./ r))
+    cols = HDI === nothing ? hcat(HII ./ r, H2I ./ r) : hcat(HII ./ r, H2I ./ r, HDI ./ r)
+    ArepoLib.set_cell_field!(h, :scalars, cols)
     return (; ncells = length(rho))
 end

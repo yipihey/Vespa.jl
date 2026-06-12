@@ -77,8 +77,10 @@ ck, U = RamsesLib.get_hydro_all(h, :uold, lev)      # noct×8×nvar
 noct = size(U,1)
 rho_block = U[:,:,1]
 xHII0 = 0.047; xH20 = 1e-12
+const DEUT = get(ENV,"DEUT","0") == "1"              # also track HD (var 8)
 RamsesLib.set_hydro!(h, :uold, 6, lev, ck, rho_block .* xHII0)   # HII = rho*x
 RamsesLib.set_hydro!(h, :uold, 7, lev, ck, rho_block .* xH20)    # H2I
+DEUT && RamsesLib.set_hydro!(h, :uold, 8, lev, ck, rho_block .* 1e-20)  # HDI
 
 # also raise the gas energy to ~T=2728 K so the chemistry has a real temperature
 vel_u = len_u/time_u; Tunits = mh*vel_u^2/1.380649e-16
@@ -88,7 +90,8 @@ RamsesLib.set_hydro!(h, :uold, 5, lev, ck, Etot)
 
 # init the shared chemistry service for these RAMSES units, run one step
 MultiCode.chem_init!(; hubble=71.0, Om=0.27, OL=0.73, a_value=1/(1+z), fh=XH,
-    density_units=dens_u, length_units=len_u, time_units=time_u, data_file=GD)
+    density_units=dens_u, length_units=len_u, time_units=time_u, data_file=GD,
+    deuterium=DEUT)
 
 ck6,b6 = RamsesLib.get_hydro(h,:uold,6,lev); ck7,b7 = RamsesLib.get_hydro(h,:uold,7,lev)
 ckr,br = RamsesLib.get_hydro(h,:uold,1,lev)
@@ -96,11 +99,14 @@ xHII_before = b6[1]/br[1]; xH2_before = (b7[1]/br[1])/2
 @printf("before: x_HII=%.4e  x_H2=%.4e\n", xHII_before, xH2_before)
 
 res = MultiCode.ramses_chem_step!(h, lev; dt=0.01, a_value=1/(1+z),
-    density_units=dens_u, length_units=len_u, time_units=time_u, iHII=6, iH2I=7)
+    density_units=dens_u, length_units=len_u, time_units=time_u, iHII=6, iH2I=7,
+    iHDI = DEUT ? 8 : nothing)
 
 ck6,b6 = RamsesLib.get_hydro(h,:uold,6,lev); ck7,b7 = RamsesLib.get_hydro(h,:uold,7,lev)
 ckr,br = RamsesLib.get_hydro(h,:uold,1,lev)
 xHII_after = b6[1]/br[1]; xH2_after = (b7[1]/br[1])/2
-@printf("after : x_HII=%.4e  x_H2=%.4e  (%d cells)\n", xHII_after, xH2_after, res.ncells)
+xHD_str = ""
+if DEUT; ck8,b8 = RamsesLib.get_hydro(h,:uold,8,lev); xHD_str = @sprintf("  x_HD=%.4e",(b8[1]/br[1])/3); end
+@printf("after : x_HII=%.4e  x_H2=%.4e%s  (%d cells)\n", xHII_after, xH2_after, xHD_str, res.ncells)
 @printf("RAMSES reduced-chemistry slot %s: species evolved on live cells.\n",
         (xHII_after != xHII_before) ? "WORKS" : "NO-CHANGE")

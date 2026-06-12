@@ -21,9 +21,11 @@ dens_u = mh; len_u = 3.0857e21; time_u = 3.1557e13
 GD = get(ENV,"GRACKLE_DATA_FILE",
          joinpath(homedir(),"Research","codes","grackle","input","CloudyData_noUVB.h5"))
 
+const DEUT = get(ENV,"DEUT","0") == "1"          # also track HD (deuterium)
 z = 1000.0
 GrackleChem.grackle_reduced_init!(; hubble=h*100, Om=Om, OL=OL, a_value=1/(1+z),
-    fh=XH, density_units=dens_u, length_units=len_u, time_units=time_u, data_file=GD)
+    fh=XH, density_units=dens_u, length_units=len_u, time_units=time_u,
+    data_file=GD, deuterium=DEUT)
 
 # RECFAST ICs at z=1000
 T = 2728.0; xe = 0.047
@@ -31,6 +33,7 @@ nH = nH0*(1+z)^3; rho_tot = nH*mh/XH
 rho  = [rho_tot/dens_u]                          # code density
 HII  = [xe*XH*rho[1]]                             # rho*x_HII
 H2I  = [2e-15*XH*rho[1]]                          # rho*x_H2 (mass), seed 1e-15
+HDI  = DEUT ? [1e-20*XH*rho[1]] : nothing        # rho*x_HD (mass=3), tiny seed
 # specific internal energy in code units: e = T/(Tunits)/(gamma-1)/mu
 vel_u = len_u/time_u; Tunits = mh*vel_u^2/1.380649e-16  # m_H v^2 / k_B
 e_int = [T/Tunits/(5/3-1)/1.22]
@@ -41,12 +44,14 @@ while z > 10.0
     znew = (1+z)*exp(-dlna) - 1; znew < 10 && (znew = 10.0)
     fac = (1+znew)/(1+z); f3 = fac^3
     rho[1]*=f3; HII[1]*=f3; H2I[1]*=f3; e_int[1]*=fac^2     # dilute + adiabatic
+    DEUT && (HDI[1]*=f3)
     dt = (cosmic_time(znew,H0_s,Om) - cosmic_time(z,H0_s,Om))/time_u
-    GrackleChem.grackle_reduced_step!(rho, e_int, HII, H2I; a_value=1/(1+znew), dt=dt)
+    GrackleChem.grackle_reduced_step!(rho, e_int, HII, H2I, HDI; a_value=1/(1+znew), dt=dt)
     global z = znew
 end
 Tg = GrackleChem.grackle_reduced_temperature(rho, e_int, HII, H2I; a_value=1/(1+z))
 nHmass = XH*rho[1]
-@printf("z=%6.2f  x_HII=%.4e  x_H2=%.4e  T_gas=%.3f K\n",
-        z, HII[1]/nHmass, (H2I[1]/2)/nHmass, Tg[1])
-println("(Enzo cosmo_evolve HE=1 reference at z=10: x_HII~2.0e-4, x_H2~3.1e-6)")
+xHD = DEUT ? @sprintf("  x_HD=%.4e", (HDI[1]/3)/nHmass) : ""
+@printf("z=%6.2f  x_HII=%.4e  x_H2=%.4e%s  T_gas=%.3f K\n",
+        z, HII[1]/nHmass, (H2I[1]/2)/nHmass, xHD, Tg[1])
+println("(Enzo cosmo_evolve HE=1 ref at z=10: x_HII~2.0e-4, x_H2~3.1e-6, x_HD~1.6e-9)")
