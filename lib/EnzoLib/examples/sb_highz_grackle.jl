@@ -51,11 +51,12 @@ function write_highz_param(z)
     RadiativeCooling            = 1
     use_grackle                 = 1
     with_radiative_cooling      = 1
-    MultiSpecies                = 2
+    MultiSpecies                = $(get(ENV,"DEUT","0")=="1" ? 3 : 2)
     CaseBRecombination          = 1
     cmb_dissociation            = 1
     equilibrium_h2_intermediates = $(get(ENV, "EQUIL", "0"))
     neutral_helium              = $(get(ENV, "HE", "0"))
+    equilibrium_deuterium       = $(get(ENV, "DEUT", "0"))
     cmb_recombination           = $(get(ENV, "REC", "0"))
     grackle_data_file           = $(GRACKLE_DATA)
     DualEnergyFormalism         = 1
