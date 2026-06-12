@@ -102,9 +102,14 @@ Canonicalize one RAMSES level's conserved state (`uold`): vars 1..5 are
 mini-ramses ckey convention; normalization divides out `boxlen`.
 """
 function ramses_extract(h::RamsesLib.Handle; lev::Integer, boxlen::Real = 1.0,
-                        lib::Symbol = :cpu)
+                        lib::Symbol = :cpu,
+                        species::Union{Nothing,AbstractVector{<:Integer}} = nothing)
     nv = RamsesLib.nvar(; lib = lib)
     nv >= 5 || error("ramses_extract: nvar=$nv < 5 — not a HYDRO build (set RAMSES_LIB to bin64h)")
+    if species !== nothing
+        maximum(species) <= nv ||
+            error("ramses_extract: species vars $species exceed nvar=$nv (rebuild with NPSCAL>=$(length(species)))")
+    end
     ck, U = RamsesLib.get_hydro_all(h, :uold, lev; lib = lib)  # ck: noct×3, U: noct×8×nv
     noct = size(ck, 1)
     dx = 1.0 / 2^lev                                           # normalized cell size
@@ -113,6 +118,7 @@ function ramses_extract(h::RamsesLib.Handle; lev::Integer, boxlen::Real = 1.0,
     rho = Vector{Float64}(undef, n)
     mom = Matrix{Float64}(undef, n, 3)
     etot = Vector{Float64}(undef, n)
+    spec = species === nothing ? nothing : Matrix{Float64}(undef, n, length(species))
     @inbounds for i in 1:noct, c in 1:8
         k = (i - 1) * 8 + c
         for d in 1:3
@@ -122,12 +128,17 @@ function ramses_extract(h::RamsesLib.Handle; lev::Integer, boxlen::Real = 1.0,
         rho[k]  = U[i, c, 1]
         mom[k, 1] = U[i, c, 2]; mom[k, 2] = U[i, c, 3]; mom[k, 3] = U[i, c, 4]
         etot[k] = U[i, c, 5]
+        if spec !== nothing
+            for (j, iv) in enumerate(species); spec[k, j] = U[i, c, iv]; end   # ρ·x
+        end
     end
     all(p -> 0.0 <= p <= 1.0, pos) ||
         error("ramses_extract: positions escaped [0,1] — ckey convention drifted")
     return CellSet(:ramses, pos, fill(dx^3, n), rho, mom, etot,
                    (length = float(boxlen), time = float(boxlen), density = 1.0),
-                   (handle = h, lev = Int(lev), ckey = ck, noct = noct, lib = lib))
+                   (handle = h, lev = Int(lev), ckey = ck, noct = noct, lib = lib,
+                    species_vars = species === nothing ? Int[] : collect(Int, species)),
+                   spec)
 end
 
 """
@@ -145,6 +156,14 @@ function ramses_inject!(h::RamsesLib.Handle, cs::CellSet)
         RamsesLib.set_hydro!(h, :uold, 1 + d, lev, ck, asoct(cs.mom[:, d]); lib = lib)
     end
     RamsesLib.set_hydro!(h, :uold, 5, lev, ck, asoct(cs.etot); lib = lib)
+    if cs.species !== nothing
+        sv = get(cs.meta, :species_vars, Int[])
+        length(sv) == size(cs.species, 2) ||
+            error("ramses_inject!: $(length(sv)) species vars vs $(size(cs.species,2)) species columns")
+        for (j, iv) in enumerate(sv)
+            RamsesLib.set_hydro!(h, :uold, iv, lev, ck, asoct(cs.species[:, j]); lib = lib)
+        end
+    end
     return nothing
 end
 
@@ -159,7 +178,7 @@ velocity), which are well-defined regardless of Arepo's internal cell-
 integrated bookkeeping.  Arepo's velocities live on the particle record of the
 gas cells (the first `numgas` particles).
 """
-function arepo_extract(h::ArepoLib.Handle; boxlen::Real)
+function arepo_extract(h::ArepoLib.Handle; boxlen::Real, species::Bool = false)
     nfo = ArepoLib.info(h)
     ng = nfo.numgas
     rho = ArepoLib.get_cell_field(h, :rho)
@@ -175,11 +194,28 @@ function arepo_extract(h::ArepoLib.Handle; boxlen::Real)
     v̂ = vol ./ sum(vol)
     mom = rho .* vel
     etot = rho .* (uth .+ 0.5 .* vec(sum(abs2, vel; dims = 2)))
+    # primitive abundances x → mass densities ρ·x (the canonical species convention)
+    spec = species ? Float64.(rho) .* Float64.(ArepoLib.get_cell_field(h, :scalars)) : nothing
     return CellSet(:arepo, pos, v̂, rho, mom, etot,
                    # `volume` = the PHYSICAL domain volume (Arepo's 1-D boxes are
                    # L×1×1, not L³) — exact-deposit geometry needs the true scale
                    (length = L, time = L, density = 1.0, volume = sum(vol)),
-                   (handle = h, numgas = ng))
+                   (handle = h, numgas = ng),
+                   spec)
+end
+
+"""
+    arepo_inject_species!(h, cs::CellSet)
+
+Write a CellSet's species (mass densities ρ·x) back to Arepo's passive-scalar
+abundances via `set_cell_field!(h, :scalars, x)`.  No-op when `cs.species` is
+`nothing`.
+"""
+function arepo_inject_species!(h::ArepoLib.Handle, cs::CellSet)
+    cs.species === nothing && return nothing
+    rho = Float64.(ArepoLib.get_cell_field(h, :rho))
+    ArepoLib.set_cell_field!(h, :scalars, cs.species ./ max.(rho, eps()))   # ρ·x → x
+    return nothing
 end
 
 """

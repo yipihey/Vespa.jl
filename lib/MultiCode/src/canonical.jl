@@ -12,6 +12,12 @@ code units are recoverable), `meta` carries per-code context the matching
 Fields are row-aligned: cell `i` is `pos[i,:]`, `vol[i]`, `rho[i]`, `mom[i,:]`,
 `etot[i]`.  `mom` is momentum DENSITY (ρu), `etot` total energy DENSITY — the
 conservative variables every finite-volume code shares.
+
+`species` optionally carries advected chemical species as MASS densities ρ·x
+(n×nspecies), `nothing` when the snapshot is pure hydro.  The v2026 reduced
+primordial network uses two columns, HII and H2I; the shared Grackle service
+(`GrackleChem`) and the per-code chemistry slots read/write exactly those, so a
+shared IC can ride the chemistry across codes that already share hydro state.
 """
 struct CellSet
     code::Symbol
@@ -22,7 +28,15 @@ struct CellSet
     etot::Vector{Float64}     # total energy density
     units::NamedTuple         # scales divided out: (; length, time, density)
     meta::NamedTuple          # per-code adapter context (opaque to consumers)
+    species::Union{Nothing,Matrix{Float64}}  # n×nspecies mass densities ρ·x, or nothing
 end
+
+# backward-compatible constructor: pure-hydro CellSet (no species)
+CellSet(code, pos, vol, rho, mom, etot, units, meta) =
+    CellSet(code, pos, vol, rho, mom, etot, units, meta, nothing)
+
+"Number of advected species columns (0 when the CellSet is pure hydro)."
+nspecies(cs::CellSet) = cs.species === nothing ? 0 : size(cs.species, 2)
 
 ncells(cs::CellSet) = length(cs.vol)
 
