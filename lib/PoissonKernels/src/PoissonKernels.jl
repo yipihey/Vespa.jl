@@ -40,6 +40,8 @@ export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!
 export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
+export power_spectrum_gpu
+export cic_deposit!
 
 # ── backend registry ─────────────────────────────────────────────────────────
 # `:cpu` is always present; the Metal extension registers `:metal` on load.
@@ -106,5 +108,6 @@ include("fft_poisson.jl")  # root-grid FFT Poisson solve (CPU-host FFTW + Green'
 include("gpu_fft.jl")      # GPU-resident radix-2 FFT + fft_poisson_root_gpu! (device root solve)
 include("mg_batched.jl")   # batched multigrid: NB same-size subgrids per kernel launch
 include("masked_cg.jl")    # masked 7-point CG — the irregular-region Dirichlet solve
+include("deposit.jl")      # cic_deposit!  — KA Cloud-In-Cell particle→grid mass scatter
 
 end # module

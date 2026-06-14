@@ -51,4 +51,5 @@ include("harness.jl")
     include("test_comp_accel.jl")
     include("test_vcycle.jl")
     include("test_fft_poisson.jl")
+    include("test_deposit.jl")
 end

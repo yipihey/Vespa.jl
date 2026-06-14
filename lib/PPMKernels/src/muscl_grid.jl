@@ -68,6 +68,27 @@ end
     @inbounds Ge[cl] -= (fge[fo+1] - fge[fo]) * dtdx
 end
 
+# Passive colour (species mass-density) interface flux for one Hancock sweep:
+# fcol[fo] = fd[fo]·(c/ρ)_upwind, upwind by the sign of the mass flux `fd` (the SAME
+# flux that updated the density). The colour then rides it via `_ge_update_k!`
+# (c[cl] -= (fcol[fo+1]-fcol[fo])·dtdx), exactly conserving species mass with the gas
+# and keeping a uniform mass fraction uniform (c=const·ρ ⇒ fcol=const·fd). Mirrors
+# Enzo's PPM colour advection; `rho` is the pre-update primitive density of this sweep.
+@kernel function _colour_flux_k!(fcol, @Const(c), @Const(rho), @Const(fd),
+                                 na::Int, nfi::Int, nghost::Int)
+    gi, gj = @index(Global, NTuple)               # gi=1..nfi (faces), gj=1..ntr
+    fo = (gj - 1) * nfi + gi
+    rc = (gj - 1) * na + nghost + gi              # cell to the RIGHT of face fo
+    lc = rc - 1                                   # cell to the LEFT
+    T = eltype(fcol)
+    @inbounds begin
+        f = fd[fo]
+        frac = f >= zero(T) ? c[lc] / max(rho[lc], T(1e-20)) :
+                              c[rc] / max(rho[rc], T(1e-20))
+        fcol[fo] = f * frac
+    end
+end
+
 # end-of-step sync (Grid_UpdatePrim.C reset): re-select eint and overwrite the gas
 # energy Ge=ρ·eint and the total energy τ=ρ·(eint+½v²) so the two stay consistent
 # (and so a hot region's purely-advected Ge does not drift). Whole-grid, per cell.
@@ -366,6 +387,7 @@ end
 function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, axis::Int;
                               dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real,
                               recon::Symbol = :plm, coeffs = nothing, ge = nothing, eta1::Real = 1e-3,
+                              colours = nothing,
                               frec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
                               face_periodic::Bool = false, contact_label = nothing,
                               contact_label2 = nothing,
@@ -399,6 +421,7 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
     fd = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
     fs3 = _scratch(D, nfi * ntr); fe = _scratch(D, nfi * ntr)
     fge = dual ? _scratch(D, nfi * ntr) : nothing
+    fcol = colours === nothing ? nothing : _scratch(D, nfi * ntr)
     fA1 = update_moments ? _scratch(D, nfi * ntr) : nothing
     fA2 = update_moments ? _scratch(D, nfi * ntr) : nothing
     c2p(r, e, x, y, z, d_, sn, st1, st2, tau, g_) = dual ?
@@ -433,6 +456,12 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
         _cons_update_k!(be)(D, Sn, St1, St2, Tau, fd, fs1, fs2, fs3, fe,
                             na, nfi, ng, dtdx; ndrange = (active, ntr))
         dual && _ge_update_k!(be)(ge, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
+        if colours !== nothing                       # passive species ride the mass flux fd
+            for cc in colours
+                _colour_flux_k!(be)(fcol, cc, rho, fd, na, nfi, ng; ndrange = (nfi, ntr))
+                _ge_update_k!(be)(cc, fcol, na, nfi, ng, dtdx; ndrange = (active, ntr))
+            end
+        end
         update_moments && _ge_update_k!(be)(contact_moment1, fA1, na, nfi, ng, dtdx; ndrange = (active, ntr))
         update_moments && _ge_update_k!(be)(contact_moment2, fA2, na, nfi, ng, dtdx; ndrange = (active, ntr))
     else
@@ -455,6 +484,14 @@ function _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int, 
         _untranspose_into!(Sn, SnT, dims, perm);  _untranspose_into!(St1, St1T, dims, perm)
         _untranspose_into!(St2, St2T, dims, perm)
         dual && _untranspose_into!(ge, GeT, dims, perm)
+        if colours !== nothing                       # passive species (transposed like ge)
+            for cc in colours
+                ccT = transpose3(cc, dims, perm)
+                _colour_flux_k!(be)(fcol, ccT, rho, fd, na, nfi, ng; ndrange = (nfi, ntr))
+                _ge_update_k!(be)(ccT, fcol, na, nfi, ng, dtdx; ndrange = (active, ntr))
+                _untranspose_into!(cc, ccT, dims, perm)
+            end
+        end
         update_moments && _untranspose_into!(contact_moment1, A1T, dims, perm)
         update_moments && _untranspose_into!(contact_moment2, A2T, dims, perm)
     end
@@ -477,11 +514,12 @@ linear), `:ppm` (monotonized piecewise-parabolic, via the certified
 quadratic with a PLM troubled-cell fallback; requires `predictor=:trace` and only
 `ng ≥ 1`).
 `riemann` selects the flux: `:hll`
-(default, the certified Enzo-`hydro_rk` solver), `:hllc` (contact-resolving — helps where
-there are entropy/shear discontinuities, e.g. supersonic turbulence), or `:twoshock` (the
-van Leer solver Enzo's PPM-DirectEuler uses, resolving both acoustic waves). Empirically
-the Riemann choice barely moves a smooth advected acoustic wave — the dissipation there is
-set by the time integration (the Hancock half-step), not the flux.
+(default, the certified Enzo-`hydro_rk` solver), `:llf`/`:rusanov` (local
+Lax-Friedrichs, more diffusive than HLL), `:hllc` (contact-resolving — helps where
+there are entropy/shear discontinuities, e.g. supersonic turbulence), or `:twoshock`
+(the van Leer solver Enzo's PPM-DirectEuler uses, resolving both acoustic waves).
+Empirically the Riemann choice barely moves a smooth advected acoustic wave — the
+dissipation there is set by the time integration (the Hancock half-step), not the flux.
 
 Passing `ge` (the gas-energy conserved field, `ρ·eint`) turns on the DUAL-ENERGY
 FORMALISM (Enzo hydro_rk style): `ge` is advected alongside the state and the
@@ -493,6 +531,7 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
                                 dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
                                 order = (1, 2, 3), small_rho::Real = 1e-10,
                                 bc! = nothing, recon::Symbol = :plm, ge = nothing, eta1::Real = 1e-3,
+                                colours = nothing,
                                 fluxrec = nothing, riemann::Symbol = :hll, predictor::Symbol = :hancock,
                                 face_periodic::Bool = false, contact_label = nothing,
                                 contact_label2 = nothing,
@@ -524,7 +563,8 @@ function muscl_hancock_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int
         bcfill!()
         _hancock_sweep_axis!(D, S1, S2, S3, Tau, dims, ng, axis;
                              dt = dt, gamma = gamma, theta = theta, dx = dx, small_rho = small_rho,
-                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, frec = fluxrec,
+                             recon = recon, coeffs = coeffs, ge = ge, eta1 = eta1, colours = colours,
+                             frec = fluxrec,
                              riemann = riemann, predictor = predictor, face_periodic = face_periodic,
                              contact_label = contact_label, contact_label2 = contact_label2,
                              contact_moment1 = contact_moment1, contact_moment2 = contact_moment2,

@@ -869,7 +869,8 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        regrid::Bool = true, gravity::Bool = false, cooling::Bool = false,
                        radiation::Bool = false, star_sources::Bool = false,
                        star_formation::Bool = false, cosmology::Bool = false,
-                       mhdct::Bool = false, maxsub::Int = 100000)
+                       mhdct::Bool = false, maxsub::Int = 100000,
+                       copy_old::Bool = true)
     eng = engine !== nothing ? engine :
           engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
                             gravity = gravity, cooling = cooling, radiation = radiation,
@@ -877,7 +878,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                             cosmology = cosmology, mhdct = mhdct,
                             hooks = hydro! === nothing ? Dict{Symbol,Function}() :
                                     Dict{Symbol,Function}(:hydro => hydro!))
-    rec(l, dta) = evolve_level!(h, l, dta; engine = eng, regrid = regrid, maxsub = maxsub)
+    rec(l, dta) = evolve_level!(h, l, dta; engine = eng, regrid = regrid, maxsub = maxsub, copy_old = copy_old)
     ct = eng.mhd_ct !== :off
     # Enzo's flux-register machinery (clear/create/finalize/project) is the hydro's
     # conservation bookkeeping — SolveHydroEquations fills SubgridFluxes, finalize/
@@ -898,7 +899,12 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         run_slot(:radiation, eng, h, level, dt)
         ef && session_create_fluxes(h, level)
         run_slot(:gravity, eng, h, level, dt)
-        session_copy_baryon_to_old(h, level)
+        # OldBaryonField time-centering. `copy_old=false` saves the per-cycle full
+        # baryon-field copy (~8s over a cosmo run) BUT is UNSAFE for self-gravitating
+        # cosmology: it changes the baryon large-scale power ~2× (the comoving
+        # expansion / gravity source reads OldBaryonField). Only disable for a pure
+        # non-self-gravitating :julia hydro that provably never reads it. Default on.
+        copy_old && session_copy_baryon_to_old(h, level)
         run_slot(:hydro, eng, h, level, dt)                  # :enzo fills boundary fluxes; :julia owns its own
         run_slot(:cooling, eng, h, level, dt)
         run_slot(:star_formation, eng, h, level, dt)
