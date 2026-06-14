@@ -133,3 +133,59 @@ function fft_poisson_root_gpu!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
     KA.synchronize(be)
     return phi
 end
+
+"""
+    power_spectrum_gpu(delta; boxsize=1.0, nbins=0) -> (k, P, Nmodes)
+
+Isotropic power spectrum P(k) of a real overdensity field `delta` (a cubic,
+power-of-two device array), computed with the GPU radix-2 FFT.  Convention: the
+mean-normalized transform δ̂(k) = (1/N³) Σ_x δ(x) e^{-ik·x} and
+P(k) = V ⟨|δ̂(k)|²⟩ with V = boxsize³ — so a white-noise field of variance σ²
+returns P = σ²·V/N³ (the shot/grid floor).  Modes are radially binned in |k| in
+units of the fundamental k_f = 2π/boxsize; `nbins` defaults to N/2 linear bins
+out to the Nyquist k_f·N/2.  Returns bin-centre wavenumbers `k` (physical, =
+2π/length), the binned power `P`, and the mode count `Nmodes` per bin (bins with
+no modes are dropped).  The FFT runs on `delta`'s backend; only the (small)
+|δ̂|² radial binning is on the host.
+"""
+function power_spectrum_gpu(delta::AbstractArray{T,3}; boxsize = 1.0, nbins::Integer = 0) where {T}
+    be = KA.get_backend(delta); N = size(delta)
+    all(_ispow2, N) || error("power_spectrum_gpu needs power-of-two dims, got $N")
+    all(==(N[1]), N) || error("power_spectrum_gpu currently needs a cubic grid, got $N")
+    n = N[1]
+    L = boxsize isa Number ? Float64(boxsize) : Float64(boxsize[1])
+    brdev = get!(_GPUFFT_CACHE, (:brev, typeof(be), T, n)) do
+        to_device(be, _bitrev_table(n), Int32)
+    end
+    xr = copyto!(similar(delta), delta); xi = KA.zeros(be, T, N...)
+    xr, xi = _fft3d!(xr, xi, brdev, -1)                # forward DFT (unnormalized)
+    KA.synchronize(be)
+    ar = Array(xr); ai = Array(xi)                     # bring |δ̂|² home for binning
+    invN3 = 1.0 / Float64(n)^3
+    V = L^3
+    nb = nbins > 0 ? Int(nbins) : n ÷ 2
+    kf = 2π / L                                         # fundamental wavenumber
+    kny_modes = n / 2                                  # Nyquist in fundamental units
+    Psum = zeros(Float64, nb); ksum = zeros(Float64, nb); cnt = zeros(Int, nb)
+    @inbounds for k in 0:n-1
+        kz = k <= n ÷ 2 ? k : k - n
+        for j in 0:n-1
+            ky = j <= n ÷ 2 ? j : j - n
+            for i in 0:n-1
+                kx = i <= n ÷ 2 ? i : i - n
+                km = sqrt(Float64(kx*kx + ky*ky + kz*kz))   # |k| in fundamental units
+                (km <= 0 || km > kny_modes) && continue
+                b = clamp(1 + floor(Int, (km / kny_modes) * nb), 1, nb)
+                re = Float64(ar[i+1, j+1, k+1]) * invN3
+                im = Float64(ai[i+1, j+1, k+1]) * invN3
+                Psum[b] += V * (re*re + im*im)
+                ksum[b] += km * kf
+                cnt[b]  += 1
+            end
+        end
+    end
+    keep = cnt .> 0
+    kc = (ksum[keep] ./ cnt[keep])
+    Pc = (Psum[keep] ./ cnt[keep])
+    return (k = kc, P = Pc, Nmodes = cnt[keep])
+end

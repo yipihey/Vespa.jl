@@ -15,3 +15,24 @@ lib/EnzoViz/assets/veusz-embed.js
 lib/EnzoViz/assets/wasm/
 # CondaPkg-provisioned env spec (generated; reproduced from CondaPkg.toml)
 **/.CondaPkg/
+
+# ── generated report/bench data (keep .md + small .csv summaries tracked) ──
+reports/multicode/*.dat
+reports/multicode/*.png
+reports/multicode/*.log
+reports/multicode/*.html
+reports/multicode/*.ppm
+lib/PPMKernels/bench/kh_out/
+lib/PPMKernels/bench/turb_out/
+lib/PPMKernels/bench/contact_out/
+lib/PowerFoam/examples/out/
+lib/PowerFoam/examples/**/results/
+lib/PowerFoam/examples/**/*.csv
+lib/PowerFoam/examples/**/*.png
+lib/PowerFoam/examples/**/*.svg
+lib/PowerFoam/examples/**/*.md
+lib/PowerFoam/examples/**/*.ppm
+lib/PowerFoam/examples/**/*.txt
+reports/multicode/sb_campaign_cpu_f32/
+reports/multicode/sb_campaign_metal_f32/
+run/

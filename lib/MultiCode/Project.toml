@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [deps]
 ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
+ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
 CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -12,6 +13,7 @@ PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
 PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 R3D = "6888587b-6711-4ff3-8558-83329515e735"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
 
 [weakdeps]
@@ -19,6 +21,7 @@ Gadget4Lib = "f395cddf-e2ec-4c78-a2b4-52aaf06ca4c4"
 DiscoDJLib = "5afedbe5-b79e-4f2e-a3b9-6aaab87d91a7"
 MusicLib = "24953f1b-bc07-41df-b160-2069462b055e"
 AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
+CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 
 [extras]
@@ -26,22 +29,27 @@ Gadget4Lib = "f395cddf-e2ec-4c78-a2b4-52aaf06ca4c4"
 DiscoDJLib = "5afedbe5-b79e-4f2e-a3b9-6aaab87d91a7"
 MusicLib = "24953f1b-bc07-41df-b160-2069462b055e"
 AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
+CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 
 [extensions]
 MultiCodeGadget4Ext = "Gadget4Lib"
 MultiCodeDiscoDJExt = "DiscoDJLib"
 MultiCodeMusicExt = "MusicLib"
+MultiCodeMusicDiscoDJExt = ["MusicLib", "DiscoDJLib"]
 MultiCodeAthenaExt = "AthenaLib"
+MultiCodeCICASSExt = "CICASSLib"
 MultiCodeDfmmExt = "dfmm"
 
 [sources]
+CICASSLib = {path = "../../../../CICASS.jl/lib/CICASSLib"}
 Gadget4Lib = {path = "../../../../Gadget4.jl/lib/Gadget4Lib"}
 DiscoDJLib = {path = "../../../../DiscoDJ.jl/lib/DiscoDJLib"}
 MusicLib = {path = "../../../../Music.jl/lib/MusicLib"}
 AthenaLib = {path = "../../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../../dfmm"}
 ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
+ChemistryKernels = {path = "../ChemistryKernels"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}

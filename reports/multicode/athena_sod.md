@@ -4,4 +4,4 @@ The stock `athinput.sod` (γ = 1.4, interface recentred to x = 0.5) run IN-PROCE
 
 | engine | cells | wall-clock [s] | L1(ρ) | L1(u) | mass drift |
 |--------|-------|----------------|-------|-------|------------|
-| athena++ (:hydro) | 256 | 0.02 | 0.0019 | 0.0034 | 0.0e+00 |
+| athena++ (:hydro) | 256 | 0.00 | 0.0019 | 0.0034 | 0.0e+00 |

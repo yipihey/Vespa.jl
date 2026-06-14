@@ -22,10 +22,12 @@ function turbulence_ic(n::Int, ng::Int; mach, gamma, cs = 1.0, seed = 271,
     N = n + 2ng; dx = 1.0 / n
     X = Float64[(i - ng - 0.5) * dx for i in 1:N]          # periodic cell-centre coord
     vx = zeros(N, N, N); vy = zeros(N, N, N); vz = zeros(N, N, N)
+    kmin2 = kmin * kmin
+    kmax2 = kmax * kmax
     modes = [(kx, ky, kz) for kx in -kmax:kmax, ky in -kmax:kmax, kz in -kmax:kmax
-             if kmin^2 <= kx^2 + ky^2 + kz^2 <= kmax^2]
+             if kmin2 <= kx*kx + ky*ky + kz*kz <= kmax2]
     for (kx, ky, kz) in modes
-        kk = sqrt(kx^2 + ky^2 + kz^2)
+        kk = sqrt(kx*kx + ky*ky + kz*kz)
         amp = kk^(-specidx / 2)                            # |v_k| ∝ k^(-specidx/2)
         kh = (kx, ky, kz) ./ kk
         a = randn(3); a .-= dot(a, collect(kh)) .* collect(kh)   # project ⊥ k ⇒ solenoidal

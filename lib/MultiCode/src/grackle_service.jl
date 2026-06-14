@@ -52,11 +52,25 @@ function grackle_reduced_step!(rho::Vector{Float64}, e_int::Vector{Float64},
     n = length(rho)
     @assert length(e_int)==n && length(HII)==n && length(H2I)==n
     HDI === nothing || @assert length(HDI)==n
-    rc = ccall((:grackle_reduced_step, LIBGR), Cint,
-        (Clong,Cdouble,Cdouble,Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble}),
-        n, a_value, dt, rho, e_int, HII, H2I,
-        HDI === nothing ? C_NULL : HDI)
-    rc == 1 || error("grackle_reduced_step failed (rc=$rc)")
+    # Chunk the cells: the shim hands Grackle grid_dimension=[m,1,1], and
+    # solve_rate_cool_g allocates AUTOMATIC (stack) arrays sized m — passing all
+    # ~2M cells at once overflows the stack (segfault).  Enzo slices by j,k for
+    # the same reason.  4096-cell chunks keep those arrays small.  e_int/HII/H2I/
+    # HDI are updated in place per chunk via pointer offsets.
+    CHUNK = 256
+    GC.@preserve rho e_int HII H2I HDI begin
+        off = 0
+        while off < n
+            m = min(CHUNK, n - off)
+            rc = ccall((:grackle_reduced_step, LIBGR), Cint,
+                (Clong,Cdouble,Cdouble,Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble},Ptr{Cdouble}),
+                m, a_value, dt, pointer(rho, off+1), pointer(e_int, off+1),
+                pointer(HII, off+1), pointer(H2I, off+1),
+                HDI === nothing ? C_NULL : pointer(HDI, off+1))
+            rc == 1 || error("grackle_reduced_step failed (rc=$rc) at chunk offset $off")
+            off += m
+        end
+    end
     return nothing
 end
 

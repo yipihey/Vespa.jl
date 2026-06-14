@@ -14,6 +14,67 @@ using MultiCode
 using MultiCode: SodSpec, CellSet
 using AthenaLib
 
+function _stage_arrays(cs::CellSet, dims::NTuple{3,Int})
+    n = prod(dims)
+    MultiCode.ncells(cs) == n ||
+        error("athena_stage_cellset: dims=$dims contain $n cells, but CellSet has $(MultiCode.ncells(cs))")
+    size(cs.pos) == (n, 3) || error("athena_stage_cellset: pos must be n×3")
+    size(cs.mom) == (n, 3) || error("athena_stage_cellset: mom must be n×3")
+    D = reshape(copy(cs.rho), dims)
+    E = reshape(copy(cs.etot), dims)
+    S1 = Array{Float64}(undef, dims)
+    S2 = Array{Float64}(undef, dims)
+    S3 = Array{Float64}(undef, dims)
+    @inbounds for q in 1:n
+        S1[q] = cs.mom[q, 1]
+        S2[q] = cs.mom[q, 2]
+        S3[q] = cs.mom[q, 3]
+    end
+    return D, S1, S2, S3, E
+end
+
+function _stage_cellset(template::CellSet, rho3, s13, s23, s33, e3, dims::NTuple{3,Int}, diag)
+    n = prod(dims)
+    rho = vec(copy(rho3))
+    etot = vec(copy(e3))
+    mom = Matrix{Float64}(undef, n, 3)
+    @inbounds for q in 1:n
+        mom[q, 1] = s13[q]
+        mom[q, 2] = s23[q]
+        mom[q, 3] = s33[q]
+    end
+    meta = merge(template.meta,
+                 (athena_stage = true, athena_dims = dims, athena_diag = diag,
+                  source_code = template.code))
+    return CellSet(:athena_stage, copy(template.pos), copy(template.vol), rho, mom, etot,
+                   template.units, meta)
+end
+
+"""
+    athena_stage_cellset(cs; dims, dt, gamma=5/3, workdir=mktempdir())
+
+Uniform-cartesian canonical-state adapter for Athena++'s staged-binary pgen.
+Hierarchy adapters call this after rasterizing blocks into `CellSet` order
+(i fastest, then j, then k); the returned `CellSet` preserves positions,
+volumes, and units, with Athena diagnostics attached in `meta`.
+"""
+function MultiCode.athena_stage_cellset(cs::CellSet; dims::NTuple{3,Int},
+                                        dt::Real, gamma::Real = 5 / 3,
+                                        workdir::AbstractString = mktempdir())
+    AthenaLib.available() || error("libathena_capi not found (build the Athena++ capi flavors)")
+    before = MultiCode.ledger(cs)
+    D, S1, S2, S3, E = _stage_arrays(cs, dims)
+    r = AthenaLib.advance_hydro_uniform(D, S1, S2, S3, E;
+                                        dt = Float64(dt), gamma = Float64(gamma),
+                                        workdir = workdir)
+    out = _stage_cellset(cs, r.D, r.S1, r.S2, r.S3, r.E, dims, r.diag)
+    after = MultiCode.ledger(out)
+    return (cs = out, t = r.t, seconds = r.seconds, diag = r.diag,
+            ledger_before = before, ledger_after = after,
+            ledger_drift = MultiCode.ledger_drift(before, after),
+            free = () -> nothing)
+end
+
 function MultiCode.run_athena_sod(spec::SodSpec = SodSpec();
                                   athinput::AbstractString = normpath(joinpath(
                                       dirname(AthenaLib.libpath()), "..",

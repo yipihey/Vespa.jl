@@ -32,6 +32,7 @@ using RamsesLib
 using ArepoLib
 using PPMKernels
 import PoissonKernels
+import ChemistryKernels
 import R3D
 
 export CellSet, ledger, ledger_drift, ncells, exact_sod, SodSpec

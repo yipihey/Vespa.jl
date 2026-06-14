@@ -5,9 +5,12 @@
    reconstructed, and H-/H2+ are equilibrium -- all inside Grackle -- so the
    host need only carry HII and H2I.
 
-   Build links the installed f64 Grackle (~/grackle_install, GRACKLE_FLOAT_8 ->
-   gr_float == double).  All per-cell arrays are double and density-weighted
-   (HII, H2I are MASS densities rho*x, in the code_units passed to _init). */
+   PRECISION-AGNOSTIC: the host (Julia) ABI is always double, but the grackle
+   field_data arrays use gr_float (double for an f64 grackle build, float for
+   f32).  We convert double<->gr_float at the boundary, so this same source links
+   against EITHER ~/grackle_install (f64) or ~/grackle_install_f32 (f32 -- the
+   precision the rest of the EnzoNG stack uses).  HII, H2I are MASS densities
+   rho*x, in the code_units passed to _init. */
 #include <stdlib.h>
 #include <stdio.h>
 extern "C" {
@@ -75,25 +78,33 @@ extern "C" int grackle_reduced_step(long n, double a_value, double dt,
   if (g_cd == NULL) return 0;
   g_units.a_value = a_value;
 
-  /* 7 reconstructed species (+2 deuterium scratch DI,DII when deuterium on). */
+  /* gr_float work block (one malloc): rho,e_int,HII,H2I,HDI in/out copies +
+     nsc reconstructed-species scratch + a zero-velocity array.  gr_float adapts
+     to the linked grackle precision; the host arrays stay double. */
   long nsc = g_deut ? 9 : 7;
-  double *sc = (double *) malloc((size_t)nsc * n * sizeof(double));
-  double *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
-         *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
-  double *sc_DI = g_deut ? sc+7*n : NULL, *sc_DII = g_deut ? sc+8*n : NULL;
+  long nf  = 5 + nsc + 1;
+  gr_float *w = (gr_float *) malloc((size_t)nf * n * sizeof(gr_float));
+  gr_float *gr_rho=w+0*n,*gr_e=w+1*n,*gr_HII=w+2*n,*gr_H2I=w+3*n,*gr_HDI=w+4*n;
+  gr_float *sc = w + 5*n;
+  gr_float *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
+           *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
+  gr_float *sc_DI = g_deut ? sc+7*n : NULL, *sc_DII = g_deut ? sc+8*n : NULL;
+  gr_float *zero = w + (5+nsc)*n;
   const double tiny = 1e-20;
   for (long i = 0; i < n; i++) {
-    sc_e[i]   = HII[i];                            /* n_e = n_HII */
+    gr_rho[i]=(gr_float)rho[i]; gr_e[i]=(gr_float)e_int[i];
+    gr_HII[i]=(gr_float)HII[i]; gr_H2I[i]=(gr_float)H2I[i];
+    gr_HDI[i]=(gr_float)(g_deut ? HDI[i] : 0.0); zero[i]=(gr_float)0.0;
+    sc_e[i]   = gr_HII[i];                         /* n_e = n_HII */
     double hi = g_fh*rho[i] - HII[i] - H2I[i];
-    sc_HI[i]  = (hi > tiny) ? hi : tiny;           /* X_H*rho - HII - H2I */
-    sc_HeI[i] = (1.0 - g_fh)*rho[i];               /* all-neutral helium  */
-    sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=tiny;
+    sc_HI[i]  = (gr_float)((hi > tiny) ? hi : tiny);
+    sc_HeI[i] = (gr_float)((1.0 - g_fh)*rho[i]);   /* all-neutral helium  */
+    sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=(gr_float)tiny;
     if (g_deut) {
-      /* seed D, D+ at their cosmic partition (DToHRatio is a MASS ratio,
-         2*3.4e-5) so the first subcycle's rates are sane; the solver then keeps
-         D+ in charge-exchange equilibrium and reconstructs D from conservation. */
-      sc_DI[i]  = 6.8e-5 * sc_HI[i];
-      sc_DII[i] = 6.8e-5 * HII[i];
+      /* seed D, D+ at their cosmic partition (mass ratio 2*3.4e-5); the solver
+         keeps D+ in charge-exchange equilibrium, reconstructs D from conservation */
+      sc_DI[i]  = (gr_float)(6.8e-5 * sc_HI[i]);
+      sc_DII[i] = (gr_float)(6.8e-5 * HII[i]);
     }
   }
 
@@ -103,13 +114,12 @@ extern "C" int grackle_reduced_step(long n, double a_value, double dt,
   int gend[3]  = { (int)n - 1, 0, 0 };
   f.grid_rank = 1; f.grid_dimension = dim; f.grid_start = gstart; f.grid_end = gend;
   f.grid_dx = 0.0;
-  double *zero = (double *) calloc((size_t)n, sizeof(double));
-  f.density = rho; f.internal_energy = e_int;
+  f.density = gr_rho; f.internal_energy = gr_e;
   f.x_velocity = zero; f.y_velocity = zero; f.z_velocity = zero;
-  f.HI_density=sc_HI;   f.HII_density=HII;     f.HeI_density=sc_HeI;
+  f.HI_density=sc_HI;   f.HII_density=gr_HII;  f.HeI_density=sc_HeI;
   f.HeII_density=sc_HeII; f.HeIII_density=sc_HeIII; f.e_density=sc_e;
-  f.HM_density=sc_HM;   f.H2I_density=H2I;     f.H2II_density=sc_H2II;
-  f.DI_density=sc_DI;   f.DII_density=sc_DII;  f.HDI_density=HDI;  /* HDI advected */
+  f.HM_density=sc_HM;   f.H2I_density=gr_H2I;  f.H2II_density=sc_H2II;
+  f.DI_density=sc_DI;   f.DII_density=sc_DII;  f.HDI_density=g_deut?gr_HDI:NULL;
   f.metal_density=NULL; f.dust_density=NULL;
   f.volumetric_heating_rate=NULL; f.specific_heating_rate=NULL;
   f.RT_HI_ionization_rate=NULL; f.RT_HeI_ionization_rate=NULL;
@@ -118,7 +128,12 @@ extern "C" int grackle_reduced_step(long n, double a_value, double dt,
   f.H2_custom_shielding_factor=NULL; f.isrf_habing=NULL;
 
   int rc = solve_chemistry(&g_units, &f, dt);
-  free(sc); free(zero);
+  /* copy the evolved in/out fields back to the host (double) arrays */
+  for (long i = 0; i < n; i++) {
+    e_int[i]=(double)gr_e[i]; HII[i]=(double)gr_HII[i]; H2I[i]=(double)gr_H2I[i];
+    if (g_deut) HDI[i]=(double)gr_HDI[i];
+  }
+  free(w);
   return rc;
 }
 
@@ -130,30 +145,37 @@ extern "C" int grackle_reduced_temperature(long n, double a_value,
   if (g_cd == NULL) return 0;
   g_units.a_value = a_value;
   long nsc = g_deut ? 10 : 7;   /* +DI,DII,HDI scratch when deuterium on */
-  double *sc = (double *) malloc((size_t)nsc * n * sizeof(double));
-  double *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
-         *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
-  double *sc_DI=g_deut?sc+7*n:NULL,*sc_DII=g_deut?sc+8*n:NULL,*sc_HDI=g_deut?sc+9*n:NULL;
+  /* gr_float block: rho,e_int,HII,H2I,Tout + nsc scratch + zero */
+  long nf = 5 + nsc + 1;
+  gr_float *w=(gr_float*)malloc((size_t)nf*n*sizeof(gr_float));
+  gr_float *gr_rho=w+0*n,*gr_e=w+1*n,*gr_HII=w+2*n,*gr_H2I=w+3*n,*gr_T=w+4*n;
+  gr_float *sc=w+5*n;
+  gr_float *sc_e=sc+0*n,*sc_HI=sc+1*n,*sc_HeI=sc+2*n,*sc_HeII=sc+3*n,
+           *sc_HeIII=sc+4*n,*sc_HM=sc+5*n,*sc_H2II=sc+6*n;
+  gr_float *sc_DI=g_deut?sc+7*n:NULL,*sc_DII=g_deut?sc+8*n:NULL,*sc_HDI=g_deut?sc+9*n:NULL;
+  gr_float *zero=w+(5+nsc)*n;
   const double tiny = 1e-20;
   for (long i = 0; i < n; i++) {
-    sc_e[i]=HII[i]; double hi=g_fh*rho[i]-HII[i]-H2I[i];
-    sc_HI[i]=(hi>tiny)?hi:tiny; sc_HeI[i]=(1.0-g_fh)*rho[i];
-    sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=tiny;
-    if (g_deut) { sc_DI[i]=tiny; sc_DII[i]=tiny; sc_HDI[i]=tiny; }
+    gr_rho[i]=(gr_float)rho[i]; gr_e[i]=(gr_float)e_int[i];
+    gr_HII[i]=(gr_float)HII[i]; gr_H2I[i]=(gr_float)H2I[i]; zero[i]=(gr_float)0.0;
+    sc_e[i]=gr_HII[i]; double hi=g_fh*rho[i]-HII[i]-H2I[i];
+    sc_HI[i]=(gr_float)((hi>tiny)?hi:tiny); sc_HeI[i]=(gr_float)((1.0-g_fh)*rho[i]);
+    sc_HeII[i]=sc_HeIII[i]=sc_HM[i]=sc_H2II[i]=(gr_float)tiny;
+    if (g_deut) { sc_DI[i]=(gr_float)tiny; sc_DII[i]=(gr_float)tiny; sc_HDI[i]=(gr_float)tiny; }
   }
   grackle_field_data f; int dim[3]={(int)n,1,1},gs[3]={0,0,0},ge[3]={(int)n-1,0,0};
   f.grid_rank=1; f.grid_dimension=dim; f.grid_start=gs; f.grid_end=ge; f.grid_dx=0.0;
-  double *zero=(double*)calloc((size_t)n,sizeof(double));
-  f.density=rho; f.internal_energy=e_int; f.x_velocity=zero; f.y_velocity=zero; f.z_velocity=zero;
-  f.HI_density=sc_HI; f.HII_density=HII; f.HeI_density=sc_HeI; f.HeII_density=sc_HeII;
-  f.HeIII_density=sc_HeIII; f.e_density=sc_e; f.HM_density=sc_HM; f.H2I_density=H2I;
+  f.density=gr_rho; f.internal_energy=gr_e; f.x_velocity=zero; f.y_velocity=zero; f.z_velocity=zero;
+  f.HI_density=sc_HI; f.HII_density=gr_HII; f.HeI_density=sc_HeI; f.HeII_density=sc_HeII;
+  f.HeIII_density=sc_HeIII; f.e_density=sc_e; f.HM_density=sc_HM; f.H2I_density=gr_H2I;
   f.H2II_density=sc_H2II; f.DI_density=sc_DI; f.DII_density=sc_DII; f.HDI_density=sc_HDI;
   f.metal_density=NULL; f.dust_density=NULL;
   f.volumetric_heating_rate=NULL; f.specific_heating_rate=NULL;
   f.RT_HI_ionization_rate=NULL; f.RT_HeI_ionization_rate=NULL; f.RT_HeII_ionization_rate=NULL;
   f.RT_H2_dissociation_rate=NULL; f.RT_heating_rate=NULL; f.H2_self_shielding_length=NULL;
   f.H2_custom_shielding_factor=NULL; f.isrf_habing=NULL;
-  int rc = calculate_temperature(&g_units, &f, Tout);
-  free(sc); free(zero);
+  int rc = calculate_temperature(&g_units, &f, gr_T);
+  for (long i = 0; i < n; i++) Tout[i] = (double)gr_T[i];
+  free(w);
   return rc;
 }

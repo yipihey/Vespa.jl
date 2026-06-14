@@ -62,7 +62,7 @@ transverse pencils. `p` is the precomputed pressure, `gr` the acceleration. `kw`
 are the `ppm_sweep_1d!` physics flags. Cell widths are uniform `dx` (kw `dx=`).
 """
 function sweep_axis!(d, e, ge, vx, vy, vz, p, gr, dims::NTuple{3,Int}, ng::Int, axis::Int;
-                     dt::Real, gamma::Real, dx::Real = 1.0, kw...)
+                     dt::Real, gamma::Real, dx::Real = 1.0, colours = (), kw...)
     na = dims[axis]
     ntr = (dims[1] * dims[2] * dims[3]) ÷ na
     dxi = _axisdxi(d, na, dx)
@@ -72,20 +72,26 @@ function sweep_axis!(d, e, ge, vx, vy, vz, p, gr, dims::NTuple{3,Int}, ng::Int, 
 
     if axis == 1                                   # x is contiguous — sweep in place
         ppm_sweep_1d!(d, e, ge, vu, vv, vw, p, gr, dxi;
-                      idim = na, i1 = i1, i2 = i2, jdim = ntr, dt = dt, gamma = gamma, kw...)
+                      idim = na, i1 = i1, i2 = i2, jdim = ntr, dt = dt, gamma = gamma,
+                      colours = colours, kw...)
     else
         perm = _axis_perm(axis)
         dT  = transpose3(d, dims, perm);  eT = transpose3(e, dims, perm)
         geT = transpose3(ge, dims, perm)
         uT  = transpose3(vu, dims, perm); vT = transpose3(vv, dims, perm); wT = transpose3(vw, dims, perm)
         pT  = transpose3(p, dims, perm);  grT = transpose3(gr, dims, perm)
+        colT = map(c -> transpose3(c, dims, perm), colours)
         ppm_sweep_1d!(dT, eT, geT, uT, vT, wT, pT, grT, dxi;
-                      idim = na, i1 = i1, i2 = i2, jdim = ntr, dt = dt, gamma = gamma, kw...)
+                      idim = na, i1 = i1, i2 = i2, jdim = ntr, dt = dt, gamma = gamma,
+                      colours = colT, kw...)
         # scatter the mutated slabs back into the original-layout arrays (one pass)
         _untranspose_into!(d, dT, dims, perm);  _untranspose_into!(e, eT, dims, perm)
         _untranspose_into!(ge, geT, dims, perm)
         _untranspose_into!(vu, uT, dims, perm); _untranspose_into!(vv, vT, dims, perm)
         _untranspose_into!(vw, wT, dims, perm)
+        for (c, cT) in zip(colours, colT)
+            _untranspose_into!(c, cT, dims, perm)
+        end
     end
     return nothing
 end

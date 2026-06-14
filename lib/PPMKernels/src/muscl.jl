@@ -74,6 +74,27 @@ end
             _hll(ap, am, FlG,  FrG,  UlG,  UrG))
 end
 
+# Local Lax-Friedrichs/Rusanov flux 6-vector. This is deliberately more diffusive
+# than HLL: one scalar signal speed damps every conserved jump, including contacts
+# and transverse momentum.
+@inline function _llf6(ρl::T, el::T, ul::T, vl::T, wl::T,
+                       ρr::T, er::T, ur::T, vr::T, wr::T, g::T, gm1::T) where {T}
+    h = T(0.5)
+    v2l = ul*ul + vl*vl + wl*wl; pl = gm1*ρl*el; csl = sqrt(g*pl/ρl); etl = el + h*v2l
+    UlD = ρl; UlS1 = ρl*ul; UlS2 = ρl*vl; UlS3 = ρl*wl; UlE = ρl*etl; UlG = ρl*el
+    FlD = ρl*ul; FlS1 = UlS1*ul + pl; FlS2 = UlS2*ul; FlS3 = UlS3*ul; FlE = (UlE + pl)*ul; FlG = UlG*ul
+    v2r = ur*ur + vr*vr + wr*wr; pr = gm1*ρr*er; csr = sqrt(g*pr/ρr); etr = er + h*v2r
+    UrD = ρr; UrS1 = ρr*ur; UrS2 = ρr*vr; UrS3 = ρr*wr; UrE = ρr*etr; UrG = ρr*er
+    FrD = ρr*ur; FrS1 = UrS1*ur + pr; FrS2 = UrS2*ur; FrS3 = UrS3*ur; FrE = (UrE + pr)*ur; FrG = UrG*ur
+    a = max(abs(ul) + csl, abs(ur) + csr)
+    return (h * (FlD  + FrD  - a * (UrD  - UlD)),
+            h * (FlS1 + FrS1 - a * (UrS1 - UlS1)),
+            h * (FlS2 + FrS2 - a * (UrS2 - UlS2)),
+            h * (FlS3 + FrS3 - a * (UrS3 - UlS3)),
+            h * (FlE  + FrE  - a * (UrE  - UlE)),
+            h * (FlG  + FrG  - a * (UrG  - UlG)))
+end
+
 # HLLC flux 6-vector (Toro, Davis wave speeds) — contact-RESOLVING twin of `_hll6`,
 # same (ρ,eint,u,v,w) L/R interface signature. Resolves the entropy/contact wave that
 # rides on a background advection (which plain HLL smears badly), so an advected smooth
@@ -492,7 +513,8 @@ end
         Rf = _hancock_faces(rho[cl], rho[cl+1], rho[cl+2], eint[cl], eint[cl+1], eint[cl+2],
                             vx[cl], vx[cl+1], vx[cl+2], vy[cl], vy[cl+1], vy[cl+2],
                             vz[cl], vz[cl+1], vz[cl+2], θ, gm1, cp, sr)
-        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+        F = rie == 3 ? _llf6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
             rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
                        _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
@@ -518,7 +540,8 @@ end
     @inbounds begin
         Lf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     gm1, cp, sr)
         Rf = _ppm_hancock_faces(rho, eint, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, gm1, cp, sr)
-        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+        F = rie == 3 ? _llf6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
             rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
                        _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
@@ -542,7 +565,8 @@ end
     @inbounds begin
         Lf = _ppm_trace_faces(rho, pr, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl,     cil,     g, gm1, dd, sr)
         Rf = _ppm_trace_faces(rho, pr, vx, vy, vz, c1, c2, c3, c4, c5, c6, cl + 1, cil + 1, g, gm1, dd, sr)
-        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+        F = rie == 3 ? _llf6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
             rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
                        _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
@@ -578,7 +602,8 @@ end
              _constant_faces(rho, pr, vx, vy, vz, ri, gm1, sr) :
              _ppm_local_trace_faces(rho, pr, vx, vy, vz, label, label2, ri, g, gm1, dd, sr,
                                     use_label, use_moment2, T(level1), T(level2))
-        F = rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+        F = rie == 3 ? _llf6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
+            rie == 2 ? _twoshock6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
             rie == 1 ? _hllc6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1) :
                        _hll6(Lf[6], Lf[7], Lf[8], Lf[9], Lf[10], Rf[1], Rf[2], Rf[3], Rf[4], Rf[5], g, gm1)
         fd[fo] = F[1]; fs1[fo] = F[2]; fs2[fo] = F[3]; fs3[fo] = F[4]; fe[fo] = F[5]
@@ -610,7 +635,9 @@ function muscl_hancock_flux_line!(fd, fs1, fs2, fs3, fe, rho, eint, vx, vy, vz;
     ncells, nghost = Int(ncells), Int(nghost)
     active = ncells - 2 * nghost; nfi = active + 1
     gef = fge === nothing ? fd : fge; idu = fge === nothing ? 0 : 1
-    rc = riemann === :twoshock ? 2 : riemann === :hllc ? 1 : 0
+    rc = (riemann === :llf || riemann === :rusanov) ? 3 :
+         riemann === :twoshock ? 2 :
+         riemann === :hllc ? 1 : 0
     if recon === :ppm_local
         (predictor !== :trace || pr === nothing) &&
             error("muscl_hancock_flux_line!: recon=:ppm_local requires predictor=:trace and pr")

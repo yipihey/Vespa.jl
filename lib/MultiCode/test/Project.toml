@@ -1,5 +1,6 @@
 [deps]
 ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
+ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
 CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
@@ -14,15 +15,18 @@ AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 MusicLib = "24953f1b-bc07-41df-b160-2069462b055e"
 DiscoDJLib = "5afedbe5-b79e-4f2e-a3b9-6aaab87d91a7"
 Gadget4Lib = "f395cddf-e2ec-4c78-a2b4-52aaf06ca4c4"
+CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 
 [sources]
+CICASSLib = {path = "../../../../../CICASS.jl/lib/CICASSLib"}
 Gadget4Lib = {path = "../../../../../Gadget4.jl/lib/Gadget4Lib"}
 DiscoDJLib = {path = "../../../../../DiscoDJ.jl/lib/DiscoDJLib"}
 MusicLib = {path = "../../../../../Music.jl/lib/MusicLib"}
 AthenaLib = {path = "../../../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../../../dfmm"}
 ArepoLib = {path = "../../../../../Arepo.jl/lib/ArepoLib"}
+ChemistryKernels = {path = "../../ChemistryKernels"}
 CodeBridge = {path = "../../CodeBridge"}
 EnzoLib = {path = "../../EnzoLib"}
 MultiCode = {path = ".."}

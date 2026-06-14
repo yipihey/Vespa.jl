@@ -26,12 +26,14 @@ dev(a) = _P.to_device(be, a, T)
 function turb_ic(n; mach, seed = 271, kmin = 2, kmax = 3, specidx = 4.0)
     Random.seed!(seed); nb = n + 2NG; dx = 1.0 / n
     X = Float64[(i - NG - 0.5) * dx for i in 1:nb]
-    vx = zeros(nb, nb, nb); vy = similar(vx); vz = similar(vx)
+    vx = zeros(nb, nb, nb); vy = zeros(nb, nb, nb); vz = zeros(nb, nb, nb)
+    kmin2 = kmin * kmin
+    kmax2 = kmax * kmax
     modes = [(kx, ky, kz) for kx in -kmax:kmax, ky in -kmax:kmax, kz in -kmax:kmax
-             if kmin^2 <= kx^2 + ky^2 + kz^2 <= kmax^2]
+             if kmin2 <= kx*kx + ky*ky + kz*kz <= kmax2]
     twopi = 2.0 * pi
     for (kx, ky, kz) in modes
-        kk = sqrt(float(kx^2 + ky^2 + kz^2)); amp = kk^(-specidx / 2)
+        kk = sqrt(float(kx*kx + ky*ky + kz*kz)); amp = kk^(-specidx / 2)
         khx = kx / kk; khy = ky / kk; khz = kz / kk
         a = randn(3); ad = a[1]*khx + a[2]*khy + a[3]*khz
         a1 = a[1] - ad*khx; a2 = a[2] - ad*khy; a3 = a[3] - ad*khz

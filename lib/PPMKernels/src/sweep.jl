@@ -32,7 +32,7 @@ function ppm_sweep_1d!(dslice, eslice, geslice, uslice, vslice, wslice, pslice, 
                        dt::Real, gamma::Real, gravity::Integer = 0, idual::Integer = 0,
                        eta1::Real = 0.0, eta2::Real = 0.0, isteep::Integer = 0,
                        iflatten::Integer = 0, idiff::Integer = 0, ipresfree::Integer = 0,
-                       pmin::Real = 1e-20, dfloor::Real = 0.0)
+                       pmin::Real = 1e-20, dfloor::Real = 0.0, colours = ())
     idim, i1, i2 = Int(idim), Int(i1), Int(i2)
     j1, j2 = 1, Int(jdim)
 
@@ -65,6 +65,11 @@ function ppm_sweep_1d!(dslice, eslice, geslice, uslice, vslice, wslice, pslice, 
                    dslice, uslice, vslice, wslice, eslice, geslice, dxi, diffcoef;
                    idim = idim, i1 = i1, i2 = i2, j1 = j1, j2 = j2, dt = dt, gamma = gamma,
                    idiff = idiff, idual = idual)
+
+    # 3b. passive species (colour) advection — uses the mass flux `fx.df` and the
+    #     OLD density (euler! has not run yet), so it is conservative and a uniform
+    #     mass fraction is invariant.
+    advect_colours!(colours, dslice, fx.df; idim = idim, i1 = i1, i2 = i2, j1 = j1, j2 = j2)
 
     # 4. conservative update of the zone-centred state, in place (i1..i2)
     euler!(dslice, eslice, geslice, uslice, vslice, wslice,

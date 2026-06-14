@@ -10,11 +10,42 @@ using Printf
 using MultiCode
 using AthenaLib                  # activates MultiCodeAthenaExt
 
+function _fresh_julia_ok(code::AbstractString)
+    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $code`
+    return success(pipeline(cmd; stdout = stdout, stderr = stderr))
+end
+
 @testset "the Athena++ engine in the Sod harness" begin
     if !AthenaLib.available()
         @warn "libathena_capi not found — skipping" lib = AthenaLib.libpath()
         @test_skip false
     else
+        @test _fresh_julia_ok(raw"""
+            using MultiCode, AthenaLib
+            n = 8
+            nc = n^3
+            pos = Matrix{Float64}(undef, nc, 3)
+            vol = fill(1.0 / nc, nc)
+            rho = ones(nc)
+            mom = zeros(nc, 3)
+            etot = fill(2.5, nc)
+            q = 0
+            for k in 1:n, j in 1:n, i in 1:n
+                global q += 1
+                pos[q, 1] = (i - 0.5) / n
+                pos[q, 2] = (j - 0.5) / n
+                pos[q, 3] = (k - 0.5) / n
+            end
+            cs = CellSet(:synthetic, pos, vol, rho, mom, etot,
+                         (length = 1.0, time = 1.0, density = 1.0), (;))
+            r = athena_stage_cellset(cs; dims = (n, n, n), dt = 0.01, gamma = 1.4)
+            @assert MultiCode.ncells(r.cs) == nc
+            @assert r.cs.code == :athena_stage
+            @assert r.ledger_drift < 1e-10
+            @assert maximum(abs.(r.cs.rho .- 1.0)) < 1e-10
+            @assert maximum(abs.(r.cs.etot .- 2.5)) < 1e-10
+        """)
+
         spec = SodSpec()                                   # γ=1.4, t̂=0.1, x0=0.5
         # ── Next-13: 3-D Sod → the CANONICAL state (VTK readback) ─────────────
         # RUNS FIRST: Athena++ re-entrancy survives same-or-lower dimensionality

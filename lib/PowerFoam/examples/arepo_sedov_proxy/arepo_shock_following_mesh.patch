@@ -1,0 +1,131 @@
+diff --git a/src/mesh/set_vertex_velocities.c b/src/mesh/set_vertex_velocities.c
+--- a/src/mesh/set_vertex_velocities.c
++++ b/src/mesh/set_vertex_velocities.c
+@@ -40,6 +40,63 @@
+ 
+ #include "../mesh/voronoi/voronoi.h"
+ 
++#ifdef SHOCK_FOLLOWING_MESH
++#ifndef SHOCK_FOLLOWING_MESH_GAIN
++#define SHOCK_FOLLOWING_MESH_GAIN 0.30
++#endif
++
++#ifndef SHOCK_FOLLOWING_MESH_WIDTH
++#define SHOCK_FOLLOWING_MESH_WIDTH 0.06
++#endif
++
++#ifndef SHOCK_FOLLOWING_MESH_RMIN
++#define SHOCK_FOLLOWING_MESH_RMIN 0.04
++#endif
++
++#ifndef SHOCK_FOLLOWING_MESH_RMAX_FRAC
++#define SHOCK_FOLLOWING_MESH_RMAX_FRAC 0.48
++#endif
++
++static double shock_following_mesh_radius(void)
++{
++  double local_rho  = -1.0;
++  double local_r    = 0.0;
++  const double cx   = 0.5 * boxSize_X;
++  const double cy   = 0.5 * boxSize_Y;
++  const double rmin = SHOCK_FOLLOWING_MESH_RMIN * All.BoxSize;
++  const double rmax = SHOCK_FOLLOWING_MESH_RMAX_FRAC * All.BoxSize;
++
++  for(int i = 0; i < NumGas; i++)
++    {
++      double dx = nearest_x(SphP[i].Center[0] - cx);
++      double dy = nearest_y(SphP[i].Center[1] - cy);
++      double dz = 0.0;
++#if NUMDIMS > 2
++      const double cz = 0.5 * boxSize_Z;
++      dz = nearest_z(SphP[i].Center[2] - cz);
++#endif
++      double r  = sqrt(dx * dx + dy * dy + dz * dz);
++
++      if(r > rmin && r < rmax && SphP[i].Density > local_rho)
++        {
++          local_rho = SphP[i].Density;
++          local_r   = r;
++        }
++    }
++
++  double global_rho;
++  MPI_Allreduce(&local_rho, &global_rho, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
++
++  double candidate = 0.0;
++  if(local_rho == global_rho && global_rho > 0)
++    candidate = local_r;
++
++  double global_r;
++  MPI_Allreduce(&candidate, &global_r, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
++  return global_r;
++}
++#endif /* #ifdef SHOCK_FOLLOWING_MESH */
++
+ #ifdef ONEDIMS_SPHERICAL
+ static void validate_vertex_velocities_1d();
+ #endif /* #ifdef ONEDIMS_SPHERICAL */
+@@ -248,6 +302,48 @@ void set_vertex_velocities(void)
+         SphP[i].VelVertex[j] = 0; /* vertex velocities for unused dimensions set to zero */
+     }
+ 
++#ifdef SHOCK_FOLLOWING_MESH
++  double shock_radius = shock_following_mesh_radius();
++
++  if(shock_radius > 0)
++    {
++      const double cx    = 0.5 * boxSize_X;
++      const double cy    = 0.5 * boxSize_Y;
++      const double width = SHOCK_FOLLOWING_MESH_WIDTH * All.BoxSize;
++
++      for(idx = 0; idx < TimeBinsHydro.NActiveParticles; idx++)
++        {
++          i = TimeBinsHydro.ActiveParticleList[idx];
++          if(i < 0)
++            continue;
++
++          double dx = nearest_x(P[i].Pos[0] - cx);
++          double dy = nearest_y(P[i].Pos[1] - cy);
++          double dz = 0.0;
++#if NUMDIMS > 2
++          const double cz = 0.5 * boxSize_Z;
++          dz = nearest_z(P[i].Pos[2] - cz);
++#endif
++          double r  = sqrt(dx * dx + dy * dy + dz * dz);
++
++          if(r <= 0 || width <= 0)
++            continue;
++
++          double q      = (r - shock_radius) / width;
++          double shell  = exp(-0.5 * q * q);
++          double vscale = All.cf_atime * get_sound_speed(i);
++          double vr     = -SHOCK_FOLLOWING_MESH_GAIN * vscale * q * shell;
++
++          SphP[i].VelVertex[0] += vr * dx / r;
++          SphP[i].VelVertex[1] += vr * dy / r;
++          SphP[i].VelVertex[2] += vr * dz / r;
++
++          for(j = NUMDIMS; j < 3; j++)
++            SphP[i].VelVertex[j] = 0;
++        }
++    }
++#endif /* #ifdef SHOCK_FOLLOWING_MESH */
++
+ #ifdef OUTPUT_VERTEX_VELOCITY_DIVERGENCE
+   voronoi_exchange_primitive_variables();
+   calculate_vertex_velocity_divergence();
+diff --git a/Template-Config.sh b/Template-Config.sh
+--- a/Template-Config.sh
++++ b/Template-Config.sh
+@@ -42,6 +42,11 @@
+ #REGULARIZE_MESH_CM_DRIFT      # Mesh regularization; Move mesh generating point towards center of mass to make cells rounder.
+ #REGULARIZE_MESH_CM_DRIFT_USE_SOUNDSPEED  # Limit mesh regularization speed by local sound speed
+ #REGULARIZE_MESH_FACE_ANGLE    # Use maximum face angle as roundness criterion in mesh regularization
++#SHOCK_FOLLOWING_MESH          # Add a solution-following radial mesh velocity toward the current shock shell.
++#SHOCK_FOLLOWING_MESH_GAIN=0.30 # Strength of the shock-following radial mesh velocity.
++#SHOCK_FOLLOWING_MESH_WIDTH=0.06 # Gaussian shell width as a fraction of BoxSize.
++#SHOCK_FOLLOWING_MESH_RMIN=0.04 # Minimum shock sensor radius as a fraction of BoxSize.
++#SHOCK_FOLLOWING_MESH_RMAX_FRAC=0.48 # Maximum shock sensor radius as a fraction of BoxSize.
+ 
+ #--------------------------------------- Refinement and derefinement; default: no refinement/derefinement; criterion: target mass
+ #REFINEMENT_SPLIT_CELLS        # Refinement

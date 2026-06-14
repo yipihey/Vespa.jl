@@ -102,11 +102,13 @@ end
 function turb_ic(n; mach=5.0, seed=271, kmin=2, kmax=3, specidx=4.0)
     Random.seed!(seed); nb=n+2NG; dx=1/n
     X = [(i-NG-0.5)*dx for i in 1:nb]
-    vx=zeros(nb,nb,nb); vy=similar(vx); vz=similar(vx)
+    vx=zeros(nb,nb,nb); vy=zeros(nb,nb,nb); vz=zeros(nb,nb,nb)
+    kmin2 = kmin * kmin
+    kmax2 = kmax * kmax
     modes=[(kx,ky,kz) for kx in -kmax:kmax, ky in -kmax:kmax, kz in -kmax:kmax
-           if kmin^2 <= kx^2+ky^2+kz^2 <= kmax^2]
+           if kmin2 <= kx*kx + ky*ky + kz*kz <= kmax2]
     for (kx,ky,kz) in modes
-        kk=sqrt(float(kx^2+ky^2+kz^2)); amp=kk^(-specidx/2)
+        kk=sqrt(float(kx*kx + ky*ky + kz*kz)); amp=kk^(-specidx/2)
         kh=(kx/kk,ky/kk,kz/kk); a=randn(3); ad=sum(a[i]*kh[i] for i in 1:3)
         b=(a[1]-ad*kh[1],a[2]-ad*kh[2],a[3]-ad*kh[3])
         bn=sqrt(sum(abs2,b)); bn < 1e-6 && continue

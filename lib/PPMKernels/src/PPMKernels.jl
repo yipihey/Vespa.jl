@@ -153,6 +153,7 @@ include("inteuler.jl")         # PPM parabolic reconstruction     (Phase 2.3) �
 include("twoshock.jl")         # two-shock Riemann solver         (Phase 2.4) ✓
 include("flux_twoshock.jl")    # physical fluxes                  (Phase 2.5) ✓
 include("euler.jl")            # conservative update              (Phase 2.6) ✓
+include("colour.jl")           # passive species advection (rides the PPM mass flux)
 include("sweep.jl")            # composed 1-D directional sweep   (Phase 3) ✓
 include("ppm_grid.jl")         # 3-D Strang-split sweeps          (Phase 4) ✓
 include("muscl.jl")            # PLM + HLL flux line (Enzo HydroMethod=3, HD_RK)
