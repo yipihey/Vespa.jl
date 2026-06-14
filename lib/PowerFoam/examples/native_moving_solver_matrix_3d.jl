@@ -52,6 +52,14 @@ const COMPACT_CELL_SCAN_MODE =
                          String(DEFAULT_COMPACT_CELL_SCAN_MODE))))
 COMPACT_CELL_SCAN_MODE in (:chunked, :parallel) ||
     error("POWERFOAM_COMPACT_CELL_SCAN_MODE must be chunked or parallel")
+const COMPACT_BLOCK_SCAN_MODE =
+    Symbol(lowercase(get(ENV, "POWERFOAM_COMPACT_BLOCK_SCAN_MODE", "auto")))
+COMPACT_BLOCK_SCAN_MODE in (:auto, :serial, :parallel) ||
+    error("POWERFOAM_COMPACT_BLOCK_SCAN_MODE must be auto, serial, or parallel")
+const COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD =
+    parse(Int, get(ENV, "POWERFOAM_COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD", "2048"))
+COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD > 0 ||
+    error("POWERFOAM_COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD must be positive")
 const FACE_CLIP_WORKGROUP = parse(Int, get(ENV, "POWERFOAM_FACE_CLIP_WORKGROUP", "16"))
 FACE_CLIP_WORKGROUP > 0 || error("POWERFOAM_FACE_CLIP_WORKGROUP must be positive")
 const CLIP_SELF_IMAGES = lowercase(get(ENV, "POWERFOAM_CLIP_SELF_IMAGES", "true")) in
@@ -65,6 +73,8 @@ const CANDIDATE_TIER_CODE = CANDIDATE_TIER == :full ? Int32(0) :
                             CANDIDATE_TIER == :axial ? Int32(1) : Int32(2)
 const MESH_WORK_STATS = lowercase(get(ENV, "POWERFOAM_MESH_WORK_STATS", "false")) in
                         ("1", "true", "yes")
+const WRITE_FINAL_FIELDS = lowercase(get(ENV, "POWERFOAM_WRITE_FINAL_FIELDS", "false")) in
+                           ("1", "true", "yes")
 const DIRTY_MOTION_THRESHOLD = parse(Float64, get(ENV, "POWERFOAM_DIRTY_MOTION_THRESHOLD",
                                                   string(0.05 / N)))
 DIRTY_MOTION_THRESHOLD >= 0 || error("POWERFOAM_DIRTY_MOTION_THRESHOLD must be non-negative")
@@ -73,19 +83,22 @@ const STEP_TAG = length(STEP_COUNTS) == 1 ? @sprintf("n%d", only(STEP_COUNTS)) :
 const ACTIVE_TAG = ACTIVE_CELL_MODE == :off ? "" : "_active-$(ACTIVE_CELL_MODE)"
 const CELL_SCAN_TAG = COMPACT_CELL_SCAN_MODE == DEFAULT_COMPACT_CELL_SCAN_MODE ?
                       "" : "_$(COMPACT_CELL_SCAN_MODE)-cellscan"
+const BLOCK_SCAN_TAG = COMPACT_BLOCK_SCAN_MODE == :auto ? "" :
+                       "_$(COMPACT_BLOCK_SCAN_MODE)-blockscan"
 const SELF_CLIP_TAG = CLIP_SELF_IMAGES ? "" : "_no-selfclip"
 const PLANE_CULL_TAG = PLANE_CULL ? "" : "_nocull"
 const TIER_TAG = CANDIDATE_TIER == :full ? "" : "_$(CANDIDATE_TIER)-candidates"
 const SYNC_TAG = SYNC_TIMING ? "_sync-timing" : ""
 const PROFILE_TAG = MESH_PROFILE ? "_mesh-profile" : ""
 const WORK_STATS_TAG = MESH_WORK_STATS ? "_workstats" : ""
+const FINAL_FIELDS_TAG = WRITE_FINAL_FIELDS ? "_fields" : ""
 const RUN_TAG = replace(@sprintf("N%d_dt%.3g_%s_r%d_%s_%s_%s%s", N, DT, STEP_TAG,
                                  SEARCH_RADIUS, ORDER, REBUILD_MODE,
                                  join(String.(SOLVERS), "-"),
                                  string(ACTIVE_TAG, CELL_SCAN_TAG,
-                                        SELF_CLIP_TAG, PLANE_CULL_TAG,
+                                        BLOCK_SCAN_TAG, SELF_CLIP_TAG, PLANE_CULL_TAG,
                                         TIER_TAG, SYNC_TAG, PROFILE_TAG,
-                                        WORK_STATS_TAG)),
+                                        WORK_STATS_TAG, FINAL_FIELDS_TAG)),
                         "." => "p")
 const OUTDIR = joinpath(OUTBASE, RUN_TAG)
 
@@ -408,20 +421,49 @@ end
 @inline function _clip_or_cull_polygon_plane_lane3!(xout, yout, xin, yin, nv,
                                                     ca, cb, cc, lane,
                                                     plane_cull)
-    if plane_cull
-        any_inside = false
-        any_outside = false
-        @inbounds for q in 1:nv
-            s = ca * xin[q, lane] + cb * yin[q, lane] - cc
-            inside = s <= 1.0f-5
-            any_inside |= inside
-            any_outside |= !inside
-        end
-        !any_outside && return nv, Int32(1)
-        !any_inside && return 0, Int32(2)
+    if !plane_cull
+        return _clip_polygon_plane_lane3!(xout, yout, xin, yin, nv,
+                                          ca, cb, cc, lane), Int32(3)
     end
-    return _clip_polygon_plane_lane3!(xout, yout, xin, yin, nv,
-                                      ca, cb, cc, lane), Int32(3)
+    nv == 0 && return 0, Int32(2)
+    nout = 0
+    any_inside = false
+    any_outside = false
+    px0 = xin[nv, lane]
+    py0 = yin[nv, lane]
+    sp = ca * px0 + cb * py0 - cc
+    pin = sp <= 1.0f-5
+    @inbounds for q in 1:nv
+        cx0 = xin[q, lane]
+        cy0 = yin[q, lane]
+        sc = ca * cx0 + cb * cy0 - cc
+        cin = sc <= 1.0f-5
+        any_inside |= cin
+        any_outside |= !cin
+        if cin != pin
+            den = sp - sc
+            t = abs(den) > 1.0f-12 ? sp / den : 0.5f0
+            nout += 1
+            if nout <= 64
+                xout[nout, lane] = px0 + t * (cx0 - px0)
+                yout[nout, lane] = py0 + t * (cy0 - py0)
+            end
+        end
+        if cin
+            nout += 1
+            if nout <= 64
+                xout[nout, lane] = cx0
+                yout[nout, lane] = cy0
+            end
+        end
+        px0 = cx0
+        py0 = cy0
+        sp = sc
+        pin = cin
+    end
+    !any_outside && return nv, Int32(1)
+    !any_inside && return 0, Int32(2)
+    return min(nout, 64), Int32(3)
 end
 
 @inline function _candidate_tier_allowed3(i, j, sx, sy, sz, n, tier)
@@ -437,6 +479,151 @@ end
 end
 
 @kernel function _refresh_local_candidate_faces3_k!(
+    face_area, face_center_x, face_center_y, face_center_z,
+    normal_x, normal_y, normal_z, face_vx, face_vy, face_vz,
+    @Const(c1), @Const(c2), @Const(shift_x), @Const(shift_y), @Const(shift_z),
+    @Const(px), @Const(py), @Const(pz), @Const(vx), @Const(vy), @Const(vz),
+    ngrid, box, clip_self_images, plane_cull, candidate_tier)
+    f = @index(Global, Linear)
+    lane = @index(Local, Linear)
+    @uniform lanes = prod(@groupsize())
+    T = eltype(face_area)
+    x1 = @localmem eltype(face_area) (64, lanes)
+    y1 = @localmem eltype(face_area) (64, lanes)
+    x2 = @localmem eltype(face_area) (64, lanes)
+    y2 = @localmem eltype(face_area) (64, lanes)
+    @inbounds begin
+        i = Int(c1[f])
+        j = Int(c2[f])
+        sx = shift_x[f]
+        sy = shift_y[f]
+        sz = shift_z[f]
+        rejected = !_candidate_tier_allowed3(i, j, sx, sy, sz, Int(ngrid),
+                                             Int(candidate_tier))
+        if rejected
+            face_area[f] = zero(T)
+            normal_x[f] = zero(T)
+            normal_y[f] = zero(T)
+            normal_z[f] = zero(T)
+            face_center_x[f] = zero(T)
+            face_center_y[f] = zero(T)
+            face_center_z[f] = zero(T)
+            face_vx[f] = zero(T)
+            face_vy[f] = zero(T)
+            face_vz[f] = zero(T)
+        else
+            pix = px[i]; piy = py[i]; piz = pz[i]
+            pjx = px[j] + T(sx) * box
+            pjy = py[j] + T(sy) * box
+            pjz = pz[j] + T(sz) * box
+            dx = pjx - pix
+            dy = pjy - piy
+            dz = pjz - piz
+            dist = sqrt(dx * dx + dy * dy + dz * dz)
+            valid = dist > zero(T)
+            dist = valid ? dist : one(T)
+            nx = dx / dist
+            ny = dy / dist
+            nz = dz / dist
+            ox = T(0.5) * (pix + pjx)
+            oy = T(0.5) * (piy + pjy)
+            oz = T(0.5) * (piz + pjz)
+            ux = abs(nx) < T(0.8) ? zero(T) : -nz
+            uy = abs(nx) < T(0.8) ? -nz : zero(T)
+            uz = abs(nx) < T(0.8) ? ny : nx
+            un = sqrt(ux * ux + uy * uy + uz * uz)
+            ux /= un; uy /= un; uz /= un
+            vx1 = ny * uz - nz * uy
+            vy1 = nz * ux - nx * uz
+            vz1 = nx * uy - ny * ux
+
+            h = box
+            x1[1, lane] = -h; y1[1, lane] = -h
+            x1[2, lane] =  h; y1[2, lane] = -h
+            x1[3, lane] =  h; y1[3, lane] =  h
+            x1[4, lane] = -h; y1[4, lane] =  h
+            nv = 4
+            src_is_1 = true
+
+            if clip_self_images
+                for selfp in 1:6
+                    nv > 0 || continue
+                    a1, a2, a3, b = _plane_for_self_image3(i, selfp, px, py, pz, box)
+                    ca = a1 * ux + a2 * uy + a3 * uz
+                    cb = a1 * vx1 + a2 * vy1 + a3 * vz1
+                    cc = b - (a1 * ox + a2 * oy + a3 * oz)
+                    action = Int32(0)
+                    if src_is_1
+                        nv, action = _clip_or_cull_polygon_plane_lane3!(
+                            x2, y2, x1, y1, nv, ca, cb, cc, lane, plane_cull)
+                    else
+                        nv, action = _clip_or_cull_polygon_plane_lane3!(
+                            x1, y1, x2, y2, nv, ca, cb, cc, lane, plane_cull)
+                    end
+                    src_is_1 = action == 3 ? !src_is_1 : src_is_1
+                end
+            end
+            for ozoff in -1:1, oyoff in -1:1, oxoff in -1:1
+                nv > 0 || continue
+                oxoff == 0 && oyoff == 0 && ozoff == 0 && continue
+                a1, a2, a3, b = _plane_for_neighbor3(i, oxoff, oyoff, ozoff,
+                                                      Int(ngrid), px, py, pz, box)
+                ca = a1 * ux + a2 * uy + a3 * uz
+                cb = a1 * vx1 + a2 * vy1 + a3 * vz1
+                cc = b - (a1 * ox + a2 * oy + a3 * oz)
+                action = Int32(0)
+                if src_is_1
+                    nv, action = _clip_or_cull_polygon_plane_lane3!(
+                        x2, y2, x1, y1, nv, ca, cb, cc, lane, plane_cull)
+                else
+                    nv, action = _clip_or_cull_polygon_plane_lane3!(
+                        x1, y1, x2, y2, nv, ca, cb, cc, lane, plane_cull)
+                end
+                src_is_1 = action == 3 ? !src_is_1 : src_is_1
+            end
+
+            valid = valid && nv >= 3
+            sx2 = zero(T); su = zero(T); sv = zero(T)
+            if src_is_1
+                for q in 1:nv
+                    r = q == nv ? 1 : q + 1
+                    sx2 += x1[q, lane] * y1[r, lane] -
+                           y1[q, lane] * x1[r, lane]
+                    su += x1[q, lane]
+                    sv += y1[q, lane]
+                end
+            else
+                for q in 1:nv
+                    r = q == nv ? 1 : q + 1
+                    sx2 += x2[q, lane] * y2[r, lane] -
+                           y2[q, lane] * x2[r, lane]
+                    su += x2[q, lane]
+                    sv += y2[q, lane]
+                end
+            end
+            area = T(0.5) * abs(sx2)
+            valid = valid && area > T(1.0f-8)
+            denom = T(max(nv, 1))
+            cu = su / denom
+            cv = sv / denom
+            fx = ox + cu * ux + cv * vx1
+            fy = oy + cu * uy + cv * vy1
+            fz = oz + cu * uz + cv * vz1
+            face_area[f] = valid ? area : zero(T)
+            normal_x[f] = nx
+            normal_y[f] = ny
+            normal_z[f] = nz
+            face_center_x[f] = fx - floor(fx / box) * box
+            face_center_y[f] = fy - floor(fy / box) * box
+            face_center_z[f] = fz - floor(fz / box) * box
+            face_vx[f] = T(0.5) * (vx[i] + vx[j])
+            face_vy[f] = T(0.5) * (vy[i] + vy[j])
+            face_vz[f] = T(0.5) * (vz[i] + vz[j])
+        end
+    end
+end
+
+@kernel function _refresh_local_candidate_faces3_stats_k!(
     face_area, face_center_x, face_center_y, face_center_z,
     normal_x, normal_y, normal_z, face_vx, face_vy, face_vz,
     clip_stats,
@@ -730,6 +917,58 @@ end
         end
         total[1] = acc
     end
+end
+
+@kernel function _scan_counts_step3_k!(dst, @Const(src), stride)
+    i = @index(Global, Linear)
+    @inbounds begin
+        v = src[i]
+        if i > Int(stride)
+            v += src[i - Int(stride)]
+        end
+        dst[i] = v
+    end
+end
+
+@kernel function _exclusive_offsets_from_inclusive3_k!(block_offsets, total,
+                                                       @Const(inclusive))
+    i = @index(Global, Linear)
+    I = eltype(block_offsets)
+    @inbounds begin
+        if i == 1
+            block_offsets[i] = zero(I)
+        else
+            block_offsets[i] = inclusive[i - 1]
+        end
+        if i == Int(length(inclusive))
+            total[1] = inclusive[i]
+        end
+    end
+end
+
+function _use_parallel_block_scan(nblocks::Integer)
+    COMPACT_BLOCK_SCAN_MODE == :parallel && return true
+    COMPACT_BLOCK_SCAN_MODE == :serial && return false
+    return nblocks >= COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD
+end
+
+function scan_counts_prefix3!(be, block_offsets, total, block_counts, scratch)
+    nblocks = length(block_counts)
+    if !_use_parallel_block_scan(nblocks)
+        _scan_counts_serial3_k!(be)(block_offsets, total, block_counts; ndrange = 1)
+        return block_offsets
+    end
+    src = block_counts
+    dst = scratch
+    stride = 1
+    while stride < nblocks
+        _scan_counts_step3_k!(be)(dst, src, Int32(stride); ndrange = nblocks)
+        src, dst = dst, src
+        stride <<= 1
+    end
+    _exclusive_offsets_from_inclusive3_k!(be)(block_offsets, total, src;
+                                              ndrange = nblocks)
+    return block_offsets
 end
 
 @kernel function _compact_faces3_k!(
@@ -1145,6 +1384,9 @@ function reconstructed_workspace(state, mesh, points, be)
             compact_face_block_counts_backend = compact_geom === nothing ? nothing :
                                                 PowerFoam._backend_zeros(
                                                     be, Int32, nface_blocks),
+            compact_face_block_scan_scratch_backend = compact_geom === nothing ? nothing :
+                                                      PowerFoam._backend_zeros(
+                                                          be, Int32, nface_blocks),
             compact_face_block_offsets_backend = compact_geom === nothing ? nothing :
                                                  PowerFoam._backend_zeros(
                                                      be, Int32, nface_blocks),
@@ -1155,6 +1397,9 @@ function reconstructed_workspace(state, mesh, points, be)
             compact_cell_block_counts_backend = compact_geom === nothing ? nothing :
                                                 PowerFoam._backend_zeros(
                                                     be, Int32, ncell_blocks),
+            compact_cell_block_scan_scratch_backend = compact_geom === nothing ? nothing :
+                                                      PowerFoam._backend_zeros(
+                                                          be, Int32, ncell_blocks),
             compact_cell_block_offsets_backend = compact_geom === nothing ? nothing :
                                                  PowerFoam._backend_zeros(
                                                      be, Int32, ncell_blocks),
@@ -1425,20 +1670,36 @@ function refresh_local_candidate_faces!(be, geom, workspace, prim,
                                         volume_dst = geom.volume,
                                         mesh_timing = nothing)
     t0 = time_ns()
-    _refresh_local_candidate_faces3_k!(be, FACE_CLIP_WORKGROUP)(
-        geom.face_area,
-        workspace.face_center_x_backend[], workspace.face_center_y_backend[],
-        workspace.face_center_z_backend[],
-        geom.normal_x, geom.normal_y, geom.normal_z,
-        geom.face_vx, geom.face_vy, geom.face_vz,
-        workspace.clip_stats_backend,
-        geom.c1, geom.c2,
-        workspace.shift_x_backend, workspace.shift_y_backend,
-        workspace.shift_z_backend,
-        px, py, pz,
-        prim.vx, prim.vy, prim.vz, Int32(N), Float32(1.0), CLIP_SELF_IMAGES,
-        PLANE_CULL, CANDIDATE_TIER_CODE;
-        ndrange = length(geom.c1))
+    if MESH_WORK_STATS
+        _refresh_local_candidate_faces3_stats_k!(be, FACE_CLIP_WORKGROUP)(
+            geom.face_area,
+            workspace.face_center_x_backend[], workspace.face_center_y_backend[],
+            workspace.face_center_z_backend[],
+            geom.normal_x, geom.normal_y, geom.normal_z,
+            geom.face_vx, geom.face_vy, geom.face_vz,
+            workspace.clip_stats_backend,
+            geom.c1, geom.c2,
+            workspace.shift_x_backend, workspace.shift_y_backend,
+            workspace.shift_z_backend,
+            px, py, pz,
+            prim.vx, prim.vy, prim.vz, Int32(N), Float32(1.0), CLIP_SELF_IMAGES,
+            PLANE_CULL, CANDIDATE_TIER_CODE;
+            ndrange = length(geom.c1))
+    else
+        _refresh_local_candidate_faces3_k!(be, FACE_CLIP_WORKGROUP)(
+            geom.face_area,
+            workspace.face_center_x_backend[], workspace.face_center_y_backend[],
+            workspace.face_center_z_backend[],
+            geom.normal_x, geom.normal_y, geom.normal_z,
+            geom.face_vx, geom.face_vy, geom.face_vz,
+            geom.c1, geom.c2,
+            workspace.shift_x_backend, workspace.shift_y_backend,
+            workspace.shift_z_backend,
+            px, py, pz,
+            prim.vx, prim.vy, prim.vz, Int32(N), Float32(1.0), CLIP_SELF_IMAGES,
+            PLANE_CULL, CANDIDATE_TIER_CODE;
+            ndrange = length(geom.c1))
+    end
     record_mesh_timing!(be, mesh_timing, :face_clip, t0)
     t0 = time_ns()
     _update_local_candidate_volumes3_k!(be)(
@@ -1480,11 +1741,11 @@ function compact_local_candidate_faces!(be, candidate_geom, workspace,
         workspace.compact_face_block_counts_backend,
         candidate_geom.face_area, Int32(COMPACT_SCAN_CHUNK);
         ndrange = nface_blocks)
-    _scan_counts_serial3_k!(be)(
+    scan_counts_prefix3!(be,
         workspace.compact_face_block_offsets_backend,
         workspace.compact_active_total_backend,
-        workspace.compact_face_block_counts_backend;
-        ndrange = 1)
+        workspace.compact_face_block_counts_backend,
+        workspace.compact_face_block_scan_scratch_backend)
     record_mesh_timing!(be, mesh_timing, :face_scan, t0)
     t0 = time_ns()
     _compact_faces3_k!(be)(
@@ -1527,11 +1788,11 @@ function compact_local_candidate_faces!(be, candidate_geom, workspace,
             Int32(COMPACT_SCAN_CHUNK);
             ndrange = ncell_blocks)
     end
-    _scan_counts_serial3_k!(be)(
+    scan_counts_prefix3!(be,
         workspace.compact_cell_block_offsets_backend,
         workspace.compact_active_total_backend,
-        workspace.compact_cell_block_counts_backend;
-        ndrange = 1)
+        workspace.compact_cell_block_counts_backend,
+        workspace.compact_cell_block_scan_scratch_backend)
     record_mesh_timing!(be, mesh_timing, :cell_scan, t0)
     t0 = time_ns()
     _finalize_offsets_fill_compact_csr3_k!(be)(
@@ -1887,6 +2148,22 @@ function write_csv(path, summaries)
     end
 end
 
+function write_final_state_csv(path, state)
+    D = Array(state.D)
+    Mx = Array(state.Mx)
+    My = Array(state.My)
+    Mz = Array(state.Mz)
+    E = Array(state.E)
+    open(path, "w") do io
+        println(io, "cell,D,Mx,My,Mz,E")
+        for i in eachindex(D)
+            @printf(io, "%d,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                    i, D[i], Mx[i], My[i], Mz[i], E[i])
+        end
+    end
+    return path
+end
+
 baseline_for(summaries, nsteps) = first(filter(s -> s.nsteps == nsteps, summaries))
 summary_for(summaries, nsteps, solver) =
     first(filter(s -> s.nsteps == nsteps && s.solver == solver, summaries))
@@ -1910,17 +2187,20 @@ function write_report(path, summaries, gpu_enabled)
         @printf(io, "- active-cell traversal: `%s`\n", ACTIVE_CELL_MODE)
         @printf(io, "- compact scan chunk: `%d`\n", COMPACT_SCAN_CHUNK)
         @printf(io, "- compact cell scan mode: `%s`\n", COMPACT_CELL_SCAN_MODE)
+        @printf(io, "- compact block scan mode: `%s`\n", COMPACT_BLOCK_SCAN_MODE)
+        @printf(io, "- compact block scan parallel threshold: `%d`\n",
+                COMPACT_BLOCK_SCAN_PARALLEL_THRESHOLD)
         @printf(io, "- face clip workgroup: `%d`\n", FACE_CLIP_WORKGROUP)
         @printf(io, "- clip self-image planes: `%s`\n", CLIP_SELF_IMAGES)
         @printf(io, "- plane culling: `%s`\n", PLANE_CULL)
         @printf(io, "- candidate tier: `%s`\n", CANDIDATE_TIER)
         @printf(io, "- mesh work stats: `%s`\n", MESH_WORK_STATS)
+        @printf(io, "- write final fields: `%s`\n", WRITE_FINAL_FIELDS)
         @printf(io, "- dirty motion threshold: `%.8g`\n", DIRTY_MOTION_THRESHOLD)
         @printf(io, "- synchronized phase timing: `%s`\n", SYNC_TIMING)
         @printf(io, "- new-mesh subprofile: `%s`\n", MESH_PROFILE)
         @printf(io, "- timing warmup: `%s`\n", PERF_WARMUP)
         @printf(io, "- diagnostics: `%s`\n", DIAGNOSTICS)
-        @printf(io, "- Metal storage: `%s`\n", get(ENV, "POWERFOAM_METAL_STORAGE", "shared"))
         println(io)
         println(io, "## End-to-end timing")
         println(io)
@@ -2097,7 +2377,9 @@ function write_report(path, summaries, gpu_enabled)
             println(io, "are written directly into the target compact geometry, stale")
             println(io, "tail clearing is fused into face compaction, cell incident")
             println(io, "counts use per-cell parallel counting plus chunk-local row scans,")
-            println(io, "and final row offsets are fused with CSR row fill. The local candidate")
+            println(io, "and block offsets use either a tiny serial device scan or an")
+            println(io, "auto-selected parallel KA prefix scan for larger grids. Final row")
+            println(io, "offsets are fused with CSR row fill. The local candidate")
             println(io, "clipper uses lane-local scratch with a tuned workgroup")
             println(io, "and culls planes that leave the current polygon wholly inside")
             println(io, "or outside. Optional work counters expose dirty-cell, dirty-face,")
@@ -2177,12 +2459,24 @@ function main()
                     run_case("Metal", gpu_be; solver, nsteps)
             end
             diffs = compare_states(cpu_state, gpu_state)
+            if WRITE_FINAL_FIELDS
+                write_final_state_csv(joinpath(OUTDIR, @sprintf("final_state_steps%d_%s_cpu.csv",
+                                                                nsteps, solver)),
+                                      cpu_state)
+                write_final_state_csv(joinpath(OUTDIR, @sprintf("final_state_steps%d_%s_metal.csv",
+                                                                nsteps, solver)),
+                                      gpu_state)
+            end
         else
             gpu_rows = cpu_rows
             gpu_elapsed = cpu_elapsed
             gpu_timing = cpu_timing
             gpu_mesh_timing = cpu_mesh_timing
             gpu_mesh_work = cpu_mesh_work
+            WRITE_FINAL_FIELDS &&
+                write_final_state_csv(joinpath(OUTDIR, @sprintf("final_state_steps%d_%s_cpu.csv",
+                                                                nsteps, solver)),
+                                      cpu_state)
         end
         push!(summaries, (; nsteps, solver, cpu_rows, gpu_rows, diffs,
                           cpu_elapsed, gpu_elapsed, cpu_timing, gpu_timing,

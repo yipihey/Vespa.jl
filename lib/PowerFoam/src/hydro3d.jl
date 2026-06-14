@@ -581,7 +581,8 @@ end
     T = eltype(FD)
     nface = Int(length(FD))
     @inbounds begin
-        if Int(c2[f]) <= 0
+        a = area[f]
+        if Int(c2[f]) <= 0 || a <= zero(T)
             FD[f] = zero(T); FMx[f] = zero(T); FMy[f] = zero(T)
             FMz[f] = zero(T); FE[f] = zero(T)
         else
@@ -604,7 +605,6 @@ end
                                        CR[1], CR[2], CR[3], CR[4], CR[5],
                                        nx[f], ny[f], nz[f], wx[f], wy[f], wz[f],
                                        gamma, solver, small)
-            a = area[f]
             FD[f] = flux[1] * a
             FMx[f] = flux[2] * a
             FMy[f] = flux[3] * a
@@ -1096,7 +1096,7 @@ end
 @kernel function _pack_predict_face_data_3d_k!(
     face_data, @Const(face_center_x), @Const(face_center_y),
     @Const(face_center_z), @Const(face_vx), @Const(face_vy), @Const(face_vz),
-    @Const(normal_x), @Const(normal_y), @Const(normal_z))
+    @Const(normal_x), @Const(normal_y), @Const(normal_z), @Const(face_area))
     f = @index(Global, Linear)
     nf = Int(length(face_center_x))
     @inbounds begin
@@ -1109,6 +1109,7 @@ end
         face_data[6 * nf + f] = normal_x[f]
         face_data[7 * nf + f] = normal_y[f]
         face_data[8 * nf + f] = normal_z[f]
+        face_data[9 * nf + f] = face_area[f]
     end
 end
 
@@ -2065,29 +2066,42 @@ end
     ncell = Int(length(cell_data) ÷ 9)
     nface = Int(length(left) ÷ 5)
     @inbounds begin
-        i = Int(c1[f])
-        j = Int(c2[f])
-        L = _predict_primitive_face_state3(i, f, ncell, nface, cell_data,
-                                           grad_data, face_data, box_size, gamma)
-        left[f] = L[1]
-        left[nface + f] = L[2]
-        left[2 * nface + f] = L[3]
-        left[3 * nface + f] = L[4]
-        left[4 * nface + f] = L[5]
-        if j > 0
-            R = _predict_primitive_face_state3(j, f, ncell, nface, cell_data,
-                                               grad_data, face_data, box_size, gamma)
-            right[f] = R[1]
-            right[nface + f] = R[2]
-            right[2 * nface + f] = R[3]
-            right[3 * nface + f] = R[4]
-            right[4 * nface + f] = R[5]
+        if face_data[9 * nface + f] <= zero(T)
+            left[f] = zero(T)
+            left[nface + f] = zero(T)
+            left[2 * nface + f] = zero(T)
+            left[3 * nface + f] = zero(T)
+            left[4 * nface + f] = zero(T)
+            right[f] = zero(T)
+            right[nface + f] = zero(T)
+            right[2 * nface + f] = zero(T)
+            right[3 * nface + f] = zero(T)
+            right[4 * nface + f] = zero(T)
         else
-            right[f] = L[1]
-            right[nface + f] = L[2]
-            right[2 * nface + f] = L[3]
-            right[3 * nface + f] = L[4]
-            right[4 * nface + f] = L[5]
+            i = Int(c1[f])
+            j = Int(c2[f])
+            L = _predict_primitive_face_state3(i, f, ncell, nface, cell_data,
+                                               grad_data, face_data, box_size, gamma)
+            left[f] = L[1]
+            left[nface + f] = L[2]
+            left[2 * nface + f] = L[3]
+            left[3 * nface + f] = L[4]
+            left[4 * nface + f] = L[5]
+            if j > 0
+                R = _predict_primitive_face_state3(j, f, ncell, nface, cell_data,
+                                                   grad_data, face_data, box_size, gamma)
+                right[f] = R[1]
+                right[nface + f] = R[2]
+                right[2 * nface + f] = R[3]
+                right[3 * nface + f] = R[4]
+                right[4 * nface + f] = R[5]
+            else
+                right[f] = L[1]
+                right[nface + f] = L[2]
+                right[2 * nface + f] = L[3]
+                right[3 * nface + f] = L[4]
+                right[4 * nface + f] = L[5]
+            end
         end
     end
 end
@@ -2121,7 +2135,7 @@ function predict_face_states_3d!(states::FaceStates3D, mesh::ArepoMeshArrays3D,
                                view(face_center, :, 3), Array(mesh.face_vx),
                                Array(mesh.face_vy), Array(mesh.face_vz),
                                Array(mesh.normal_x), Array(mesh.normal_y),
-                               Array(mesh.normal_z)), T)
+                               Array(mesh.normal_z), Array(mesh.face_area)), T)
     _predict_face_states_3d_k!(be)(states.left, states.right, c1, c2,
                                    cell_data, grad_data, face_data,
                                    T(box_size), T(gamma);
@@ -2160,10 +2174,10 @@ function predict_face_states_3d!(states::FaceStates3D, mesh::ArepoMeshArrays3D,
     fcx = _backend_copy(be, collect(view(face_center, :, 1)), T)
     fcy = _backend_copy(be, collect(view(face_center, :, 2)), T)
     fcz = _backend_copy(be, collect(view(face_center, :, 3)), T)
-    face_data = _backend_zeros(be, T, 9 * nf)
+    face_data = _backend_zeros(be, T, 10 * nf)
     _pack_predict_face_data_3d_k!(be)(
         face_data, fcx, fcy, fcz, mesh.face_vx, mesh.face_vy, mesh.face_vz,
-        mesh.normal_x, mesh.normal_y, mesh.normal_z;
+        mesh.normal_x, mesh.normal_y, mesh.normal_z, mesh.face_area;
         ndrange = nf)
     _predict_face_states_3d_k!(be)(states.left, states.right, mesh.c1, mesh.c2,
                                    cell_data, grad_data, face_data,
@@ -2203,11 +2217,11 @@ function predict_face_states_3d!(states::FaceStates3D, mesh::ArepoMeshArrays3D,
         center_x, center_y, center_z, dt;
         ndrange = n)
     grad_data = _pack_hydro_gradients_backend(be, T, gradients)
-    face_data = _backend_zeros(be, T, 9 * nf)
+    face_data = _backend_zeros(be, T, 10 * nf)
     _pack_predict_face_data_3d_k!(be)(
         face_data, face_center_x, face_center_y, face_center_z,
         mesh.face_vx, mesh.face_vy, mesh.face_vz,
-        mesh.normal_x, mesh.normal_y, mesh.normal_z;
+        mesh.normal_x, mesh.normal_y, mesh.normal_z, mesh.face_area;
         ndrange = nf)
     _predict_face_states_3d_k!(be)(states.left, states.right, mesh.c1, mesh.c2,
                                    cell_data, grad_data, face_data,

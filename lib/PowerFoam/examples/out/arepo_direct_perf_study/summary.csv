@@ -1,0 +1,5 @@
+case,code,backend_or_ranks,n,steps_or_sync_intervals,solver,elapsed_s,step_s,relative_to_arepo_serial,notes
+arepo_n12_serial_hll,AREPO,1 MPI rank,12,8,HLL,0.795056,0.099382,1.000,"compile-time HLL; TimeMax=0.0625; includes init/final snapshot/restart"
+arepo_n12_mpi4_hll,AREPO,4 MPI ranks,12,8,HLL,0.346238,0.043280,2.296,"compile-time HLL; TimeMax=0.0625; includes init/final snapshot/restart"
+powerfoam_n12_ka_cpu,PowerFoam KA,CPU Float32,12,8,HLL,0.0930996,0.0116375,8.540,"gpu_compact compact local rebuild; warmed; no AREPO I/O"
+powerfoam_n12_metal,PowerFoam KA,Metal Float32,12,8,HLL,0.0779346,0.00974182,10.202,"gpu_compact compact local rebuild; warmed; no AREPO I/O"

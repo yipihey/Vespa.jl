@@ -6,7 +6,8 @@ using Statistics
 const KA = KernelAbstractions
 
 export PowerSites2D, PolygonMesh2D, FaceTable2D
-export ArepoMeshArrays2D, EulerState2D, FaceFluxWork2D
+export ArepoMeshArrays2D, EulerState2D, PrimitiveState2D, FaceFluxWork2D,
+       HydroGradients2D, FaceStates2D
 export ArepoMeshArrays3D, EulerState3D, PrimitiveState3D, FaceFluxWork3D
 export GradientConnections3D, HydroGradients3D, FaceStates3D
 export power_diagram, from_arepo_polygons, arepo_face_table
@@ -15,9 +16,13 @@ export cell_quality, mesh_quality, reconstruction_condition_numbers
 export face_velocity_alignment, mesh_loss, refine_patch, refine_patch_points,
        relax_points_velocity_alignment, relax_weights
 export arepo_mesh_arrays, to_backend, euler_state_2d, primitive_to_conserved_2d!,
-       conserved_to_primitive_2d, hydro_work_2d, finite_volume_step_2d!,
-       moving_mesh_step_2d!, advect_generators_2d, total_conserved_2d,
-       max_signal_speed_2d
+       conserved_to_primitive_2d, primitive_work_2d, conserved_to_primitive_2d!,
+       primitive_to_arrays_2d, hydro_work_2d, hydro_gradient_work_2d,
+       calculate_gradients_from_mesh_2d!, face_prediction_work_2d,
+       predict_face_states_2d!, finite_volume_step_2d!,
+       finite_volume_reconstructed_step_2d!,
+       moving_mesh_step_2d!, moving_mesh_reconstructed_step_2d!,
+       advect_generators_2d, total_conserved_2d, max_signal_speed_2d
 export cartesian_periodic_mesh_arrays_3d, arepo_voronoi_mesh_arrays_3d,
        bounded_voronoi_mesh_arrays_3d, periodic_voronoi_mesh_arrays_3d,
        local_periodic_voronoi_mesh_arrays_3d,

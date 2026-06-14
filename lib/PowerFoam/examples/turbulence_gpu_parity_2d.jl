@@ -29,7 +29,10 @@ const TFINAL = parse_arg(3, 0.02, Float64)
 const CFL = parse_arg(4, 0.18, Float64)
 const RIEMANN = Symbol(length(ARGS) >= 5 ? ARGS[5] : "hll")
 const BOUNDARY = Symbol(length(ARGS) >= 6 ? ARGS[6] : "clamp")
-const RUN_TAG = @sprintf("N%d_M%.3g_t%.3g_%s_%s", N, MACH, TFINAL, RIEMANN, BOUNDARY)
+const ORDER = Symbol(length(ARGS) >= 7 ? ARGS[7] : "first")
+ORDER in (:first, :reconstruct) || error("ORDER must be first or reconstruct")
+const RUN_TAG = @sprintf("N%d_M%.3g_t%.3g_%s_%s_%s", N, MACH, TFINAL, RIEMANN,
+                         BOUNDARY, ORDER)
 const OUTDIR = joinpath(BASE_OUTDIR, replace(RUN_TAG, "." => "p"))
 
 function maybe_metal_backend()
@@ -109,7 +112,7 @@ function stable_dt(state, geom; cfl)
     return cfl * dx / wavespeed
 end
 
-function run_case(label, be; n, mach, tfinal, cfl, riemann, boundary)
+function run_case(label, be; n, mach, tfinal, cfl, riemann, boundary, order)
     mesh, host_state = make_initial_state(n; mach)
     geom_host = arepo_mesh_arrays(mesh; T = Float64)
     state = to_backend(be, host_state; T = Float32)
@@ -121,9 +124,15 @@ function run_case(label, be; n, mach, tfinal, cfl, riemann, boundary)
         dt = min(stable_dt(state, geom; cfl), tfinal - t)
         prim = conserved_to_primitive_2d(state; gamma = GAMMA)
         vmesh = hcat(prim.vx, prim.vy)
-        moved = moving_mesh_step_2d!(state, mesh; dt, gamma = GAMMA,
-                                     mesh_velocity = vmesh, riemann,
-                                     backend = be, boundary)
+        moved = if order == :reconstruct
+            moving_mesh_reconstructed_step_2d!(state, mesh; dt, gamma = GAMMA,
+                                               mesh_velocity = vmesh, riemann,
+                                               backend = be, boundary)
+        else
+            moving_mesh_step_2d!(state, mesh; dt, gamma = GAMMA,
+                                 mesh_velocity = vmesh, riemann,
+                                 backend = be, boundary)
+        end
         mesh = moved.mesh
         geom = moved.geom
         t += dt
@@ -183,6 +192,7 @@ function write_report(path, cpu_rows, gpu_rows, diffs, arepo_lines, gpu_enabled)
         @printf(io, "- CFL: %.6g\n", CFL)
         @printf(io, "- Riemann solver: %s\n", RIEMANN)
         @printf(io, "- Bounded-mesh boundary mode: %s\n", BOUNDARY)
+        @printf(io, "- Hydro order: %s\n", ORDER)
         println(io)
         println(io, "## Julia rewrite results")
         println(io)
@@ -247,7 +257,8 @@ function main()
     cpu_rows, cpu_state, cpu_geom = run_case("cpu-f32", cpu_be; n = N, mach = MACH,
                                              tfinal = TFINAL, cfl = CFL,
                                              riemann = RIEMANN,
-                                             boundary = BOUNDARY)
+                                             boundary = BOUNDARY,
+                                             order = ORDER)
     gpu_be = maybe_metal_backend()
     gpu_rows = NamedTuple[]
     diffs = (; D = NaN, Mx = NaN, My = NaN, E = NaN)
@@ -255,7 +266,8 @@ function main()
         gpu_rows, gpu_state, gpu_geom = run_case("metal-f32", gpu_be; n = N, mach = MACH,
                                                  tfinal = TFINAL, cfl = CFL,
                                                  riemann = RIEMANN,
-                                                 boundary = BOUNDARY)
+                                                 boundary = BOUNDARY,
+                                                 order = ORDER)
         diffs = compare_states(cpu_state, gpu_state)
         _ = gpu_geom
     end

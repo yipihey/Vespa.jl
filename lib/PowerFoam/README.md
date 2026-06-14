@@ -195,11 +195,14 @@ about 2.21x for HLL and 1.57x for LLF, and the cleaner N24 gate reaches about
 2.13x for HLL and 2.03x for LLF, with exact CPU/Metal final fields.  The local
 candidate face clipper uses lane-local scratch with a default Metal workgroup
 of 16; set `POWERFOAM_FACE_CLIP_WORKGROUP` to tune that occupancy knob.
-`POWERFOAM_PLANE_CULL=true` keeps the same halfspace result but avoids full
-polygon clipping when a plane leaves the current polygon wholly inside or
-wholly outside.  `POWERFOAM_MESH_WORK_STATS=true` records operation counts for
-newly advected compact rebuilds, including dirty cells/faces, planes per face,
-and the inside/empty/clipped plane fractions.  The dirty mask is controlled by
+`POWERFOAM_PLANE_CULL=true` keeps the same halfspace result with a single-pass
+classify-and-clip helper that avoids swapping polygon buffers when a plane
+leaves the current polygon wholly inside or wholly outside.
+`POWERFOAM_MESH_WORK_STATS=true` records operation counts for newly advected
+compact rebuilds, including dirty cells/faces, planes per face, and the
+inside/empty/clipped plane fractions; the stats kernel is separate from the
+normal geometry-refresh kernel so default GPU runs do not write counter arrays.
+The dirty mask is controlled by
 `POWERFOAM_DIRTY_MOTION_THRESHOLD` and is the current scaffold for topology
 coherence and hierarchical active-cell rebuilds.  `POWERFOAM_CANDIDATE_TIER`
 is an experimental lattice-near candidate stencil knob (`full`, `axis_edge`,

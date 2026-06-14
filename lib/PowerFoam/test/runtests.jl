@@ -178,6 +178,89 @@ using KernelAbstractions
         @test all(conserved_to_primitive_2d(state; gamma = 1.4).rho .> 0)
     end
 
+    @testset "2D reconstructed hydro backend work preserves linear data and uniform flow" begin
+        pts = Matrix{Float64}(undef, 9, 2)
+        q = 1
+        for j in 1:3, i in 1:3
+            pts[q, 1] = (i - 0.5) / 3
+            pts[q, 2] = (j - 0.5) / 3
+            q += 1
+        end
+        mesh = power_diagram(PowerSites2D(pts))
+        center = cell_centroids(mesh)
+        face_center = mesh.faces.center
+        geom = arepo_mesh_arrays(mesh; T = Float64)
+
+        rho = @. 1.0 + 0.2 * center[:, 1] - 0.1 * center[:, 2]
+        vx = @. 0.05 + 0.03 * center[:, 1] + 0.02 * center[:, 2]
+        vy = @. -0.04 + 0.01 * center[:, 1] - 0.025 * center[:, 2]
+        pressure = @. 1.0 + 0.15 * center[:, 1] + 0.05 * center[:, 2]
+        state = euler_state_2d(mesh; rho, vx, vy, pressure, gamma = 1.4)
+        be = KernelAbstractions.CPU()
+        bgeom = to_backend(be, geom; T = Float32)
+        bstate = to_backend(be, state; T = Float32)
+        prim = primitive_work_2d(bstate)
+        conserved_to_primitive_2d!(prim, bstate; gamma = 1.4)
+        parr = primitive_to_arrays_2d(prim)
+        @test parr.rho ≈ Float32.(rho)
+        @test parr.vx ≈ Float32.(vx)
+        @test parr.vy ≈ Float32.(vy)
+        @test parr.pressure ≈ Float32.(pressure)
+
+        bcx = PowerFoam._backend_copy(be, collect(center[:, 1]), Float32)
+        bcy = PowerFoam._backend_copy(be, collect(center[:, 2]), Float32)
+        bfcx = PowerFoam._backend_copy(be, collect(face_center[:, 1]), Float32)
+        bfcy = PowerFoam._backend_copy(be, collect(face_center[:, 2]), Float32)
+        gradients = hydro_gradient_work_2d(prim.rho)
+        calculate_gradients_from_mesh_2d!(gradients, bgeom, prim, bcx, bcy, bfcx, bfcy;
+                                          box_size = 0.0, gamma = 1.4)
+        g = hydro_gradients_to_arrays(gradients)
+        mid = 5
+        @test g.drho[mid, :] ≈ Float32[0.2, -0.1] atol=1f-5
+        @test g.dvel[mid, 1, :] ≈ Float32[0.03, 0.02] atol=1f-5
+        @test g.dvel[mid, 2, :] ≈ Float32[0.01, -0.025] atol=1f-5
+        @test g.dpress[mid, :] ≈ Float32[0.15, 0.05] atol=1f-5
+
+        face_states = face_prediction_work_2d(bgeom)
+        zdt = PowerFoam._backend_copy(be, zeros(Float32, length(bstate.D)), Float32)
+        predict_face_states_2d!(face_states, bgeom, gradients, prim, bcx, bcy, bfcx, bfcy;
+                                dt_extrapolation = zdt, box_size = 0.0, gamma = 1.4)
+        fs = face_states_to_arrays(face_states)
+        f = first(findall((mesh.faces.c1 .== mid) .& (mesh.faces.c2 .> 0)))
+        expected_rho = rho[mid] + 0.2 * (face_center[f, 1] - center[mid, 1]) -
+                       0.1 * (face_center[f, 2] - center[mid, 2])
+        expected_vx = vx[mid] + 0.03 * (face_center[f, 1] - center[mid, 1]) +
+                      0.02 * (face_center[f, 2] - center[mid, 2])
+        expected_vy = vy[mid] + 0.01 * (face_center[f, 1] - center[mid, 1]) -
+                      0.025 * (face_center[f, 2] - center[mid, 2])
+        expected_p = pressure[mid] + 0.15 * (face_center[f, 1] - center[mid, 1]) +
+                     0.05 * (face_center[f, 2] - center[mid, 2])
+        @test fs.left.rho[f] ≈ Float32(expected_rho) atol=1f-5
+        @test fs.left.vx[f] ≈ Float32(expected_vx) atol=1f-5
+        @test fs.left.vy[f] ≈ Float32(expected_vy) atol=1f-5
+        @test fs.left.pressure[f] ≈ Float32(expected_p) atol=1f-5
+
+        uniform = euler_state_2d(mesh; rho = 1.0, vx = 0.1, vy = -0.05,
+                                 pressure = 1.0, gamma = 1.4)
+        buniform = to_backend(be, uniform; T = Float32)
+        uprim = primitive_work_2d(buniform)
+        conserved_to_primitive_2d!(uprim, buniform; gamma = 1.4)
+        ugrad = hydro_gradient_work_2d(uprim.rho)
+        calculate_gradients_from_mesh_2d!(ugrad, bgeom, uprim, bcx, bcy, bfcx, bfcy;
+                                          box_size = 0.0, gamma = 1.4)
+        total0 = total_conserved_2d(buniform, bgeom)
+        finite_volume_reconstructed_step_2d!(buniform, bgeom, ugrad, uprim,
+                                             bcx, bcy, bfcx, bfcy;
+                                             dt = 0.001f0, gamma = 1.4,
+                                             riemann = :hll, box_size = 0.0)
+        total1 = total_conserved_2d(buniform, bgeom)
+        @test total1.mass ≈ total0.mass
+        @test total1.mx ≈ total0.mx
+        @test total1.my ≈ total0.my
+        @test total1.energy ≈ total0.energy
+        @test all(conserved_to_primitive_2d(buniform; gamma = 1.4).pressure .> 0)
+    end
+
     @testset "moving mesh ALE step rebuilds geometry and conserves integrals" begin
         pts = [0.25 0.5;
                0.75 0.5]
@@ -197,6 +280,30 @@ using KernelAbstractions
         @test moving_state.Mx ≈ static_state.Mx
         @test moving_state.My ≈ static_state.My
         @test moving_state.E ≈ static_state.E
+
+        recon_static = euler_state_2d(mesh; rho = [1.0, 2.0], vx = 0.0, vy = 0.0,
+                                      pressure = 1.0, gamma = 1.4)
+        recon_moving = euler_state_2d(mesh; rho = [1.0, 2.0], vx = 0.0, vy = 0.0,
+                                      pressure = 1.0, gamma = 1.4)
+        prim = primitive_work_2d(recon_static)
+        conserved_to_primitive_2d!(prim, recon_static; gamma = 1.4)
+        gradients = hydro_gradient_work_2d(prim.rho)
+        calculate_gradients_from_mesh_2d!(gradients, geom, prim,
+                                          cell_centroids(mesh), mesh.faces.center;
+                                          box_size = 0.0, gamma = 1.4)
+        finite_volume_reconstructed_step_2d!(recon_static, geom, gradients, prim,
+                                             cell_centroids(mesh), mesh.faces.center;
+                                             dt = 0.01, gamma = 1.4,
+                                             riemann = :hll, box_size = 0.0)
+        moved_recon0 = moving_mesh_reconstructed_step_2d!(recon_moving, mesh;
+                                                          dt = 0.01, gamma = 1.4,
+                                                          riemann = :hll,
+                                                          mesh_velocity = zero_v)
+        @test moved_recon0.mesh.generators ≈ mesh.generators
+        @test recon_moving.D ≈ recon_static.D
+        @test recon_moving.Mx ≈ recon_static.Mx
+        @test recon_moving.My ≈ recon_static.My
+        @test recon_moving.E ≈ recon_static.E
 
         state = euler_state_2d(mesh; rho = [1.0, 2.0], vx = 0.0, vy = 0.0,
                                pressure = 1.0, gamma = 1.4)
@@ -436,6 +543,21 @@ using KernelAbstractions
         @test pred.right.rho ≈ expected_right
         @test pred.left.vx ≈ zeros(nf)
         @test pred.right.pressure ≈ ones(nf)
+
+        inactive_geom = ArepoMeshArrays3D(geom.c1, geom.c2, geom.cell_face_offsets,
+                                          geom.cell_faces, geom.cell_face_signs,
+                                          geom.volume,
+                                          [i == 1 ? 0.0 : geom.face_area[i] for i in 1:nf],
+                                          geom.normal_x, geom.normal_y, geom.normal_z,
+                                          geom.face_vx, geom.face_vy, geom.face_vz)
+        inactive_states = face_prediction_work_3d(inactive_geom)
+        predict_face_states_3d!(inactive_states, inactive_geom, gradients, rho,
+                                zero_cell, zero_cell, zero_cell, one_cell,
+                                center, face_center; box_size = 1.0, gamma = 1.4)
+        inactive = face_states_to_arrays(inactive_states)
+        @test inactive.left.rho[1] == 0.0
+        @test inactive.right.pressure[1] == 0.0
+        @test inactive.left.rho[2:end] ≈ expected_left[2:end]
     end
 
     @testset "3D primitive backend work matches host recovery" begin
