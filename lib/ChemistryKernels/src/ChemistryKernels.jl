@@ -7,6 +7,10 @@ primordial + deuterium** chemistry/cooling network — the exact model wrapped b
 neutral; H⁻/H₂⁺/D⁺ in algebraic equilibrium; nₑ = n_HII; primordial only, no
 metals, no UV background).
 
+Also implements density-dependent Lyα-mixing recombination (`solve_chem_mixing!`)
+for early-Universe / PMF science, where the Peebles C-factor escape rate uses a
+host-supplied smoothed neutral density instead of the cell-local value.
+
 Design contract (mirrors `PPMKernels`/`PoissonKernels`):
 
   * **One source, two devices.** Every compute kernel is a precision-generic
@@ -103,5 +107,8 @@ include("network_step.jl")
 include("recombination.jl")
 include("subcycle.jl")
 include("solve.jl")
+# Wave 5 — Lyα-mixing recombination for early-Universe / PMF science.
+include("tables.jl")
+include("recombination_clumping.jl")
 
 end # module ChemistryKernels

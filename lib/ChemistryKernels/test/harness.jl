@@ -1,9 +1,13 @@
 # Verification "ladder" for ChemistryKernels — self-contained (the reference is
 # grackle's analytic functions via ChemOracle, not a fixture file).
 #
-#   Layer A  port faithfulness : KA kernel on CPU f64   vs grackle fn (units=1, f64)
-#   Layer B  CPU↔GPU parity     : same kernel, CPU f32   vs Metal f32
-#   Layer C  f32 accuracy floor : Metal f32              vs grackle fn (f64)
+#   Layer A  port faithfulness  : KA kernel on CPU f64  vs grackle fn (units=1, f64)
+#   Layer B  CPU↔Metal parity   : same kernel, CPU f32  vs Metal f32
+#   Layer C  f32 accuracy floor : Metal f32             vs grackle fn (f64)
+#   Layer D  CPU↔CUDA parity    : same kernel, CPU f32  vs CUDA f32
+#   Layer E  f32 accuracy floor : CUDA f32              vs grackle fn (f64)
+#
+# Layers B/C skip when Metal is absent; layers D/E skip when CUDA is absent.
 
 using Test
 
@@ -25,6 +29,7 @@ const RTOL_C = (rtol = 1e-4, atol = 1e-30)    # f32 Metal vs f64 grackle
 const F32_TMAX = 1.0e8
 
 metal_ready() = ChemistryKernels.has_backend(:metal)
+cuda_ready()  = ChemistryKernels.has_backend(:cuda)
 _flat(a) = vec(collect(a))
 
 "Worst relative/absolute deviation between two flat sequences (matched scale)."
@@ -64,6 +69,18 @@ function layerB!(label, run)
     @check(string(label, " [B:cpu≡metal f32]"), gpu, cpu, RTOL_B)
 end
 
+# CUDA parity layers (D: cpu≡cuda f32, E: cuda-f32 vs grackle) — skip when CUDA absent.
+function layerE!(label, run, ref)
+    cuda_ready() || return nothing
+    @check(string(label, " [E:cuda-f32 vs grackle]"), run(:cuda, Float32), ref, RTOL_C)
+end
+
+function layerD!(label, run)
+    cuda_ready() || return nothing
+    cpu = run(:cpu, Float32); gpu = run(:cuda, Float32)
+    @check(string(label, " [D:cpu≡cuda f32]"), gpu, cpu, RTOL_B)
+end
+
 """
     check_scalar_kernel(label, jl_fn, oracle_vals, Ts; f32rtol = RTOL_B.rtol)
 
@@ -79,7 +96,7 @@ f32-vs-f64 trajectory.
 """
 function check_scalar_kernel(label, jl_fn, oracle_vals, Ts; f32rtol = RTOL_B.rtol)
     layerA!(label, jl_fn(:cpu, Float64, Ts), oracle_vals)
-    metal_ready() || return nothing
+    (metal_ready() || cuda_ready()) || return nothing
     # f32 layers: operating range (T ≤ F32_TMAX) AND where the value is
     # non-negligible (≥ 1e-6 of its grid peak). Relative error in the deep tail of
     # a rate (value 1e-17 vs its 1e-9 peak) is f32 noise with zero physical impact.
@@ -88,10 +105,17 @@ function check_scalar_kernel(label, jl_fn, oracle_vals, Ts; f32rtol = RTOL_B.rto
     tol  = (rtol = f32rtol, atol = 1e-30)
     mask = findall(i -> Tv[i] <= F32_TMAX && abs(refv[i]) >= 1e-6 * peak, eachindex(Tv))
     cpuf = _flat(jl_fn(:cpu, Float32, Ts))[mask]
-    gpuf = _flat(jl_fn(:metal, Float32, Ts))[mask]
     ref  = refv[mask]
-    @check(string(label, " [B:cpu≡metal f32, T≤$(F32_TMAX)]"), gpuf, cpuf, tol)
-    @check(string(label, " [C:metal-f32 vs grackle, T≤$(F32_TMAX)]"), gpuf, ref, tol)
+    if metal_ready()
+        gpuf = _flat(jl_fn(:metal, Float32, Ts))[mask]
+        @check(string(label, " [B:cpu≡metal f32, T≤$(F32_TMAX)]"), gpuf, cpuf, tol)
+        @check(string(label, " [C:metal-f32 vs grackle, T≤$(F32_TMAX)]"), gpuf, ref, tol)
+    end
+    if cuda_ready()
+        cudf = _flat(jl_fn(:cuda, Float32, Ts))[mask]
+        @check(string(label, " [D:cpu≡cuda f32, T≤$(F32_TMAX)]"), cudf, cpuf, tol)
+        @check(string(label, " [E:cuda-f32 vs grackle, T≤$(F32_TMAX)]"), cudf, ref, tol)
+    end
 end
 
 # f32 device-parity floor per fit (Layer A still pins correctness at 5e-11):

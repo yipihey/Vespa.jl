@@ -34,52 +34,92 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
 `dt` = the subcycle step. Returns a NamedTuple of the updated species. Pure.
 """
 @inline function network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
-                              yDI, yDII, yHDI, K, dt; deuterium::Bool = false)
+                              yDI, yDII, yHDI, K, dt; deuterium::Bool = false,
+                              yHeII_in = nothing, yHeIII_in = nothing)
     R    = typeof(yHI)
     tiny = R(_NET_TINY)
     two  = R(2); half = R(0.5); four = R(4)
 
-    # helium forced neutral
-    yHeI   = (one(R) - R(fh)) * d
-    yHeII  = tiny
-    yHeIII = tiny
+    # Helium ionisation.  Two modes (both in the mass-equivalent ×4 convention,
+    # yHeX = 4·n(HeX)):
+    #   • Saha (default, yHeII_in===nothing): instantaneous Saha equilibrium with
+    #     the CMB (K.she1 = n_HeII·n_e/n_HeI, K.she2 = n_HeIII·n_e/n_HeII, at T_rad),
+    #     solved semi-implicitly off the OLD n_e.  Exact at z≳3000 and z≲1700; ~3%
+    #     low in the He⁺→He⁰ freeze-out (z≈2000-2500).  Cold CMB ⇒ He neutral ⇒ no
+    #     cost at late times.
+    #   • Evolved (yHeII_in given): the caller (evolve_cell_mixing) has integrated
+    #     He⁺ with the full He I recombination (helium_HeI_rate_AB), capturing the
+    #     freeze-out; we just consume its yHeII/yHeIII here for the electron balance.
+    nHe4 = (one(R) - R(fh)) * d                  # total He in ×4 convention
+    if yHeII_in === nothing
+        nHe_tot = nHe4 / four
+        ne_old  = max(yde, tiny)
+        rHe1    = K.she1 / ne_old
+        rHe2    = K.she2 / ne_old
+        Heden   = one(R) + rHe1 + rHe1 * rHe2
+        yHeII   = four * nHe_tot * rHe1        / Heden
+        yHeIII  = four * nHe_tot * rHe1 * rHe2 / Heden
+    else
+        yHeII   = R(yHeII_in)
+        yHeIII  = R(yHeIII_in)
+    end
+    yHeI = max(nHe4 - yHeII - yHeIII, tiny)      # neutral He (×4)
 
     k1=K.k1; k2=K.k2; k3=K.k3; k4=K.k4; k5=K.k5; k6=K.k6; k7=K.k7; k8=K.k8
     k9=K.k9; k10=K.k10; k11=K.k11; k12=K.k12; k13=K.k13; k14=K.k14; k15=K.k15
     k16=K.k16; k17=K.k17; k18=K.k18; k19=K.k19; k22=K.k22; k57=K.k57; k58=K.k58
-    k27=K.k27; k28=K.k28
+    k27=K.k27; k28=K.k28; k_beta1s=K.k_beta1s
 
-    # ── (C) HI / HII / e⁻ / H2 with molecular terms (OLD state) ──────────────
-    # 1) HI  (solve_rate_cool_g.F:2339-2360)
+    # ── (C) HI / HII / e⁻ / H2 with molecular terms ──────────────────────────
+    # H⁻ and H₂⁺ are fast algebraic-equilibrium intermediaries. We evaluate them
+    # from the OLD state FIRST and substitute the equilibrium H₂⁺ (H2IIeq) into the
+    # HI/HII/e⁻/H2 source terms — INCLUDING the CMB photodissociation return k28
+    # (H₂⁺+γ → HI + HII) that grackle's step_rate_g omits in the HI/HII equations.
+    #
+    # DELIBERATE DEVIATION FROM grackle (solve_rate_cool_g.F): grackle drops the
+    # k28 return and uses the lagged H₂⁺ density because H₂⁺ is trace at z<100, its
+    # validated regime.  During recombination (z≈1000-1200), however, the radiative
+    # association k9 (HI+HII→H₂⁺) reaches ~1.5% of the net recombination rate; the
+    # CMB then photodissociates that H₂⁺ straight back (k28≈330 s⁻¹), so the cycle
+    # is very nearly null for HII.  Without crediting the k28/k10 return, the k9
+    # term leaks HII and biases x_e ~1-1.5% low at z≈1000-1100.  Closing the cycle
+    # (the only net HII sink via H₂⁺ is the dissociative k18·de branch) recovers the
+    # full network to <0.25% of HyRec across z=700-1100.  H₂⁺ being trace at low z,
+    # the change is negligible for grackle's original galaxy-formation regime.
+    HMp    = equilibrium_HM(yHI, yHII, yde, yH2II, k7, k8, k14, k15, k16, k17, k19, k27)
+    H2IIeq = equilibrium_H2II(yHI, yHII, yH2I, yde, HMp,
+                              k9, k10, k11, k17, k18, k19, k28)
+    nH2II  = H2IIeq / two          # n(H₂⁺); H2IIeq carries the 2× mass-equiv convention
+
+    # 1) HI  (+ β₁s CMB photoionisation of H(1s); + k28 H₂⁺ photodissociation return)
     sc = k2*yHII*yde + two*k13*yHI*yH2I/two + k11*yHII*yH2I/two +
          two*k12*yde*yH2I/two + k14*yHM*yde + k15*yHM*yHI +
-         two*k16*yHM*yHII + two*k18*yH2II*yde/two + k19*yH2II*yHM/two
-    ac = k1*yde + k7*yde + k8*yHM + k9*yHII + k10*yH2II/two +
-         two*k22*yHI^2 + k57*yHI + k58*yHeI/four
+         two*k16*yHM*yHII + two*k18*H2IIeq*yde/two + k19*H2IIeq*yHM/two +
+         k28*nH2II
+    ac = k1*yde + k7*yde + k8*yHM + k9*yHII + k10*H2IIeq/two +
+         two*k22*yHI^2 + k57*yHI + k58*yHeI/four + k_beta1s
     HIp = (sc*dt + yHI) / (one(R) + ac*dt)
 
-    # 2) HII  (:2384-2398)
-    sc = k1*yHI*yde + k10*yH2II*yHI/two + k57*yHI*yHI + k58*yHI*yHeI/four
+    # 2) HII  (+ β₁s source; + k28 H₂⁺ photodissociation return)
+    sc = k1*yHI*yde + k10*H2IIeq*yHI/two + k57*yHI*yHI + k58*yHI*yHeI/four +
+         k_beta1s*yHI + k28*nH2II
     ac = k2*yde + k9*yHI + k11*yH2I/two + k16*yHM + k17*yHM
     HIIp = (sc*dt + yHII) / (one(R) + ac*dt)
 
-    # 3) e⁻ provisional  (:2401-2424) — used ONLY for the H2⁺ equilibrium below
-    sc = k8*yHM*yHI + k15*yHM*yHI + k17*yHM*yHII + k57*yHI*yHI + k58*yHI*yHeI/four
+    # 3) e⁻ provisional — used ONLY for downstream consistency
+    sc = k8*yHM*yHI + k15*yHM*yHI + k17*yHM*yHII + k57*yHI*yHI + k58*yHI*yHeI/four +
+         k_beta1s*yHI
     ac = -(k1*yHI - k2*yHII + k3*yHeI/four - k6*yHeIII/four +
-           k5*yHeII/four - k4*yHeII/four + k14*yHM - k7*yHI - k18*yH2II/two)
+           k5*yHeII/four - k4*yHeII/four + k14*yHM - k7*yHI - k18*H2IIeq/two)
     dep = (sc*dt + yde) / (one(R) + ac*dt)
 
-    # 7) H2  (:2427-2445)
-    sc = two*(k8*yHM*yHI + k10*yH2II*yHI/two + k19*yH2II*yHM/two + k22*yHI*yHI^2)
+    # 7) H2  (formation via the H₂⁺ and H⁻ channels uses the equilibrium H₂⁺)
+    sc = two*(k8*yHM*yHI + k10*H2IIeq*yHI/two + k19*H2IIeq*yHM/two + k22*yHI*yHI^2)
     ac = k13*yHI + k11*yHII + k12*yde
     H2Ip = (sc*dt + yH2I) / (one(R) + ac*dt)
 
-    # 8) H⁻ equilibrium (OLD HI,de,H2II,HII)  (:2450-2459)
-    HMp = equilibrium_HM(yHI, yHII, yde, yH2II, k7, k8, k14, k15, k16, k17, k19, k27)
-
-    # 9) H2⁺ equilibrium (NEW provisionals + dep)  (:2465-2475)
-    H2IIp = equilibrium_H2II(HIp, HIIp, H2Ip, dep, HMp,
-                             k9, k10, k11, k17, k18, k19, k28)
+    # 8,9) store the consistent old-state equilibrium H₂⁺ (H⁻ already in HMp above)
+    H2IIp = H2IIeq
 
     # ── (D) deuterium (OLD state)  (:2484-2536) ──────────────────────────────
     if deuterium

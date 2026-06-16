@@ -9,14 +9,15 @@ export solve_chem!
 
 # Per-cell: convert code units → CGS, evolve, convert back. Keeps fields in place.
 @kernel function _evolve_k!(e, HII, H2I, HDI, @Const(rho),
-                            du, vu2, tu, dt, z, hubble, Om, OL, fh, deut)
+                            du, vu2, tu, dt, z, hubble, Om, OL, fh, deut, hexp, aoa)
     i = @index(Global)
     @inbounds begin
         T   = eltype(e)
         hd_in = deut ? HDI[i]*du : zero(T)
         en, hii, h2, hd = evolve_cell(rho[i]*du, e[i]*vu2, HII[i]*du, H2I[i]*du,
                                       hd_in, dt*tu, z; hubble=hubble, Om=Om, OL=OL,
-                                      fh=fh, deuterium=deut)
+                                      fh=fh, deuterium=deut,
+                                      hubble_expansion=hexp, adot_over_a=aoa)
         e[i]   = en  / vu2
         HII[i] = hii / du
         H2I[i] = h2  / du
@@ -43,6 +44,7 @@ function solve_chem!(rho::AbstractVector, e_int::AbstractVector,
                      length_units::Real, time_units::Real,
                      hubble::Real = 71.0, Om::Real = 0.27, OL::Real = 0.73,
                      fh::Real = 0.76, deuterium::Bool = false,
+                     hubble_expansion::Bool = false, adot_over_a::Real = NaN,
                      backend::Symbol = :cpu, precision::Type = Float64)
     n  = length(rho)
     @assert length(e_int) == n && length(HII) == n && length(H2I) == n
@@ -63,7 +65,8 @@ function solve_chem!(rho::AbstractVector, e_int::AbstractVector,
     d_HDI = deut ? to_device(be, collect(HDI), P) : device_zeros(be, P, (n,))
 
     _evolve_k!(be)(d_e, d_HII, d_H2I, d_HDI, d_rho, du, vu2, tu,
-                   P(dt), z, P(hubble), P(Om), P(OL), P(fh), deut; ndrange = n)
+                   P(dt), z, P(hubble), P(Om), P(OL), P(fh), deut,
+                   hubble_expansion, P(adot_over_a); ndrange = n)
 
     e_int .= to_host(d_e)
     HII   .= to_host(d_HII)

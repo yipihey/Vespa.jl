@@ -11,6 +11,12 @@ try
 catch
 end
 
+# CUDA lights up the :cuda backend where available (NVIDIA); harmless elsewhere.
+try
+    @eval using CUDA
+catch
+end
+
 include("oracle.jl");  using .ChemOracle
 include("harness.jl")
 
@@ -28,4 +34,5 @@ include("harness.jl")
     include("test_edot.jl")
     include("test_driver.jl")
     include("test_onezone.jl")
+    include("test_recombination_mixing.jl")
 end

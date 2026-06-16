@@ -27,8 +27,10 @@
 const COMPA = 5.65e-36
 
 # comp2: CMB radiation temperature [K] as a function of redshift z.
-# cool1d_multi_g.F:199:  comp2 = 2.73_DKIND * (1._DKIND + zr)
-@inline comp2_cmb(z::Real) = (R = typeof(z); R(2.73) * (R(1.0) + z))
+# Grackle (cool1d_multi_g.F:199) uses the rounded value 2.73; we use the
+# physically correct T_CMB,0 = 2.725 K (Fixsen 2009, consistent with the
+# radiation density _OR_FAC in recombination.jl and the CAMB reference fixture).
+@inline comp2_cmb(z::Real) = (R = typeof(z); R(2.725) * (R(1.0) + z))
 
 # comp1: Compton coupling coefficient (CGS) as a function of redshift z.
 # cool1d_multi_g.F:198:  comp1 = compa * (1._DKIND + zr)**4

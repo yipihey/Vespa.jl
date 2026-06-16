@@ -27,3 +27,7 @@ const DTOH_SEED = 6.8e-5
 
 # A tiny floor mirroring grackle's `tiny` (1e-20) for species/abundances.
 const TINY = 1e-20
+
+# Lyα mixing recombination constants (recombination_clumping.jl).
+const _LAM_ALPHA_CM = 1.215668e-5   # Lyα wavelength [cm]  (= _REC_LAM × 100)
+const _E_ALPHA_K    = 118348.0      # Lyα photon energy / k_B [K]  (10.1988 eV × 11605)

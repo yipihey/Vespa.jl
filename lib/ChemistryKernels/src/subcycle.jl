@@ -38,11 +38,20 @@ all others are the Wave-1 analytic fits. Pure.
 """
 @inline function build_rates(T, Trad, nHI, Hz; deuterium::Bool = false)
     R = typeof(T)
-    base = (; k1=k1(T), k2=peebles_k2(T, nHI, Hz), k3=k3(T), k4=k4(T), k5=k5(T),
+    k2_val = peebles_k2(T, nHI, Hz)
+    # C-weighted β₁s: matches k2=α_B×C so equilibrium gives true Saha (C cancels).
+    # At high z (xe≈1, nHI≈0): C→1, k_beta1s→β₁s (drives Saha).
+    # At z≈1200 (C≈0.006): k_beta1s negligible vs recombination → freeze-out preserved.
+    k_b1s = beta1s_freq(T) * k2_val / (recfast_alpha(T) * R(1.0e6))
+    # Helium Saha factors at the CMB temperature (cosmological photoionisation
+    # equilibrium; → fully neutral He at low z, costing nothing for late-time gas).
+    she1, she2 = helium_saha_pair(Trad)
+    base = (; k1=k1(T), k2=k2_val, k3=k3(T), k4=k4(T), k5=k5(T),
             k6=k6(T), k7=k7(T), k8=k8(T), k9=k9(T), k10=k10(T), k11=k11(T),
             k12=k12(T), k13=k13(T), k14=k14(T), k15=k15(T), k16=k16(T), k17=k17(T),
             k18=k18(T), k19=k19(T), k22=k22(T), k57=k57(T), k58=k58(T),
-            k27=k27_cmb(Trad), k28=k28_cmb(Trad))
+            k27=k27_cmb(Trad), k28=k28_cmb(Trad), k_beta1s=k_b1s,
+            she1=she1, she2=she2)
     deuterium || return base
     return merge(base, (; k50=k50(T), k51=k51(T), k52=k52(T), k53=k53(T),
                         k54=k54(T), k55=k55(T), k56=k56(T)))
@@ -57,11 +66,12 @@ end
             R(2)*K.k13*yHI*yH2I/R(2) + K.k11*yHII*yH2I/R(2) +
             R(2)*K.k12*yde*yH2I/R(2) + K.k14*yHM*yde + K.k15*yHM*yHI +
             R(2)*K.k16*yHM*yHII + R(2)*K.k18*yH2II*yde/R(2) + K.k19*yH2II*yHM/R(2) -
-            K.k57*yHI*yHI - K.k58*yHI*yHeI/R(4)
+            K.k57*yHI*yHI - K.k58*yHI*yHeI/R(4) - K.k_beta1s*yHI
     dedot = K.k1*yHI*yde + K.k3*yHeI*yde/R(4) + K.k5*yHeII*yde/R(4) +
             K.k8*yHM*yHI + K.k15*yHM*yHI + K.k17*yHM*yHII + K.k14*yHM*yde -
             K.k2*yHII*yde - K.k4*yHeII*yde/R(4) - K.k6*yHeIII*yde/R(4) -
-            K.k7*yHI*yde - K.k18*yH2II*yde/R(2) + K.k57*yHI*yHI + K.k58*yHI*yHeI/R(4)
+            K.k7*yHI*yde - K.k18*yH2II*yde/R(2) + K.k57*yHI*yHI + K.k58*yHI*yHeI/R(4) +
+            K.k_beta1s*yHI
     return dedot, HIdot
 end
 
@@ -74,13 +84,26 @@ densities [g/cm³] (ρ·x).  Returns the updated `(e, HII_m, H2I_m, HDI_m)`. Pur
 """
 @inline function evolve_cell(rho, e, HII_m, H2I_m, HDI_m, dt, z;
                              hubble = 71.0, Om = 0.27, OL = 0.73,
-                             fh = FH_DEFAULT, deuterium::Bool = false)
+                             fh = FH_DEFAULT, deuterium::Bool = false,
+                             hubble_expansion::Bool = false,
+                             adot_over_a = NaN)
     R    = typeof(e)
     mh   = R(MH); tiny = R(_SUB_TINY)
     d    = rho / mh                       # network density (∝ n)
-    Hz   = hubble_z_of(R(z); hubble = hubble, Om = Om, OL = OL)
-    Tc   = comp2_cmb(R(z))                # CMB temperature
-    c1   = comp1_cmb(R(z))                # Compton coefficient
+    z0   = R(z)                           # redshift at step BEGIN
+    Hz0  = hubble_z_of(z0; hubble = hubble, Om = Om, OL = OL)
+    # ȧ/a [1/s] for the ADIABATIC term: analytic by default, OR a caller-supplied value
+    # (Enzo's own CosmologyComputeExpansionFactor at the step endpoints, ln(a1/a0)/Δt)
+    # so the adiabatic integral matches the host's expansion EXACTLY.  (a1≈a0 on sub-
+    # resolution steps → 0, i.e. no expansion: fine.)
+    Hz_ad = isnan(adot_over_a) ? Hz0 : R(adot_over_a)
+    # When the host supplies its expansion rate (cosmological one-zone use), evolve the
+    # redshift ACROSS the macro-step inside the sub-cycle: z(t)=(1+z0)exp(-ȧ/a·t)−1.
+    # The CMB Compton target T_cmb(z), the Compton coefficient, and the recombination
+    # H(z) then track z continuously instead of being frozen at z0 — essential for the
+    # host's large (CIC_MAXEXP) steps, accurate in both the Compton-locked (high-z) and
+    # decoupled (low-z) limits.  When no rate is supplied (default), z is held at z0.
+    evolve_z = !isnan(adot_over_a)
     yHeI = (one(R) - R(fh)) * d
 
     # advected species → y-convention number densities; nₑ = n_HII initially
@@ -99,6 +122,13 @@ densities [g/cm³] (ρ·x).  Returns the updated `(e, HII_m, H2I_m, HDI_m)`. Pur
         iter += 1
         rem = dt - ttot
 
+        # redshift at the current point in the sub-cycle (frozen at z0 unless the host
+        # handed us its expansion rate, in which case z evolves across the macro-step).
+        zt   = evolve_z ? (one(R) + z0) * exp(-Hz_ad * ttot) - one(R) : z0
+        Tc   = comp2_cmb(zt)              # CMB temperature at zt
+        c1   = comp1_cmb(zt)             # Compton coefficient at zt
+        Hz   = evolve_z ? hubble_z_of(zt; hubble = hubble, Om = Om, OL = OL) : Hz0
+
         # temperature from the current state (number densities; nH2=yH2I/2 etc.)
         T = gas_temperature(rho, e, yHI, yHII, yHeI/R(4), tiny, tiny, yde,
                             yHM, yH2I/R(2), yH2II/R(2); gamma = GAMMA_DEFAULT)
@@ -108,9 +138,14 @@ densities [g/cm³] (ρ·x).  Returns the updated `(e, HII_m, H2I_m, HDI_m)`. Pur
         # cooling rate (volumetric, signed) + temstart shutoff (no cooling at
         # the temperature floor — set to exactly 0, not a spurious-sign tiny).
         nHD  = yHDI / R(3)
-        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, R(z))
+        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, zt)
         if T <= R(1.01)*R(MIN_TEMPERATURE) && edot < zero(R)
             edot = zero(R)
+        end
+        # adiabatic Hubble cooling: de/dt = -2H·e (γ=5/3); volumetric = ×ρ.
+        # Only active when the host hands adiabatic cooling to the kernel.
+        if hubble_expansion
+            edot -= R(2) * Hz_ad * e * rho
         end
 
         # chemistry 10% sub-step (no constraint when a rate is ~0)
