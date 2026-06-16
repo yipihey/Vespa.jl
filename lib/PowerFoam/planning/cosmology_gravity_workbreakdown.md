@@ -18,6 +18,36 @@ The near-term goal is not full hydro+cosmology parity.  It is a gravity-first,
 cosmology-capable MVP that can run the same class of early AREPO problems with
 clear acceptance gates and without baking in a future dead-end.
 
+## Current PowerFoam Integration Status
+
+As of the latest 2026-06-15 execution pass, the gravity/cosmology lane has
+three package-level footholds:
+
+- direct tiny-`N` gravity is no longer only an oracle helper.  The runtime
+  scaffold can route an `ArepoProblemSpec` with metadata-provided particles to
+  a typed `ArepoDirectGravityResult`, including an opt-in one-step kick-drift
+  update;
+- root periodic PM gravity is exposed as reusable
+  `ArepoPMGravityWorkspace` / `ArepoPMGravityResult` APIs around the
+  deposit -> solve -> ghost-fill -> interpolate chain, and
+  `arepo_run_scaffold` can now execute that branch for explicit
+  `metadata.gravity_solver=:periodic_pm_root` requests; the PM preflight
+  remains the artifact-producing diagnostic wrapper;
+- core cosmology parameters normalize into `ArepoCosmologyRuntime`, so
+  `ComovingIntegrationOn`, `PeriodicBoundariesOn`, `BoxSize`, `Omega0`,
+  `OmegaBaryon`, `OmegaLambda`, and `HubbleParam` are visible to runtime
+  feature detection before any force integration starts.
+- `arepo_cosmology_step_metadata` now exposes a small public flat-Lambda coefficient
+  surface for future PM KDK bookkeeping without touching the PM runtime path.
+
+The current verified fast gate is still component-level, not full cosmology:
+`lib/PowerFoam/test/runtests.jl` passes with `745` passing checks, `1` broken
+optional PM check, and the snapshot IO preflight at `30/30`.  The gravity lane
+in `examples/arepo_rewrite_gate_matrix.jl` is now `4/4` runnable with fresh
+observed passes for direct gravity, PM gravity, and the gravity solver
+registry.  The cosmology lane remains planned until the synchronized PM KDK
+loop, IC ingest, and AREPO comparison gates land.
+
 ## Acceptance Policy
 
 - Certify gravity components before claiming end-to-end cosmology agreement.
@@ -189,6 +219,9 @@ Minimum design rule:
 - every gravity update path must state which quantity lives in comoving units,
   which in peculiar units, and where factors of `a`, `1/a`, `a^2`, or `adot/a`
   enter.
+- the IO/runtime layer should expose a typed cosmology summary for
+  `ComovingIntegrationOn`, `Omega0`, `OmegaBaryon`, `OmegaLambda`, and
+  `HubbleParam` before any particle-force work starts.
 
 Concrete repo guidance:
 

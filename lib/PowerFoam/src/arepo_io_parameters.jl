@@ -34,6 +34,23 @@ struct ArepoParameterValidation
 end
 
 """
+    ArepoCosmologyRuntime
+
+Typed summary of the core AREPO cosmology/runtime fields already present in the
+parameter surface.
+"""
+struct ArepoCosmologyRuntime
+    enabled::Bool
+    comoving_integration_on::Union{Bool,Nothing}
+    periodic_boundaries_on::Union{Bool,Nothing}
+    box_size::Union{Float64,Nothing}
+    omega0::Union{Float64,Nothing}
+    omega_baryon::Union{Float64,Nothing}
+    omega_lambda::Union{Float64,Nothing}
+    hubble_param::Union{Float64,Nothing}
+end
+
+"""
     read_arepo_param_file(path)
 
 Read `param.txt`-style text and forward to `parse_arepo_param_text`.
@@ -127,12 +144,9 @@ function normalize_arepo_parameters(raw, config_flags::ArepoConfigFlags = ArepoC
     domain = (
         box_size = _get_float(raw_dict, :BoxSize),
         periodic_boundaries_on = _get_bool(raw_dict, :PeriodicBoundariesOn),
-        comoving_integration_on = _get_bool(raw_dict, :ComovingIntegrationOn),
-        omega0 = _get_float(raw_dict, :Omega0),
-        omega_baryon = _get_float(raw_dict, :OmegaBaryon),
-        omega_lambda = _get_float(raw_dict, :OmegaLambda),
-        hubble_param = _get_float(raw_dict, :HubbleParam),
     )
+
+    cosmology = _normalize_arepo_cosmology(raw_dict)
 
     hydro = (
         courant_fac = _get_float(raw_dict, :CourantFac),
@@ -227,6 +241,7 @@ function normalize_arepo_parameters(raw, config_flags::ArepoConfigFlags = ArepoC
         io = io,
         time = time,
         domain = domain,
+        cosmology = cosmology,
         hydro = hydro,
         mesh = mesh,
         gravity = gravity,
@@ -234,6 +249,20 @@ function normalize_arepo_parameters(raw, config_flags::ArepoConfigFlags = ArepoC
         extras = _named_tuple(extra_entries),
     )
     return ArepoParameterSet(raw_nt, normalized, config_flags)
+end
+
+function _normalize_arepo_cosmology(raw_dict::Dict{Symbol,String})
+    comoving_integration_on = _get_bool(raw_dict, :ComovingIntegrationOn)
+    return ArepoCosmologyRuntime(
+        comoving_integration_on === true,
+        comoving_integration_on,
+        _get_bool(raw_dict, :PeriodicBoundariesOn),
+        _get_float(raw_dict, :BoxSize),
+        _get_float(raw_dict, :Omega0),
+        _get_float(raw_dict, :OmegaBaryon),
+        _get_float(raw_dict, :OmegaLambda),
+        _get_float(raw_dict, :HubbleParam),
+    )
 end
 
 """
@@ -248,6 +277,7 @@ function validate_arepo_parameters(params::ArepoParameterSet)
     io = params.normalized.io
     time = params.normalized.time
     domain = params.normalized.domain
+    cosmology = params.normalized.cosmology
     hydro = params.normalized.hydro
     mesh = params.normalized.mesh
     gravity = params.normalized.gravity
@@ -279,6 +309,20 @@ function validate_arepo_parameters(params::ArepoParameterSet)
         _require(domain.box_size > 0, errors, "BoxSize must be positive")
     end
 
+    if cosmology.comoving_integration_on === true
+        _require(cosmology.omega0 !== nothing, errors,
+                 "Omega0 is required when ComovingIntegrationOn=1")
+        _require(cosmology.omega_lambda !== nothing, errors,
+                 "OmegaLambda is required when ComovingIntegrationOn=1")
+        _require(cosmology.hubble_param !== nothing, errors,
+                 "HubbleParam is required when ComovingIntegrationOn=1")
+    end
+
+    if cosmology.omega0 !== nothing && cosmology.omega_lambda !== nothing &&
+       cosmology.omega0 + cosmology.omega_lambda < 0
+        push!(warnings, "Omega0 + OmegaLambda is negative; check cosmology inputs")
+    end
+
     if hydro.courant_fac !== nothing
         _require(hydro.courant_fac > 0, errors, "CourantFac must be positive")
     end
@@ -293,15 +337,6 @@ function validate_arepo_parameters(params::ArepoParameterSet)
                  "OutputListFilename is required when OutputListOn=1")
     elseif io.output_list_on === false && io.output_list_filename !== nothing
         push!(warnings, "OutputListFilename is set while OutputListOn is disabled")
-    end
-
-    if domain.comoving_integration_on === true
-        _require(domain.omega0 !== nothing, errors,
-                 "Omega0 is required when ComovingIntegrationOn=1")
-        _require(domain.omega_lambda !== nothing, errors,
-                 "OmegaLambda is required when ComovingIntegrationOn=1")
-        _require(domain.hubble_param !== nothing, errors,
-                 "HubbleParam is required when ComovingIntegrationOn=1")
     end
 
     if mesh.des_num_ngb !== nothing

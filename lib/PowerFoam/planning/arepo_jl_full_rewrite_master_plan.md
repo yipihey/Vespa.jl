@@ -82,7 +82,11 @@ Arepo.jl
 - Delaunay degeneracy and AREPO tie-breaking for exact lattices are unresolved.
 - Candidate compaction, predicate kernels, edge-ring face extraction, compact
   face table, and CSR rebuild are still incomplete on device.
-- Gravity/cosmology rewrite is not integrated as an AREPO-equivalent runtime.
+- Gravity/cosmology rewrite is only partially integrated: tiny-N direct gravity
+  can now route through the runtime scaffold, PM has a reusable root-mesh
+  workspace/result surface, and core cosmology parameters normalize to a typed
+  runtime summary.  Cosmological KDK, TreePM, hydro self-gravity, and
+  production AREPO-equivalent cosmology runs remain open.
 - Snapshot/IC/parameter compatibility is incomplete.
 - MPI/domain decomposition is not rewritten; single-node shared-memory/GPU is
   the first target.
@@ -458,6 +462,24 @@ Integrated since the first master-plan pass:
   image oracle with zero net-force projection, and the repo-local
   `PoissonKernels` PM deposit/FFT/ghost/interp chain run through the
   PowerFoam project via a path source dependency.
+- Direct gravity has a bounded runtime path: an `ArepoProblemSpec` with
+  `physics.gravity=true`, positive `particle_count`, and
+  `metadata.particles` now dispatches through `arepo_run_scaffold` into a typed
+  `ArepoDirectGravityResult`, with optional one-step kick-drift advancement.
+- PM gravity now exposes `ArepoPMGravityWorkspace`,
+  `ArepoPMGravityResult`, `arepo_pm_gravity_workspace`, `arepo_pm_gravity!`,
+  `arepo_pm_gravity`, and `arepo_pm_gravity_result_rows`, so the
+  deposit -> solve -> ghost-fill -> interpolate chain is reusable outside the
+  preflight report.
+- `arepo_run_scaffold` can now route an explicit
+  `metadata.gravity_solver=:periodic_pm_root` request to that PM workspace and
+  return `status=:gravity_pm` with an `ArepoPMGravityResult`.  This branch is
+  acceleration-only today; cosmological kick-drift-kick remains the next
+  integration target.
+- Core cosmology parameter fields now normalize into
+  `ArepoCosmologyRuntime` and feed `arepo_runtime_features`; the typed summary
+  covers `ComovingIntegrationOn`, `PeriodicBoundariesOn`, `BoxSize`, `Omega0`,
+  `OmegaBaryon`, `OmegaLambda`, and `HubbleParam`.
 - Noh2D now has a package-level executable bounded PowerFoam standard-problem
   rung at `N=24`, `t_final=0.2`, `HLL`, with conservation and radial-bin
   diagnostics.  It is labeled `calibration-PENDING`, not physics parity.
@@ -484,18 +506,24 @@ Integrated since the first master-plan pass:
 
 Latest fast evidence from this pass:
 
-- `lib/PowerFoam/test/runtests.jl`: `692` passing, `1` broken optional PM
-  backend check, `693` total, plus snapshot IO `30/30`, including
+- `lib/PowerFoam/test/runtests.jl`: `745` passing, `1` broken optional PM
+  backend check, `746` total, plus snapshot IO `30/30`, including
   source-owned CSR padding, reciprocal compact-face pairing, compact
   owner-only hydro CSR, HDF5 snapshot IO, numeric PM chain preflight,
   PM self-force control, runtime-executed Noh2D, runtime-executed sound-wave
   2D, runtime-executed Gresho 2D, split/direct snapshot preflight,
   snapshot-to-hydro payload conversion, compact canonical face CSR scan
-  scaffolding, and sound-wave/Gresho helper tests.
+  scaffolding, sound-wave/Gresho helper tests, typed cosmology normalization,
+  direct-gravity runtime dispatch, PM runtime dispatch, reusable PM
+  workspace/result parity against the existing preflight rows, and
+  flat-Lambda cosmology coefficient helpers for future PM KDK bookkeeping.
 - `examples/arepo_runtime_hydro_smoke.jl`: prebuilt 3-D uniform hydro smoke
   reports zero conserved and primitive drift.
 - `examples/arepo_gravity_direct_smoke.jl`: two-body and three-body direct
   gravity checks pass with zero acceleration error and zero momentum residual.
+  It also now exercises runtime dispatch with a two-body
+  `ArepoProblemSpec`, returning `status=gravity_advanced`, `dt=0.125`,
+  `max_abs_accel=3.0`, and expected post-kick positions.
 - `examples/arepo_noh2d_proxy_gate.jl`: proxy readiness passes with required
   sources and archived/generated artifacts present.
 - `examples/tessellator_backend_parity_probe.jl`: CPU probe passes with
@@ -518,6 +546,11 @@ Latest fast evidence from this pass:
   `0.0`, PM net force is roundoff-scale, the finite direct oracle reports
   roundoff net force after projection, PM-vs-direct-oracle diagnostic rows are
   emitted, and the one-particle PM self-force control is roundoff-scale.
+- `examples/arepo_gravity_solver_registry_smoke.jl`: gravity registry smoke
+  writes a five-row readiness table.  On this laptop, `direct_tiny_n` is
+  `component_ready`, `periodic_pm_root` is `runtime_ready` when probing
+  `PoissonKernels`, while `tree_short_range`, `cosmological_pm`, and
+  `hydro_self_gravity` remain planned.
 - `examples/arepo_noh2d_gate.jl`: executable bounded Noh2D rung passes with
   `calibration-PENDING`, mass drift `1.97e-16`, energy drift `9.87e-16`,
   `rho_max=2.54`, and shock-radius proxy `0.25`.
@@ -534,9 +567,10 @@ Latest fast evidence from this pass:
   executes the sound-wave 2D standard-problem dispatch and reports
   `calibration_pending` with final time `0.01`.
 - `examples/arepo_rewrite_gate_matrix.jl --summary-only --observed-pass ...`:
-  40 total gates, 35 runnable by file existence, 5 observed artifact-backed
-  passes in the latest targeted run, 30 runnable-without-observed-pass rows,
-  and 5 planned rows.
+  41 total gates, 36 runnable by file existence, 3 fresh observed
+  artifact-backed gravity passes in the latest targeted gravity run,
+  33 runnable-without-observed-pass rows, and 5 planned rows.  The gravity lane
+  is now 4/4 runnable with 3 observed passes; cosmology remains 0/3 runnable.
 - `examples/arepo_hydro_problem_registry_smoke.jl`: KH2D, Noh3D, and
   turbulence rows have local runnable drivers; Noh2D and sound-wave 2D now
   have executable PowerFoam rungs; Gresho now has an executable calibration gate but still lacks an original-AREPO profile comparison.
@@ -557,9 +591,11 @@ Latest fast evidence from this pass:
    path through a thin orchestrator.
    - Done for prebuilt static 3-D uniform hydro smoke; next is moving-mesh
      geometry adapter hookup.
-3. Certify the finite PM gravity direct oracle against a production periodic
-   zero-mode convention; the PM FFT chain and a zero-net-force finite image
-   oracle are now loadable and executable from PowerFoam.
+3. Promote the gravity runtime from component slices to a real cosmology MVP:
+   keep tiny-N direct gravity as the oracle, wire the reusable PM
+   workspace/result into a synchronized cosmological KDK loop, and certify the
+   finite PM gravity direct oracle against a production periodic zero-mode
+   convention.
 4. Calibrate the executable Noh2D, sound-wave 2D, and Gresho 2D rungs against
    original AREPO and analytic thresholds, then promote from
    `calibration-PENDING` to physics gates.

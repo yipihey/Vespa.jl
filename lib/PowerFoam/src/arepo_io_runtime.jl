@@ -20,6 +20,20 @@ struct ArepoRuntimeFeatureSet
 end
 
 """
+    arepo_cosmology_runtime(params)
+
+Return a typed summary of the AREPO cosmology fields carried through
+normalization.
+"""
+function arepo_cosmology_runtime(params::ArepoParameterSet)
+    return params.normalized.cosmology
+end
+
+function arepo_cosmology_runtime(normalized::NamedTuple)
+    return _runtime_cosmology_group(normalized)
+end
+
+"""
     arepo_runtime_features(params)
 
 Return a typed feature summary for an `ArepoParameterSet`, normalized parameter
@@ -32,14 +46,14 @@ end
 function arepo_runtime_features(normalized::NamedTuple,
                                 config_flags::ArepoConfigFlags = ArepoConfigFlags())
     features = _runtime_feature_group(normalized, config_flags)
-    domain = _runtime_namedtuple_group(normalized, :domain)
+    cosmology = _runtime_cosmology_group(normalized)
     gravity = _runtime_namedtuple_group(normalized, :gravity)
     dimensionality = _runtime_feature_bool(features, :twodims) ? 2 : 3
     config_hdf5 = _runtime_feature_bool(features, :have_hdf5)
     package_hdf5 = arepo_snapshot_hdf5_available()
     gravity_on = (:SELFGRAVITY in config_flags.enabled) ||
                  any(value !== nothing for value in values(pairs(gravity)))
-    cosmology_on = _runtime_group_value(domain, :comoving_integration_on, false) === true
+    cosmology_on = cosmology.enabled
     riemann = _runtime_feature_bool(features, :riemann_hll) ? :hll : :default
     return ArepoRuntimeFeatureSet(
         dimensionality,
@@ -66,7 +80,9 @@ function arepo_runtime_features(config_flags::ArepoConfigFlags)
                       local_ppm = :LOCAL_PPM in config_flags.enabled,
                       riemann_hll = :RIEMANN_HLL in config_flags.enabled,
                   ),
-                  domain = (comoving_integration_on = false,),
+                  domain = (box_size = nothing, periodic_boundaries_on = false),
+                  cosmology = ArepoCosmologyRuntime(false, false, false, nothing, nothing,
+                                                   nothing, nothing, nothing),
                   gravity = (;))
     return arepo_runtime_features(normalized, config_flags)
 end
@@ -88,6 +104,24 @@ end
 
 function _runtime_namedtuple_group(normalized::NamedTuple, name::Symbol)
     return name in keys(normalized) ? getfield(normalized, name) : (;)
+end
+
+function _runtime_cosmology_group(normalized::NamedTuple)
+    if :cosmology in keys(normalized)
+        return getfield(normalized, :cosmology)
+    end
+    domain = _runtime_namedtuple_group(normalized, :domain)
+    comoving_integration_on = _runtime_group_value(domain, :comoving_integration_on, false)
+    return ArepoCosmologyRuntime(
+        comoving_integration_on === true,
+        comoving_integration_on,
+        _runtime_group_value(domain, :periodic_boundaries_on, nothing),
+        _runtime_group_value(domain, :box_size, nothing),
+        _runtime_group_value(domain, :omega0, nothing),
+        _runtime_group_value(domain, :omega_baryon, nothing),
+        _runtime_group_value(domain, :omega_lambda, nothing),
+        _runtime_group_value(domain, :hubble_param, nothing),
+    )
 end
 
 function _runtime_feature_bool(features::NamedTuple, name::Symbol)

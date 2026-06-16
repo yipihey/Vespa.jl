@@ -237,6 +237,88 @@ end
                                                                periodic = true)
         @test_throws ErrorException arepo_direct_gravity_potential_energy(x, y, z, m;
                                                                           softening = -1.0)
+
+        step = arepo_direct_gravity_kick_drift_step([0.0, 1.0],
+                                                    [0.0, 0.0],
+                                                    [0.0, 0.0],
+                                                    [2.0, 3.0],
+                                                    [0.0, 0.0],
+                                                    [0.0, 0.0],
+                                                    [0.0, 0.0];
+                                                    dt = 0.1)
+        @test step.ax ≈ [3.0, -2.0]
+        @test step.vx ≈ [0.3, -0.2]
+        @test step.x ≈ [0.03, 0.98]
+        @test step.potential_energy ≈ -6.0
+        @test step.momentum_residual.x ≈ 0.0
+
+        runtime_spec = arepo_problem_spec(:direct_gravity_runtime; particle_count = 2,
+                                          physics = (hydro = false,
+                                                     tessellation = false,
+                                                     gravity = true),
+                                          metadata = (particles = (x = [0.0, 1.0],
+                                                                   y = [0.0, 0.0],
+                                                                   z = [0.0, 0.0],
+                                                                   m = [2.0, 3.0],
+                                                                   vx = [0.0, 0.0],
+                                                                   vy = [0.0, 0.0],
+                                                                   vz = [0.0, 0.0]),
+                                                      softening = 0.0,
+                                                      G = 1.0,
+                                                      dt = 0.1,
+                                                      advance_gravity = true))
+        runtime_state = arepo_run_scaffold(runtime_spec)
+        @test runtime_state.status == :gravity_advanced
+        @test runtime_state.payload.gravity isa ArepoDirectGravityResult
+        @test runtime_state.payload.gravity.accelerations.ax ≈ [3.0, -2.0]
+        @test runtime_state.payload.gravity.after.vx ≈ [0.3, -0.2]
+        @test runtime_state.payload.gravity.after.x ≈ [0.03, 0.98]
+        @test runtime_state.payload.gravity.potential_energy ≈ -6.0
+        @test runtime_state.payload.direct_gravity_particles isa ArepoDirectGravityParticleState
+
+        pm_fixture = arepo_pm_gravity_fixture()
+        pm_runtime_spec = arepo_problem_spec(:pm_gravity_runtime;
+                                             particle_count = length(pm_fixture.x),
+                                             physics = (hydro = false,
+                                                        tessellation = false,
+                                                        gravity = true),
+                                             metadata = (gravity_solver = :periodic_pm_root,
+                                                         particles = (x = pm_fixture.x,
+                                                                      y = pm_fixture.y,
+                                                                      z = pm_fixture.z,
+                                                                      m = pm_fixture.m,
+                                                                      vx = pm_fixture.vx,
+                                                                      vy = pm_fixture.vy,
+                                                                      vz = pm_fixture.vz),
+                                                         Npm = pm_fixture.Npm,
+                                                         ng = pm_fixture.ng,
+                                                         boxsize = pm_fixture.boxsize,
+                                                         greens = :spectral))
+        pm_runtime_state = arepo_run_scaffold(pm_runtime_spec)
+        if PowerFoam.probe_poissonkernels_monorepo().pm_module === nothing
+            @test pm_runtime_state.status == :unsupported
+            @test :pm_gravity_dependency in pm_runtime_state.unsupported
+        else
+            @test pm_runtime_state.status == :gravity_pm
+            @test pm_runtime_state.payload.gravity isa ArepoPMGravityResult
+            @test pm_runtime_state.payload.pm_gravity.mass_sum ≈ sum(pm_fixture.m)
+            @test pm_runtime_state.payload.pm_gravity.rhs_sum ≈ 0.0
+            @test length(pm_runtime_state.payload.pm_gravity.ax) == length(pm_fixture.x)
+        end
+
+        registry = arepo_gravity_solver_registry()
+        @test length(registry) >= 4
+        direct_row = arepo_gravity_solver_status(:direct_tiny_n)
+        @test direct_row isa ArepoGravitySolverSpec
+        @test direct_row.family == :direct
+        @test direct_row.status == :component_ready
+        @test !direct_row.periodic
+        pm_row = arepo_gravity_solver_status(:periodic_pm_root)
+        @test pm_row.family == :pm
+        @test pm_row.periodic
+        @test pm_row.status == :component_ready
+        @test arepo_gravity_solver_status(:tree_short_range).status == :planned
+        @test arepo_gravity_solver_status(:cosmological_pm).cosmological
     end
 
     @testset "AREPO parameter/config parser normalizes runtime fields" begin
@@ -304,6 +386,69 @@ end
         @test runtime_features.hydro
         @test !runtime_features.cosmology
         @test runtime_features.riemann == :hll
+
+        cosmo_param_text = """
+        InitCondFile ics.hdf5
+        ICFormat 3
+        OutputDir output
+        SnapshotFileBase snap
+        SnapFormat 3
+        NumFilesPerSnapshot 1
+        TimeBegin 0.0
+        TimeMax 0.2
+        CourantFac 0.4
+        BoxSize 1.0
+        PeriodicBoundariesOn 1
+        ComovingIntegrationOn 1
+        Omega0 0.31
+        OmegaBaryon 0.048
+        OmegaLambda 0.69
+        HubbleParam 0.67
+        OutputListOn 0
+        """
+        cosmo_params = normalize_arepo_parameters(parse_arepo_param_text(cosmo_param_text))
+        cosmo_validation = validate_arepo_parameters(cosmo_params)
+        @test cosmo_validation.valid
+        @test isempty(cosmo_validation.errors)
+        @test cosmo_params.normalized.cosmology.enabled
+        @test cosmo_params.normalized.cosmology.comoving_integration_on === true
+        @test cosmo_params.normalized.cosmology.omega0 == 0.31
+        @test cosmo_params.normalized.cosmology.omega_baryon == 0.048
+        @test cosmo_params.normalized.cosmology.omega_lambda == 0.69
+        @test cosmo_params.normalized.cosmology.hubble_param == 0.67
+        @test PowerFoam.arepo_cosmology_runtime(cosmo_params).enabled
+        @test PowerFoam.arepo_cosmology_runtime(cosmo_params).omega0 == 0.31
+        cosmo_runtime_features = arepo_runtime_features(cosmo_params)
+        @test cosmo_runtime_features.cosmology
+        @test cosmo_runtime_features.parameter_io
+        @test cosmo_runtime_features.cosmology == cosmo_params.normalized.cosmology.enabled
+
+        cosmo_step = arepo_cosmology_step_metadata(cosmo_params; a = 0.5)
+        @test cosmo_step isa ArepoCosmologyStepMetadata
+        @test cosmo_step.runtime === cosmo_params.normalized.cosmology
+        @test cosmo_step.scale_factor == 0.5
+        @test cosmo_step.expansion_factor ≈ sqrt(0.31 / 0.5^3 + 0.69)
+        @test cosmo_step.hubble_a ≈ 0.67 * cosmo_step.expansion_factor
+        @test arepo_cosmology_expansion_factor(cosmo_params; a = 0.5) ≈
+              cosmo_step.expansion_factor
+        @test arepo_cosmology_adot_over_a(cosmo_params; a = 0.5) ≈ cosmo_step.hubble_a
+
+        off_cosmo = ArepoCosmologyRuntime(false, false, true, 1.0, nothing, nothing,
+                                          nothing, nothing)
+        off_step = arepo_cosmology_step_metadata(off_cosmo; a = 1.0)
+        @test !off_step.runtime.enabled
+        @test off_step.expansion_factor == 1.0
+        @test off_step.hubble_a == 0.0
+
+        @test_throws ErrorException arepo_cosmology_step_metadata(
+            ArepoCosmologyRuntime(true, true, true, 1.0, nothing, 0.0, 0.69, 0.67);
+            a = 0.5)
+        @test_throws ErrorException arepo_cosmology_step_metadata(
+            ArepoCosmologyRuntime(true, true, true, 1.0, 0.31, 0.0, nothing, 0.67);
+            a = 0.5)
+        @test_throws ErrorException arepo_cosmology_step_metadata(
+            ArepoCosmologyRuntime(true, true, true, 1.0, 0.31, 0.0, 0.69, nothing);
+            a = 0.5)
 
         @test_throws ErrorException parse_arepo_param_text("BoxSize 1.0\nBoxSize 2.0\n")
         @test_throws ErrorException normalize_arepo_parameters((; OutputListOn = "maybe"))
@@ -2036,6 +2181,66 @@ end
             @test self_row.value < 1e-12
             @test result.pm !== nothing
             @test length(result.pm.ax) == length(fixture.x)
+
+            reusable_workspace = arepo_pm_gravity_workspace(; fixture = fixture,
+                                                            greens = result.greens)
+            reusable_pm = arepo_pm_gravity!(reusable_workspace, PoissonKernels,
+                                            fixture.x, fixture.y, fixture.z, fixture.m,
+                                            fixture.vx, fixture.vy, fixture.vz)
+            reusable_rows = arepo_pm_gravity_result_rows(
+                reusable_pm;
+                reference_mass = sum(fixture.m),
+                direct_oracle = result.direct_oracle,
+                direct_nimg = result.direct_oracle.nimg,
+            )
+            preflight_rows = filter(row -> row.category in ("pm", "pm_vs_direct_oracle"),
+                                    result.rows)
+            @test length(reusable_rows) == length(preflight_rows)
+            for (got, want) in zip(reusable_rows, preflight_rows)
+                @test got.category == want.category
+                @test got.label == want.label
+                @test got.status == want.status
+                @test got.note == want.note
+                if got.value === nothing
+                    @test want.value === nothing
+                else
+                    @test want.value !== nothing
+                    @test got.value ≈ want.value
+                end
+                if got.reference === nothing
+                    @test want.reference === nothing
+                else
+                    @test want.reference !== nothing
+                    @test got.reference ≈ want.reference
+                end
+                if got.delta === nothing
+                    @test want.delta === nothing
+                else
+                    @test want.delta !== nothing
+                    @test got.delta ≈ want.delta
+                end
+            end
+
+            one_fixture = (
+                Npm = fixture.Npm,
+                boxsize = fixture.boxsize,
+                ng = fixture.ng,
+                x = [3.5 / fixture.Npm],
+                y = [5.5 / fixture.Npm],
+                z = [7.5 / fixture.Npm],
+                m = [1.0],
+                vx = [0.0],
+                vy = [0.0],
+                vz = [0.0],
+            )
+            one_workspace = arepo_pm_gravity_workspace(; fixture = one_fixture,
+                                                       particle_count = 1,
+                                                       greens = result.greens)
+            one_pm = arepo_pm_gravity!(one_workspace, PoissonKernels,
+                                       one_fixture.x, one_fixture.y, one_fixture.z,
+                                       one_fixture.m, one_fixture.vx, one_fixture.vy,
+                                       one_fixture.vz)
+            @test one_pm.max_abs_accel < 1e-12
         else
             @test_skip "PoissonKernels not available on LOAD_PATH in PowerFoam test env"
         end

@@ -164,6 +164,12 @@ function arepo_run_scaffold(spec::ArepoProblemSpec;
     standard = _try_arepo_standard_problem_run(spec, backend, device, options)
     standard === nothing || return standard
 
+    gravity = arepo_pm_gravity_runtime_state(spec; backend, device, options)
+    gravity === nothing || return gravity
+
+    gravity = arepo_direct_gravity_runtime_state(spec; backend, device, options)
+    gravity === nothing || return gravity
+
     diagnostics, unsupported = _scaffold_diagnostics(spec, backend, device, options)
     smoke = classify_ka_hydro_smoke(spec; backend, device)
     status = isempty(unsupported) ? :ready : :unsupported
@@ -460,7 +466,7 @@ function _scaffold_diagnostics(spec::ArepoProblemSpec, backend::Symbol, device,
     end
     if get(spec.physics, :gravity, false) || spec.particle_count > 0
         push!(unsupported, :gravity)
-        push!(diagnostics, "Gravity/cosmology integration is not wired: future versions should attach PM/tree or direct-force phases plus kick-drift-kick scheduling.")
+        push!(diagnostics, "Gravity/cosmology integration is not wired for this request: the bounded direct-gravity slice only runs when metadata.particles is present, and PM/tree plus long-horizon kick-drift-kick scheduling remain future work.")
     end
     if backend != :ka
         push!(unsupported, :backend_selector)

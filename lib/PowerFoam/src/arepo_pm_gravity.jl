@@ -175,6 +175,194 @@ function max_abs_accel(ax, ay, az)
     return maximum(sqrt.(ax .* ax .+ ay .* ay .+ az .* az))
 end
 
+struct ArepoPMGravityWorkspace
+    Npm::Int
+    boxsize::Float64
+    ng::Int
+    greens::Symbol
+    cellsize::Float64
+    leftedge::NTuple{3,Float64}
+    rho_flat::Vector{Float64}
+    rhs::Array{Float64,3}
+    phi::Array{Float64,3}
+    phi_pad::Array{Float64,3}
+    gx_active::Array{Float64,3}
+    gy_active::Array{Float64,3}
+    gz_active::Array{Float64,3}
+    gx::Array{Float64,3}
+    gy::Array{Float64,3}
+    gz::Array{Float64,3}
+    ax::Vector{Float64}
+    ay::Vector{Float64}
+    az::Vector{Float64}
+end
+
+struct ArepoPMGravityResult
+    workspace::ArepoPMGravityWorkspace
+    rho::AbstractArray{Float64,3}
+    rhs::AbstractArray{Float64,3}
+    phi::AbstractArray{Float64,3}
+    gx::AbstractArray{Float64,3}
+    gy::AbstractArray{Float64,3}
+    gz::AbstractArray{Float64,3}
+    ax::Vector{Float64}
+    ay::Vector{Float64}
+    az::Vector{Float64}
+    mass_sum::Float64
+    rhs_mean::Float64
+    rhs_sum::Float64
+    phi_mean::Float64
+    net_force::NamedTuple{(:x, :y, :z),NTuple{3,Float64}}
+    max_abs_accel::Float64
+end
+
+function arepo_pm_gravity_workspace(; fixture = arepo_pm_gravity_fixture(),
+                                    particle_count::Integer = length(fixture.x),
+                                    greens::Symbol = :spectral)
+    Npm = fixture.Npm
+    boxsize = fixture.boxsize
+    ng = fixture.ng
+    cellsize = boxsize / Npm
+    leftedge = ntuple(_ -> -ng * cellsize, 3)
+    M = Npm + 2ng
+    return ArepoPMGravityWorkspace(
+        Npm,
+        boxsize,
+        ng,
+        greens,
+        cellsize,
+        leftedge,
+        zeros(Float64, Npm^3),
+        zeros(Float64, Npm, Npm, Npm),
+        zeros(Float64, Npm, Npm, Npm),
+        zeros(Float64, M, M, M),
+        zeros(Float64, Npm, Npm, Npm),
+        zeros(Float64, Npm, Npm, Npm),
+        zeros(Float64, Npm, Npm, Npm),
+        zeros(Float64, M, M, M),
+        zeros(Float64, M, M, M),
+        zeros(Float64, M, M, M),
+        zeros(Float64, Int(particle_count)),
+        zeros(Float64, Int(particle_count)),
+        zeros(Float64, Int(particle_count)),
+    )
+end
+
+function arepo_pm_gravity!(workspace::ArepoPMGravityWorkspace, pkmod,
+                           x, y, z, m, vx, vy, vz)
+    pkmod === nothing &&
+        error("arepo_pm_gravity!: PoissonKernels module is required for the reusable PM chain")
+
+    cellsize = workspace.cellsize
+    leftedge = workspace.leftedge
+    ng = workspace.ng
+    Npm = workspace.Npm
+    rho_flat = workspace.rho_flat
+    rhs = workspace.rhs
+    phi = workspace.phi
+    phi_pad = workspace.phi_pad
+    gx_active = workspace.gx_active
+    gy_active = workspace.gy_active
+    gz_active = workspace.gz_active
+    gx = workspace.gx
+    gy = workspace.gy
+    gz = workspace.gz
+    ax = workspace.ax
+    ay = workspace.ay
+    az = workspace.az
+
+    Base.invokelatest(pkmod.cic_deposit!, rho_flat, x, y, z, vx, vy, vz, m;
+                      N = Npm, disp = 0.0, shift = -0.5)
+    rho = reshape(rho_flat, Npm, Npm, Npm)
+    copyto!(rhs, rho)
+    rhs .-= mean(rho)
+    Base.invokelatest(pkmod.fft_poisson_root!, phi, rhs; G = 1.0, a = 1.0,
+                      boxsize = workspace.boxsize, greens = workspace.greens)
+
+    M = Npm + 2ng
+    fill!(phi_pad, 0.0)
+    interior = ng + 1:ng + Npm
+    phi_pad[interior, interior, interior] .= phi
+    Base.invokelatest(pkmod.fill_periodic_ghosts!, phi_pad; ng = ng)
+
+    Base.invokelatest(pkmod.comp_accel!, gx_active, gy_active, gz_active, phi_pad;
+                      iflag = 1, start = (ng, ng, ng),
+                      del = (cellsize, cellsize, cellsize))
+    fill!(gx, 0.0)
+    fill!(gy, 0.0)
+    fill!(gz, 0.0)
+    gx[interior, interior, interior] .= gx_active
+    gy[interior, interior, interior] .= gy_active
+    gz[interior, interior, interior] .= gz_active
+    Base.invokelatest(pkmod.fill_periodic_ghosts!, gx; ng = ng)
+    Base.invokelatest(pkmod.fill_periodic_ghosts!, gy; ng = ng)
+    Base.invokelatest(pkmod.fill_periodic_ghosts!, gz; ng = ng)
+
+    Base.invokelatest(pkmod.interp_accel_to_particles!, ax, ay, az,
+                      x, y, z, vx, vy, vz,
+                      gx, gy, gz;
+                      dcoef = 0.0,
+                      cellsize = cellsize,
+                      leftedge = leftedge)
+
+    return ArepoPMGravityResult(
+        workspace,
+        rho,
+        rhs,
+        phi,
+        gx,
+        gy,
+        gz,
+        ax,
+        ay,
+        az,
+        sum(rho),
+        mean(rhs),
+        sum(rhs),
+        mean(phi),
+        momentum_residual(m, ax, ay, az),
+        max_abs_accel(ax, ay, az),
+    )
+end
+
+function arepo_pm_gravity(pkmod; fixture = arepo_pm_gravity_fixture(),
+                          greens::Symbol = :spectral)
+    workspace = arepo_pm_gravity_workspace(; fixture = fixture, greens = greens)
+    return arepo_pm_gravity!(workspace, pkmod,
+                             fixture.x, fixture.y, fixture.z, fixture.m,
+                             fixture.vx, fixture.vy, fixture.vz)
+end
+
+function arepo_pm_gravity_result_rows(result::ArepoPMGravityResult;
+                                      reference_mass::Real,
+                                      direct_oracle,
+                                      direct_nimg::Int = 2)
+    residual = result.net_force
+    comp_diffs = vcat(abs.(result.ax .- direct_oracle.ax),
+                      abs.(result.ay .- direct_oracle.ay),
+                      abs.(result.az .- direct_oracle.az))
+    rows = NamedTuple[]
+    push!(rows, _numeric_row("pm", "mass_sum", result.mass_sum,
+                             reference = reference_mass,
+                             delta = result.mass_sum - reference_mass))
+    push!(rows, _numeric_row("pm", "rhs_mean", result.rhs_mean))
+    push!(rows, _numeric_row("pm", "rhs_sum", result.rhs_sum))
+    push!(rows, _numeric_row("pm", "phi_mean", result.phi_mean))
+    push!(rows, _numeric_row("pm", "net_force_x", residual.x))
+    push!(rows, _numeric_row("pm", "net_force_y", residual.y))
+    push!(rows, _numeric_row("pm", "net_force_z", residual.z))
+    push!(rows, _numeric_row("pm", "max_abs_accel", result.max_abs_accel))
+    push!(rows, _numeric_row("pm_vs_direct_oracle",
+                             "nimg$(direct_nimg)_max_component_diff",
+                             maximum(comp_diffs),
+                             note = "PM zero-mode convention compared to finite neutralized image oracle"))
+    push!(rows, _numeric_row("pm_vs_direct_oracle",
+                             "nimg$(direct_nimg)_rms_component_diff",
+                             sqrt(sum(abs2, comp_diffs) / length(comp_diffs)),
+                             note = "PM zero-mode convention compared to finite neutralized image oracle"))
+    return rows
+end
+
 function periodic_cell_center_residual(coords, Npm::Int)
     scaled = coords .* Npm
     return maximum(abs.(scaled .- (round.(scaled .- 0.5) .+ 0.5)))
@@ -227,68 +415,6 @@ function _poissonkernels_blocker_rows(pk_probe)
                                 note = sprint(showerror, pk_probe.error)))
     end
     return rows
-end
-
-function _poissonkernels_pm_chain(pkmod, x, y, z, m, vx, vy, vz;
-                                  Npm::Int, boxsize::Real,
-                                  ng::Int, greens::Symbol)
-    cellsize = boxsize / Npm
-    leftedge = ntuple(_ -> -ng * cellsize, 3)
-
-    ρflat = zeros(Float64, Npm^3)
-    pkmod.cic_deposit!(ρflat, x, y, z, vx, vy, vz, m;
-                       N = Npm, disp = 0.0, shift = -0.5)
-    ρ = reshape(copy(ρflat), Npm, Npm, Npm)
-    rhs = ρ .- mean(ρ)
-    phi = zeros(Float64, Npm, Npm, Npm)
-    pkmod.fft_poisson_root!(phi, rhs; G = 1.0, a = 1.0,
-                            boxsize = boxsize, greens = greens)
-
-    M = Npm + 2ng
-    phi_pad = zeros(Float64, M, M, M)
-    interior = ng+1:ng+Npm
-    phi_pad[interior, interior, interior] .= phi
-    pkmod.fill_periodic_ghosts!(phi_pad; ng = ng)
-
-    gx_active = zeros(Float64, Npm, Npm, Npm)
-    gy_active = zeros(Float64, Npm, Npm, Npm)
-    gz_active = zeros(Float64, Npm, Npm, Npm)
-    pkmod.comp_accel!(gx_active, gy_active, gz_active, phi_pad;
-                      iflag = 1, start = (ng, ng, ng),
-                      del = (cellsize, cellsize, cellsize))
-
-    gx = zeros(Float64, M, M, M)
-    gy = zeros(Float64, M, M, M)
-    gz = zeros(Float64, M, M, M)
-    gx[interior, interior, interior] .= gx_active
-    gy[interior, interior, interior] .= gy_active
-    gz[interior, interior, interior] .= gz_active
-    pkmod.fill_periodic_ghosts!(gx; ng = ng)
-    pkmod.fill_periodic_ghosts!(gy; ng = ng)
-    pkmod.fill_periodic_ghosts!(gz; ng = ng)
-
-    ax_pm = zeros(Float64, length(x))
-    ay_pm = zeros(Float64, length(x))
-    az_pm = zeros(Float64, length(x))
-    pkmod.interp_accel_to_particles!(ax_pm, ay_pm, az_pm,
-                                     x, y, z, vx, vy, vz,
-                                     gx, gy, gz;
-                                     dcoef = 0.0,
-                                     cellsize = cellsize,
-                                     leftedge = leftedge)
-    return (
-        rho = ρ,
-        rhs = rhs,
-        phi = phi,
-        gx = gx,
-        gy = gy,
-        gz = gz,
-        ax = ax_pm,
-        ay = ay_pm,
-        az = az_pm,
-        leftedge = leftedge,
-        cellsize = cellsize,
-    )
 end
 
 function run_arepo_pm_gravity_preflight(pkmod = nothing;
@@ -367,48 +493,24 @@ function run_arepo_pm_gravity_preflight(pkmod = nothing;
                                 note = "PoissonKernels not available on LOAD_PATH for this run"))
         append!(rows, _poissonkernels_blocker_rows(pk_probe))
     else
-        pm = _poissonkernels_pm_chain(pkmod, x, y, z, m, vx, vy, vz;
-                                      Npm = Npm, boxsize = boxsize,
-                                      ng = ng, greens = greens)
-        ρ = pm.rho
-        rhs = pm.rhs
-        phi = pm.phi
-        ax_pm = pm.ax
-        ay_pm = pm.ay
-        az_pm = pm.az
-        residual = momentum_residual(m, ax_pm, ay_pm, az_pm)
-        push!(rows, _numeric_row("pm", "mass_sum", sum(ρ), reference = sum(m),
-                                 delta = sum(ρ) - sum(m)))
-        push!(rows, _numeric_row("pm", "rhs_mean", mean(rhs)))
-        push!(rows, _numeric_row("pm", "rhs_sum", sum(rhs)))
-        push!(rows, _numeric_row("pm", "phi_mean", mean(phi)))
-        push!(rows, _numeric_row("pm", "net_force_x", residual.x))
-        push!(rows, _numeric_row("pm", "net_force_y", residual.y))
-        push!(rows, _numeric_row("pm", "net_force_z", residual.z))
-        push!(rows, _numeric_row("pm", "max_abs_accel", max_abs_accel(ax_pm, ay_pm, az_pm)))
-
-        comp_diffs = vcat(abs.(ax_pm .- direct_oracle.ax),
-                          abs.(ay_pm .- direct_oracle.ay),
-                          abs.(az_pm .- direct_oracle.az))
-        push!(rows, _numeric_row("pm_vs_direct_oracle",
-                                 "nimg$(direct_oracle.nimg)_max_component_diff",
-                                 maximum(comp_diffs),
-                                 note = "PM zero-mode convention compared to finite neutralized image oracle"))
-        push!(rows, _numeric_row("pm_vs_direct_oracle",
-                                 "nimg$(direct_oracle.nimg)_rms_component_diff",
-                                 sqrt(sum(abs2, comp_diffs) / length(comp_diffs)),
-                                 note = "PM zero-mode convention compared to finite neutralized image oracle"))
+        pm = arepo_pm_gravity(pkmod; fixture = fixture, greens = greens)
+        append!(rows, arepo_pm_gravity_result_rows(pm;
+                                                   reference_mass = sum(m),
+                                                   direct_oracle = direct_oracle,
+                                                   direct_nimg = direct_oracle.nimg))
         one_x = [3.5 / Npm]
         one_y = [5.5 / Npm]
         one_z = [7.5 / Npm]
         one_m = [1.0]
         one_v = [0.0]
-        self_pm = _poissonkernels_pm_chain(pkmod, one_x, one_y, one_z, one_m,
-                                           one_v, one_v, one_v;
-                                           Npm = Npm, boxsize = boxsize,
-                                           ng = ng, greens = greens)
+        self_workspace = arepo_pm_gravity_workspace(; fixture = fixture,
+                                                    particle_count = 1,
+                                                    greens = greens)
+        self_pm = arepo_pm_gravity!(self_workspace, pkmod,
+                                     one_x, one_y, one_z, one_m,
+                                     one_v, one_v, one_v)
         push!(rows, _numeric_row("pm_self_control", "one_particle_max_abs_accel",
-                                 max_abs_accel(self_pm.ax, self_pm.ay, self_pm.az);
+                                 self_pm.max_abs_accel;
                                  note = "single cell-centered particle in periodic mean-free PM solve"))
     end
 

@@ -132,6 +132,7 @@ Recommended entrypoints:
 - `read_arepo_config_flags(path::AbstractString)`
 - `parse_arepo_config_text(text::AbstractString)`
 - `normalize_arepo_parameters(raw::AbstractDict, flags::ArepoConfigFlags)`
+- `arepo_cosmology_runtime(params::ArepoParameterSet)`
 - `arepo_runtime_features(params::ArepoParameterSet)`
 - `validate_arepo_parameters(params::ArepoParameterSet)`
 
@@ -252,6 +253,10 @@ That example should keep the runtime contract narrow:
 - `normalize_arepo_parameters` should be the only place that maps strings like
   `SnapFormat`, `OutputListOn`, or `ComovingIntegrationOn` into typed Julia
   values.
+- core cosmology fields should be grouped into a typed runtime summary so the
+  feature layer can inspect `ComovingIntegrationOn`, `Omega0`,
+  `OmegaBaryon`, `OmegaLambda`, and `HubbleParam` together instead of as loose
+  scalar leaves.
 
 ## Initial-Condition Read/Write Names
 

@@ -141,6 +141,69 @@ function arepo_direct_gravity_oracle(x::AbstractVector,
     return (ax = ax, ay = ay, az = az, potential_energy = pe)
 end
 
+"""
+    arepo_direct_gravity_kick_drift_step(x, y, z, m, vx, vy, vz; dt, kwargs...)
+
+Advance a frozen tiny-`N` particle set with a single kick-drift step.
+The helper is intentionally scalar and allocation-friendly enough for smoke
+tests, not for production integration loops.
+"""
+function arepo_direct_gravity_kick_drift_step(x::AbstractVector,
+                                              y::AbstractVector,
+                                              z::AbstractVector,
+                                              m::AbstractVector,
+                                              vx::AbstractVector,
+                                              vy::AbstractVector,
+                                              vz::AbstractVector;
+                                              dt::Real,
+                                              kwargs...)
+    n = _arepo_direct_gravity_check_lengths(x, y, z, m, vx, vy, vz)
+    dtf = float(dt)
+    oracle = arepo_direct_gravity_oracle(x, y, z, m; kwargs...)
+
+    x1 = similar(x, promote_type(eltype(x), Float64), n)
+    y1 = similar(y, promote_type(eltype(y), Float64), n)
+    z1 = similar(z, promote_type(eltype(z), Float64), n)
+    vx1 = similar(vx, promote_type(eltype(vx), Float64), n)
+    vy1 = similar(vy, promote_type(eltype(vy), Float64), n)
+    vz1 = similar(vz, promote_type(eltype(vz), Float64), n)
+    m1 = copy(m)
+
+    @inbounds for i in 1:n
+        vx1[i] = float(vx[i]) + dtf * oracle.ax[i]
+        vy1[i] = float(vy[i]) + dtf * oracle.ay[i]
+        vz1[i] = float(vz[i]) + dtf * oracle.az[i]
+        x1[i] = float(x[i]) + dtf * vx1[i]
+        y1[i] = float(y[i]) + dtf * vy1[i]
+        z1[i] = float(z[i]) + dtf * vz1[i]
+    end
+
+    net_force = (
+        x = sum(m .* oracle.ax),
+        y = sum(m .* oracle.ay),
+        z = sum(m .* oracle.az),
+    )
+    max_abs_accel = maximum(sqrt.(oracle.ax .* oracle.ax .+
+                                  oracle.ay .* oracle.ay .+
+                                  oracle.az .* oracle.az))
+    return (
+        x = x1,
+        y = y1,
+        z = z1,
+        m = m1,
+        vx = vx1,
+        vy = vy1,
+        vz = vz1,
+        ax = oracle.ax,
+        ay = oracle.ay,
+        az = oracle.az,
+        potential_energy = oracle.potential_energy,
+        momentum_residual = net_force,
+        max_abs_accel = max_abs_accel,
+        dt = dtf,
+    )
+end
+
 function _arepo_direct_gravity_check_lengths(arrays::AbstractVector...)
     isempty(arrays) && error("_arepo_direct_gravity_check_lengths: expected at least one array")
     n = length(arrays[1])

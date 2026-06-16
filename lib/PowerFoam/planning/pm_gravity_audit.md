@@ -341,8 +341,10 @@ Resolution for this planning note:
 `lib/PowerFoam/examples/arepo_pm_gravity_gate_skeleton.jl` and
 `lib/PowerFoam/src/arepo_pm_gravity.jl` now give `PowerFoam` an executable
 frozen-particle PM preflight plus finite direct oracle. The remaining gap is
-not the PM harness itself; it is the lack of a production direct-side periodic
-comparator with the same zero-mode convention.
+not the PM harness itself; the PM side now also has a bounded reusable
+workspace/result surface around the same deposit -> solve -> ghost-fill ->
+interpolate chain. The remaining gap is the lack of a production direct-side
+periodic comparator with the same zero-mode convention.
 
 ### 4. Root PM force comparison should lock to acceleration before potential
 

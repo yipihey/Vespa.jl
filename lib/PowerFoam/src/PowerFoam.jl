@@ -13,17 +13,29 @@ export GradientConnections3D, HydroGradients3D, FaceStates3D
 export ArepoRunOptions, ArepoHydroSmokeAssessment, ArepoProblemSpec,
        ArepoRuntimeState3D, arepo_problem_spec, arepo_runtime_state_3d,
        arepo_run_scaffold, classify_ka_hydro_smoke,
+       ArepoDirectGravityParticleState, ArepoDirectGravityResult,
        arepo_direct_gravity_accel!, arepo_direct_gravity_accel,
        arepo_direct_gravity_potential_energy, arepo_direct_gravity_oracle,
+       arepo_direct_gravity_kick_drift_step, arepo_direct_gravity_runtime_state,
+       arepo_pm_gravity_runtime_state,
        arepo_pm_gravity_fixture, periodic_image_sum_accel,
        periodic_background_subtracted_image_oracle,
        momentum_residual, max_abs_accel, periodic_cell_center_residual,
        probe_poissonkernels_monorepo, run_arepo_pm_gravity_preflight,
+       ArepoGravitySolverSpec, arepo_gravity_solver_registry,
+       arepo_gravity_solver_status,
+       ArepoPMGravityWorkspace, ArepoPMGravityResult,
+       arepo_pm_gravity_workspace, arepo_pm_gravity!, arepo_pm_gravity,
+       arepo_pm_gravity_result_rows,
        ArepoConfigFlags, ArepoParameterSet, ArepoParameterValidation,
+       ArepoCosmologyRuntime,
+       ArepoCosmologyStepMetadata,
        ArepoRuntimeFeatureSet, arepo_runtime_features,
        read_arepo_param_file, read_arepo_config_flags,
        parse_arepo_param_text, parse_arepo_config_text,
        normalize_arepo_parameters, validate_arepo_parameters,
+       arepo_cosmology_runtime, arepo_cosmology_step_metadata,
+       arepo_cosmology_expansion_factor, arepo_cosmology_adot_over_a,
        ArepoSnapshotLocator, ArepoSnapshotHeader, ArepoGasSnapshotBlock,
        ArepoSnapshotData, ArepoHydroRuntimePayload, ArepoSnapshotValidation, ArepoSnapshotIOResult,
        arepo_snapshot_hdf5_available, snapshot_available_fields,
@@ -1285,7 +1297,9 @@ end
 include("arepo_runtime_scaffold.jl")
 include("arepo_gravity_scaffold.jl")
 include("arepo_pm_gravity.jl")
+include("arepo_gravity_runtime.jl")
 include("arepo_io_parameters.jl")
+include("arepo_cosmology_coefficients.jl")
 include("hydro3d.jl")
 include("arepo_io_snapshots.jl")
 include("arepo_io_runtime.jl")

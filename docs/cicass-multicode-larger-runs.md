@@ -117,12 +117,58 @@ signal well above the shot-noise floor across the compared k-range.
    `a ≥ a_out`, a ≤`MaxSizeTimestep` (≤2%) overshoot — fine for P(k), and visible
    in the Arepo `.dat` z labels (e.g. 675 vs 680).
 
+## Repository manifest (exact clone list)
+
+The whole framework is a path-`[sources]` tree rooted at `~/Projects/` (the
+parent of `enzo-dev/`). Clone **all** of these as siblings — every one is a
+`[sources]` path that must exist for `lib/MultiCode/test` to instantiate, even
+the codes the CICASS run doesn't exercise. All are under `github.com/yipihey`:
+
+| local dir (`~/Projects/…`) | clone | branch | needed for |
+|---|---|---|---|
+| `enzo-dev` | `yipihey/enzo-dev` | `enzong-amr-subcycling-refluxing` | Enzo + EnzoNG.jl (this tree) |
+| `Arepo.jl` | `yipihey/Arepo.jl` | `main` | ArepoLib wrapper |
+| `RamsesNG.jl` | `yipihey/RamsesNG.jl` | `main` | RamsesLib wrapper |
+| `CICASS.jl` | `yipihey/CICASS.jl` | `main` | CICASSLib (IC wrapper) |
+| `r3djl` | `yipihey/r3djl` | `main` | R3D (transitive dep) |
+| `Gadget4.jl` | `yipihey/Gadget4.jl` | `main` | instantiate (Gadget4Lib) |
+| `DiscoDJ.jl` | `yipihey/DiscoDJ.jl` | `main` | instantiate (DiscoDJLib) |
+| `Music.jl` | `yipihey/Music.jl` | `main` | instantiate (MusicLib) |
+| `Athena.jl` | `yipihey/Athena.jl` | `main` | instantiate (AthenaLib) |
+| `dfmm` | `yipihey/dfmm` | `main` | optional engine ext |
+| `HierarchicalGrids.jl` | `yipihey/HierarchicalGrids.jl` | `feat-cell-average-fieldset` | HGBackend (not the CICASS path) |
+
+Native-code source repos (the compiled libs do **not** move — rebuild on host):
+
+| local dir | clone | branch | builds |
+|---|---|---|---|
+| `arepo` | `yipihey/arepo` | `arepo-jl-bridge` | `libarepo3d_cosmo.dylib` (incl. the per-step leak fix) |
+| `mini-ramses` | `yipihey/mini-ramses-metal` | **`cicass-cosmology`** | RAMSES `bin64*` flavors |
+| `cicass` | `yipihey/CICASS` | `main` | CICASS C IC tool (transfer.x) |
+
+⚠️ **mini-ramses branch matters.** The validated `bin64*` libs and every CICASS
+run were built from the `cicass-cosmology` branch, which is the old `develop`
+base + the `ramses_boost_particles` capi commit. The remote `develop` is ~165
+commits ahead (a large upstream GPU/CUB merge) and would change behavior — so
+clone **`cicass-cosmology`** to reproduce, and decide separately whether/when to
+rebase onto the new upstream (re-validation required).
+
+Native libs to build on the new host (Julia binary is juliaup-managed and not on
+the non-interactive PATH — use the absolute path):
+- **Enzo grid dylib**: `EnzoModules/deps/build_grid_darwin.sh` (Linux: the
+  equivalent; deps = mpicc, hdf5).
+- **Arepo cosmo dylib**: see step 3 above (deps = mpicc, fftw3, gsl, hdf5, gmp).
+- **RAMSES flavor `bin64sc_chem`** (the one `run_c64_ramses.sh` uses) from
+  `mini-ramses` (gfortran). Verify it does not hard-link grackle, since the run
+  uses the in-repo ChemistryKernels engine, not the C grackle.
+- **grackle is NOT required** for the default CICASS run (`CIC_CHEM_ENGINE=kernels`).
+  Only needed if you switch a code to `engine=:grackle` (the C reduced lib).
+- Python for the plots: any env with `numpy`+`matplotlib` (the scripts hard-code
+  `~/Projects/disco-dj-fem/.venv/bin/python` — repoint it on the new host).
+
 ## Moving to a bigger machine — checklist
 
-- Clone the sibling repos the framework expects (paths via cross-repo
-  `[sources]`): `Arepo.jl`, `RamsesNG.jl`, `CICASS.jl`/`cicass`,
-  `HierarchicalGrids.jl` (+ unregistered `R3D`), and the grackle fork install if
-  using the C chemistry. See `docs/framework-surface.md`.
+- Clone every repo in the manifest above as a sibling of `enzo-dev/`.
 - Build the native libs on the new host: Enzo grid dylib
   (`EnzoModules/deps/build_grid_darwin.sh`, or the Linux equivalent), RAMSES
   flavors (`bin64h`/`bin64hrt`/`bin64sc`), and the patched Arepo cosmo dylib

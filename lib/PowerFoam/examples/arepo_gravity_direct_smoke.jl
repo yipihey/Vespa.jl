@@ -121,6 +121,79 @@ function evaluate_case(case::GravityCase; atol = 1e-12)
     )
 end
 
+function build_runtime_spec(case::GravityCase; dt = 0.125, advance_gravity = true)
+    particles = (
+        x = copy(case.x),
+        y = copy(case.y),
+        z = copy(case.z),
+        m = copy(case.m),
+        vx = zeros(Float64, length(case.x)),
+        vy = zeros(Float64, length(case.y)),
+        vz = zeros(Float64, length(case.z)),
+    )
+    return arepo_problem_spec(Symbol(case.name, :_runtime);
+                              particle_count = length(case.m),
+                              physics = (hydro = false,
+                                         tessellation = false,
+                                         gravity = true),
+                              metadata = (particles = particles,
+                                          softening = 0.0,
+                                          G = 1.0,
+                                          dt = dt,
+                                          advance_gravity = advance_gravity))
+end
+
+function evaluate_runtime_case(case::GravityCase; dt = 0.125, atol = 1e-12)
+    spec = build_runtime_spec(case; dt = dt)
+    state = arepo_run_scaffold(spec)
+    state.status == :gravity_advanced ||
+        error("$(case.name): runtime dispatch did not advance gravity")
+    result = state.payload.gravity
+    oracle = arepo_direct_gravity_oracle(case.x, case.y, case.z, case.m)
+
+    expected_vx = dt .* oracle.ax
+    expected_vy = dt .* oracle.ay
+    expected_vz = dt .* oracle.az
+    expected_x = case.x .+ dt .* expected_vx
+    expected_y = case.y .+ dt .* expected_vy
+    expected_z = case.z .+ dt .* expected_vz
+
+    result.accelerations.ax ≈ oracle.ax ||
+        error("$(case.name): runtime ax mismatch")
+    result.accelerations.ay ≈ oracle.ay ||
+        error("$(case.name): runtime ay mismatch")
+    result.accelerations.az ≈ oracle.az ||
+        error("$(case.name): runtime az mismatch")
+    result.potential_energy ≈ oracle.potential_energy ||
+        error("$(case.name): runtime potential mismatch")
+    result.after.vx ≈ expected_vx ||
+        error("$(case.name): runtime vx mismatch")
+    result.after.vy ≈ expected_vy ||
+        error("$(case.name): runtime vy mismatch")
+    result.after.vz ≈ expected_vz ||
+        error("$(case.name): runtime vz mismatch")
+    result.after.x ≈ expected_x ||
+        error("$(case.name): runtime x mismatch")
+    result.after.y ≈ expected_y ||
+        error("$(case.name): runtime y mismatch")
+    result.after.z ≈ expected_z ||
+        error("$(case.name): runtime z mismatch")
+    maximum(abs, collect(result.momentum_residual)) <= atol ||
+        error("$(case.name): runtime momentum residual too large")
+
+    return (
+        name = case.name * "_runtime",
+        particle_count = length(case.m),
+        dt = dt,
+        status = state.status,
+        max_abs_accel = result.max_abs_accel,
+        potential_energy = result.potential_energy,
+        after_x = result.after.x,
+        after_y = result.after.y,
+        after_z = result.after.z,
+    )
+end
+
 function csvquote(x)
     s = string(x)
     return "\"" * replace(s, "\"" => "\"\"") * "\""
@@ -157,8 +230,9 @@ function write_readme(path, rows; command)
         println(io, "helpers through `using PowerFoam` on two tiny frozen particle")
         println(io, "systems: a two-body pair with closed-form integer accelerations")
         println(io, "and a small three-body triangle. It checks direct-force values,")
-        println(io, "potential energy, and the action-reaction momentum sum")
-        println(io, "`sum(m .* a)`.")
+        println(io, "potential energy, the action-reaction momentum sum `sum(m .* a)`,")
+        println(io, "and the metadata-driven runtime dispatch path on a frozen kick-drift")
+        println(io, "step.")
         println(io)
         @printf(io, "- generated: %s\n", Dates.format(now(), dateformat"yyyy-mm-dd HH:MM:SS"))
         @printf(io, "- command: `%s`\n", command)
@@ -179,12 +253,18 @@ function write_readme(path, rows; command)
         println(io, "- `two_body`: `x=[0,1]`, `m=[2,3]`, expected potential `-6`.")
         println(io, "- `three_body`: points `(0,0,0)`, `(1,0,0)`, `(0,1,0)` with")
         println(io, "  masses `[2,3,4]`, expected potential `-(14 + 6sqrt(2))`.")
+        println(io)
+        println(io, "## Runtime Slice")
+        println(io)
+        println(io, "A frozen metadata payload also routes through `arepo_run_scaffold`")
+        println(io, "with `gravity=true`, `particle_count>0`, and `advance_gravity=true`.")
     end
 end
 
 function main()
     cases = build_cases()
     rows = [evaluate_case(case) for case in cases]
+    runtime_row = evaluate_runtime_case(first(cases))
     mkpath(OUTDIR)
     readme_path = joinpath(OUTDIR, "README.md")
     csv_path = joinpath(OUTDIR, "results.csv")
@@ -199,6 +279,10 @@ function main()
                 row.name, row.particle_count, row.potential_energy,
                 max_accel_err, row.momentum_residual_max)
     end
+    @printf("%-10s particles=%d status=%s dt=%.3f max_abs_accel=%.3e after_x=[%.6g, %.6g]\n",
+            runtime_row.name, runtime_row.particle_count, runtime_row.status,
+            runtime_row.dt, runtime_row.max_abs_accel,
+            runtime_row.after_x[1], runtime_row.after_x[2])
 end
 
 main()
