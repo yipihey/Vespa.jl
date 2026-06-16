@@ -1,10 +1,9 @@
 # ChemistryKernels — session handoff & plan
 
-Last updated: 2026-06-16 (session 2). Branch `enzong-amr-subcycling-refluxing`.
-Commits `ffda32b6`/`55abef3a` are **pushed**; **Task A (UVB-into-solver) work below is
-committed locally? NO — it is UNCOMMITTED in the working tree** (staged only mentally:
-all changes are confined to `lib/ChemistryKernels/`). Run the suite, then commit
-`lib/ChemistryKernels` only (don't sweep the parallel WIP — see Notes).
+Last updated: 2026-06-16 (session 2). Branch `enzong-amr-subcycling-refluxing`, last
+commit `2286ab7c`. All work below (incl. Task A, the UVB-into-solver wiring) is
+**committed and pushed**. (Only `lib/ChemistryKernels` was staged; the parallel WIP in
+the working tree — see Notes — was left untouched.)
 
 ## What this module is
 
@@ -62,7 +61,7 @@ equilibrium** (or optionally advected He⁺); nₑ from charge conservation.
    TREECOOL data under `data/`. `fg20_uvb()`; validated against published FG20
    z=0 rates; feeds the He Γ hooks → He photoionisation equilibrium at low z.
 
-5. **UVB wired into the solver (Task A, DONE this session, UNCOMMITTED)**: a UV
+5. **UVB wired into the solver (Task A, DONE, `2286ab7c`)**: a UV
    background now drives H photoionisation, He photoionisation equilibrium, and
    photoheating end-to-end. Validated: a one-zone cell under `fg20_uvb()` at z=3 mean
    IGM density relaxes to **T≈1.5×10⁴ K and x_HI≈3×10⁻⁶** (textbook IGM), with the
