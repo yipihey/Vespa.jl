@@ -10,6 +10,30 @@ export ArepoMeshArrays2D, EulerState2D, PrimitiveState2D, FaceFluxWork2D,
        HydroGradients2D, FaceStates2D
 export ArepoMeshArrays3D, EulerState3D, PrimitiveState3D, FaceFluxWork3D
 export GradientConnections3D, HydroGradients3D, FaceStates3D
+export ArepoRunOptions, ArepoHydroSmokeAssessment, ArepoProblemSpec,
+       ArepoRuntimeState3D, arepo_problem_spec, arepo_runtime_state_3d,
+       arepo_run_scaffold, classify_ka_hydro_smoke,
+       arepo_direct_gravity_accel!, arepo_direct_gravity_accel,
+       arepo_direct_gravity_potential_energy, arepo_direct_gravity_oracle,
+       arepo_pm_gravity_fixture, periodic_image_sum_accel,
+       periodic_background_subtracted_image_oracle,
+       momentum_residual, max_abs_accel, periodic_cell_center_residual,
+       probe_poissonkernels_monorepo, run_arepo_pm_gravity_preflight,
+       ArepoConfigFlags, ArepoParameterSet, ArepoParameterValidation,
+       ArepoRuntimeFeatureSet, arepo_runtime_features,
+       read_arepo_param_file, read_arepo_config_flags,
+       parse_arepo_param_text, parse_arepo_config_text,
+       normalize_arepo_parameters, validate_arepo_parameters,
+       ArepoSnapshotLocator, ArepoSnapshotHeader, ArepoGasSnapshotBlock,
+       ArepoSnapshotData, ArepoHydroRuntimePayload, ArepoSnapshotValidation, ArepoSnapshotIOResult,
+       arepo_snapshot_hdf5_available, snapshot_available_fields,
+       locate_arepo_snapshot, arepo_snapshot_read_preflight,
+       arepo_snapshot_hydro_payload, arepo_snapshot_hydro_state,
+       arepo_snapshot_hydro_state_2d, arepo_snapshot_hydro_state_3d,
+       derive_arepo_snapshot_volume!,
+       derive_arepo_snapshot_pressure!, resolve_arepo_snapshot_centers!,
+       validate_arepo_snapshot, read_arepo_snapshot, write_arepo_snapshot,
+       read_arepo_snapshot_header, read_arepo_gas_snapshot_block
 export power_diagram, from_arepo_polygons, arepo_face_table
 export polygon_area, polygon_centroid, cell_areas, cell_centroids
 export cell_quality, mesh_quality, reconstruction_condition_numbers
@@ -22,17 +46,73 @@ export arepo_mesh_arrays, to_backend, euler_state_2d, primitive_to_conserved_2d!
        predict_face_states_2d!, finite_volume_step_2d!,
        finite_volume_reconstructed_step_2d!,
        moving_mesh_step_2d!, moving_mesh_reconstructed_step_2d!,
-       advect_generators_2d, total_conserved_2d, max_signal_speed_2d
+       advect_generators_2d, periodic_power_mesh_arrays_2d,
+       total_conserved_2d, max_signal_speed_2d,
+       PF_NOH2D_DEFAULT_GAMMA, pf_noh2d_run_tag,
+       pf_noh2d_uniform_points, pf_noh2d_mesh,
+       pf_noh2d_initial_primitives, pf_noh2d_initial_state,
+       pf_noh2d_stable_dt, pf_noh2d_radial_bins,
+       pf_noh2d_metric_row, pf_noh2d_run,
+       PF_SOUNDWAVE2D_DEFAULT_GAMMA,
+       pf_soundwave2d_run_tag, pf_soundwave2d_mesh,
+       PF_GRESHO2D_DEFAULT_GAMMA,
+       pf_gresho2d_run_tag, pf_gresho2d_mesh,
+       pf_gresho2d_exact_primitives, pf_gresho2d_initial_state,
+       pf_gresho2d_stable_dt, pf_gresho2d_tangential_velocity,
+       pf_gresho2d_metric_row,
+       pf_gresho2d_profile_rows, pf_gresho2d_run,
+       pf_soundwave2d_exact_primitives, pf_soundwave2d_initial_state,
+       pf_soundwave2d_stable_dt, pf_soundwave2d_metric_row,
+       pf_soundwave2d_profile_rows, pf_soundwave2d_run
 export cartesian_periodic_mesh_arrays_3d, arepo_voronoi_mesh_arrays_3d,
        bounded_voronoi_mesh_arrays_3d, periodic_voronoi_mesh_arrays_3d,
        local_periodic_voronoi_mesh_arrays_3d,
+       TessellationReference3D, build_arepo_tessellation_3d,
+       DelaunayTetrahedra3D, DelaunaySoA3D, PeriodicPointImages3D,
+       DenseCandidatePairs3D, CandidateStencil3D, CandidateTetraPredicates3D,
+       CandidateConflictFaceRows3D, CandidateBoundaryFaceRows3D,
+       CompactBoundaryFaces3D, CompactFaceCandidates3D,
+       CompactFaceCandidateCSR3D, SourceOwnedFaceCSR3D,
+       ReciprocalFaceCandidatePairs3D, CompactCanonicalFaces3D,
+       CompactCanonicalFaceCSR3D,
+       TessellationSoA3D,
+       delaunay_soa_3d, tessellation_soa_3d,
+       periodic_point_images_soa_3d, dense_candidate_pairs_soa_3d,
+       pack_candidate_stencil_soa_3d, candidate_tetra_predicates_soa_3d,
+       candidate_conflict_face_rows_soa_3d,
+       candidate_boundary_face_rows_soa_3d, pack_boundary_faces_soa_3d,
+       compact_face_candidates_soa_3d, compact_face_candidate_csr_soa_3d,
+       source_owned_face_csr_soa_3d, reciprocal_face_candidate_pairs_soa_3d,
+       canonical_face_candidate_csr_soa_3d,
+       compact_face_candidate_mesh_arrays_3d,
+       canonical_face_candidate_mesh_arrays_3d,
+       compact_canonical_faces_soa_3d, compact_canonical_face_csr_soa_3d,
+       compact_canonical_mesh_arrays_3d,
+       recompute_circumcenters_soa_3d,
+       tessellation_reference_3d, canonical_face_keys_3d,
+       canonical_face_order_3d,
+       TessellationPredicatePolicy3D, TessellationPredicateAdaptive3D,
+       TessellationPredicateFloat64Only3D, TessellationPredicateExactCPU3D,
+       TessellationPredicateCPUFallback3D, TessellationPointIdentity3D,
+       TessellationFaceProvenance3D, TessellationFallbackCounters3D,
+       record_in_sphere_test!, record_convex_edge_test!,
+       record_in_tetra_test!, record_orient3d_test!,
+       record_exact_cpu_fallback!, record_gpu_fallback!,
+       record_topology_retry!, record_degenerate_face!,
+       record_skipped_infinite_tetra!,
+       with_update_targets_3d, face_update_activity_3d,
        advect_generators_3d,
        moving_mesh_step_3d!,
        euler_state_3d, primitive_to_conserved_3d!, conserved_to_primitive_3d,
        primitive_work_3d, conserved_to_primitive_3d!, primitive_to_arrays_3d,
        hydro_work_3d, finite_volume_step_3d!, finite_volume_reconstructed_step_3d!,
        finite_volume_reconstructed_step_activecells_3d!,
-       arepo_hydro_dt_3d, arepo_timebin_3d, total_conserved_3d,
+       finite_volume_reconstructed_hierarchy_step_3d!,
+       arepo_hydro_dt_3d, arepo_timebin_3d, arepo_system_step_3d,
+       arepo_next_sync_step_3d,
+       arepo_active_cells_3d,
+       arepo_hydro_timebins_3d, active_face_table_3d,
+       arepo_mesh_velocity_3d, total_conserved_3d,
        max_signal_speed_3d, gradient_connections_3d, hydro_gradient_work_3d,
        gradient_connections_from_mesh_3d, calculate_gradients_3d!,
        calculate_gradients_from_mesh_3d!,
@@ -948,6 +1028,268 @@ function write_svg(path::AbstractString, mesh::PolygonMesh2D;
 end
 
 include("hydro2d.jl")
+include("arepo_standard_problems.jl")
+
+@inline function _wrap_periodic2(x::Real, lo::Real, len::Real)
+    return float(lo) + mod(float(x) - float(lo), float(len))
+end
+
+function _cell_face_csr_periodic2(ncells, c1, c2, ::Type{I}) where {I<:Integer}
+    counts = zeros(Int, ncells)
+    for f in eachindex(c1)
+        counts[Int(c1[f])] += 1
+        counts[Int(c2[f])] += 1
+    end
+    offsets = Vector{I}(undef, ncells + 1)
+    offsets[1] = one(I)
+    for i in 1:ncells
+        offsets[i + 1] = offsets[i] + I(counts[i])
+    end
+    faces = Vector{I}(undef, Int(offsets[end] - one(I)))
+    signs = Vector{I}(undef, length(faces))
+    cursor = Int.(offsets[1:end-1])
+    for f in eachindex(c1)
+        i = Int(c1[f])
+        p = cursor[i]
+        faces[p] = I(f)
+        signs[p] = -one(I)
+        cursor[i] += 1
+        j = Int(c2[f])
+        p = cursor[j]
+        faces[p] = I(f)
+        signs[p] = one(I)
+        cursor[j] += 1
+    end
+    return offsets, faces, signs
+end
+
+function _periodic_bins2(points, domain, bins_per_axis)
+    xmin, xmax = domain[1]
+    ymin, ymax = domain[2]
+    lx = xmax - xmin
+    ly = ymax - ymin
+    if bins_per_axis === nothing
+        n = max(1, round(Int, sqrt(size(points, 1))))
+        nbx = n
+        nby = n
+    elseif bins_per_axis isa Integer
+        nbx = Int(bins_per_axis)
+        nby = Int(bins_per_axis)
+    else
+        nbx = Int(bins_per_axis[1])
+        nby = Int(bins_per_axis[2])
+    end
+    nbx > 0 && nby > 0 || error("bins_per_axis must be positive")
+    bins = [Int[] for _ in 1:(nbx * nby)]
+    coords = Matrix{Int}(undef, size(points, 1), 2)
+    @inbounds for i in axes(points, 1)
+        ix = clamp(floor(Int, (points[i, 1] - xmin) / lx * nbx) + 1, 1, nbx)
+        iy = clamp(floor(Int, (points[i, 2] - ymin) / ly * nby) + 1, 1, nby)
+        coords[i, 1] = ix
+        coords[i, 2] = iy
+        push!(bins[ix + nbx * (iy - 1)], i)
+    end
+    return bins, coords, (nbx, nby)
+end
+
+@inline function _wrap_bin_shift(raw::Int, nb::Int)
+    shift = fld(raw - 1, nb)
+    return mod(raw - 1, nb) + 1, shift
+end
+
+function _periodic_candidate_images2(i, bins, coords, nbx::Int, nby::Int,
+                                     search_radius::Integer)
+    out = Tuple{Int,Int,Int}[]
+    ix0 = coords[i, 1]
+    iy0 = coords[i, 2]
+    r = Int(search_radius)
+    for dy in -r:r, dx in -r:r
+        ix, sx = _wrap_bin_shift(ix0 + dx, nbx)
+        iy, sy = _wrap_bin_shift(iy0 + dy, nby)
+        for j in bins[ix + nbx * (iy - 1)]
+            push!(out, (j, sx, sy))
+        end
+    end
+    return out
+end
+
+function _periodic_power_cell2(points, weights, i, domain; tol::Float64,
+                               candidate_images = nothing)
+    xmin, xmax = domain[1]
+    ymin, ymax = domain[2]
+    lx = xmax - xmin
+    ly = ymax - ymin
+    pix = points[i, 1]
+    piy = points[i, 2]
+    wi = weights[i]
+    poly = [pix - lx piy - ly;
+            pix + lx piy - ly;
+            pix + lx piy + ly;
+            pix - lx piy + ly]
+    planes = NamedTuple[]
+    images = candidate_images === nothing ?
+             ((j, sx, sy) for j in axes(points, 1), sx in -1:1, sy in -1:1) :
+             candidate_images
+    for item in images
+        j, sx, sy = item
+        j == i && sx == 0 && sy == 0 && continue
+        pjx = points[j, 1] + sx * lx
+        pjy = points[j, 2] + sy * ly
+        a = (2 * (pjx - pix), 2 * (pjy - piy))
+        b = pjx^2 + pjy^2 - pix^2 - piy^2 + wi - weights[j]
+        push!(planes, (; a, b, neighbor = j, sx, sy))
+        poly = _clip_halfplane(poly, a, b; tol)
+        size(poly, 1) == 0 && break
+    end
+    poly = _ensure_ccw(poly)
+    return poly, planes
+end
+
+"""
+    periodic_power_mesh_arrays_2d(points; domain=((0,1),(0,1)), ...)
+
+Build a periodic 2-D power/Voronoi face table directly on the torus.  Cells are
+represented by a local unwrapped polygon around each generator, so boundary
+cells can have true cross-boundary neighbors without forcing split torus cells
+into `PolygonMesh2D`.
+"""
+function periodic_power_mesh_arrays_2d(points::AbstractMatrix;
+                                       weights = nothing,
+                                       domain = ((0.0, 1.0), (0.0, 1.0)),
+                                       T::Type{<:AbstractFloat} = Float64,
+                                       index_type::Type{<:Integer} = Int32,
+                                       face_velocity = nothing,
+                                       cell_velocity = nothing,
+                                       bins_per_axis = nothing,
+                                       search_radius::Integer = 1,
+                                       tol::Float64 = 1e-10)
+    size(points, 2) == 2 || error("points must be n x 2")
+    pts = Matrix{Float64}(points)
+    n = size(pts, 1)
+    w = weights === nothing ? zeros(n) : Float64.(collect(weights))
+    length(w) == n || error("weights length must match point count")
+    dom = ((float(domain[1][1]), float(domain[1][2])),
+           (float(domain[2][1]), float(domain[2][2])))
+    xmin, xmax = dom[1]
+    ymin, ymax = dom[2]
+    lx = xmax - xmin
+    ly = ymax - ymin
+    for i in 1:n
+        pts[i, 1] = _wrap_periodic2(pts[i, 1], xmin, lx)
+        pts[i, 2] = _wrap_periodic2(pts[i, 2], ymin, ly)
+    end
+    local_bins = bins_per_axis === nothing ? nothing :
+                 _periodic_bins2(pts, dom, bins_per_axis)
+
+    volume = Vector{Float64}(undef, n)
+    center = Matrix{Float64}(undef, n, 2)
+    c1 = Int[]
+    c2 = Int[]
+    area = Float64[]
+    normal = NTuple{2,Float64}[]
+    face_center = NTuple{2,Float64}[]
+    seen = Set{Tuple{Int,Int,Int,Int}}()
+
+    for i in 1:n
+        candidate_images = if local_bins === nothing
+            nothing
+        else
+            bins, coords, nb = local_bins
+            _periodic_candidate_images2(i, bins, coords, nb[1], nb[2],
+                                        search_radius)
+        end
+        poly, planes = _periodic_power_cell2(pts, w, i, dom; tol,
+                                             candidate_images)
+        volume[i] = abs(polygon_area(poly))
+        ci = polygon_centroid(poly)
+        center[i, 1] = _wrap_periodic2(ci[1], xmin, lx)
+        center[i, 2] = _wrap_periodic2(ci[2], ymin, ly)
+        m = size(poly, 1)
+        m < 2 && continue
+        for e in 1:m
+            ep = e == m ? 1 : e + 1
+            ax = poly[e, 1]; ay = poly[e, 2]
+            bx = poly[ep, 1]; by = poly[ep, 2]
+            len = hypot(bx - ax, by - ay)
+            len <= 1e-12 && continue
+            mx = 0.5 * (ax + bx)
+            my = 0.5 * (ay + by)
+            best = 0
+            best_abs = Inf
+            for p in eachindex(planes)
+                v = abs(planes[p].a[1] * mx + planes[p].a[2] * my - planes[p].b)
+                if v < best_abs
+                    best_abs = v
+                    best = p
+                end
+            end
+            best == 0 && continue
+            plane = planes[best]
+            j = plane.neighbor
+            j == i && continue
+            sx = plane.sx
+            sy = plane.sy
+            key = i < j ? (i, j, sx, sy) : (j, i, -sx, -sy)
+            key in seen && continue
+            push!(seen, key)
+            nn = hypot(plane.a[1], plane.a[2])
+            nn > 0 || continue
+            nx = plane.a[1] / nn
+            ny = plane.a[2] / nn
+            if i < j
+                push!(c1, i); push!(c2, j)
+                push!(normal, (nx, ny))
+            else
+                push!(c1, j); push!(c2, i)
+                push!(normal, (-nx, -ny))
+            end
+            push!(area, len)
+            push!(face_center, (_wrap_periodic2(mx, xmin, lx),
+                                _wrap_periodic2(my, ymin, ly)))
+        end
+    end
+
+    nf = length(c1)
+    fc = Matrix{Float64}(undef, nf, 2)
+    nm = Matrix{Float64}(undef, nf, 2)
+    @inbounds for f in 1:nf
+        fc[f, 1] = face_center[f][1]
+        fc[f, 2] = face_center[f][2]
+        nm[f, 1] = normal[f][1]
+        nm[f, 2] = normal[f][2]
+    end
+    fvx = zeros(T, nf)
+    fvy = zeros(T, nf)
+    if face_velocity !== nothing
+        size(face_velocity) == (nf, 2) || error("face_velocity must be nf x 2")
+        fvx .= T.(@view face_velocity[:, 1])
+        fvy .= T.(@view face_velocity[:, 2])
+    elseif cell_velocity !== nothing
+        cv = _velocity_matrix(cell_velocity, n)
+        @inbounds for f in 1:nf
+            i = c1[f]; j = c2[f]
+            fvx[f] = T(0.5 * (cv[i, 1] + cv[j, 1]))
+            fvy[f] = T(0.5 * (cv[i, 2] + cv[j, 2]))
+        end
+    end
+    offsets, faces, signs = _cell_face_csr_periodic2(n, c1, c2, index_type)
+    geom = ArepoMeshArrays2D(index_type.(c1), index_type.(c2), offsets, faces,
+                             signs, T.(volume), T.(area), T.(nm[:, 1]),
+                             T.(nm[:, 2]), fvx, fvy)
+    return (; geom, volume, center, face_center = fc,
+            generators = pts, weights = w, domain = dom,
+            bins_per_axis = local_bins === nothing ? nothing : local_bins[3],
+            search_radius = local_bins === nothing ? nothing : Int(search_radius))
+end
+
+include("arepo_runtime_scaffold.jl")
+include("arepo_gravity_scaffold.jl")
+include("arepo_pm_gravity.jl")
+include("arepo_io_parameters.jl")
 include("hydro3d.jl")
+include("arepo_io_snapshots.jl")
+include("arepo_io_runtime.jl")
+include("tessellation3d_semantics.jl")
+include("tessellation3d.jl")
 
 end # module

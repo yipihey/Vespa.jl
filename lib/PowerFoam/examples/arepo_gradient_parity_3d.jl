@@ -53,12 +53,40 @@ function stage_arepo_case(n)
     isdir(EXAMPLE) || error("AREPO turbulence example not found at $EXAMPLE")
     dir = mktempdir()
     cp(joinpath(EXAMPLE, "param_decay.txt"), joinpath(dir, "param.txt"))
+    param = joinpath(dir, "param.txt")
+    write(param, normalize_param_for_linked_arepo(read(param, String)))
     mkpath(joinpath(dir, "output"))
     py = python_cmd()
     run(pipeline(`$py $(joinpath(EXAMPLE, "create.py")) $dir unused $n 271`;
                  stdout = devnull))
     isfile(joinpath(dir, "IC.hdf5")) || error("AREPO create.py produced no IC.hdf5")
     return dir
+end
+
+function normalize_param_for_linked_arepo(text)
+    lines = split(text, '\n'; keepempty = true)
+    keep = String[]
+    for line in lines
+        if occursin(r"^SofteningComovingType[2-5]\s", line) ||
+           occursin(r"^SofteningMaxPhysType[2-5]\s", line)
+            continue
+        end
+        push!(keep, line)
+    end
+    text = join(keep, "\n")
+    text = replace(text,
+                   r"(?m)^SofteningTypeOfPartType1\s+.*$" => "SofteningTypeOfPartType1              1",
+                   r"(?m)^SofteningTypeOfPartType2\s+.*$" => "SofteningTypeOfPartType2              1",
+                   r"(?m)^SofteningTypeOfPartType3\s+.*$" => "SofteningTypeOfPartType3              1",
+                   r"(?m)^SofteningTypeOfPartType4\s+.*$" => "SofteningTypeOfPartType4              1",
+                   r"(?m)^SofteningTypeOfPartType5\s+.*$" => "SofteningTypeOfPartType5              1")
+    if !occursin(r"(?m)^MinimumComovingHydroSoftening\s", text)
+        text *= "\nMinimumComovingHydroSoftening         0.001\n"
+    end
+    if !occursin(r"(?m)^AdaptiveHydroSofteningSpacing\s", text)
+        text *= "AdaptiveHydroSofteningSpacing         1.2\n"
+    end
+    return text
 end
 
 maxdiff(a, b) = maximum(abs.(Array(a) .- Array(b)))

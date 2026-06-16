@@ -66,6 +66,51 @@ function cicass_thermal(z)
     return (T_gas=interp(tg), x_e=interp(xe), T_cmb=2.73*(1+z))
 end
 
+# Compton momentum-drag rate on the baryons / Hubble rate, Γ_drag/H, at redshift z.
+# Γ_drag = (4/3)(ργ/ρb)·x_e·n_H·σT·c; the ρb in (ργ/ρb) cancels the ρb in n_H, so it
+# reduces to (4/3)·a_rad·T_cmb⁴·x_e·X_H·σT/(c·m_H) — INDEPENDENT of Ω_b (cgs throughout).
+# This is the drag the codes (and CICASS below z=1000) omit; we add it back as an
+# operator.  Γ/H = 5.3 @z=990, 1 @z≈886, <0.01 below z≈440 (see compton_drag_vs_hubble).
+function compton_drag_over_H(z; hubble=0.71)
+    xe = cicass_thermal(z).x_e
+    σT=6.6524e-25; cc=2.998e10; mH=1.673e-24; a_rad=7.5657e-15; XH=0.76; Tcmb0=2.726
+    Or = 4.15e-5/hubble^2; H0 = 100.0*hubble*1e5/3.086e24            # 1/s
+    Γ = (4.0/3.0)*a_rad*(Tcmb0*(1+z))^4 * xe * XH * σT / (cc*mH)     # 1/s
+    H = H0*sqrt(OMEGA_M*(1+z)^3 + Or*(1+z)^4 + (1-OMEGA_M-Or))
+    return Γ/H
+end
+
+# Apply the Compton momentum drag to the gas over a step of Δln a at redshift z_mid:
+# damp the peculiar velocity toward the CMB rest frame (= 0 in the baryon rest frame)
+# by exp(−(Γ/H)·Δln a), and rebuild the total energy from the (unchanged) internal
+# energy + new kinetic energy (the dissipated bulk KE goes to the CMB, not to heat).
+# Damps the peculiar velocity toward `v_cmb` (the CMB-frame gas velocity, code units):
+# v → v_cmb + (v − v_cmb)·f.  v_cmb = 0 in the boosted (baryon rest) frame, = the streaming
+# bulk in the unboosted frame — so the operator is Galilean-frame-correct.  Returns f.
+function compton_drag!(h, z_mid, dlna; v_cmb=nothing)
+    γH = compton_drag_over_H(z_mid)
+    f  = exp(-γH * dlna)
+    f >= 0.999999 && return f                       # negligible → skip the field I/O
+    iD  = EnzoLib.field_index(h, 0; grid=0)                         # density (for mass-weighting)
+    iV1 = EnzoLib.field_index(h, 4; grid=0); iV2 = EnzoLib.field_index(h, 5; grid=0)
+    iV3 = EnzoLib.field_index(h, 6; grid=0); iTE = EnzoLib.field_index(h, 1; grid=0)
+    gpos = findfirst(==(2), EnzoLib.problem_field_types(h, 0))   # internal-energy field (dual energy)
+    ρ  = EnzoLib.problem_get_field(h, iD, 0)
+    v1 = EnzoLib.problem_get_field(h, iV1, 0); v2 = EnzoLib.problem_get_field(h, iV2, 0)
+    v3 = EnzoLib.problem_get_field(h, iV3, 0)
+    # Damp the PECULIAR velocity toward the mass-weighted bulk (≡ CMB/streaming frame):
+    # frame-agnostic, never damps the bulk — same prescription as the RAMSES/Arepo drags.
+    M = sum(ρ); vb1 = sum(ρ.*v1)/M; vb2 = sum(ρ.*v2)/M; vb3 = sum(ρ.*v3)/M
+    v1 .= vb1 .+ (v1 .- vb1).*f; v2 .= vb2 .+ (v2 .- vb2).*f; v3 .= vb3 .+ (v3 .- vb3).*f
+    EnzoLib.problem_set_field(h, iV1, v1; grid=0); EnzoLib.problem_set_field(h, iV2, v2; grid=0)
+    EnzoLib.problem_set_field(h, iV3, v3; grid=0)
+    if gpos !== nothing
+        ge = EnzoLib.problem_get_field(h, gpos-1, 0)
+        EnzoLib.problem_set_field(h, iTE, ge .+ 0.5 .* (v1.^2 .+ v2.^2 .+ v3.^2); grid=0)
+    end
+    return f
+end
+
 # ── :gravity slot, fully on the GPU: device radix-2 FFT Poisson + device comp_accel
 #    (the root-grid solve mirrors sb_metal_amr.gravity! but swaps the CPU FFTW root
 #    solve for `fft_poisson_root_gpu!` so no stage touches the host) ──
@@ -98,18 +143,28 @@ const _GT = Dict(:prep=>Ref(0.0), :gmf=>Ref(0.0), :fft=>Ref(0.0),
 # and we never call it again.
 const _RECON_GRAV = get(ENV, "CIC_GRAV_RECON", "1") == "1"
 const _GRAV_DIAG  = get(ENV, "CIC_GRAV_DIAG", "0") == "1"   # legacy path: isolate baryon vs Enzo GMF
+# CIC_GRAVPOST=fields (default): field-only gravity-post when the GPU push owns particles
+# (skips Enzo's redundant ParticleAcceleration interp). =full forces the full post (for A/B).
+const _GRAVPOST_FIELDS = get(ENV, "CIC_GRAVPOST", "fields") == "fields"
 const _diagcyc = Ref(0)
 const _gstate = Dict{Symbol,Int}()                  # one-time mesh-geometry capture (M, N, ng)
 # Build the GPU reconstruction (DM CIC shift−0.5 drifted + baryon) on the ACTIVE N³ mesh
 # — shared by the bypass path and the diagnostic. Returns (dm, bar) host arrays (mean-zero off).
-function _recon_source(h, g, bep, Nact, dt, acosmo)
-    px = dev(bep, EnzoLib.problem_get_particle_pos(h, 0, g))
-    py = dev(bep, EnzoLib.problem_get_particle_pos(h, 1, g))
-    pz = dev(bep, EnzoLib.problem_get_particle_pos(h, 2, g))
-    vx = dev(bep, EnzoLib.problem_get_particle_vel(h, 0, g))
-    vy = dev(bep, EnzoLib.problem_get_particle_vel(h, 1, g))
-    vz = dev(bep, EnzoLib.problem_get_particle_vel(h, 2, g))
-    m  = dev(bep, EnzoLib.problem_get_particle_mass(h, g))
+function _recon_source(h, g, bep, Nact, dt, acosmo; respart=nothing)
+    if respart === nothing
+        px = dev(bep, EnzoLib.problem_get_particle_pos(h, 0, g))
+        py = dev(bep, EnzoLib.problem_get_particle_pos(h, 1, g))
+        pz = dev(bep, EnzoLib.problem_get_particle_pos(h, 2, g))
+        vx = dev(bep, EnzoLib.problem_get_particle_vel(h, 0, g))
+        vy = dev(bep, EnzoLib.problem_get_particle_vel(h, 1, g))
+        vz = dev(bep, EnzoLib.problem_get_particle_vel(h, 2, g))
+        m  = dev(bep, EnzoLib.problem_get_particle_mass(h, g))
+    else
+        # deposit straight from the GPU-resident particles — no bridge read this cycle
+        px, py, pz = respart.px, respart.py, respart.pz
+        vx, vy, vz = respart.vx, respart.vy, respart.vz
+        m = respart.mass
+    end
     gd = Tuple(Int.(EnzoLib.problem_grid_dims(h, g)))
     NGb = (gd[1] - Nact) ÷ 2; Rb = (NGb+1):(NGb+Nact)
     barA = Array(reshape(Float64.(EnzoLib.problem_get_field(h, 0, g)), gd...)[Rb, Rb, Rb])
@@ -118,7 +173,7 @@ function _recon_source(h, g, bep, Nact, dt, acosmo)
                                 N=Nact, disp=0.5*dt/acosmo, shift=-0.5)
     return reshape(ρ, Nact, Nact, Nact), barA
 end
-function gravity_gpu!(h, level, dt)
+function gravity_gpu!(h, level, dt; respart=nothing)
     level == 0 || return SUBGRID_GRAV!(h, level, dt)
     bep = PoissonKernels.backend(BE)
     acosmo = EnzoLib.session_cosmology(h)[1]    # Enzo internal a (=1 at z_init)
@@ -168,7 +223,8 @@ function gravity_gpu!(h, level, dt)
             end
             _GT[:set][] += @elapsed EnzoLib.problem_set_potential(h, vec(full), g)
         end
-        _GT[:post][] += @elapsed EnzoLib.session_gravity_post(h, 0)
+        _GT[:post][] += @elapsed ((respart === nothing || !_GRAVPOST_FIELDS) ? EnzoLib.session_gravity_post(h, 0) :
+                                                        EnzoLib.session_gravity_post_fields(h, 0))
         return nothing
     end
     # ── GPU source build: bypass PrepareDensityField ─────────────────────────────
@@ -185,7 +241,7 @@ function gravity_gpu!(h, level, dt)
         g = EnzoLib.problem_grid_index_on_level(h, 0, i)
         local src3
         _GT[:prep][] += @elapsed begin
-            src3, barA = _recon_source(h, g, bep, Nact, dt, acosmo)   # ρ_dm (device) + baryon (host)
+            src3, barA = _recon_source(h, g, bep, Nact, dt, acosmo; respart=respart)   # ρ_dm (device) + baryon (host)
             src3 .+= dev(bep, barA)                  # GMF = ρ_dm + baryon  (device add)
             src3 .-= sum(src3)/length(src3)          # mean-zero periodic source
         end
@@ -210,7 +266,10 @@ function gravity_gpu!(h, level, dt)
         end
         _GT[:set][] += @elapsed EnzoLib.problem_set_potential(h, vec(full), g)
     end
-    _GT[:post][] += @elapsed EnzoLib.session_gravity_post(h, 0)   # difference φ → accelerations
+    # field-only post when the GPU push owns the particle interp (skips Enzo's redundant
+    # ParticleAcceleration interpolation + ±½ drift); else the full post (fills particles too)
+    _GT[:post][] += @elapsed ((respart === nothing || !_GRAVPOST_FIELDS) ? EnzoLib.session_gravity_post(h, 0) :
+                                                    EnzoLib.session_gravity_post_fields(h, 0))   # difference φ → accelerations
     return nothing
 end
 
@@ -310,7 +369,7 @@ function main_cic()
     s0 = cicass_thermal(ZSTART)
     # CFL/timestep parameters set EQUAL to RAMSES for an apples-to-apples comparison
     # (RAMSES newdt_fine.f90: courant_factor=0.8, da/a ≤ 0.1/hexp). Appended last so
-    # they override the SB host (which used 0.015 / 0.5). Override via env if needed.
+    # they override the native param defaults (0.015 / 0.5). Override via env if needed.
     maxexp   = parse(Float64, get(ENV, "CIC_MAXEXP",   "0.1"))    # = RAMSES da/a cap (0.1/hexp)
     courant  = parse(Float64, get(ENV, "CIC_COURANT",  "0.8"))    # = RAMSES courant_factor
     pcourant = parse(Float64, get(ENV, "CIC_PCOURANT", "0.8"))    # = RAMSES courant_factor (particles)
@@ -333,14 +392,26 @@ function main_cic()
     GreensFunctionMaxNumber      = 30
     NumberOfGhostZones           = 4
     CosmologyFinalRedshift       = $(ZEND)
-    CosmologySimulationInitialTemperature = $(round(s0.T_gas, digits=3))
     CosmologySimulationInitialFractionHII = $(s0.x_e)
     """
+    # NB: the gas temperature is OWNED by run_cicass_enzo (init_temperature below); it sets
+    # the internal energy explicitly with μ=1.22 (neutral).  Do NOT also set
+    # CosmologySimulationInitialTemperature here — Enzo's μ≈0.6 conversion would be 2× hot.
     @printf("CICASS z=%.0f: box=%.4f Mpc/h, %d³, T_gas=%.1f K, x_e=%.3e (H+D reduced chem)\n",
             ZSTART, BOX, NGRID, s0.T_gas, s0.x_e)
 
+    # CIC_ZERO_BARYON_BULK=1 → boost to the baryon rest frame (subtract the coherent
+    # gas bulk velocity from BOTH gas and DM); preserves the relative streaming offset.
+    zero_bulk = get(ENV, "CIC_ZERO_BARYON_BULK", "0") == "1"
+    # CIC_UNIFORM_BARYONS=1 → start baryons uniform (δb=0) at rest + Compton drag
+    # (the physical recombination start; pair with CIC_COMPTON_DRAG=1 below).
+    uniform_b = get(ENV, "CIC_UNIFORM_BARYONS", "0") == "1"
+    # CIC_BARYON_IC = particle (default) | smooth (raw CAMB/CLASS Fourier δb grid) | uniform
+    baryon_ic = Symbol(get(ENV, "CIC_BARYON_IC", "particle"))
     res = MultiCode.run_cicass_enzo(; vbc=VBC, boxlength=BOX, zstart=ZSTART, ngrid=NGRID,
-                                    omega_m=OMEGA_M, param_extra=chem)
+                                    omega_m=OMEGA_M, param_extra=chem, zero_baryon_bulk=zero_bulk,
+                                    uniform_baryons=uniform_b, baryon_ic=baryon_ic,
+                                    init_temperature=s0.T_gas, mu_init=1.22)
     h = res.handle; dims = res.dims; act = res.act; N = res.n; snap = res.snap
     cic_lin = read_cicass_pk(res.pk_file)           # CICASS analytic linear theory @ z_start
     pk_results = NamedTuple[]                        # one per output redshift
@@ -364,26 +435,36 @@ function main_cic()
         end
     end
     chemt = Ref(0.0); evolvet = Ref(0.0)   # wall-time accumulators (function scope)
-    hydrot = Ref(0.0); gravt = Ref(0.0); ncyc = Ref(0)
+    hydrot = Ref(0.0); gravt = Ref(0.0); ncyc = Ref(0); particlet = Ref(0.0); rebuildt = Ref(0.0)
+    # CIC_PROBE=1 attaches a per-slot timer (boundary/baryon_copy/comoving_expansion/…)
+    probe = get(ENV, "CIC_PROBE", "0") == "1" ? EnzoLib.SlotProbe() : nothing
     try
-        # ── inject the CICASS baryon overdensity into the gas density (+ scale the
-        #    advected species so their fractions are preserved) ──
-        gδ = reshape(snap.gas_delta, N, N, N)
-        ρfull = reshape(EnzoLib.problem_get_field(h, iD, 0), dims...)
-        ρmean = sum(@view ρfull[act...]) / N^3
-        factor = (1.0 .+ gδ) ./ (Array(@view ρfull[act...]) ./ ρmean)   # per-cell rescale
-        for ft in (0, 9, 14, 18)                       # Density, HII, H2I, HDI
-            fi = try EnzoLib.field_index(h, ft; grid=0) catch; -1 end
-            fi < 0 && continue
-            full = reshape(EnzoLib.problem_get_field(h, fi, 0), dims...)
-            if ft == 0
-                full[act...] = ρmean .* (1.0 .+ gδ)
-            else
-                full[act...] = Array(@view full[act...]) .* factor
+        # The native CICASS HDF5 ICs (run_cicass_enzo) already carry the baryon density
+        # in Enzo code units — (Ωb/Ωm)·(1+δb) per cell, from the realization's OWN
+        # constants — so the GravitatingMassField sums to 1 at boot and the chem species
+        # (MultiSpecies=3) are initialized by Enzo relative to that correct density.  No
+        # post-init renormalization of the gas field is needed or wanted.
+
+        # CIC_CHEM_INIT_MATCH=1 → set the initial species fields to the SAME explicit
+        # fractions the RAMSES driver uses (HII=ρ·x_e, H2I=ρ·1e-6, HDI=ρ·6.8e-5·x_e), so
+        # both codes feed ChemistryKernels identical starting HII/H2I/HDI (field 9/14/18).
+        if get(ENV, "CIC_CHEM_INIT_MATCH", "0") == "1"
+            xe0 = s0.x_e
+            ρf = reshape(EnzoLib.problem_get_field(h, iD, 0), dims...)
+            for (ft, frac) in ((9, xe0), (14, 1e-6), (18, 6.8e-5*xe0))
+                fi = try EnzoLib.field_index(h, ft; grid=0) catch; -1 end
+                fi < 0 && continue
+                EnzoLib.problem_set_field(h, fi, vec(ρf) .* frac; grid=0)
             end
-            EnzoLib.problem_set_field(h, fi, vec(full); grid=0)
+            # (gas temperature is now owned by run_cicass_enzo: μ=1.22 explicit eint.)
+            # verify the override took (read back H2I/ρ over the active region)
+            chk(ft) = begin
+                a = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,ft;grid=0), 0), dims, N)
+                sum(a)/sum(active_of(EnzoLib.problem_get_field(h, iD, 0), dims, N))
+            end
+            @printf("Enzo chem init match: set {HII,H2I,HDI}/ρ = {%.3e,1e-6,%.2e} + T_gas=%.0fK(μ=1.22); READBACK = {%.3e,%.3e,%.3e}\n",
+                    xe0, 6.8e-5*xe0, s0.T_gas, chk(9), chk(14), chk(18))
         end
-        EnzoLib.session_rebuild(h, 0)
 
         # ── IC power spectra (z=zstart) — the linear-theory anchor ──
         a_start = 1.0 / (1.0 + ZSTART); a_end = 1.0 / (1.0 + ZEND)
@@ -395,23 +476,39 @@ function main_cic()
         @printf("IC anchored: baryon kmax=%.2f h/Mpc, DM modes=%d, D(z=%.0f)=%.4e\n",
                 maximum(pk_b_ic.k), sum(pk_d_ic.N), ZSTART, D_start)
 
-        # ── log-spaced scale-factor checkpoints a_start→a_end ──
-        a_outs = exp.(range(log(a_start), log(a_end), length=NOUT))
+        # ── log-spaced scale-factor checkpoints a_start→a_end, with CIC_NEARLY extra
+        #    early-time (high-z) outputs in the first factor-4 of a (where the drag acts) ──
+        a_main = exp.(range(log(a_start), log(a_end), length=NOUT))
+        nearly = parse(Int, get(ENV, "CIC_NEARLY", "4"))
+        # CIC_ZOUT="z1,z2,…" → EXPLICIT output redshifts (the consistent cross-code list);
+        # else the default log-spaced a_main + CIC_NEARLY early extras.
+        a_outs = haskey(ENV, "CIC_ZOUT") ?
+            sort([1.0/(1.0+parse(Float64,s)) for s in split(ENV["CIC_ZOUT"], ",")]) :
+            nearly > 0 ?
+            sort(unique(vcat(exp.(range(log(1.06*a_start), log(min(4*a_start, a_end)), length=nearly)), a_main))) :
+            a_main
+        NOUT_eff = length(a_outs)
         ai = 1                                          # next checkpoint index
 
         gmode = Symbol(get(ENV, "CIC_GRAV", "julia"))   # :julia (Metal hook) or :enzo (certified)
         hmode = Symbol(get(ENV, "CIC_HYDRO", "julia"))  # :julia (PPMKernels) or :enzo (native PPM)
-        # chemistry engine: :enzo = native C Grackle (cooling=:enzo); :kernels = the
-        # native ChemistryKernels Julia port via the cooling=:julia hook (GPU-capable).
-        cmode = Symbol(get(ENV, "CIC_CHEM_ENGINE", "enzo"))
-        cbk   = Symbol(get(ENV, "CIC_CHEM_BACKEND", "metal"))
+        # chemistry engine: :kernels (DEFAULT) = the native ChemistryKernels Julia port via
+        # the cooling=:julia hook, run on the GPU — profiling showed native Grackle cooling
+        # was ~47% of the per-cycle cost (1.125 s/cyc → 0.186 s/cyc on Metal, a 1.8× whole-
+        # cycle speedup). :enzo = native C Grackle (cooling=:enzo) for cross-checking.
+        cmode = Symbol(get(ENV, "CIC_CHEM_ENGINE", "kernels"))
+        cbk   = Symbol(get(ENV, "CIC_CHEM_BACKEND", string(BE)))   # match the main backend (cpu/metal)
         hooks = Dict{Symbol,Function}()
         # CIC_HYDRO_SOLVER: :ppm (Enzo-PPM port, default) or :localppm (fast one-ghost Local PPM)
         hsolver = Symbol(get(ENV, "CIC_HYDRO_SOLVER", "ppm"))
         hydrofn = hsolver === :localppm ? hydro_localppm! : hydro!
         hmode === :julia && @printf("  hydro slot = :julia / %s\n", hsolver)
         hmode === :julia && (hooks[:hydro]   = (hh_,l_,d_)->(t=time(); hydrofn(hh_,l_,d_);       hydrot[]+=time()-t))
-        gmode === :julia && (hooks[:gravity] = (hh_,l_,d_)->(t=time(); gravity_gpu!(hh_,l_,d_); gravt[]+=time()-t))
+        # `respart` (the GPU-resident particle state, set below) lets the gravity slot
+        # deposit straight from the device-resident particles instead of re-reading
+        # them from Enzo every cycle — captured by reference so the closure sees it.
+        respart = nothing
+        gmode === :julia && (hooks[:gravity] = (hh_,l_,d_)->(t=time(); gravity_gpu!(hh_,l_,d_; respart=respart); gravt[]+=time()-t))
         coolmode = cmode === :kernels ? :julia : :enzo
         if cmode === :kernels
             cprec = cbk === :metal ? Float32 : Float64
@@ -432,8 +529,26 @@ function main_cic()
         else
             @printf("chemistry engine: native Enzo Grackle (:enzo)\n")
         end
+        # ── GPU-resident particle push: move the per-cycle CIC accel interpolation
+        #    + leapfrog drift/kick (Enzo's session_update_particles, ~N³=2M particles
+        #    on the CPU) onto the GPU via PoissonKernels, particles resident on the
+        #    device, coefficients from Enzo's CosmologyComputeExpansionFactor. Synced
+        #    back to Enzo each cycle so compute_dt/rebuild/diagnostics stay correct. ──
+        pmode = Symbol(get(ENV, "CIC_PARTICLES", "enzo"))   # :julia (GPU resident) or :enzo
+        # CIC_PARTICLE_SYNC: "output" (default for :julia) keeps particles resident and
+        # writes them back to Enzo ONLY at output checkpoints — gravity deposits from the
+        # resident arrays, so NO particles cross the bridge per cycle. "cycle" syncs every
+        # cycle (the safe baseline: Enzo's compute_dt/rebuild always see fresh particles).
+        psync = Symbol(get(ENV, "CIC_PARTICLE_SYNC", "output"))
+        if pmode === :julia
+            respart = MultiCode.resident_particles_init(h, PoissonKernels.backend(BE), T; grid=0, wrap=1.0)
+            sync_each = psync === :cycle
+            hooks[:particle_push] = (hh_,l_,d_)->(t=time(); MultiCode.particle_push_gpu!(respart, hh_, l_, d_; sync=sync_each); particlet[]+=time()-t)
+            @printf("  particle push = :julia (GPU resident, backend=%s, N=%d, sync=%s)\n", BE, respart.N, psync)
+        end
         eng = EnzoLib.EngineConfig(; hydro=hmode, gravity=gmode, cooling=coolmode,
-                                   comoving_expansion=:enzo, reflux=false, hooks=hooks)
+                                   comoving_expansion=:enzo, reflux=false,
+                                   particle_push=pmode, hooks=hooks, probe=probe)
         # CIC_COPYOLD=0 skips the per-cycle OldBaryonField copy (~8s/run) but is UNSAFE:
         # measured to change baryon large-scale P(k) ~2× (the comoving-expansion/gravity
         # source reads OldBaryonField). Keep =1 for self-gravitating cosmology.
@@ -449,6 +564,61 @@ function main_cic()
             ρb = active_of(EnzoLib.read_density(h; grid=0), dims, N)
             ρd = active_of(EnzoLib.deposit_particle_density(h; grid=0, periodic=true), dims, N)
             φ  = enzo_phi_grid()
+            # ── DM bulk (streaming) velocity diagnostic: the coherent mean DM peculiar
+            #    velocity should redshift as 1/a (∝ 1+z) — only Hubble drag acts on the
+            #    bulk (no Compton drag on DM, no net gravity on a uniform flow). ──
+            if get(ENV, "CIC_DMBULK", "0") == "1"
+                np = EnzoLib.problem_num_particles(h, 0)
+                vku = 1.22475e7 * BOX * sqrt(OMEGA_M) * sqrt(1+ZSTART) / 1e5      # km/s per code vel
+                dmv = ntuple(d -> sum(EnzoLib.problem_get_particle_vel(h, d-1, 0))/np * vku, 3)
+                gxf = EnzoLib.problem_get_field(h, EnzoLib.field_index(h,4;grid=0), 0)   # gas v_x
+                gasvx = (sum(@view active_of(gxf, dims, N)[:]) / N^3) * vku
+                exp_vbc = VBC * (1+z) / 1001.0                                    # 1/a redshift of v_bc
+                @printf("    [bulk z=%.1f: DM=(%.3f,%.3f,%.3f)|%.4f  gas_vx=%.4f km/s  expected 1/a=%.4f  DMratio=%.4f gasratio=%.4f]\n",
+                        z, dmv..., sqrt(sum(abs2,dmv)), gasvx, exp_vbc, sqrt(sum(abs2,dmv))/exp_vbc, gasvx/exp_vbc); flush(stdout)
+            end
+            # ── mid-box (z=N/2) slices: baryon δ, DM δ, vx, vy [km/s] — one per output ──
+            if get(ENV, "CIC_SLICES", "1") == "1"
+                kmid = N ÷ 2 + 1
+                vkms = 1.22475e7 * BOX * sqrt(OMEGA_M) * sqrt(1+ZSTART) / 1e5   # km/s per code vel
+                vxf = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,4;grid=0), 0), dims, N)
+                vyf = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,5;grid=0), 0), dims, N)
+                open(joinpath(REPORTS, "enzo_slice$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(N))
+                    write(io, vec(ρb[:, :, kmid]));           write(io, vec(ρd[:, :, kmid]))
+                    write(io, vec(vxf[:, :, kmid] .* vkms));  write(io, vec(vyf[:, :, kmid] .* vkms))
+                end
+            end
+            # ── full 3D baryon+DM density for cross-spectra P_bc(k), r(k) ──
+            if get(ENV, "CIC_XSPEC", "0") == "1"
+                open(joinpath(REPORTS, "enzo_xspec$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(N)); write(io, vec(ρb)); write(io, vec(ρd))
+                end
+            end
+            # ── per-cell density + chemistry on the regular grid, for cell-by-cell vs RAMSES.
+            #    x_HII=n_HII/n_H, f_H2=2n_H2/n_H, f_HD=n_HD/n_H (species fields 9,14,18; X_H=0.76). ──
+            if get(ENV, "CIC_CELLCMP", "0") == "1"
+                XH = 0.76
+                HII = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h, 9;grid=0), 0), dims, N)
+                H2I = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,14;grid=0), 0), dims, N)
+                HDI = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,18;grid=0), 0), dims, N)
+                geA = active_of(EnzoLib.problem_get_field(h, iGE, 0), dims, N)  # specific internal e
+                vu_cgs = 1.22475e7 * BOX * sqrt(OMEGA_M) * sqrt(1+ZSTART)       # cm/s (const z_init)
+                xHIIv = vec(HII) ./ vec(ρb) ./ XH; fH2v = vec(H2I) ./ vec(ρb) ./ XH
+                # grackle reduced-network μ (neutral He, n_e=n_HII): μ=1/[(X_H+Y/4)+
+                # X_H(x_HII−f_H2/2)] (→1.22 neutral) — consistent with calculate_temperature
+                # and with the RAMSES/Arepo dumps (was a fixed μ=1.22).
+                muv = 1.0 ./ ((XH+(1-XH)/4) .+ XH.*(xHIIv .- 0.5.*fH2v))
+                Tcell = vec(geA) .* muv .* ((5/3-1)*1.6726e-24*vu_cgs^2/1.380649e-16)
+                open(joinpath(REPORTS, "enzo_cellcmp$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(N))
+                    write(io, vec(ρb))                               # gas density (mean Ωb/Ωm)
+                    write(io, xHIIv)                                 # x_HII
+                    write(io, fH2v)                                  # f_H2
+                    write(io, vec(HDI) ./ vec(ρb))                   # f_HD
+                    write(io, Tcell)                                 # gas temperature [K] (grackle μ)
+                end
+            end
             # gas temperature diagnostic: e_int (code) × VelocityUnits² → T [K].
             # Enzo's VelocityUnits/TemperatureUnits are CONSTANT — defined once at the
             # INITIAL redshift (CosmologyGetUnits.C uses (1+InitialRedshift), not the
@@ -498,27 +668,58 @@ function main_cic()
             flush(stdout)
         end
 
+        # CIC_COMPTON_DRAG=1 → apply the baryon momentum drag each cycle.  Damps toward
+        # res.v_cmb (= 0 boosted / streaming-bulk unboosted), so it is frame-correct.
+        DO_DRAG = get(ENV, "CIC_COMPTON_DRAG", "0") == "1"
+        DRAG_VCMB = hasproperty(res, :v_cmb) ? res.v_cmb : (0.0, 0.0, 0.0)
+        z_prev = ZSTART
         @printf("%-4s %-8s %-9s %-10s %-8s\n", "cyc", "a_phys", "z", "ρmax", "sec")
         for cyc in 0:MAXCYC-1
             t0 = time()
-            EnzoLib.evolve_level!(h, 0, 0.0; engine=eng, regrid=false, copy_old=COPYOLD)
+            # Cap dt so the step lands EXACTLY on the next output a — the Julia frontend
+            # honoring CosmologyOutputRedshift like Enzo's own EvolveHierarchy. a_outs is
+            # physical; Enzo's internal a is normalized to 1 at z_start ⇒ ×(1+ZSTART).
+            mdt = Inf
+            if ai <= NOUT_eff
+                tn = EnzoLib.session_time(h); ae, dadt = EnzoLib.session_expansion_factor(h, tn)
+                aout_e = a_outs[ai]*(1.0+ZSTART)
+                (aout_e > ae && dadt > 0) && (mdt = (aout_e - ae)/dadt)
+            end
+            EnzoLib.evolve_level!(h, 0, 0.0; engine=eng, regrid=false, copy_old=COPYOLD, max_dt=mdt)
             sec = time() - t0; evolvet[] += sec; ncyc[] += 1
-            EnzoLib.session_rebuild(h, 0)
+            tr = time(); EnzoLib.session_rebuild(h, 0); rebuildt[] += time() - tr
             _, z = EnzoLib.session_cosmology(h)        # Enzo's a is normalized to 1 at z_start;
             a = 1.0 / (1.0 + z)                          # use the PHYSICAL scale factor
+            if DO_DRAG                                    # Compton momentum drag over this Δln a
+                dlna = log((1.0+z_prev)/(1.0+z)); zmid = 0.5*(z_prev+z)
+                # v_CMB is a peculiar velocity → redshifts as 1/a (∝ 1+z), like the DM bulk.
+                # (0 in the boosted/CMB-rest frame stays 0; the streaming bulk decays unboosted.)
+                vc = DRAG_VCMB .* ((1.0+zmid)/(1.0+ZSTART))
+                f = compton_drag!(h, zmid, dlna; v_cmb=vc)
+                (cyc % 10 == 0) && @printf("    [compton drag z=%.1f: Γ/H=%.2f  v×%.4f/cyc]\n",
+                                           zmid, compton_drag_over_H(zmid), f)
+                EnzoLib.session_rebuild(h, 0)            # refresh derived quantities after the kick
+            end
+            z_prev = z
             ρ = EnzoLib.problem_get_field(h, iD, 0)
             if cyc % 10 == 0 || z <= ZEND
                 @printf("%-4d %-8.5f %-9.3f %-10.3f %-8.2f\n", cyc, a, z, maximum(ρ), sec)
                 flush(stdout)
             end
             any(isnan, ρ) && (println("  NaN — abort"); break)
-            # record at each crossed log-a checkpoint
-            while ai <= NOUT && a >= a_outs[ai] - 1e-12
-                record!(a, z); ai += 1
+            # record at each crossed log-a checkpoint. In resident mode the particles
+            # live on the GPU and are NOT synced per cycle — flush them back to Enzo here
+            # so record!'s deposit_particle_density (Enzo's own CIC) sees the live state.
+            if ai <= NOUT_eff && a >= a_outs[ai] - 1e-12
+                respart !== nothing && MultiCode.sync_to_enzo!(respart, h)
+                while ai <= NOUT_eff && a >= a_outs[ai] - 1e-12
+                    record!(a, z); ai += 1
+                end
             end
             z <= ZEND && break
         end
-        if ai <= NOUT
+        if ai <= NOUT_eff
+            respart !== nothing && MultiCode.sync_to_enzo!(respart, h)
             _, zf = EnzoLib.session_cosmology(h); record!(1.0/(1.0+zf), zf)   # final
         end
     finally
@@ -528,12 +729,22 @@ function main_cic()
     # ── final table (already written incrementally per checkpoint) ──
     write_tables()
     @printf("\nwrote %d outputs → %s\n", length(pk_results), datafile)
-    @printf("TIMING Enzo: evolve=%.1fs  chem=%.1fs  hydro=%.1fs  gravity=%.1fs  other=%.1fs  | ncyc=%d (%.3fs/cyc: hydro %.3f, grav %.3f, chem %.3f)\n",
-            evolvet[], chemt[], hydrot[], gravt[],
-            evolvet[]-chemt[]-hydrot[]-gravt[], ncyc[],
-            evolvet[]/max(ncyc[],1), hydrot[]/max(ncyc[],1), gravt[]/max(ncyc[],1), chemt[]/max(ncyc[],1))
+    @printf("TIMING Enzo: evolve=%.1fs  chem=%.1fs  hydro=%.1fs  gravity=%.1fs  particles=%.1fs  other=%.1fs  | ncyc=%d (%.3fs/cyc: hydro %.3f, grav %.3f, part %.3f, chem %.3f)\n",
+            evolvet[], chemt[], hydrot[], gravt[], particlet[],
+            evolvet[]-chemt[]-hydrot[]-gravt[]-particlet[], ncyc[],
+            evolvet[]/max(ncyc[],1), hydrot[]/max(ncyc[],1), gravt[]/max(ncyc[],1), particlet[]/max(ncyc[],1), chemt[]/max(ncyc[],1))
     @printf("  GRAVITY sub-steps (total s): prep(deposit)=%.1f  gmf_copy=%.1f  fft=%.1f  continuation=%.1f  set_potential=%.1f  post(diff)=%.1f\n",
             _GT[:prep][], _GT[:gmf][], _GT[:fft][], _GT[:cont][], _GT[:set][], _GT[:post][])
+    @printf("  REBUILD (driver session_rebuild, outside evolve): total=%.1fs  %.3fs/cyc\n",
+            rebuildt[], rebuildt[]/max(ncyc[],1))
+    if probe !== nothing
+        ps = EnzoLib.probe_summary(probe); nc = max(ncyc[],1)
+        @printf("  PER-SLOT breakdown (probe, total s | s/cyc):\n")
+        for sl in (:boundary, :baryon_copy, :comoving_expansion, :gravity, :hydro, :cooling, :particle_push)
+            haskey(ps, sl) || continue
+            @printf("    %-20s %.2fs   %.4fs/cyc  (%d calls)\n", sl, ps[sl].total_ns/1e9, ps[sl].total_ns/1e9/nc, ps[sl].calls)
+        end
+    end
     flush(stdout)
     return datafile
 end

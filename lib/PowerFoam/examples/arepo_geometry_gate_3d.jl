@@ -54,7 +54,22 @@ function python_cmd()
     error("no Python with h5py/numpy found; set AREPO_PYTHON")
 end
 
-function stage_arepo_case(n)
+function _arepo_solver_name(riemann::Symbol)
+    riemann == :hll && return "HLL"
+    riemann == :llf && return "LLF"
+    riemann == :hllc && return "HLLC"
+    riemann == :exact && return "Exact"
+    error("unsupported AREPO Riemann solver for parity gate: $riemann")
+end
+
+function _set_param_line(text::String, key::AbstractString, value::AbstractString)
+    line = @sprintf("%-50s %s", key, value)
+    occursin(Regex("(?m)^$(key)\\s"), text) ?
+    replace(text, Regex("(?m)^$(key)\\s+.*\$") => line) :
+    string(text, endswith(text, "\n") ? "" : "\n", line, "\n")
+end
+
+function stage_arepo_case(n; riemann::Symbol = RIEMANN)
     isdir(EXAMPLE) || error("AREPO turbulence example not found at $EXAMPLE")
     dir = mktempdir()
     param = joinpath(dir, "param.txt")
@@ -63,6 +78,8 @@ function stage_arepo_case(n)
     text = replace(text,
                    r"(?m)^TimeOfFirstSnapshot\s+.*$" => "TimeOfFirstSnapshot                               2",
                    r"(?m)^TimeBetSnapshot\s+.*$" => "TimeBetSnapshot                                   2")
+    text = normalize_param_for_linked_arepo(text)
+    text = _set_param_line(text, "HydroRiemannSolver", _arepo_solver_name(riemann))
     write(param, text)
     mkpath(joinpath(dir, "output"))
     py = python_cmd()
@@ -70,6 +87,32 @@ function stage_arepo_case(n)
                  stdout = devnull))
     isfile(joinpath(dir, "IC.hdf5")) || error("AREPO create.py produced no IC.hdf5")
     return dir
+end
+
+function normalize_param_for_linked_arepo(text)
+    lines = split(text, '\n'; keepempty = true)
+    keep = String[]
+    for line in lines
+        if occursin(r"^SofteningComovingType[2-5]\s", line) ||
+           occursin(r"^SofteningMaxPhysType[2-5]\s", line)
+            continue
+        end
+        push!(keep, line)
+    end
+    text = join(keep, "\n")
+    text = replace(text,
+                   r"(?m)^SofteningTypeOfPartType1\s+.*$" => "SofteningTypeOfPartType1              1",
+                   r"(?m)^SofteningTypeOfPartType2\s+.*$" => "SofteningTypeOfPartType2              1",
+                   r"(?m)^SofteningTypeOfPartType3\s+.*$" => "SofteningTypeOfPartType3              1",
+                   r"(?m)^SofteningTypeOfPartType4\s+.*$" => "SofteningTypeOfPartType4              1",
+                   r"(?m)^SofteningTypeOfPartType5\s+.*$" => "SofteningTypeOfPartType5              1")
+    if !occursin(r"(?m)^MinimumComovingHydroSoftening\s", text)
+        text *= "\nMinimumComovingHydroSoftening         0.001\n"
+    end
+    if !occursin(r"(?m)^AdaptiveHydroSofteningSpacing\s", text)
+        text *= "AdaptiveHydroSofteningSpacing         1.2\n"
+    end
+    return text
 end
 
 function arepo_initial_export(dir)
@@ -84,10 +127,12 @@ function arepo_initial_export(dir)
         pressure = ArepoLib.get_cell_field(h, :pressure)
         center = ArepoLib.get_cell_field(h, :center)
         csnd = ArepoLib.get_cell_field(h, :csnd)
+        velvertex = ArepoLib.get_cell_field(h, :velvertex)
         vel = ArepoLib.get_particle_field(h, :vel)[1:ng, :]
         cgrad = ArepoLib.get_hydro_gradients(h)
         conn = ArepoLib.get_gradient_connections_3d(h)
-        return (; h, ng, geo, vol, rho, pressure, center, csnd, vel, cgrad, conn,
+        return (; h, ng, geo, vol, rho, pressure, center, csnd, velvertex,
+                vel, cgrad, conn,
                 box = ArepoLib.box_size(h), dir)
     catch
         ArepoLib.finalize(h)
@@ -174,7 +219,7 @@ end
 function make_state_and_geom(exported, be)
     geom_host = arepo_voronoi_mesh_arrays_3d(exported.geo, exported.vol;
                                              T = Float64,
-                                             cell_velocity = exported.vel)
+                                             cell_velocity = exported.velvertex)
     state_host = euler_state_3d(geom_host; rho = exported.rho,
                                 vx = exported.vel[:, 1],
                                 vy = exported.vel[:, 2],
@@ -223,6 +268,61 @@ function moving_face_stats(geom)
             normal_maxabs = maximum(abs.(normal_speed)))
 end
 
+function geometry_parity_stats(exported, geom)
+    nc = exported.ng
+    c1_expected = Int.(exported.geo.c1)
+    c2_expected = Int.(exported.geo.c2)
+    normals_expected = Matrix{Float64}(exported.geo.normals)
+    for f in eachindex(c1_expected)
+        if !(1 <= c1_expected[f] <= nc) && (1 <= c2_expected[f] <= nc)
+            c1_expected[f], c2_expected[f] = c2_expected[f], c1_expected[f]
+            normals_expected[f, 1] = -normals_expected[f, 1]
+            normals_expected[f, 2] = -normals_expected[f, 2]
+            normals_expected[f, 3] = -normals_expected[f, 3]
+        end
+    end
+    nf = length(c1_expected)
+    area_expected = Vector{Float64}(undef, nf)
+    nx_expected = Vector{Float64}(undef, nf)
+    ny_expected = Vector{Float64}(undef, nf)
+    nz_expected = Vector{Float64}(undef, nf)
+    offsets_ring = vcat(0, cumsum(Int.(exported.geo.nv)))
+    for f in 1:nf
+        lo = offsets_ring[f] + 1
+        hi = offsets_ring[f + 1]
+        sx, sy, sz = PowerFoam._ring_area_normal(@view exported.geo.verts[lo:hi, :])
+        area_expected[f] = 0.5 * sqrt(sx * sx + sy * sy + sz * sz)
+        gx, gy, gz = normals_expected[f, 1], normals_expected[f, 2], normals_expected[f, 3]
+        gn = sqrt(gx * gx + gy * gy + gz * gz)
+        nx_expected[f] = gx / gn
+        ny_expected[f] = gy / gn
+        nz_expected[f] = gz / gn
+    end
+    counts_expected = zeros(Int, nc)
+    for f in 1:nf
+        counts_expected[c1_expected[f]] += 1
+        c2_expected[f] > 0 && (counts_expected[c2_expected[f]] += 1)
+    end
+    offsets = Int.(Array(geom.cell_face_offsets))
+    counts_actual = offsets[2:end] .- offsets[1:end-1]
+    return (;
+        cells = nc,
+        faces_expected = nf,
+        faces_actual = length(geom.c1),
+        vertices = size(exported.geo.verts, 1),
+        c1_mismatches = count(Int.(Array(geom.c1)) .!= c1_expected),
+        c2_mismatches = count(Int.(Array(geom.c2)) .!= c2_expected),
+        volume_maxdiff = maximum(abs.(Array(geom.volume) .- exported.vol)),
+        area_maxdiff = maximum(abs.(Array(geom.face_area) .- area_expected)),
+        normal_maxdiff = maximum(vcat(abs.(Array(geom.normal_x) .- nx_expected),
+                                      abs.(Array(geom.normal_y) .- ny_expected),
+                                      abs.(Array(geom.normal_z) .- nz_expected))),
+        csr_count_maxdiff = maximum(abs.(counts_actual .- counts_expected)),
+        csr_entries = length(geom.cell_faces),
+        csr_entries_expected = sum(counts_expected),
+    )
+end
+
 function conservation_drift(initial, final)
     return (; mass = final.mass - initial.mass,
             mx = final.mx - initial.mx,
@@ -231,7 +331,7 @@ function conservation_drift(initial, final)
             energy = final.energy - initial.energy)
 end
 
-function write_report(path, exported, geom_host, before, cpu_rows, gpu_rows,
+function write_report(path, exported, geom_host, geom_stats, before, cpu_rows, gpu_rows,
                       diffs, gpu_enabled, recon_cpu_rows, recon_gpu_rows,
                       recon_diffs, dt_stats, rebuild)
     cpu_after = cpu_rows[end]
@@ -265,6 +365,23 @@ function write_report(path, exported, geom_host, before, cpu_rows, gpu_rows,
                 face_stats.normal_rms, face_stats.normal_maxabs)
         @printf(io, "- AREPO-style hydro dt min/median/max: %.8g / %.8g / %.8g\n",
                 dt_stats.min, dt_stats.median, dt_stats.max)
+        println(io)
+        println(io, "## Geometry conversion parity")
+        println(io)
+        println(io, "| check | value |")
+        println(io, "| --- | ---: |")
+        @printf(io, "| cells | %d |\n", geom_stats.cells)
+        @printf(io, "| faces expected / actual | %d / %d |\n",
+                geom_stats.faces_expected, geom_stats.faces_actual)
+        @printf(io, "| vertices | %d |\n", geom_stats.vertices)
+        @printf(io, "| c1 mismatches | %d |\n", geom_stats.c1_mismatches)
+        @printf(io, "| c2 mismatches | %d |\n", geom_stats.c2_mismatches)
+        @printf(io, "| volume max abs diff | %.12g |\n", geom_stats.volume_maxdiff)
+        @printf(io, "| face area max abs diff | %.12g |\n", geom_stats.area_maxdiff)
+        @printf(io, "| normal max abs diff | %.12g |\n", geom_stats.normal_maxdiff)
+        @printf(io, "| CSR cell-face count max diff | %d |\n", geom_stats.csr_count_maxdiff)
+        @printf(io, "| CSR entries expected / actual | %d / %d |\n",
+                geom_stats.csr_entries_expected, geom_stats.csr_entries)
         println(io)
         println(io, "## First-order ALE diagnostics")
         println(io)
@@ -374,6 +491,7 @@ function main()
     try
         cpu_be = KernelAbstractions.CPU()
         cpu_geom, cpu_state, geom_host, _ = make_state_and_geom(exported, cpu_be)
+        geom_stats = geometry_parity_stats(exported, geom_host)
         before = diagnostics("AREPO init in PowerFoam table", cpu_state, cpu_geom, 0, 0.0)
         cpu_rows = [diagnostics("PowerFoam CPU", cpu_state, cpu_geom, 0, 0.0)]
         for step in 1:NSTEPS
@@ -413,7 +531,7 @@ function main()
         write_csv(joinpath(OUTDIR, "metrics.csv"),
                   isempty(gpu_rows) ? vcat([before], cpu_rows) :
                   vcat([before], cpu_rows, gpu_rows))
-        write_report(joinpath(OUTDIR, "README.md"), exported, geom_host, before,
+        write_report(joinpath(OUTDIR, "README.md"), exported, geom_host, geom_stats, before,
                      cpu_rows, gpu_rows, diffs, gpu_be !== nothing,
                      recon_cpu_rows, recon_gpu_rows, recon_diffs, dt_stats, rebuild)
         @printf("wrote %s\n", joinpath(OUTDIR, "metrics.csv"))
@@ -421,6 +539,10 @@ function main()
         @printf("AREPO geometry: cells=%d faces=%d vertices=%d volume_sum=%.9g\n",
                 exported.ng, length(exported.geo.nv), size(exported.geo.verts, 1),
                 sum(exported.vol))
+        @printf("geometry conversion: c1_mismatch=%d c2_mismatch=%d volume=%.3g area=%.3g normal=%.3g csr_count=%d\n",
+                geom_stats.c1_mismatches, geom_stats.c2_mismatches,
+                geom_stats.volume_maxdiff, geom_stats.area_maxdiff,
+                geom_stats.normal_maxdiff, geom_stats.csr_count_maxdiff)
         cpu_after = cpu_rows[end]
         @printf("CPU after %d steps: vrms=%.6g density_rms=%.6g\n",
                 NSTEPS, cpu_after.vrms, cpu_after.density_rms)
@@ -442,4 +564,6 @@ function main()
     end
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

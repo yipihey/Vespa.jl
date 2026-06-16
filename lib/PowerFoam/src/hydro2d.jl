@@ -629,7 +629,8 @@ end
 
 @kernel function _gradients_from_mesh_2d_k!(
     grad_data, @Const(offsets), @Const(cell_faces), @Const(cell_signs),
-    @Const(c1), @Const(c2), @Const(cell_data), @Const(face_data), box_size)
+    @Const(c1), @Const(c2), @Const(cell_data), @Const(face_data),
+    box_size_x, box_size_y)
     i = @index(Global, Linear)
     T = eltype(cell_data)
     ncell = Int(length(offsets) - 1)
@@ -658,8 +659,8 @@ end
             sign = Int(cell_signs[p])
             other = sign < 0 ? Int(c2[f]) : Int(c1[f])
             other > 0 || continue
-            dx = _periodic_delta2(cell_data[5 * ncell + other] - cx, box_size)
-            dy = _periodic_delta2(cell_data[6 * ncell + other] - cy, box_size)
+            dx = _periodic_delta2(cell_data[5 * ncell + other] - cx, box_size_x)
+            dy = _periodic_delta2(cell_data[6 * ncell + other] - cy, box_size_y)
             dist = sqrt(dx * dx + dy * dy)
             dist > zero(T) || continue
             invd = one(T) / dist
@@ -701,8 +702,8 @@ end
         for p in Int(offsets[i]):(Int(offsets[i + 1]) - 1)
             f = Int(cell_faces[p])
             face_data[f] > zero(T) || continue
-            dx = _periodic_delta2(face_data[nface + f] - cx, box_size)
-            dy = _periodic_delta2(face_data[2 * nface + f] - cy, box_size)
+            dx = _periodic_delta2(face_data[nface + f] - cx, box_size_x)
+            dy = _periodic_delta2(face_data[2 * nface + f] - cy, box_size_y)
             gr = _limit_gradient2(dx, dy, r0, minr, maxr, grx, gry)
             grx = gr[1]; gry = gr[2]
             gvx = _limit_gradient2(dx, dy, vx0, minvx, maxvx, gvxx, gvxy)
@@ -716,8 +717,8 @@ end
         for p in Int(offsets[i]):(Int(offsets[i + 1]) - 1)
             f = Int(cell_faces[p])
             face_data[f] > zero(T) || continue
-            dx = _periodic_delta2(face_data[nface + f] - cx, box_size)
-            dy = _periodic_delta2(face_data[2 * nface + f] - cy, box_size)
+            dx = _periodic_delta2(face_data[nface + f] - cx, box_size_x)
+            dy = _periodic_delta2(face_data[2 * nface + f] - cy, box_size_y)
             gvx = _limit_vel_gradient2(dx, dy, csnd, gvxx, gvxy)
             gvxx = gvx[1]; gvxy = gvx[2]
             gvy = _limit_vel_gradient2(dx, dy, csnd, gvyx, gvyy)
@@ -740,6 +741,7 @@ function calculate_gradients_from_mesh_2d!(out::HydroGradients2D,
                                            prim::PrimitiveState2D,
                                            center, face_center;
                                            box_size::Real = 1.0,
+                                           box_size_y::Real = box_size,
                                            gamma::Real = 5/3,
                                            synchronize::Bool = true)
     n = length(prim.rho)
@@ -753,7 +755,7 @@ function calculate_gradients_from_mesh_2d!(out::HydroGradients2D,
     fcx = _backend_copy(be, collect(view(face_center, :, 1)), T)
     fcy = _backend_copy(be, collect(view(face_center, :, 2)), T)
     calculate_gradients_from_mesh_2d!(out, mesh, prim, cx, cy, fcx, fcy;
-                                      box_size, gamma, synchronize)
+                                      box_size, box_size_y, gamma, synchronize)
 end
 
 function calculate_gradients_from_mesh_2d!(out::HydroGradients2D,
@@ -762,6 +764,7 @@ function calculate_gradients_from_mesh_2d!(out::HydroGradients2D,
                                            center_x, center_y,
                                            face_center_x, face_center_y;
                                            box_size::Real = 1.0,
+                                           box_size_y::Real = box_size,
                                            gamma::Real = 5/3,
                                            synchronize::Bool = true)
     n = length(prim.rho)
@@ -785,7 +788,7 @@ function calculate_gradients_from_mesh_2d!(out::HydroGradients2D,
     _gradients_from_mesh_2d_k!(be)(
         grad_data, mesh.cell_face_offsets, mesh.cell_faces,
         mesh.cell_face_signs, mesh.c1, mesh.c2, cell_data, face_data,
-        T(box_size);
+        T(box_size), T(box_size_y);
         ndrange = n)
     _unpack_gradients_2d_k!(be)(
         out.drho_x, out.drho_y, out.dvelx_x, out.dvelx_y,
@@ -830,7 +833,8 @@ end
 @inline function _predict_primitive_face_state2(cell::Int, f::Int, ncell::Int,
                                                 nface::Int, cell_data,
                                                 grad_data, face_data,
-                                                box_size::T, gamma::T) where {T}
+                                                box_size_x::T, box_size_y::T,
+                                                gamma::T) where {T}
     r0 = cell_data[cell]
     vx0 = cell_data[ncell + cell]
     vy0 = cell_data[2 * ncell + cell]
@@ -853,8 +857,8 @@ end
     wx = face_data[2 * nface + f]
     wy = face_data[3 * nface + f]
 
-    dx = _periodic_delta2(fx - cx, box_size)
-    dy = _periodic_delta2(fy - cy, box_size)
+    dx = _periodic_delta2(fx - cx, box_size_x)
+    dy = _periodic_delta2(fy - cy, box_size_y)
 
     vx = vx0 - wx
     vy = vy0 - wy
@@ -884,7 +888,7 @@ end
 @kernel function _predict_face_states_2d_k!(
     left, right, @Const(c1), @Const(c2),
     @Const(cell_data), @Const(grad_data), @Const(face_data),
-    box_size, gamma)
+    box_size_x, box_size_y, gamma)
     f = @index(Global, Linear)
     ncell = Int(length(cell_data) ÷ 7)
     nface = Int(length(left) ÷ 4)
@@ -892,14 +896,16 @@ end
         i = Int(c1[f])
         j = Int(c2[f])
         L = _predict_primitive_face_state2(i, f, ncell, nface, cell_data,
-                                           grad_data, face_data, box_size, gamma)
+                                           grad_data, face_data, box_size_x,
+                                           box_size_y, gamma)
         left[f] = L[1]
         left[nface + f] = L[2]
         left[2 * nface + f] = L[3]
         left[3 * nface + f] = L[4]
         if j > 0
             R = _predict_primitive_face_state2(j, f, ncell, nface, cell_data,
-                                               grad_data, face_data, box_size, gamma)
+                                               grad_data, face_data, box_size_x,
+                                               box_size_y, gamma)
             right[f] = R[1]
             right[nface + f] = R[2]
             right[2 * nface + f] = R[3]
@@ -918,6 +924,7 @@ function predict_face_states_2d!(states::FaceStates2D, mesh::ArepoMeshArrays2D,
                                  prim::PrimitiveState2D, center, face_center;
                                  dt_extrapolation = nothing,
                                  box_size::Real = 1.0,
+                                 box_size_y::Real = box_size,
                                  gamma::Real = 5/3,
                                  synchronize::Bool = true)
     n = length(prim.rho)
@@ -934,7 +941,8 @@ function predict_face_states_2d!(states::FaceStates2D, mesh::ArepoMeshArrays2D,
     fcx = _backend_copy(be, collect(view(face_center, :, 1)), T)
     fcy = _backend_copy(be, collect(view(face_center, :, 2)), T)
     predict_face_states_2d!(states, mesh, gradients, prim, cx, cy, fcx, fcy;
-                            dt_extrapolation = dt, box_size, gamma, synchronize)
+                            dt_extrapolation = dt, box_size, box_size_y, gamma,
+                            synchronize)
 end
 
 function predict_face_states_2d!(states::FaceStates2D, mesh::ArepoMeshArrays2D,
@@ -944,6 +952,7 @@ function predict_face_states_2d!(states::FaceStates2D, mesh::ArepoMeshArrays2D,
                                  face_center_x, face_center_y;
                                  dt_extrapolation = nothing,
                                  box_size::Real = 1.0,
+                                 box_size_y::Real = box_size,
                                  gamma::Real = 5/3,
                                  synchronize::Bool = true)
     n = length(prim.rho)
@@ -972,7 +981,7 @@ function predict_face_states_2d!(states::FaceStates2D, mesh::ArepoMeshArrays2D,
         ndrange = nf)
     _predict_face_states_2d_k!(be)(states.left, states.right, mesh.c1, mesh.c2,
                                    cell_data, grad_data, face_data,
-                                   T(box_size), T(gamma);
+                                   T(box_size), T(box_size_y), T(gamma);
                                    ndrange = nf)
     synchronize && KA.synchronize(be)
     return states
@@ -987,6 +996,7 @@ function finite_volume_reconstructed_step_2d!(
     states::Union{Nothing,FaceStates2D} = nothing,
     new_volume = mesh.volume,
     box_size::Real = 1.0,
+    box_size_y::Real = box_size,
     small_pressure::Real = 1e-12,
     synchronize::Bool = true)
     n = length(prim.rho)
@@ -999,7 +1009,7 @@ function finite_volume_reconstructed_step_2d!(
               dt_extrapolation
     s = states === nothing ? face_prediction_work_2d(mesh) : states
     predict_face_states_2d!(s, mesh, gradients, prim, center, face_center;
-                            dt_extrapolation = half_dt, box_size, gamma,
+                            dt_extrapolation = half_dt, box_size, box_size_y, gamma,
                             synchronize = false)
     w = work === nothing ? hydro_work_2d(state, mesh) : work
     _face_flux_from_predicted_2d_k!(be)(w.FD, w.FMx, w.FMy, w.FE,
@@ -1027,6 +1037,7 @@ function finite_volume_reconstructed_step_2d!(
     states::Union{Nothing,FaceStates2D} = nothing,
     new_volume = mesh.volume,
     box_size::Real = 1.0,
+    box_size_y::Real = box_size,
     small_pressure::Real = 1e-12,
     synchronize::Bool = true)
     n = length(prim.rho)
@@ -1039,7 +1050,7 @@ function finite_volume_reconstructed_step_2d!(
     s = states === nothing ? face_prediction_work_2d(mesh) : states
     predict_face_states_2d!(s, mesh, gradients, prim, center_x, center_y,
                             face_center_x, face_center_y;
-                            dt_extrapolation = half_dt, box_size, gamma,
+                            dt_extrapolation = half_dt, box_size, box_size_y, gamma,
                             synchronize = false)
     w = work === nothing ? hydro_work_2d(state, mesh) : work
     _face_flux_from_predicted_2d_k!(be)(w.FD, w.FMx, w.FMy, w.FE,
@@ -1162,6 +1173,7 @@ function moving_mesh_reconstructed_step_2d!(state::EulerState2D, mesh::PolygonMe
                                             backend = nothing,
                                             boundary::Symbol = :clamp,
                                             box_size::Real = 0.0,
+                                            box_size_y::Real = box_size,
                                             small_pressure::Real = 1e-12)
     vmesh = _mesh_velocity_from_input(mesh, state, mesh_velocity; gamma)
     old_host = arepo_mesh_arrays(mesh; T = Float64, cell_velocity = vmesh)
@@ -1185,14 +1197,14 @@ function moving_mesh_reconstructed_step_2d!(state::EulerState2D, mesh::PolygonMe
     conserved_to_primitive_2d!(prim, state; gamma, synchronize = false)
     gradients = hydro_gradient_work_2d(prim.rho)
     calculate_gradients_from_mesh_2d!(gradients, old_geom, prim, cx, cy, fcx, fcy;
-                                      box_size, gamma, synchronize = false)
+                                      box_size, box_size_y, gamma, synchronize = false)
     work = hydro_work_2d(state, old_geom)
     states = face_prediction_work_2d(old_geom)
     finite_volume_reconstructed_step_2d!(state, old_geom, gradients, prim,
                                          cx, cy, fcx, fcy;
                                          dt, gamma, riemann, work, states,
                                          new_volume = new_geom.volume,
-                                         box_size, small_pressure)
+                                         box_size, box_size_y, small_pressure)
     return (; mesh = new_mesh, geom = new_geom, state, mesh_velocity = vmesh)
 end
 

@@ -73,6 +73,7 @@ include("zeldovich.jl")
 include("gravity_slot.jl")
 include("grackle_service.jl")     # code-neutral reduced primordial chemistry (HII,H2I)
 include("grackle_slot.jl")        # wire the service onto RAMSES / Arepo hosts
+include("enzo_resident.jl")        # GPU-resident particle push (replaces session_update_particles)
 
 """
     run_dfmm_sod(spec = SodSpec(gamma = 5/3, t = 0.2); N = 200, tau = 1e-3,
@@ -148,12 +149,14 @@ function run_cicass_streaming end
 """
     run_cicass_enzo(; vbc=30.0, boxlength=0.2, zstart=100.0) -> (; ...)
 
-Inject a CICASS streaming realization into a LIVE Enzo 128³ hydro cosmology grid
-(the SantaBarbaraCluster host, patched to the CICASS cosmology so Enzo's velocity
-units match): the gas velocity field into the BaryonField velocities and the DM
-velocities into the particles, then read both back and confirm the coherent
-gas–DM bulk offset survives into Enzo's data structures (≈ vbc·(1+z)/1001 km/s).
-Implemented in `MultiCodeCICASSExt` — `using CICASSLib` activates it.
+Boot a LIVE Enzo hydro cosmology grid directly from NATIVE CICASS HDF5 ICs (a
+fully self-contained `CosmologySimulation`, ProblemType 30 — no external host
+template): the realization's gas density/velocity and DM particle position/velocity
+are written to Enzo's IC datasets in code units, with the cosmology (Ωb, Ωcdm, Ωr,
+ΩΛ flat) set from the realization's own constants.  Reads the coherent gas–DM bulk
+offset back out and confirms it survives into Enzo's data structures
+(≈ vbc·(1+z)/1001 km/s).  Implemented in `MultiCodeCICASSExt` — `using CICASSLib`
+activates it.
 """
 function run_cicass_enzo end
 

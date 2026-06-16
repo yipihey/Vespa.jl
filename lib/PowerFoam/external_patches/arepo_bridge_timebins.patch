@@ -1,0 +1,124 @@
+diff --git a/src/bridge/arepo_bridge.h b/src/bridge/arepo_bridge.h
+index 0000000..0000000 100644
+--- a/src/bridge/arepo_bridge.h
++++ b/src/bridge/arepo_bridge.h
+@@
+   int arepo_get_hydro_gradients(double *drho, double *dvel, double *dpress, long n);
++
++  /*! Export the current hydro scheduler state.
++   *  bins[i] is P[i].TimeBinHydro for local gas cell i.
++   *  active[i] is true when the cell is active at All.Ti_Current.
++   *  sync is length TIMEBINS and receives TimeBinSynchronized.
++   *  active_list is length at least max_active and receives the current
++   *  TimeBinsHydro.ActiveParticleList entries. If max_active is too small,
++   *  returns -required_active_count so callers can retry.
++   *  Returns active count on success, -1 if not initialized / bad pointers,
++   *          -2 if n != NumGas. */
++  long long arepo_get_hydro_timebins(int *bins, int *active, int *sync, int *active_list,
++                                     long long *ti_current, double *timebase_interval,
++                                     long n, long long max_active);
+ 
+   /*! Export the exact local connection rows used by calculate_gradients().
+diff --git a/src/bridge/arepo_bridge.c b/src/bridge/arepo_bridge.c
+index 0000000..0000000 100644
+--- a/src/bridge/arepo_bridge.c
++++ b/src/bridge/arepo_bridge.c
+@@
+ int arepo_get_hydro_gradients(double *drho, double *dvel, double *dpress, long n)
+ {
+@@
+   return 0;
+ }
++
++long long arepo_get_hydro_timebins(int *bins, int *active, int *sync, int *active_list,
++                                     long long *ti_current, double *timebase_interval,
++                                     long n, long long max_active)
++{
++  if(!bridge_initialized || bins == NULL || active == NULL || sync == NULL || active_list == NULL ||
++     ti_current == NULL || timebase_interval == NULL)
++    return -1;
++  if(n != (long)NumGas)
++    return -2;
++
++  long long required = (long long)TimeBinsHydro.NActiveParticles;
++  if(max_active < required)
++    return -required;
++
++  for(long i = 0; i < n; i++)
++    {
++      bins[i]   = P[i].TimeBinHydro;
++      active[i] = TimeBinSynchronized[P[i].TimeBinHydro] ? 1 : 0;
++    }
++
++  for(int b = 0; b < TIMEBINS; b++)
++    sync[b] = TimeBinSynchronized[b] ? 1 : 0;
++
++  for(long long k = 0; k < required; k++)
++    active_list[k] = TimeBinsHydro.ActiveParticleList[k];
++
++  *ti_current        = (long long)All.Ti_Current;
++  *timebase_interval = All.Timebase_interval;
++  return required;
++}
+ 
+ static long long bridge_count_gradient_connections(void)
+ {
+diff --git a/lib/ArepoLib/src/fields.jl b/lib/ArepoLib/src/fields.jl
+index 0000000..0000000 100644
+--- a/lib/ArepoLib/src/fields.jl
++++ b/lib/ArepoLib/src/fields.jl
+@@
+ export get_particle_field, set_particle_field!, get_particle_ids,
+        get_cell_field, set_cell_field!, get_particles, get_cells,
+        get_voronoi_2d, get_voronoi_3d, get_hydro_gradients,
+-       get_gradient_connections_3d
++       get_gradient_connections_3d, get_hydro_timebins
+@@
+ function get_hydro_gradients(h::Handle)
+@@
+     return (; drho, dvel, dpress)
+ end
++
++"""
++    get_hydro_timebins(h) -> NamedTuple
++
++Read AREPO's live hydro scheduler state for local gas cells. `bins` are
++`P[i].TimeBinHydro`, `active` is the synchronized local-cell mask, and
++`active_list` mirrors `TimeBinsHydro.ActiveParticleList` using 1-based Julia
++cell indices.
++"""
++function get_hydro_timebins(h::Handle)
++    _check(h)
++    n = num_gas(h)
++    bins = Vector{Cint}(undef, n)
++    active = Vector{Cint}(undef, n)
++    sync = Vector{Cint}(undef, 64)
++    ti = Ref{Clonglong}(0)
++    tbi = Ref{Cdouble}(0)
++    maxactive = max(1, n)
++    while true
++        active_list0 = Vector{Cint}(undef, maxactive)
++        got = GC.@preserve bins active sync active_list0 @xcall(
++            :arepo_get_hydro_timebins, Clonglong,
++            (Ptr{Cint}, Ptr{Cint}, Ptr{Cint}, Ptr{Cint}, Ref{Clonglong}, Ref{Cdouble}, Clong, Clonglong),
++            bins, active, sync, active_list0, ti, tbi, Clong(n), Clonglong(maxactive))
++        got == -1 && error("get_hydro_timebins: not initialized or bad bridge pointers")
++        got == -2 && error("get_hydro_timebins: NumGas changed while reading scheduler state")
++        if got < 0
++            required = Int(-got)
++            required <= maxactive && error("get_hydro_timebins failed ($got)")
++            maxactive = required
++            continue
++        end
++        nactive = Int(got)
++        return (; bins = Int.(bins),
++                active = active .!= 0,
++                synchronized = sync .!= 0,
++                active_list = Int.(active_list0[1:nactive]) .+ 1,
++                ti_current = Int(ti[]),
++                timebase_interval = Float64(tbi[]))
++    end
++end
+ 
+ """
+     get_gradient_connections_3d(h) -> NamedTuple

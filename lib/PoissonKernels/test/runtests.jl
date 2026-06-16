@@ -52,4 +52,6 @@ include("harness.jl")
     include("test_vcycle.jl")
     include("test_fft_poisson.jl")
     include("test_deposit.jl")
+    include("test_particle_push.jl")
+    include("test_field_ops.jl")
 end

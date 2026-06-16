@@ -38,6 +38,12 @@ const CHEM_INPROC = CHEM_ENG === :kernels
 const BE      = Symbol(get(ENV, "BACKEND", "metal"))
 const T       = Float32
 const TAG     = get(ENV, "CIC_TAG", "")
+const DO_DRAG = get(ENV, "CIC_COMPTON_DRAG", "0") == "1"   # Compton momentum drag on the gas
+# Hard memory ceiling (MB): if process RSS exceeds this, abort the step loop
+# gracefully (write what we have, finalize Arepo) rather than letting a leak run
+# the machine out of RAM.  Default 50 GB — well above the ~3.5 GB a healthy run
+# holds, low enough to catch a runaway long before it hurts the system.
+const RSS_CEIL_MB = parse(Float64, get(ENV, "CIC_RSS_CEIL_MB", "50000"))
 const REPORTS = joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
 const GRACKLE_DATA = get(ENV, "GRACKLE_DATA_FILE",
     joinpath(homedir(), "Research", "codes", "grackle", "input", "CloudyData_noUVB.h5"))
@@ -71,6 +77,65 @@ function cic_density(xp::AbstractMatrix, w::AbstractVector, N::Integer)
         ρ[i0,j1,k1]+=m*(1-fx)*fy*fz;ρ[i1,j1,k1]+=m*fx*fy*fz
     end
     ρ
+end
+
+# ── Memory guard ─────────────────────────────────────────────────────────────
+# Each chem step (and every pk_of) allocates fresh Metal device arrays.  Their
+# Julia-side handles are tiny, so Julia's GC heuristic almost never fires on its
+# own — but the backing MTLBuffers are unified GPU/wired memory and are only
+# freed by the MtlArray finalizers, which run on GC.  Without a forced GC the
+# buffers accumulate every step until macOS jetsam SIGTERMs the process
+# (signal 15 — exactly what killed the prior _c64 run at step 100).  So we drive
+# GC explicitly: a cheap incremental collect every chem step (frees the step's
+# device temporaries) and a full collect + memory readout periodically.
+const _IS_METAL = BE === :metal
+function gpu_gc!(full::Bool=false)
+    _IS_METAL && Metal.synchronize()         # let in-flight kernels finish before we free their buffers
+    GC.gc(full)
+    return nothing
+end
+# current process resident set size in MB (the number jetsam watches), -1 on failure
+proc_rss_mb() = try
+    parse(Float64, strip(read(`ps -o rss= -p $(getpid())`, String))) / 1024
+catch; -1.0 end
+
+# ── Compton momentum drag on the gas (mirrors the Enzo/RAMSES operators) ─────
+# Γ_drag/H from the CICASS recombination history (x_e); Ω_b-independent.  Damps
+# the gas PECULIAR velocity toward the CMB rest frame by f = exp(-(Γ/H)·Δln a).
+function compton_drag_over_H(z; hubble=0.71)
+    xe = try CICASSLib.thermal_state(z).x_e catch; 0.0 end
+    σT=6.6524e-25; cc=2.998e10; mH=1.673e-24; a_rad=7.5657e-15; XH=0.76; Tcmb0=2.726
+    Or = 4.15e-5/hubble^2; H0 = 100.0*hubble*1e5/3.086e24            # 1/s
+    Γ = (4.0/3.0)*a_rad*(Tcmb0*(1+z))^4 * xe * XH * σT / (cc*mH)     # 1/s
+    H = H0*sqrt(OMEGA_M*(1+z)^3 + Or*(1+z)^4 + (1-OMEGA_M-Or))
+    return Γ/H
+end
+
+# Apply the drag to the live Arepo Voronoi cells.  Arepo stores CONSERVED
+# momentum (=Mass·v) and energy (=Mass·e_tot); Mass = ρ·volume.  We damp the
+# peculiar velocity (v − v_bulk) toward zero, leaving the mass-weighted bulk
+# (≡ the CMB/streaming frame) undamped — unit-safe (no km/s↔code conversion) and
+# frame-agnostic (bulk≈0 boosted, ≈v_bc unboosted).  Internal energy (utherm) is
+# unchanged; total energy absorbs the kinetic-energy change.
+function arepo_compton_drag!(h, z_mid, dlna; hubble=0.71)
+    f = exp(-compton_drag_over_H(z_mid; hubble=hubble) * dlna)
+    f >= 0.999999 && return f                                        # negligible → skip I/O
+    rho = ArepoLib.get_cell_field(h, :rho)
+    vol = ArepoLib.get_cell_field(h, :volume)
+    mom = ArepoLib.get_cell_field(h, :momentum)                      # n×3 (Mass·v)
+    E   = ArepoLib.get_cell_field(h, :energy)                        # n   (Mass·e_tot)
+    mass = max.(rho .* vol, eps())
+    vbar = ntuple(d -> sum(@view mom[:, d]) / sum(mass), 3)          # mass-weighted bulk
+    ke0  = 0.5 .* vec(sum(abs2, mom; dims=2)) ./ mass
+    @inbounds for d in 1:3, i in eachindex(mass)
+        v = mom[i, d] / mass[i]
+        mom[i, d] = mass[i] * (vbar[d] + (v - vbar[d]) * f)          # damp peculiar part
+    end
+    ke1 = 0.5 .* vec(sum(abs2, mom; dims=2)) ./ mass
+    E .+= ke1 .- ke0                                                 # keep e_int, swap KE
+    ArepoLib.set_cell_field!(h, :momentum, mom)
+    ArepoLib.set_cell_field!(h, :energy, E)
+    return f
 end
 
 function build_gadget_ic(path, snap, a0, xHII0)
@@ -113,6 +178,23 @@ function arepo_param(dir, snap, a0, aend)
     boxk = snap.box*1000.0
     soft = (boxk/snap.n)/5                            # 1/5 of mean spacing (comoving kpc/h)
     erracc = parse(Float64, get(ENV, "CIC_ERRACC", "0.04"))   # ErrTolIntAccuracy (bigger → bigger dt)
+    # Arepo's OutputListOn=1 makes it write a full HDF5 snapshot (4M double-precision
+    # particles, SnapFormat=3) at every output redshift.  That write path allocates
+    # ~12 GB per snapshot OUTSIDE Arepo's tracked arena and never frees it — with the
+    # 11-output CIC_ZOUT list it runs the process out of RAM and macOS jetsam SIGTERMs
+    # us (signal 15).  We don't need those snapshots: `record!` captures P(k) from the
+    # LIVE Voronoi cells in-process at the same redshifts.  So default OutputListOn OFF
+    # (no Arepo snapshot writes); record! still fires at every CIC_ZOUT a (≤2% overshoot,
+    # bounded by MaxSizeTimestep).  Opt back in with CIC_AREPO_SNAPSHOTS=1 if you ever
+    # actually want the .hdf5 dumps (and have the RAM headroom for the leak).
+    olon = 0
+    if haskey(ENV, "CIC_ZOUT") && get(ENV, "CIC_AREPO_SNAPSHOTS", "0") == "1"
+        aouts = sort([1.0/(1.0+parse(Float64,s)) for s in split(ENV["CIC_ZOUT"], ",")])
+        open(joinpath(dir, "ol.txt"), "w") do io
+            for av in aouts; println(io, string(round(av; digits=10), " 1")); end
+        end
+        olon = 1
+    end
     return """
 InitCondFile         ./ics
 OutputDir            ./output
@@ -136,7 +218,7 @@ OmegaLambda          $(snap.omega_l)
 OmegaBaryon          $(snap.omega_b)
 HubbleParam          $(snap.hconst)
 BoxSize              $(boxk)
-OutputListOn         0
+OutputListOn         $(olon)
 TimeBetSnapshot      1.1
 TimeOfFirstSnapshot  2.0
 TimeBetStatistics    0.05
@@ -324,12 +406,16 @@ function main()
                 @printf("chemistry engine: native Grackle reduced lib (:grackle, worker)\n")
             end
         end
-        a_outs = exp.(range(log(a0), log(aend), length=NOUT)); ai = 1
+        # CIC_ZOUT="z1,z2,…" → EXPLICIT output redshifts (consistent cross-code list).
+        a_outs = haskey(ENV, "CIC_ZOUT") ?
+            sort([1.0/(1.0+parse(Float64,s)) for s in split(ENV["CIC_ZOUT"], ",")]) :
+            exp.(range(log(a0), log(aend), length=NOUT)); ai = 1
         function record!(z)
             gas, dm = arepo_grids(h, Na, info.boxk)
             push!(pk_results, (z=z, baryon=pk_of(gas), dm=pk_of(dm)))
             db = std(gas)/mean(gas); dd = std(dm)/mean(dm)
-            @printf("  ● Arepo z=%.2f  δb_rms=%.3e δdm_rms=%.3e  [%d]\n", z, db, dd, length(pk_results))
+            @printf("  ● Arepo z=%.2f  δb_rms=%.3e δdm_rms=%.3e  [%d]  rss=%.0fMB\n",
+                    z, db, dd, length(pk_results), proc_rss_mb())
             write_tables(); flush(stdout)
         end
         achem = a0
@@ -337,9 +423,30 @@ function main()
         @printf("%-5s %-9s %-10s\n","step","z","sec"); flush(stdout)
         for step in 0:200000
             z = znow(); a = anow()
-            while ai <= NOUT && a >= a_outs[ai]-1e-12; record!(z); ai += 1; end
+            # Hard safety net: never let a leak run the machine out of RAM.  Sys.maxrss
+            # is a cheap ccall (no fork); for a monotonically-growing leak max≈current.
+            rss_now = Sys.maxrss() / 2^20
+            if rss_now > RSS_CEIL_MB
+                @printf("ABORT: RSS %.0fMB exceeded ceiling %.0fMB at step %d z=%.2f — stopping cleanly\n",
+                        rss_now, RSS_CEIL_MB, step, z); flush(stdout)
+                break
+            end
+            while ai <= length(a_outs) && a >= a_outs[ai]-1e-12; record!(z); ai += 1; end
             z <= ZEND && break
+            dbg = get(ENV,"CIC_RSS_DEBUG","0")=="1" && step < 6
+            _r() = Sys.maxrss()/2^20
+            dbg && @printf("    [rss step%d pre =%.0f]\n", step, _r())
             t0 = time(); st = ArepoLib.run_step!(h)
+            dbg && @printf("    [rss step%d run=%.0f]\n", step, _r())
+            if DO_DRAG                                              # Compton drag over the step just taken
+                znew = znow(); dlna = log((1.0+z)/(1.0+znew))
+                if dlna > 1e-12
+                    fdr = arepo_compton_drag!(h, 0.5*(z+znew), dlna; hubble=snap.hconst)
+                    (step % 20 == 0) && @printf("    [compton drag z=%.1f Γ/H=%.2f v×%.4f]\n",
+                        0.5*(z+znew), compton_drag_over_H(0.5*(z+znew); hubble=snap.hconst), fdr)
+                end
+            end
+            dbg && @printf("    [rss step%d drag=%.0f]\n", step, _r())
             if CHEM && step % CHEM_EVERY == 0 && step > 0
                 anew = anow(); znew = znow()
                 dphys = _dt_phys(achem, anew, snap.hconst, snap.omega_m, snap.omega_l)/UTIME
@@ -376,11 +483,23 @@ function main()
                 end
                 step % (5*CHEM_EVERY) == 0 && (@printf("    [chem z=%.1f done]\n", znew); flush(stdout))
             end
+            dbg && (@printf("    [rss step%d chem=%.0f]\n", step, _r()); flush(stdout))
             sec = time()-t0; steptot += sec
-            (step % 20 == 0) && (@printf("%-5d %-9.3f %-10.2f\n", step, z, sec); flush(stdout))
+            # Per-step RSS (Sys.maxrss = cheap getrusage ccall, no fork, no alloc) for
+            # visibility.  NOTE: we deliberately do NOT force GC/Metal.synchronize here —
+            # the proven-good cmp_arepo_drag run (245 steps, no OOM) let Metal recycle its
+            # command buffers on its own schedule; interleaving a forced GC every step
+            # pinned ~1 GB/step instead.  The ceiling below is the safety net.
+            rss = Sys.maxrss() / 2^20
+            if step % 20 == 0
+                @printf("%-5d z=%-8.3f %6.2fs  rss=%.0fMB (ps=%.0fMB)\n",
+                        step, z, sec, rss, proc_rss_mb()); flush(stdout)
+            elseif step < 16 || step % 5 == 0
+                @printf("%-5d z=%-8.3f %6.2fs  rss=%.0fMB\n", step, z, sec, rss); flush(stdout)
+            end
             st == :continue || (@printf("run_step returned %s at z=%.2f\n", st, z); break)
         end
-        ai <= NOUT && record!(znow())
+        ai <= length(a_outs) && record!(znow())
         gw === nothing || (try; write(gw, Int64(0)); flush(gw); close(gw); catch; end)
         @printf("TIMING Arepo: step_loop=%.1fs  chem=%.1fs (%.1f%%)  host(hydro+grav+mesh)=%.1fs\n",
                 steptot, chemt, 100*chemt/max(steptot,eps()), steptot-chemt); flush(stdout)

@@ -56,9 +56,16 @@ end
 function _cell_face_csr(ncells::Integer, c1, c2, ::Type{I}) where {I<:Integer}
     counts = zeros(Int, ncells)
     @inbounds for f in eachindex(c1)
-        counts[Int(c1[f])] += 1
+        i = Int(c1[f])
+        if i > 0
+            i <= ncells || error("c1 contains a cell id larger than cell count")
+            counts[i] += 1
+        end
         j = Int(c2[f])
-        j > 0 && (counts[j] += 1)
+        if j > 0
+            j <= ncells || error("c2 contains a cell id larger than cell count")
+            counts[j] += 1
+        end
     end
     offsets = Vector{I}(undef, ncells + 1)
     offsets[1] = one(I)
@@ -70,10 +77,12 @@ function _cell_face_csr(ncells::Integer, c1, c2, ::Type{I}) where {I<:Integer}
     cursor = Int.(offsets[1:end-1])
     @inbounds for f in eachindex(c1)
         i = Int(c1[f])
-        p = cursor[i]
-        faces[p] = I(f)
-        signs[p] = -one(I)
-        cursor[i] += 1
+        if i > 0
+            p = cursor[i]
+            faces[p] = I(f)
+            signs[p] = -one(I)
+            cursor[i] += 1
+        end
         j = Int(c2[f])
         if j > 0
             p = cursor[j]
@@ -248,6 +257,51 @@ function arepo_voronoi_mesh_arrays_3d(geometry, volume;
     fvx, fvy, fvz = _face_velocity_arrays_3d(c1h, c2h, face_velocity, cell_velocity, T)
     return ArepoMeshArrays3D(index_type.(c1h), index_type.(c2h), offsets, faces, signs,
                              T.(volume), area, nx, ny, nz, fvx, fvy, fvz)
+end
+
+"""
+    with_update_targets_3d(mesh, update_c1, update_c2; index_type=Int32)
+
+Return a mesh with the same geometric face endpoints and face fields as `mesh`,
+but with its cell-face CSR rebuilt from explicit flux update targets.  AREPO's
+periodic/MPI ghost rows can be geometrically one-sided while still updating two
+local cells after ghost indices are mapped back to local gas cells; this helper
+keeps geometry and update ownership separate without changing the face-flux
+layout.
+"""
+function with_update_targets_3d(mesh::ArepoMeshArrays3D, update_c1, update_c2;
+                                index_type::Type{<:Integer} = Int32)
+    length(update_c1) == length(mesh.c1) ||
+        error("update_c1 length must match mesh face count")
+    length(update_c2) == length(mesh.c2) ||
+        error("update_c2 length must match mesh face count")
+    offsets, faces, signs = _cell_face_csr(length(mesh.volume), update_c1,
+                                           update_c2, index_type)
+    return ArepoMeshArrays3D(mesh.c1, mesh.c2, offsets, faces, signs,
+                             mesh.volume, mesh.face_area,
+                             mesh.normal_x, mesh.normal_y, mesh.normal_z,
+                             mesh.face_vx, mesh.face_vy, mesh.face_vz)
+end
+
+"""
+    face_update_activity_3d(update_c1, update_c2; index_type=Int32)
+
+Return a c2-shaped activity vector for predicted-state face-flux kernels from
+explicit local update targets.  AREPO periodic/import rows can be geometrically
+one-sided while still contributing flux to local cells after ghost indices are
+mapped back; this helper lets callers keep geometric `c2` separate from the
+question of whether the face should produce a flux.
+"""
+function face_update_activity_3d(update_c1, update_c2;
+                                 index_type::Type{<:Integer} = Int32)
+    length(update_c1) == length(update_c2) ||
+        error("update_c1/update_c2 lengths must match")
+    active = Vector{index_type}(undef, length(update_c1))
+    @inbounds for f in eachindex(update_c1)
+        active[f] = (Int(update_c1[f]) > 0 || Int(update_c2[f]) > 0) ?
+                    one(index_type) : zero(index_type)
+    end
+    return active
 end
 
 function to_backend(be, mesh::ArepoMeshArrays3D; T::Type{<:AbstractFloat} = Float32,
@@ -448,6 +502,98 @@ end
             (sr * FL[5] - sl * FR[5] + sl * sr * (Er  - El)) / denom)
 end
 
+@inline function _face_tangent_basis3(nx::T, ny::T, nz::T) where {T}
+    if abs(nx) > abs(ny)
+        rinv = inv(sqrt(nx * nx + nz * nz))
+        mx = -nz * rinv
+        my = zero(T)
+        mz = nx * rinv
+    else
+        rinv = inv(sqrt(ny * ny + nz * nz))
+        mx = zero(T)
+        my = nz * rinv
+        mz = -ny * rinv
+    end
+    px = ny * mz - nz * my
+    py = nz * mx - nx * mz
+    pz = nx * my - ny * mx
+    return mx, my, mz, px, py, pz
+end
+
+@inline function _arepo_frame_hll_flux_3d(ρl::T, ulx::T, uly::T, ulz::T, pl::T,
+                                          ρr::T, urx::T, ury::T, urz::T, pr::T,
+                                          nx::T, ny::T, nz::T,
+                                          wx::T, wy::T, wz::T,
+                                          gamma::T, solver::Int, small::T) where {T}
+    gm1 = gamma - one(T)
+    mx, my, mz, px, py, pz = _face_tangent_basis3(nx, ny, nz)
+    vxl = ulx * nx + uly * ny + ulz * nz
+    vyl = ulx * mx + uly * my + ulz * mz
+    vzl = ulx * px + uly * py + ulz * pz
+    vxr = urx * nx + ury * ny + urz * nz
+    vyr = urx * mx + ury * my + urz * mz
+    vzr = urx * px + ury * py + urz * pz
+    wnx = wx * nx + wy * ny + wz * nz
+    wmy = wx * mx + wy * my + wz * mz
+    wpz = wx * px + wy * py + wz * pz
+
+    El = pl / gm1 + T(0.5) * ρl * (vxl * vxl + vyl * vyl + vzl * vzl)
+    Er = pr / gm1 + T(0.5) * ρr * (vxr * vxr + vyr * vyr + vzr * vzr)
+    FLm = ρl * vxl
+    FLx = ρl * vxl * vxl + pl
+    FLy = ρl * vxl * vyl
+    FLz = ρl * vxl * vzl
+    FLe = (El + pl) * vxl
+    FRm = ρr * vxr
+    FRx = ρr * vxr * vxr + pr
+    FRy = ρr * vxr * vyr
+    FRz = ρr * vxr * vzr
+    FRe = (Er + pr) * vxr
+
+    if solver == 1
+        cl = sqrt(gamma * pl / ρl)
+        cr = sqrt(gamma * pr / ρr)
+        a = max(abs(vxl) + cl, abs(vxr) + cr)
+        h = T(0.5)
+        fm = h * (FLm + FRm - a * (ρr - ρl))
+        fx = h * (FLx + FRx - a * (ρr * vxr - ρl * vxl))
+        fy = h * (FLy + FRy - a * (ρr * vyr - ρl * vyl))
+        fz = h * (FLz + FRz - a * (ρr * vzr - ρl * vzl))
+        fe = h * (FLe + FRe - a * (Er - El))
+    else
+        cl = sqrt(gamma * pl / ρl)
+        cr = sqrt(gamma * pr / ρr)
+        sl = min(vxl - cl, vxr - cr)
+        sr = max(vxl + cl, vxr + cr)
+        if sl >= zero(T)
+            fm = FLm; fx = FLx; fy = FLy; fz = FLz; fe = FLe
+        elseif sr <= zero(T)
+            fm = FRm; fx = FRx; fy = FRy; fz = FRz; fe = FRe
+        else
+            denom = sr - sl
+            fm = (sr * FLm - sl * FRm + sr * sl * (ρr - ρl)) / denom
+            fx = (sr * FLx - sl * FRx + sr * sl * (ρr * vxr - ρl * vxl)) / denom
+            fy = (sr * FLy - sl * FRy + sr * sl * (ρr * vyr - ρl * vyl)) / denom
+            fz = (sr * FLz - sl * FRz + sr * sl * (ρr * vzr - ρl * vzl)) / denom
+            fe = (sr * FLe - sl * FRe + sr * sl * (Er - El)) / denom
+        end
+    end
+
+    fx0 = fx
+    fy0 = fy
+    fz0 = fz
+    fx += wnx * fm
+    fy += wmy * fm
+    fz += wpz * fm
+    fe += fx0 * wnx + fy0 * wmy + fz0 * wpz +
+          T(0.5) * fm * (wnx * wnx + wmy * wmy + wpz * wpz)
+    return (fm,
+            fx * nx + fy * mx + fz * px,
+            fx * ny + fy * my + fz * py,
+            fx * nz + fy * mz + fz * pz,
+            fe)
+end
+
 @kernel function _face_flux_3d_k!(FD, FMx, FMy, FMz, FE,
                                   @Const(D), @Const(Mx), @Const(My), @Const(Mz),
                                   @Const(E), @Const(c1), @Const(c2),
@@ -587,24 +733,25 @@ end
             FMz[f] = zero(T); FE[f] = zero(T)
         else
             # `predict_face_states_3d!` follows AREPO and stores velocities in
-            # the face frame. Convert them back to the lab frame before using
-            # the ALE flux, which subtracts the face velocity once.
+            # the face-rest frame (lab velocity minus face velocity). AREPO's
+            # approximate solvers apply HLL/LLF dissipation to these local-frame
+            # conserved variables, then convert the resulting flux to the lab
+            # frame.
             Dl = max(left[f], small)
-            ulx = left[nface + f] + wx[f]
-            uly = left[2 * nface + f] + wy[f]
-            ulz = left[3 * nface + f] + wz[f]
+            ulx = left[nface + f]
+            uly = left[2 * nface + f]
+            ulz = left[3 * nface + f]
             pl = max(left[4 * nface + f], small)
             Dr = max(right[f], small)
-            urx = right[nface + f] + wx[f]
-            ury = right[2 * nface + f] + wy[f]
-            urz = right[3 * nface + f] + wz[f]
+            urx = right[nface + f]
+            ury = right[2 * nface + f]
+            urz = right[3 * nface + f]
             pr = max(right[4 * nface + f], small)
-            CL = _prim_to_cons3(Dl, ulx, uly, ulz, pl, gamma)
-            CR = _prim_to_cons3(Dr, urx, ury, urz, pr, gamma)
-            flux = _hll_or_llf_flux_3d(CL[1], CL[2], CL[3], CL[4], CL[5],
-                                       CR[1], CR[2], CR[3], CR[4], CR[5],
-                                       nx[f], ny[f], nz[f], wx[f], wy[f], wz[f],
-                                       gamma, solver, small)
+            flux = _arepo_frame_hll_flux_3d(Dl, ulx, uly, ulz, pl,
+                                            Dr, urx, ury, urz, pr,
+                                            nx[f], ny[f], nz[f],
+                                            wx[f], wy[f], wz[f],
+                                            gamma, solver, small)
             FD[f] = flux[1] * a
             FMx[f] = flux[2] * a
             FMy[f] = flux[3] * a
@@ -791,11 +938,27 @@ end
 Continuous form of AREPO's non-cosmological hydro Courant rule:
 `dt = CourantFac * cell_radius / sound_speed`, clipped by min/max timestep.
 `cell_radius` is inferred from the 3-D cell volume as `(3V/4π)^(1/3)`.
+When `velocity` and `mesh_velocity` are supplied, the signal speed includes
+AREPO's moving-mesh tree timestep term `|v - VelVertex|`.
 """
 function arepo_hydro_dt_3d(volume, pressure, rho; gamma::Real = 5/3,
                            courant::Real = 0.3, max_dt::Real = 0.05,
-                           min_dt::Real = 1e-6)
+                           min_dt::Real = 1e-6,
+                           velocity = nothing,
+                           mesh_velocity = nothing)
     cs = sqrt.(gamma .* pressure ./ rho)
+    if velocity !== nothing || mesh_velocity !== nothing
+        velocity === nothing &&
+            error("arepo_hydro_dt_3d requires velocity when mesh_velocity is supplied")
+        mesh_velocity === nothing &&
+            error("arepo_hydro_dt_3d requires mesh_velocity when velocity is supplied")
+        size(velocity, 2) == 3 || error("velocity must have three columns")
+        size(mesh_velocity, 2) == 3 || error("mesh_velocity must have three columns")
+        rel2 = (view(velocity, :, 1) .- view(mesh_velocity, :, 1)).^2 .+
+               (view(velocity, :, 2) .- view(mesh_velocity, :, 2)).^2 .+
+               (view(velocity, :, 3) .- view(mesh_velocity, :, 3)).^2
+        cs = cs .+ sqrt.(rel2)
+    end
     radius = cbrt.((3 .* volume) ./ (4pi))
     dt = courant .* radius ./ max.(cs, eps(eltype(float.(cs))))
     return clamp.(dt, min_dt, max_dt)
@@ -821,6 +984,244 @@ function arepo_timebin_3d(dt; timebase_interval::Real)
         bins[i] = b
     end
     return bins
+end
+
+"""
+    arepo_system_step_3d(dt; timebase_interval=2.0^-28)
+
+Quantize continuous timestep estimates to AREPO's synchronization lattice by
+choosing the largest power-of-two integer step that does not exceed each
+continuous `dt`.  Returns physical timesteps in the same units as `dt`.
+"""
+function arepo_system_step_3d(dt; timebase_interval::Real = 2.0^-28)
+    bins = arepo_timebin_3d(dt; timebase_interval)
+    return timebase_interval .* (1 .<< bins)
+end
+
+"""
+    arepo_hydro_timebins_3d(volume, pressure, rho; ...)
+
+Compute the hydro Courant timestep and its AREPO-style power-of-two timebin for
+each cell.  `integer_steps[i] == 2^bins[i]` is the cell step in units of
+`timebase_interval`.  This is the scheduler-facing companion to
+`arepo_hydro_dt_3d`.
+"""
+function arepo_hydro_timebins_3d(volume, pressure, rho;
+                                 gamma::Real = 5/3,
+                                 courant::Real = 0.3,
+                                 max_dt::Real = 0.05,
+                                 min_dt::Real = 1e-6,
+                                 timebase_interval::Real = 2.0^-28,
+                                 velocity = nothing,
+                                 mesh_velocity = nothing)
+    dt = arepo_hydro_dt_3d(volume, pressure, rho; gamma, courant, max_dt,
+                           min_dt, velocity, mesh_velocity)
+    bins = arepo_timebin_3d(dt; timebase_interval)
+    integer_steps = 1 .<< bins
+    return (; dt, bins, integer_steps,
+            min_bin = minimum(bins), max_bin = maximum(bins),
+            timebase_interval)
+end
+
+"""
+    arepo_active_cells_3d(bins, ti_current) -> Vector{Bool}
+
+Return cells active at integer time `ti_current`, where a cell in bin `b` has an
+integer step of `2^b`.  At `ti_current == 0`, all cells are synchronized and
+therefore active.
+"""
+function arepo_active_cells_3d(bins, ti_current::Integer)
+    steps = 1 .<< Int.(bins)
+    return (ti_current .% steps) .== 0
+end
+
+"""
+    arepo_next_sync_step_3d(bins, ti_current) -> Int
+
+Return the integer timebase interval to the next synchronization point for a
+set of AREPO-style timebins.
+"""
+function arepo_next_sync_step_3d(bins, ti_current::Integer)
+    steps = 1 .<< Int.(bins)
+    rem = steps .- (ti_current .% steps)
+    rem[rem .== 0] .= steps[rem .== 0]
+    return minimum(rem)
+end
+
+function finite_volume_reconstructed_hierarchy_step_3d!(
+    state::EulerState3D, mesh::ArepoMeshArrays3D, gradients,
+    prim::PrimitiveState3D, center_x, center_y, center_z,
+    face_center_x, face_center_y, face_center_z, bins;
+    ti_current::Integer,
+    timebase_interval::Real = 2.0^-28,
+    gamma::Real, riemann::Symbol = :hll,
+    dt_extrapolation = nothing,
+    work::Union{Nothing,FaceFluxWork3D} = nothing,
+    states::Union{Nothing,FaceStates3D} = nothing,
+    new_volume = mesh.volume,
+    box_size::Real = 1.0,
+    small_pressure::Real = 1e-12,
+    synchronize::Bool = true)
+    active = arepo_active_cells_3d(bins, ti_current)
+    table = active_face_table_3d(mesh, active)
+    ti_step = arepo_next_sync_step_3d(bins, ti_current)
+    dt = timebase_interval * ti_step
+    finite_volume_reconstructed_step_activecells_3d!(
+        state, mesh, gradients, prim,
+        center_x, center_y, center_z,
+        face_center_x, face_center_y, face_center_z,
+        table.active_counts, table.active_faces, table.active_signs;
+        active_stride = table.active_stride, dt, gamma, riemann,
+        dt_extrapolation, work, states, new_volume, box_size, small_pressure,
+        synchronize)
+    return (; state, ti_next = ti_current + ti_step, ti_step, dt, active)
+end
+
+"""
+    active_face_table_3d(mesh, active; index_type=Int32)
+
+Pack the CSR face list for active cells into the dense `(cell, local-face)`
+layout consumed by the active-cell KA gradient/update kernels.  Inactive cells
+receive a zero count, so kernels leave them unchanged.
+"""
+function active_face_table_3d(mesh::ArepoMeshArrays3D, active;
+                              index_type::Type{<:Integer} = Int32)
+    nc = length(mesh.volume)
+    length(active) == nc || error("active mask length must match cell count")
+    offsets = Int.(Array(mesh.cell_face_offsets))
+    faces_src = Int.(Array(mesh.cell_faces))
+    signs_src = Int.(Array(mesh.cell_face_signs))
+    counts_all = offsets[2:end] .- offsets[1:end-1]
+    stride = maximum(counts_all)
+    counts = zeros(index_type, nc)
+    faces = zeros(index_type, stride * nc)
+    signs = zeros(index_type, stride * nc)
+    @inbounds for i in 1:nc
+        active[i] || continue
+        counts[i] = index_type(counts_all[i])
+        p0 = offsets[i]
+        p1 = offsets[i + 1] - 1
+        for (q, p) in enumerate(p0:p1)
+            faces[(i - 1) * stride + q] = index_type(faces_src[p])
+            signs[(i - 1) * stride + q] = index_type(signs_src[p])
+        end
+    end
+    be = KA.get_backend(mesh.volume)
+    return (; active_stride = stride,
+            active_counts = _backend_copy(be, counts, index_type),
+            active_faces = _backend_copy(be, faces, index_type),
+            active_signs = _backend_copy(be, signs, index_type),
+            active = collect(Bool, active))
+end
+
+function _nearest_delta(x, box_size)
+    box_size <= 0 && return x
+    return x > 0.5 * box_size ? x - box_size :
+           x < -0.5 * box_size ? x + box_size : x
+end
+
+function _face_areas_from_geometry(geometry)
+    nf = length(geometry.nv)
+    offsets_ring = vcat(0, cumsum(Int.(geometry.nv)))
+    area = Vector{Float64}(undef, nf)
+    @inbounds for f in 1:nf
+        lo = offsets_ring[f] + 1
+        hi = offsets_ring[f + 1]
+        sx, sy, sz = _ring_area_normal(@view geometry.verts[lo:hi, :])
+        area[f] = 0.5 * sqrt(sx * sx + sy * sy + sz * sz)
+    end
+    return area
+end
+
+"""
+    arepo_mesh_velocity_3d(pos, center, rho, pressure, vel, gradients, volume, geometry; ...)
+
+Reconstruct the non-cosmological AREPO mesh-generating-point velocity policy
+from exported fields.  The implemented terms are the fluid velocity, the
+pressure-gradient half-step, and CM-drift regularization with the face-angle
+trigger and sound-speed velocity scale.  Gravity and vorticity caps require
+additional AREPO bridge exports and are therefore not included here yet.
+"""
+function arepo_mesh_velocity_3d(pos, center, rho, pressure, vel, gradients,
+                                volume, geometry;
+                                dt::Real,
+                                gamma::Real = 5/3,
+                                box_size::Real = 1.0,
+                                cell_shaping_speed::Real = 0.5,
+                                cell_max_angle_factor::Real = 2.25,
+                                use_face_angle::Bool = true,
+                                use_sound_speed::Bool = true)
+    n = length(rho)
+    size(pos) == (n, 3) || error("pos must be n x 3")
+    size(center) == (n, 3) || error("center must be n x 3")
+    size(vel) == (n, 3) || error("vel must be n x 3")
+    out = Matrix{Float64}(vel)
+    dpress = gradients.dpress
+    @inbounds for i in 1:n
+        if rho[i] > 0
+            out[i, 1] += -0.5 * dt * dpress[i, 1] / rho[i]
+            out[i, 2] += -0.5 * dt * dpress[i, 2] / rho[i]
+            out[i, 3] += -0.5 * dt * dpress[i, 3] / rho[i]
+        end
+    end
+    max_face_angle = zeros(Float64, n)
+    if use_face_angle
+        area = _face_areas_from_geometry(geometry)
+        c1 = Int.(geometry.c1)
+        c2 = Int.(geometry.c2)
+        @inbounds for f in eachindex(c1)
+            i = c1[f]
+            j = c2[f]
+            if 1 <= i <= n && 1 <= j <= n
+                dx = _nearest_delta(pos[j, 1] - pos[i, 1], box_size)
+                dy = _nearest_delta(pos[j, 2] - pos[i, 2], box_size)
+                dz = _nearest_delta(pos[j, 3] - pos[i, 3], box_size)
+                h = sqrt(dx * dx + dy * dy + dz * dz)
+                h > 0 || continue
+                angle = sqrt(area[f] / pi) / h
+                max_face_angle[i] = max(max_face_angle[i], angle)
+                max_face_angle[j] = max(max_face_angle[j], angle)
+            end
+        end
+    end
+    @inbounds for i in 1:n
+        dx = _nearest_delta(pos[i, 1] - center[i, 1], box_size)
+        dy = _nearest_delta(pos[i, 2] - center[i, 2], box_size)
+        dz = _nearest_delta(pos[i, 3] - center[i, 3], box_size)
+        d = sqrt(dx * dx + dy * dy + dz * dz)
+        fraction = 0.0
+        if dt > 0
+            if use_face_angle
+                threshold = 0.75 * cell_max_angle_factor
+                if max_face_angle[i] > threshold
+                    if max_face_angle[i] > cell_max_angle_factor
+                        fraction = cell_shaping_speed
+                    else
+                        fraction = cell_shaping_speed *
+                                   (max_face_angle[i] - threshold) /
+                                   (0.25 * cell_max_angle_factor)
+                    end
+                end
+            else
+                cellrad = cbrt(3 * volume[i] / (4pi))
+                threshold = 0.75 * cellrad
+                if d > threshold
+                    if d > cellrad
+                        fraction = cell_shaping_speed
+                    else
+                        fraction = cell_shaping_speed * (d - threshold) / (0.25 * cellrad)
+                    end
+                end
+            end
+        end
+        if d > 0 && fraction > 0
+            v = use_sound_speed ? sqrt(gamma * pressure[i] / rho[i]) : d / dt
+            out[i, 1] += fraction * v * (-dx / d)
+            out[i, 2] += fraction * v * (-dy / d)
+            out[i, 3] += fraction * v * (-dz / d)
+        end
+    end
+    return out
 end
 
 function total_conserved_3d(state::EulerState3D, mesh::ArepoMeshArrays3D)
@@ -2237,7 +2638,14 @@ struct _Plane3D
     a3::Float64
     b::Float64
     neighbor::Int
+    sx::Int
+    sy::Int
+    sz::Int
 end
+
+_Plane3D(a1::Real, a2::Real, a3::Real, b::Real, neighbor::Integer) =
+    _Plane3D(Float64(a1), Float64(a2), Float64(a3), Float64(b),
+             Int(neighbor), 0, 0, 0)
 
 function _domain3(domain)
     return ((float(domain[1][1]), float(domain[1][2])),
@@ -2292,7 +2700,8 @@ function _periodic_voronoi_planes3(points, i::Int, domain)
             a2 = 2 * (pjy - piy)
             a3 = 2 * (pjz - piz)
             b = pjx * pjx + pjy * pjy + pjz * pjz - pix * pix - piy * piy - piz * piz
-            push!(planes, _Plane3D(a1, a2, a3, b, j == i ? 0 : j))
+            push!(planes, _Plane3D(a1, a2, a3, b, j == i ? 0 : j,
+                                   sx, sy, sz))
         end
     end
     return planes
@@ -2355,7 +2764,8 @@ function _periodic_local_voronoi_planes3(points, i::Int, domain, bins, coords;
             a2 = 2 * (pjy - piy)
             a3 = 2 * (pjz - piz)
             b = pjx * pjx + pjy * pjy + pjz * pjz - pix * pix - piy * piy - piz * piz
-            push!(planes, _Plane3D(a1, a2, a3, b, j == i ? 0 : j))
+            push!(planes, _Plane3D(a1, a2, a3, b, j == i ? 0 : j,
+                                   sx, sy, sz))
         end
     end
     return planes
@@ -2451,6 +2861,35 @@ function _centroid3(verts::Vector{NTuple{3,Float64}})
     return (sx * invn, sy * invn, sz * invn)
 end
 
+function _polygon_area_centroid3(verts::Vector{NTuple{3,Float64}})
+    nv = length(verts)
+    nv >= 3 || return _centroid3(verts)
+    ox, oy, oz = verts[1]
+    wx = 0.0; wy = 0.0; wz = 0.0
+    total = 0.0
+    @inbounds for i in 2:(nv - 1)
+        ax = verts[i][1] - ox
+        ay = verts[i][2] - oy
+        az = verts[i][3] - oz
+        bx = verts[i + 1][1] - ox
+        by = verts[i + 1][2] - oy
+        bz = verts[i + 1][3] - oz
+        cx = ay * bz - az * by
+        cy = az * bx - ax * bz
+        cz = ax * by - ay * bx
+        w = sqrt(cx * cx + cy * cy + cz * cz)
+        tx = (ox + verts[i][1] + verts[i + 1][1]) / 3
+        ty = (oy + verts[i][2] + verts[i + 1][2]) / 3
+        tz = (oz + verts[i][3] + verts[i + 1][3]) / 3
+        wx += w * tx
+        wy += w * ty
+        wz += w * tz
+        total += w
+    end
+    total > 0 || return _centroid3(verts)
+    return (wx / total, wy / total, wz / total)
+end
+
 function _order_face_vertices3(verts::Vector{NTuple{3,Float64}}, plane::_Plane3D)
     n = length(verts)
     n < 3 && return verts
@@ -2512,10 +2951,11 @@ function _voronoi_cell_from_planes3(planes; tol::Float64)
         sx, sy, sz = _ring_area_normal3(fverts)
         area = 0.5 * sqrt(sx * sx + sy * sy + sz * sz)
         area > 100tol || continue
-        fx, fy, fz = _centroid3(fverts)
+        fx, fy, fz = _polygon_area_centroid3(fverts)
         volume += (fx * (0.5 * sx) + fy * (0.5 * sy) + fz * (0.5 * sz)) / 3
         push!(faces, (; neighbor = plane.neighbor, center = (fx, fy, fz), area,
-                      normal = (plane.a1, plane.a2, plane.a3)))
+                      normal = (plane.a1, plane.a2, plane.a3),
+                      image_shift = (plane.sx, plane.sy, plane.sz)))
     end
     c = isempty(verts) ? (NaN, NaN, NaN) :
         _centroid3(verts)
@@ -2555,6 +2995,7 @@ function bounded_voronoi_mesh_arrays_3d(points::AbstractMatrix;
     area = Float64[]
     normals = Matrix{Float64}(undef, 0, 3)
     face_center = Matrix{Float64}(undef, 0, 3)
+    face_image_shift = Matrix{Int}(undef, 0, 3)
     @inbounds for i in 1:n
         for face in cells[i].faces
             j = face.neighbor
@@ -2566,6 +3007,8 @@ function bounded_voronoi_mesh_arrays_3d(points::AbstractMatrix;
             push!(area, face.area)
             normals = vcat(normals, reshape([nx / nn, ny / nn, nz / nn], 1, 3))
             face_center = vcat(face_center, reshape(collect(face.center), 1, 3))
+            face_image_shift = vcat(face_image_shift,
+                                    reshape(collect(face.image_shift), 1, 3))
         end
     end
     fvx, fvy, fvz = _face_velocity_arrays_3d(c1, c2, face_velocity, cell_velocity, T)
@@ -2573,7 +3016,8 @@ function bounded_voronoi_mesh_arrays_3d(points::AbstractMatrix;
     geom = ArepoMeshArrays3D(index_type.(c1), index_type.(c2), offsets, faces, signs,
                              T.(volume), T.(area), T.(normals[:, 1]),
                              T.(normals[:, 2]), T.(normals[:, 3]), fvx, fvy, fvz)
-    return (; geom, volume, center, face_center, generators = pts, domain = dom)
+    return (; geom, volume, center, face_center, face_image_shift,
+            generators = pts, domain = dom)
 end
 
 """
@@ -2607,6 +3051,7 @@ function periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
     area = Float64[]
     normals = Matrix{Float64}(undef, 0, 3)
     face_center = Matrix{Float64}(undef, 0, 3)
+    face_image_shift = Matrix{Int}(undef, 0, 3)
     @inbounds for i in 1:n
         for face in cells[i].faces
             j = face.neighbor
@@ -2618,6 +3063,8 @@ function periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
             push!(area, face.area)
             normals = vcat(normals, reshape([nx / nn, ny / nn, nz / nn], 1, 3))
             face_center = vcat(face_center, reshape(collect(face.center), 1, 3))
+            face_image_shift = vcat(face_image_shift,
+                                    reshape(collect(face.image_shift), 1, 3))
         end
     end
     fvx, fvy, fvz = _face_velocity_arrays_3d(c1, c2, face_velocity, cell_velocity, T)
@@ -2625,7 +3072,8 @@ function periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
     geom = ArepoMeshArrays3D(index_type.(c1), index_type.(c2), offsets, faces, signs,
                              T.(volume), T.(area), T.(normals[:, 1]),
                              T.(normals[:, 2]), T.(normals[:, 3]), fvx, fvy, fvz)
-    return (; geom, volume, center, face_center, generators = pts, domain = dom)
+    return (; geom, volume, center, face_center, face_image_shift,
+            generators = pts, domain = dom)
 end
 
 """
@@ -2647,6 +3095,7 @@ function local_periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
                                                bins_per_axis = nothing,
                                                search_radius::Integer = 1,
                                                threaded::Bool = Threads.nthreads() > 1,
+                                               min_face_surface_fraction::Real = 1e-5,
                                                tol::Float64 = 1e-10)
     size(points, 2) == 3 || error("points must be n x 3")
     pts = Matrix{Float64}(points)
@@ -2683,6 +3132,7 @@ function local_periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
     area = Float64[]
     normal_tuples = NTuple{3,Float64}[]
     face_center_tuples = NTuple{3,Float64}[]
+    face_image_shift_tuples = NTuple{3,Int}[]
     @inbounds for i in 1:n
         for face in cells[i].faces
             j = face.neighbor
@@ -2694,11 +3144,30 @@ function local_periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
             push!(area, face.area)
             push!(normal_tuples, (nx / nn, ny / nn, nz / nn))
             push!(face_center_tuples, face.center)
+            push!(face_image_shift_tuples, face.image_shift)
         end
+    end
+    minfrac = Float64(min_face_surface_fraction)
+    if minfrac > 0 && !isempty(c1)
+        surface = zeros(Float64, n)
+        @inbounds for f in eachindex(c1)
+            a = area[f]
+            surface[c1[f]] += a
+            surface[c2[f]] += a
+        end
+        keep = findall(f -> area[f] > minfrac * max(surface[c1[f]], surface[c2[f]]),
+                       eachindex(c1))
+        c1 = c1[keep]
+        c2 = c2[keep]
+        area = area[keep]
+        normal_tuples = normal_tuples[keep]
+        face_center_tuples = face_center_tuples[keep]
+        face_image_shift_tuples = face_image_shift_tuples[keep]
     end
     nf = length(c1)
     normals = Matrix{Float64}(undef, nf, 3)
     face_center = Matrix{Float64}(undef, nf, 3)
+    face_image_shift = Matrix{Int}(undef, nf, 3)
     @inbounds for f in 1:nf
         normals[f, 1] = normal_tuples[f][1]
         normals[f, 2] = normal_tuples[f][2]
@@ -2706,14 +3175,18 @@ function local_periodic_voronoi_mesh_arrays_3d(points::AbstractMatrix;
         face_center[f, 1] = face_center_tuples[f][1]
         face_center[f, 2] = face_center_tuples[f][2]
         face_center[f, 3] = face_center_tuples[f][3]
+        face_image_shift[f, 1] = face_image_shift_tuples[f][1]
+        face_image_shift[f, 2] = face_image_shift_tuples[f][2]
+        face_image_shift[f, 3] = face_image_shift_tuples[f][3]
     end
     fvx, fvy, fvz = _face_velocity_arrays_3d(c1, c2, face_velocity, cell_velocity, T)
     offsets, faces, signs = _cell_face_csr(n, c1, c2, index_type)
     geom = ArepoMeshArrays3D(index_type.(c1), index_type.(c2), offsets, faces, signs,
                              T.(volume), T.(area), T.(normals[:, 1]),
                              T.(normals[:, 2]), T.(normals[:, 3]), fvx, fvy, fvz)
-    return (; geom, volume, center, face_center, generators = pts, domain = dom,
-            bins_per_axis = nb, search_radius = Int(search_radius))
+    return (; geom, volume, center, face_center, face_image_shift,
+            generators = pts, domain = dom, bins_per_axis = nb,
+            search_radius = Int(search_radius))
 end
 
 function advect_generators_3d(points::AbstractMatrix, velocity, dt::Real,

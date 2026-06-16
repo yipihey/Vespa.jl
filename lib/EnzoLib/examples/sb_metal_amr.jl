@@ -167,7 +167,11 @@ function hydro!(h, level, dt)
         cols = Tuple(f(fi) for fi in sp)                    # device colour arrays
         PPMKernels.ppm_step_3d!(d, e, ge, vx, vy, vz, gx, gy, gz, gd, NG;
                                 dt=dt, gamma=GAMMA, order=order, gravity=1, idual=1,
-                                dx=dxc, colours=cols)
+                                eta1=0.001, eta2=0.1,           # Enzo's DualEnergyFormalismEta1/Eta2:
+                                dx=dxc, colours=cols)           # without them the dual-energy pressure
+                                                                # override never fires → cold high-z gas
+                                                                # fragments at the grid scale (~60× excess
+                                                                # small-scale baryon P(k) vs native PPM).
         wr(fi, a) = EnzoLib.problem_set_field(h, fi, Float64.(PPMKernels.to_host(a)); grid=g)
         wr(iD, d); wr(iTE, e); wr(iGE, ge); wr(iV1, vx); wr(iV2, vy); wr(iV3, vz)
         for (fi, c) in zip(sp, cols)                         # write advected species back

@@ -222,6 +222,21 @@ function session_cosmology(h::Handle)
     @xcall(:enzomodules_session_cosmology, Cint, (Handle, Ptr{Cdouble}, Ptr{Cdouble}), h, a, z)
     (a[], z[])
 end
+"""
+    session_expansion_factor(h, time) -> (a, dadt)
+
+Scale factor `a` and its time-derivative `dȧ/dt` at ABSOLUTE code `time`, from
+Enzo's own `CosmologyComputeExpansionFactor`. Lets a Julia particle pusher build
+the comoving drift/kick coefficients with the same `a, ȧ` Enzo uses
+(`UpdateParticlePosition` evaluates at `t+½dt`, the kick at `t+½dt`, the interp's
+internal half-drift at `t+¼dt`). Returns `(1.0, 0.0)` if non-comoving.
+"""
+function session_expansion_factor(h::Handle, time::Real)
+    a = Ref{Cdouble}(1.0); dadt = Ref{Cdouble}(0.0)
+    @xcall(:enzomodules_session_expansion_factor, Cint,
+           (Handle, Cdouble, Ptr{Cdouble}, Ptr{Cdouble}), h, time, a, dadt)
+    (a[], dadt[])
+end
 session_stop_time(h::Handle) = @xcall(:enzomodules_session_stop_time, Cdouble, (Handle,), h)
 session_cycle(h::Handle)     = @xcall(:enzomodules_session_cycle, Cint, (Handle,), h)
 session_compute_dt(h::Handle, level::Integer = 0) =
@@ -388,6 +403,18 @@ end
 "Post-solve gravity chain (accelerations from the CURRENT PotentialField) on `level`."
 session_gravity_post(h::Handle, level::Integer) =
     @xcall(:enzomodules_session_gravity_post, Cint, (Handle, Cint), h, level)
+"""
+    session_gravity_post_fields(h, level)
+
+Field-only gravity-post: difference φ into the cell-centred `AccelerationField`
+(read by hydro and by an external particle pusher via `problem_get_acceleration`)
+WITHOUT Enzo's particle branch (the ±½-step drift + `InterpolateParticlePositions`
++ field delete that `ComputeAccelerations` otherwise does). Use when a `:julia`
+GPU slot owns the particle interpolation + leapfrog — the produced field is
+identical to `session_gravity_post`'s.
+"""
+session_gravity_post_fields(h::Handle, level::Integer) =
+    @xcall(:enzomodules_session_gravity_post_fields, Cint, (Handle, Cint), h, level)
 
 "Enzo's solved gravitational PotentialField on `grid` — for testing gravity kernels."
 function problem_get_potential(h::Handle, grid::Integer = 0)
@@ -793,6 +820,11 @@ struct EngineConfig
     mhd_ct::Symbol
     radiation::Symbol
     star_formation::Symbol
+    # bookkeeping ops that were hardcoded session_* calls, now swappable slots so a
+    # GPU/KA path can own them (default :enzo ⇒ the legacy bridge call, no change):
+    boundary::Symbol                    # set_boundary (root periodic ghost fill)
+    baryon_copy::Symbol                 # copy_baryon_to_old (time-centering)
+    particle_push::Symbol               # update_particles (interp accel + leapfrog)
     star_sources::Bool                  # radiation sub-flag (not a slot)
     hooks::Dict{Symbol,Function}
     probe::Union{Nothing,SlotProbe}     # nothing ⇒ no timing (zero overhead)
@@ -801,10 +833,13 @@ end
 function EngineConfig(; hydro::Symbol = :enzo, gravity::Symbol = :off, cooling::Symbol = :off,
                       comoving_expansion::Symbol = :off, mhd_ct::Symbol = :off,
                       radiation::Symbol = :off, star_formation::Symbol = :off,
+                      boundary::Symbol = :enzo, baryon_copy::Symbol = :enzo,
+                      particle_push::Symbol = :enzo,
                       star_sources::Bool = false, hooks::Dict{Symbol,Function} = Dict{Symbol,Function}(),
                       probe::Union{Nothing,SlotProbe} = nothing, reflux::Bool = false)
     EngineConfig(hydro, gravity, cooling, comoving_expansion, mhd_ct, radiation,
-                 star_formation, star_sources, hooks, probe, reflux)
+                 star_formation, boundary, baryon_copy, particle_push,
+                 star_sources, hooks, probe, reflux)
 end
 
 # Build a config from the legacy boolean flags (every active slot → :enzo) so the
@@ -830,6 +865,9 @@ enzo_slot(::Val{:cooling}, h, level, dt, cfg) = session_solve_cooling(h, level)
 enzo_slot(::Val{:comoving_expansion}, h, level, dt, cfg) = session_comoving_expansion(h, level)
 enzo_slot(::Val{:radiation}, h, level, dt, cfg) = session_evolve_photons(h, level; stars = cfg.star_sources)
 enzo_slot(::Val{:star_formation}, h, level, dt, cfg) = session_star_particles(h, level)
+enzo_slot(::Val{:boundary}, h, level, dt, cfg) = session_set_boundary(h, level)
+enzo_slot(::Val{:baryon_copy}, h, level, dt, cfg) = session_copy_baryon_to_old(h, level)
+enzo_slot(::Val{:particle_push}, h, level, dt, cfg) = session_update_particles(h, level)
 
 # Run the resolved implementation of `slot` (impl is :enzo or :julia here).
 @inline _slot_impl(slot, impl, cfg, h, level, dt) =
@@ -870,7 +908,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        radiation::Bool = false, star_sources::Bool = false,
                        star_formation::Bool = false, cosmology::Bool = false,
                        mhdct::Bool = false, maxsub::Int = 100000,
-                       copy_old::Bool = true)
+                       copy_old::Bool = true, max_dt::Float64 = Inf)
     eng = engine !== nothing ? engine :
           engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
                             gravity = gravity, cooling = cooling, radiation = radiation,
@@ -892,9 +930,10 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
     ct && level > 0 && session_clear_avg_electric_field(h, level)   # CT EMF accumulator (EvolveLevel.C:377)
     done = 0.0; n = 0
     while n < maxsub
-        session_set_boundary(h, level)                       # interpolate from parent
+        run_slot(:boundary, eng, h, level, 0.0)              # interpolate from parent (root: periodic ghost fill)
         dt = session_compute_dt(h, level)
         dt_above > 0.0 && (dt = min(dt, dt_above - done))
+        dt = min(dt, max_dt)             # cap to hit the next output time (EvolveHierarchy parity)
         session_set_dt(h, dt, level)
         run_slot(:radiation, eng, h, level, dt)
         ef && session_create_fluxes(h, level)
@@ -904,11 +943,11 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
         # cosmology: it changes the baryon large-scale power ~2× (the comoving
         # expansion / gravity source reads OldBaryonField). Only disable for a pure
         # non-self-gravitating :julia hydro that provably never reads it. Default on.
-        copy_old && session_copy_baryon_to_old(h, level)
+        copy_old && run_slot(:baryon_copy, eng, h, level, dt)
         run_slot(:hydro, eng, h, level, dt)                  # :enzo fills boundary fluxes; :julia owns its own
         run_slot(:cooling, eng, h, level, dt)
         run_slot(:star_formation, eng, h, level, dt)
-        session_update_particles(h, level)
+        run_slot(:particle_push, eng, h, level, dt)
         session_advance_time(h, level)
         run_slot(:comoving_expansion, eng, h, level, dt)     # Hubble drag (EvolveLevel.C)
         last = dt_above <= 0.0 || done + dt >= dt_above * (1 - 1e-6)

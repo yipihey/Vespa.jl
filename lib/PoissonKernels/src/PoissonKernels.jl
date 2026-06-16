@@ -42,6 +42,8 @@ export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
 export power_spectrum_gpu
 export cic_deposit!
+export interp_accel_to_particles!, particle_kick!, particle_drift!
+export copy_field!, fill_periodic_ghosts!
 
 # ── backend registry ─────────────────────────────────────────────────────────
 # `:cpu` is always present; the Metal extension registers `:metal` on load.
@@ -109,5 +111,7 @@ include("gpu_fft.jl")      # GPU-resident radix-2 FFT + fft_poisson_root_gpu! (d
 include("mg_batched.jl")   # batched multigrid: NB same-size subgrids per kernel launch
 include("masked_cg.jl")    # masked 7-point CG — the irregular-region Dirichlet solve
 include("deposit.jl")      # cic_deposit!  — KA Cloud-In-Cell particle→grid mass scatter
+include("particle_push.jl")# interp_accel_to_particles! / particle_kick! / particle_drift!
+include("field_ops.jl")    # copy_field! / fill_periodic_ghosts! — baryon copy + set_boundary
 
 end # module

@@ -1,0 +1,179 @@
+# particle_push — KA port of Enzo's particle gravity interpolation + leapfrog
+# drift/kick (the per-cycle `session_update_particles` work), device-agnostic.
+#
+# Enzo splits the per-particle gravity update across two routines that this file
+# reproduces bit-for-bit (the `b8` f64 build is the oracle):
+#
+#   Grid::ComputeAccelerations   (src/enzo/Grid_ComputeAccelerations.C)
+#     · difference φ → AccelerationField   (comp_accel!, iflag=0, cell-centred)
+#     · drift particles +½dt forward  (UpdateParticlePosition(+0.5 dtFixed))
+#     · CIC-interpolate the field onto each particle  (cic_interp.F, 8-point)
+#     · drift particles −½dt back      (exactly reversible — same |coef|)
+#   UpdateParticlePositions      (src/enzo/UpdateParticlePositions.C)
+#     · half-kick(½dt) → drift(dt) → half-kick(½dt)            [leapfrog]
+#
+# We never mutate the stored position for the interpolation half-drift: the
+# interp kernel evaluates the field at  x + dcoef·v  inline (dcoef = ½dt/a at the
+# interp time), which is identical to drift-forward / interp / drift-back.
+#
+# Cosmology coefficients (a, ȧ) come from Enzo's own CosmologyComputeExpansionFactor
+# via `EnzoLib.session_expansion_factor` so the comoving factors match to round-off:
+#   · interp half-drift   dcoef = ½·dt / a(t+¼dt)
+#   · main drift          coef  =   dt / a(t+½dt)
+#   · semi-implicit kick  ts = ½dt,  coef = ½·(ȧ/a)·ts  with a,ȧ at t+½dt
+#     v ← ((1−coef)·v + g·ts) / (1+coef)        (g = ParticleAcceleration, already /a)
+#
+# Particle layout is the SoA used by `cic_deposit!` (px,py,pz,vx,vy,vz device
+# vectors, one thread per particle). The acceleration grids gx,gy,gz are 3-D
+# device arrays on the Enzo *grid* mesh (GridDimension, NG ghost zones); the
+# interp geometry is passed explicitly: cellsize = dx, leftedge = CellLeftEdge[0]
+# (the leftmost ghost edge, e.g. −NG·dx for a unit periodic box).
+
+# ── CIC interpolation of the three accel grids onto particles ─────────────────
+# No `where {T}` on the @kernel (would box type params → Metal InvalidIR); the
+# element type flows in via the array args, scalars converted by the launcher.
+@kernel function _interp_accel_kernel!(axp, ayp, azp,
+                                       @Const(px), @Const(py), @Const(pz),
+                                       @Const(vx), @Const(vy), @Const(vz),
+                                       @Const(gx), @Const(gy), @Const(gz),
+                                       dcoef, invcell, lex, ley, lez,
+                                       half, c05, c1, e1, e2, e3)
+    p = @index(Global)
+    @inbounds begin
+        # interpolate at the +½dt forward-drifted position (cancels on the way back)
+        xq = px[p] + dcoef * vx[p]
+        yq = py[p] + dcoef * vy[p]
+        zq = pz[p] + dcoef * vz[p]
+        # cell-coordinate, clamped exactly as cic_interp.F (clamp uses half = 0.5001)
+        xpos = min(max((xq - lex) * invcell, half), e1)
+        ypos = min(max((yq - ley) * invcell, half), e2)
+        zpos = min(max((zq - lez) * invcell, half), e3)
+        # index + weight use plain 0.5 (RKIND), NOT 0.5001
+        i1 = unsafe_trunc(Int, xpos + c05)
+        j1 = unsafe_trunc(Int, ypos + c05)
+        k1 = unsafe_trunc(Int, zpos + c05)
+        dxr = oftype(xpos, i1) + c05 - xpos
+        dyr = oftype(ypos, j1) + c05 - ypos
+        dzr = oftype(zpos, k1) + c05 - zpos
+        ex = c1 - dxr; ey = c1 - dyr; ez = c1 - dzr
+        # 8-point trilinear (cic_interp.F:158-174)
+        axp[p] = gx[i1  , j1  , k1  ] * dxr * dyr * dzr +
+                 gx[i1+1, j1  , k1  ] * ex  * dyr * dzr +
+                 gx[i1  , j1+1, k1  ] * dxr * ey  * dzr +
+                 gx[i1+1, j1+1, k1  ] * ex  * ey  * dzr +
+                 gx[i1  , j1  , k1+1] * dxr * dyr * ez  +
+                 gx[i1+1, j1  , k1+1] * ex  * dyr * ez  +
+                 gx[i1  , j1+1, k1+1] * dxr * ey  * ez  +
+                 gx[i1+1, j1+1, k1+1] * ex  * ey  * ez
+        ayp[p] = gy[i1  , j1  , k1  ] * dxr * dyr * dzr +
+                 gy[i1+1, j1  , k1  ] * ex  * dyr * dzr +
+                 gy[i1  , j1+1, k1  ] * dxr * ey  * dzr +
+                 gy[i1+1, j1+1, k1  ] * ex  * ey  * dzr +
+                 gy[i1  , j1  , k1+1] * dxr * dyr * ez  +
+                 gy[i1+1, j1  , k1+1] * ex  * dyr * ez  +
+                 gy[i1  , j1+1, k1+1] * dxr * ey  * ez  +
+                 gy[i1+1, j1+1, k1+1] * ex  * ey  * ez
+        azp[p] = gz[i1  , j1  , k1  ] * dxr * dyr * dzr +
+                 gz[i1+1, j1  , k1  ] * ex  * dyr * dzr +
+                 gz[i1  , j1+1, k1  ] * dxr * ey  * dzr +
+                 gz[i1+1, j1+1, k1  ] * ex  * ey  * dzr +
+                 gz[i1  , j1  , k1+1] * dxr * dyr * ez  +
+                 gz[i1+1, j1  , k1+1] * ex  * dyr * ez  +
+                 gz[i1  , j1+1, k1+1] * dxr * ey  * ez  +
+                 gz[i1+1, j1+1, k1+1] * ex  * ey  * ez
+    end
+end
+
+"""
+    interp_accel_to_particles!(axp,ayp,azp, px,py,pz, vx,vy,vz, gx,gy,gz;
+                               dcoef, cellsize, leftedge) -> (axp,ayp,azp)
+
+CIC-interpolate the three acceleration grids `gx,gy,gz` (3-D device arrays on the
+Enzo grid mesh) onto each particle, writing the per-particle accelerations
+`axp,ayp,azp` (device vectors). The field is evaluated at the half-step
+forward-drifted position `x + dcoef·v` (`dcoef = ½·dt/a` at the interpolation
+time) — Enzo's `Grid::ComputeAccelerations` drift-forward/interp/drift-back, done
+without mutating the stored positions. `cellsize` is the grid cell width and
+`leftedge = (lex,ley,lez)` is `CellLeftEdge[·][0]` (the leftmost ghost edge).
+Mirrors `cic_interp.F` (8-point, `half = 0.5001`).
+"""
+function interp_accel_to_particles!(axp::AbstractVector{T}, ayp, azp,
+                                    px, py, pz, vx, vy, vz,
+                                    gx::AbstractArray{<:Any,3}, gy, gz;
+                                    dcoef::Real, cellsize::Real,
+                                    leftedge) where {T}
+    be = KA.get_backend(axp)
+    d1, d2, d3 = size(gx)
+    half = T(0.5001)
+    e1 = T(d1) - half; e2 = T(d2) - half; e3 = T(d3) - half
+    _interp_accel_kernel!(be)(axp, ayp, azp, px, py, pz, vx, vy, vz,
+                              gx, gy, gz,
+                              T(dcoef), T(1) / T(cellsize),
+                              T(leftedge[1]), T(leftedge[2]), T(leftedge[3]),
+                              half, T(0.5), T(1), e1, e2, e3; ndrange = length(axp))
+    return axp, ayp, azp
+end
+
+# ── semi-implicit comoving kick (Grid_UpdateParticleVelocity.C, METHOD3) ──────
+@kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),
+                               ts, coef1, coef2)
+    p = @index(Global)
+    @inbounds begin
+        vx[p] = (coef1 * vx[p] + axp[p] * ts) * coef2
+        vy[p] = (coef1 * vy[p] + ayp[p] * ts) * coef2
+        vz[p] = (coef1 * vz[p] + azp[p] * ts) * coef2
+    end
+end
+
+"""
+    particle_kick!(vx,vy,vz, axp,ayp,azp; ts, coef) -> (vx,vy,vz)
+
+Semi-implicit comoving velocity half-kick (Enzo VELOCITY_METHOD3):
+`v ← ((1−coef)·v + g·ts) / (1+coef)`, with `ts = ½dt` the accel timestep and
+`coef = ½·(ȧ/a)·ts` (a,ȧ at `t+½dt`). The per-particle acceleration `g` is the
+output of [`interp_accel_to_particles!`] (already divided by `a`). Called twice
+per cycle, once on each side of the drift. With `coef = 0` this is the plain
+`v += g·ts` non-comoving kick.
+"""
+function particle_kick!(vx::AbstractVector{T}, vy, vz, axp, ayp, azp;
+                        ts::Real, coef::Real) where {T}
+    be = KA.get_backend(vx)
+    c = T(coef)
+    _kick_kernel!(be)(vx, vy, vz, axp, ayp, azp,
+                      T(ts), one(T) - c, one(T) / (one(T) + c);
+                      ndrange = length(vx))
+    return vx, vy, vz
+end
+
+# ── comoving drift (Grid_UpdateParticlePosition.C) ────────────────────────────
+@kernel function _drift_kernel!(px, py, pz, @Const(vx), @Const(vy), @Const(vz),
+                                coef, wrap, dowrap::Int)
+    p = @index(Global)
+    @inbounds begin
+        x = px[p] + coef * vx[p]
+        y = py[p] + coef * vy[p]
+        z = pz[p] + coef * vz[p]
+        if dowrap == 1
+            x = mod(x, wrap); y = mod(y, wrap); z = mod(z, wrap)
+        end
+        px[p] = x; py[p] = y; pz[p] = z
+    end
+end
+
+"""
+    particle_drift!(px,py,pz, vx,vy,vz; coef, wrap=0) -> (px,py,pz)
+
+Drift positions `x ← x + coef·v` (`coef = dt/a` at `t+½dt`, Enzo
+`UpdateParticlePosition`). `wrap > 0` additionally wraps each coordinate into
+`[0,wrap)` — physically identical under periodicity and needed in the resident
+loop to keep f32 positions from drifting many box-lengths over a long run; leave
+`wrap = 0` (no wrap) to match a single Enzo update bit-for-bit.
+"""
+function particle_drift!(px::AbstractVector{T}, py, pz, vx, vy, vz;
+                         coef::Real, wrap::Real = 0) where {T}
+    be = KA.get_backend(px)
+    dowrap = wrap > 0 ? 1 : 0
+    _drift_kernel!(be)(px, py, pz, vx, vy, vz, T(coef), T(wrap), dowrap;
+                       ndrange = length(px))
+    return px, py, pz
+end

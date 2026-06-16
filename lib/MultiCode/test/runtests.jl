@@ -170,4 +170,5 @@ include("test_athena_engine.jl")   # Next-8: Athena++ via MultiCodeAthenaExt (re
 end
 
 include("test_zeldovich.jl")       # Next-2: cosmology — one particle set, Enzo + RAMSES vs exact
+include("test_resident_particles.jl")  # GPU-resident particle push ≡ Enzo session_update_particles (live f64)
 include("test_chem_engines.jl")    # ChemistryKernels: :kernels engine ≡ Grackle reduced lib (sub-%)
