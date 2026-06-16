@@ -1,5 +1,6 @@
 # Deuterium reaction rates k50–k56 (precision-generic, table-free).
-# Formulas transcribed exactly from grackle/src/clib/rate_functions.c.
+# Formulas from the primary sources cited per rate below (the deuterium
+# extension of the Abel/Anninos et al. 1997 network).
 # Units = CGS (units=1.0 convention — divide by units is a no-op here).
 # Every literal is wrapped in R(...) = typeof(T)(...) so the function
 # compiles to the correct precision on any floating-point type T.

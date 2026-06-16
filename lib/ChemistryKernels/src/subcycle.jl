@@ -1,16 +1,15 @@
-# subcycle.jl — the per-cell sub-cycling driver: grackle's solve_rate_cool inner
-# loop specialized to the v2026 reduced model.  Repeats, until the requested macro
-# step `dt` is consumed, a self-limited sub-step `dtit` that:
+# subcycle.jl — the per-cell sub-cycling driver, specialized to the v2026 reduced
+# model.  Repeats, until the requested macro step `dt` is consumed, a self-limited
+# sub-step `dtit` that:
 #   1. evaluates T, all rates (with the Peebles k2 override), edot, and the
-#      net e⁻/HI rates (rate_timestep_g);
-#   2. sizes dtit to a ≤10% change in n_e, n_HI and the thermal energy
-#      (solve_rate_cool_g.F:638-674, 782-824);
+#      net e⁻/HI rates;
+#   2. sizes dtit to a ≤10% change in n_e, n_HI and the thermal energy;
 #   3. advances the energy — IMPLICITLY for the stiff CMB-Compton term when it is
-#      stiff (K·Δt>1), else explicitly (solve_rate_cool_g.F:861-883);
+#      stiff (K·Δt>1), else explicitly;
 #   4. advances the species by one backward-Euler sweep (`network_step`).
 #
 # Everything in physical CGS (number densities [cm⁻³], e [erg/g], t [s]).  State
-# is carried in the grackle mass-equivalent y-convention (yH2I=2·n(H2) etc., as in
+# is carried in the mass-equivalent y-convention (yH2I=2·n(H2) etc., as in
 # network_step.jl), with the network "density" d = ρ/m_H so yHeI=(1−fh)·d.  Pure &
 # allocation-free (isbits NamedTuples) ⇒ runs in a KA kernel and is AD-ready.
 
@@ -21,9 +20,9 @@ const _SUB_ITMAX = 5_000         # subcycle cap (bounds GPU kernel time; well-be
 const _SUB_TINY  = 1.0e-20
 
 # A 10%-change sub-step from a rate, with no constraint (Inf) when the rate is
-# ~0.  NOTE: unlike grackle (whose code-unit edot/dedot are O(1), so its absolute
-# `tiny8` floor is harmless), our rates are PHYSICAL CGS (volumetric ė ~ 1e-30),
-# so an absolute floor would EXCEED real rates and corrupt them — we guard the
+# ~0.  NOTE: unlike a code-unit scheme (whose edot/dedot are O(1), so an absolute
+# floor is harmless), our rates are PHYSICAL CGS (volumetric ė ~ 1e-30), so an
+# absolute floor would EXCEED real rates and corrupt them — we guard the
 # division instead, never the value.
 @inline _step10(X, rate) = abs(rate) > zero(rate) ? abs(oftype(rate, 0.1) * X / rate) :
                            typemax(rate)
@@ -57,8 +56,8 @@ all others are the Wave-1 analytic fits. Pure.
                         k54=k54(T), k55=k55(T), k56=k56(T)))
 end
 
-# Net rate-of-change of n_e and n_HI (rate_timestep_g, molecular branch, reduced:
-# no radiation/dust/shielding).  Used only to size the chemistry sub-step.
+# Net rate-of-change of n_e and n_HI (molecular branch, reduced: no
+# radiation/dust/shielding).  Used only to size the chemistry sub-step.
 @inline function _de_hi_dot(yHI, yHII, yde, yH2I, yHM, yH2II, yHeI, yHeII, yHeIII, K)
     R = typeof(yHI)
     HIdot = -K.k1*yHI*yde - K.k7*yHI*yde - K.k8*yHM*yHI - K.k9*yHII*yHI -

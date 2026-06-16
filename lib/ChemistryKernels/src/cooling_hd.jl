@@ -1,7 +1,6 @@
 # HD cooling-coefficient kernels — table-free, precision-generic.
 #
-# Direct transcriptions of HDlte_rate and HDlow_rate from
-# grackle/src/clib/rate_functions.c, evaluated with units=1.0.
+# HD cooling coefficients HDlte and HDlow of the Abel/Anninos et al. 1997 network.
 #
 # HDlte: Coppola et al. 2011 LTE fit (T in [10, 3e4]).
 # HDlow: Wrathmall, Gusdorf & Flower (2007) HD-H collisional excitation fit (T in [10, 6e3]).
@@ -16,7 +15,6 @@ export HDlte_grid, HDlow_grid
 
 # ── HDlte: HD LTE cooling rate (Coppola et al. 2011) ─────────────────────────
 # Constrain T to [10, 3e4].
-# Grackle:
 #   HDlte = -55.5725 + 56.649*log10(tm) - 37.9102*log10(tm)^2 + 12.698*log10(tm)^3
 #            - 2.02424*log10(tm)^4 + 0.122393*log10(tm)^5
 #   return pow(10, min(HDlte, 0)) / units
@@ -35,7 +33,6 @@ end
 
 # ── HDlow: HD low-density cooling rate (Wrathmall, Gusdorf & Flower 2007) ─────
 # Constrain T to [10, 6e3]; lt3 = log10(tm/1e3).
-# Grackle:
 #   HDlow = -23.175780 + 1.5035261*lt3 + 0.40871403*lt3^2 + 0.17849311*lt3^3
 #            - 0.077291388*lt3^4 + 0.10031326*lt3^5
 #   return pow(10, HDlow) / units

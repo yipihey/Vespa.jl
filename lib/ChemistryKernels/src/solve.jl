@@ -1,9 +1,8 @@
 # solve.jl — host boundary + device launcher.  Converts a host's code-unit fields
 # to physical CGS, sub-cycles every cell on any backend, and writes the evolved
-# fields back — the drop-in for grackle_reduced_step! (lib/MultiCode/deps/
-# grackle_reduced.c).  Unit convention = grackle's comoving_coordinates=0 (what
-# grackle_reduced.c uses): ρ_cgs = field·density_units (NO a³), e_cgs =
-# e·(length/time)², t_s = dt·time_units, z = 1/a_value − 1 (sets the CMB).
+# fields back — the reduced-network step of the Abel/Anninos et al. 1997 network.
+# Unit convention = comoving_coordinates=0: ρ_cgs = field·density_units (NO a³),
+# e_cgs = e·(length/time)², t_s = dt·time_units, z = 1/a_value − 1 (sets the CMB).
 
 export solve_chem!
 
@@ -32,10 +31,10 @@ end
 
 Evolve the v2026 reduced primordial+D chemistry/cooling over `dt` (code time
 units) for every cell, updating `e_int`, `HII`, `H2I` (and `HDI` if `deuterium`)
-in place.  `rho` is read-only; `HII`/`H2I`/`HDI` are MASS densities ρ·x in the
-host code units defined by `density_units`/`length_units`/`time_units`.  Mirrors
-`GrackleChem.grackle_reduced_step!`; the engine is a KA kernel (`backend=:cpu` or
-`:metal`) at `precision` (Float64/Float32).
+in place.  `rho` is read-only; `HII`/`H2I`/`HDI` are MASS densities ρ·x (the
+network's mass-equivalent convention) in the host code units defined by
+`density_units`/`length_units`/`time_units`.  The engine is a KA kernel
+(`backend=:cpu` or `:metal`) at `precision` (Float64/Float32).
 """
 function solve_chem!(rho::AbstractVector, e_int::AbstractVector,
                      HII::AbstractVector, H2I::AbstractVector,

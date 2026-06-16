@@ -1,13 +1,13 @@
 # H₂ cooling-coefficient kernels — table-free, precision-generic.
 #
-# Direct transcriptions of GAHI_rate, GAH2_rate, GAHe_rate, GAHp_rate, GAel_rate,
-# H2LTE_rate from grackle/src/clib/rate_functions.c (Glover & Abel 2008 fits),
-# evaluated with units=1.0.
+# H₂ collisional de-excitation cooling coefficients GAHI, GAH2, GAHe, GAHp, GAel,
+# H2LTE of the Abel/Anninos et al. 1997 network, using the Glover & Abel 2008
+# fits.
 #
-# GAHI: default h2_h_cooling_rate=1 (Lique 2015, set_default_chemistry_parameters).
+# GAHI: H₂–H cooling uses the Lique 2015 rate.
 #
-# Temperature range clamping and branch structure are transcribed exactly from
-# the C source — do NOT simplify.
+# Temperature range clamping and branch structure are kept exactly as specified —
+# do NOT simplify.
 #
 # Every numeric literal is wrapped in R(...) for precision-genericity.
 # log10(T) is computed as log(T)*R(0.4342944819032518) and 10^x as
@@ -17,10 +17,10 @@
 export GAHI, GAH2, GAHe, GAHp, GAel, H2LTE
 export GAHI_grid, GAH2_grid, GAHe_grid, GAHp_grid, GAel_grid, H2LTE_grid
 
-# ── GAHI: H₂ cooling by H collisions (Lique 2015, h2_h_cooling_rate=1) ────────
+# ── GAHI: H₂ cooling by H collisions (Lique 2015) ────────────────────────────
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
 # Returns 0 if tm < 100.
-# Grackle: pow(10, -24.07950609 + 4.54182810*lt3 - 2.40206896*lt3^2
+# pow(10, -24.07950609 + 4.54182810*lt3 - 2.40206896*lt3^2
 #               - 0.75355292*lt3^3 + 4.69258178*lt3^4 - 2.79573574*lt3^5
 #               - 3.14766075*lt3^6 + 2.50751333*lt3^7) / units
 @inline function GAHI(T::Real)
@@ -39,7 +39,7 @@ end
 
 # ── GAH2: H₂ cooling by H₂ collisions (Glover & Abel 2008) ───────────────────
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
-# Grackle: pow(10, -23.962112 + 2.09433740*lt3 - 0.77151436*lt3^2
+# pow(10, -23.962112 + 2.09433740*lt3 - 0.77151436*lt3^2
 #               + 0.43693353*lt3^3 - 0.14913216*lt3^4 - 0.033638326*lt3^5) / units
 @inline function GAH2(T::Real)
     R = typeof(T)
@@ -54,7 +54,7 @@ end
 
 # ── GAHe: H₂ cooling by He collisions (Glover & Abel 2008) ───────────────────
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
-# Grackle: pow(10, -23.689237 + 2.1892372*lt3 - 0.81520438*lt3^2
+# pow(10, -23.689237 + 2.1892372*lt3 - 0.81520438*lt3^2
 #               + 0.29036281*lt3^3 - 0.16596184*lt3^4 + 0.19191375*lt3^5) / units
 @inline function GAHe(T::Real)
     R = typeof(T)
@@ -69,7 +69,7 @@ end
 
 # ── GAHp: H₂ cooling by H⁺ collisions (Glover & Abel 2008) ──────────────────
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
-# Grackle: pow(10, -22.089523 + 1.5714711*lt3 + 0.015391166*lt3^2
+# pow(10, -22.089523 + 1.5714711*lt3 + 0.015391166*lt3^2
 #               - 0.23619985*lt3^3 - 0.51002221*lt3^4 + 0.32168730*lt3^5) / units
 @inline function GAHp(T::Real)
     R = typeof(T)
@@ -86,7 +86,7 @@ end
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
 # Returns 0 if tm < 100.
 # Two polynomial branches: 100 ≤ tm < 500 (degree 8), tm ≥ 500 (degree 8).
-# Grackle source branch boundary: (tm < 100.0) → 0, (tm < 500.0) → first poly, else second.
+# Branch boundary: (tm < 100.0) → 0, (tm < 500.0) → first poly, else second.
 @inline function GAel(T::Real)
     R = typeof(T)
     tm  = max(T, R(10.0))
@@ -116,7 +116,7 @@ end
 # Constrain T to [10, 1e4]; lt3 = log10(tm/1e3).
 # tm < 100: simple power-law extrapolation 7e-27 * tm^1.5 * exp(-512/tm).
 # tm >= 100: degree-8 polynomial in lt3.
-# Grackle: pow(10, -20.584225 + 5.0194035*lt3 - 1.5738805*lt3^2 - 4.7155769*lt3^3
+# pow(10, -20.584225 + 5.0194035*lt3 - 1.5738805*lt3^2 - 4.7155769*lt3^3
 #               + 2.4714161*lt3^4 + 5.4710750*lt3^5 - 3.9467356*lt3^6
 #               - 2.2148338*lt3^7 + 1.8161874*lt3^8) / units
 @inline function H2LTE(T::Real)

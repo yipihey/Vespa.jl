@@ -1,8 +1,8 @@
 # rates_atomic.jl — precision-generic atomic H/He reaction-rate kernels.
 #
 # Each function is a pure scalar formula of temperature T [K], returning the
-# reaction rate coefficient in CGS (cm³/s), matching grackle's
-# `kN_rate(T, 1.0, cd)` with CaseBRecombination=1 to floating-point round-off.
+# reaction rate coefficient in CGS (cm³/s), as given by the Abel/Anninos et al.
+# 1997 network with Case-B recombination.
 #
 # All functions run as real device kernels via @scalarkernel (CPU f64/f32 +
 # Metal f32).  k1/k3/k5 are degree-8 exp(poly(logTev)) Abel-1997 fits whose f32
@@ -10,15 +10,15 @@
 # verification ladder checks the f32 layers over T ≤ 1e8 K accordingly.
 #
 # Rules throughout: R = typeof(T); every numeric literal in R(...); fractional
-# exponents in R(...) (e.g. T^R(-1.5)); coefficients copied verbatim from
-# grackle/src/clib/rate_functions.c.
+# exponents in R(...) (e.g. T^R(-1.5)); coefficients taken from the primary
+# fits cited per rate below (Abel et al. 1997; Anninos et al. 1997).
 
 # ── k1 : HI + e → HII + 2e ───────────────────────────────────────────────────
 # Fit: Abel et al. (1997), degree-8 exp(poly(logTev)).
 # Branch: always evaluate poly; at Tev≤0.8 return max(tiny, poly_val)
-# (matches grackle's fmax(tiny, k1) at Tev≤0.8 — does NOT early-return,
-# since the boundary T = 9284 K lies in the log-spaced tgrid and the poly
-# value there is 2.23e-16, not tiny).
+# (fmax(tiny, k1) at Tev≤0.8 — does NOT early-return, since the boundary
+# T = 9284 K lies in the log-spaced tgrid and the poly value there is
+# 2.23e-16, not tiny).
 @inline function k1(T::Real)
     R = typeof(T)
     Tev = T / R(11605.0)
@@ -32,7 +32,7 @@ end
 
 # ── k3 : HeI + e → HeII + 2e ─────────────────────────────────────────────────
 # Fit: Abel et al. (1997), degree-8 exp(poly(logTev)).
-# Branch: Tev≤0.8 → tiny (grackle returns tiny, not fmax here).
+# Branch: Tev≤0.8 → tiny (returns tiny, not fmax here).
 @inline function k3(T::Real)
     R = typeof(T)
     Tev = T / R(11605.0)
@@ -60,9 +60,10 @@ end
 
 # ── k2 : HII + e → HI + photon  (CaseB recombination) ───────────────────────
 # Fit: Hui & Gnedin (1997) CaseB. Power-law: f32 accurate to ~5e-7 everywhere.
-# Note: grackle returns tiny for T≥1e9, but evaluating the formula for all T
-# avoids a Metal f32 quantization artifact (Float32(1e9-1) = 1.0f9 = 1e9,
-# which would falsely trigger the branch and return tiny instead of ~1.46e-19).
+# Note: the rate is conventionally floored to tiny for T≥1e9, but evaluating the
+# formula for all T avoids a Metal f32 quantization artifact (Float32(1e9-1) =
+# 1.0f9 = 1e9, which would falsely trigger the branch and return tiny instead of
+# ~1.46e-19).
 @inline function k2(T::Real)
     R = typeof(T)
     return R(4.881357e-6) * T^R(-1.5) * (R(1.0) + R(1.14813e2)*T^R(-0.407))^R(-2.242)

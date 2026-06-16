@@ -363,8 +363,8 @@ Keyword arguments:
                            density n1s; if `false` (default), approximate n1s_smoothed ≈
                            n_smoothed × (1 − Xe_mean).
   `recfast_fudge`       — RECFAST fudge `fu` on α_B (enters the C-factor as
-                           fu·(1+KL)/(1+KL+fu·KB)). Default 1.0 (pure Peebles,
-                           grackle default; = HyRec PEEBLES mode). Set to 1.14 for
+                           fu·(1+KL)/(1+KL+fu·KB)). Default 1.0 (the pure-Peebles
+                           default; = HyRec PEEBLES mode). Set to 1.14 for
                            RECFAST v1.  Overridden to 1.125 when `recfast_hswitch`.
   `recfast_hswitch`     — if `true`, use RECFAST v2: fudge fu = 1.125 on α_B PLUS
                            a multiplicative Gaussian correction gauss(z) =

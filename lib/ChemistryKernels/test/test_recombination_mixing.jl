@@ -524,4 +524,86 @@ end
     end
 end
 
+@testset "helium_equilibrium_limits" begin
+    CK = ChemistryKernels
+    nHe = 0.08; ne = 1.0
+    # 1) Saha limit: no collisions (k3=k5=0), no external photo, k4=k6=1 ⇒
+    #    n_HeII/n_HeI = she1/ne, n_HeIII/n_HeII = she2/ne.
+    let (nI, nII, nIII) = helium_equilibrium(0.5, 0.3, 0.0, 1.0, 0.0, 1.0, ne, nHe)
+        @test nII/nI  ≈ 0.5/ne rtol=1e-12
+        @test nIII/nII ≈ 0.3/ne rtol=1e-12
+        @test nI + nII + nIII ≈ nHe rtol=1e-12          # conservation
+    end
+    # 2) Collisional-ionisation-equilibrium limit: no radiation (she=0), no photo ⇒
+    #    n_HeII/n_HeI = k3/k4, n_HeIII/n_HeII = k5/k6 (Abel/Hui-Gnedin rates).
+    let T = 3.0e4
+        k3=CK.k3(T); k4=CK.k4(T); k5=CK.k5(T); k6=CK.k6(T)
+        (nI, nII, nIII) = helium_equilibrium(0.0, 0.0, k3, k4, k5, k6, ne, nHe)
+        @test nII/nI  ≈ k3/k4 rtol=1e-10
+        @test nIII/nII ≈ k5/k6 rtol=1e-10
+        @test nI + nII + nIII ≈ nHe rtol=1e-12
+        @test nII + nIII > nI                            # hot gas ⇒ He collisionally ionised
+    end
+    # 3) External photoionisation raises the ionised fraction monotonically.
+    let base = helium_equilibrium(0.0, 0.0, 0.0, 1.0, 0.0, 1.0, ne, nHe),
+        uv   = helium_equilibrium(0.0, 0.0, 0.0, 1.0, 0.0, 1.0, ne, nHe; GamHeI=5.0)
+        @test uv[2] > base[2]                            # Γ_HeI raises n_HeII
+    end
+end
+
+@testset "uv_background" begin
+    CK = ChemistryKernels
+    # Synthetic UVB (illustrative TEST values — NOT the exact HM2012 table) with
+    # rates rising to a z≈2 peak then declining, in the standard ordering
+    # (z, Γ_HI=k24, Γ_HeII=k25, Γ_HeI=k26, piHI, piHeI, piHeII).
+    zt    = [0.0, 2.0, 6.0]
+    lnzp1 = log.(1 .+ zt)
+    k24 = [2.3e-14, 1.0e-12, 2.0e-13]      # Γ_HI
+    k25 = [5.0e-17, 1.0e-15, 2.0e-18]      # Γ_HeII
+    k26 = [1.3e-14, 6.0e-13, 1.0e-13]      # Γ_HeI
+    pi0 = zeros(3)
+    uvb = UVBackground(lnzp1, k24, k25, k26, pi0, pi0, pi0)
+
+    # interpolation: endpoint exact; OFF above the tabulated z_max; log-linear inside.
+    @test uvb_rates(uvb, 0.0)[1] ≈ 2.3e-14
+    @test uvb_rates(uvb, 100.0)[1] == 0.0                       # above z_max ⇒ UVB off
+    let r = uvb_rates(uvb, 1.0)                                  # log-linear between z=0,2
+        x0=log(1.0); x1=log(3.0); t=(log(2.0)-x0)/(x1-x0)
+        @test r[1] ≈ exp(log(2.3e-14) + t*(log(1.0e-12)-log(2.3e-14))) rtol=1e-10
+    end
+
+    # The low-z debug handle: with the CMB cold (she=0) and matter cool (k3=0), the
+    # UVB drives He to PHOTOIONISATION equilibrium, n_HeII/n_HeI = Γ_HeI/(k4·nₑ)
+    # exactly — a clean analytic check that the new He equilibrium responds correctly.
+    let ne=1e-3, nHe=0.08, T=1.0e4, k4=CK.k4(T), k6=CK.k6(T)
+        (k24v,k25v,k26v,_,_,_) = uvb_rates(uvb, 0.0)            # k26v=Γ_HeI, k25v=Γ_HeII
+        (nI,nII,nIII) = helium_equilibrium(0.0, 0.0, 0.0, k4, 0.0, k6, ne, nHe;
+                                           GamHeI=k26v, GamHeII=k25v)
+        @test nII/nI ≈ k26v/(k4*ne)   rtol=1e-8                  # He I photoion. equilibrium
+        @test nIII/nII ≈ k25v/(k6*ne) rtol=1e-8                  # He II photoion. equilibrium
+        @test nII + nIII > nI                                    # UVB keeps He ionised at z=0
+    end
+
+    # Real FG20 background (shipped TREECOOL): authoritative z=0 anchor values from
+    # Faucher-Giguère (2020) — Γ_HI=3.620e-14, Γ_HeI=1.191e-14, Γ_HeII=2.842e-16 s⁻¹.
+    fg = fg20_uvb()
+    let (k24v, k25v, k26v, hHI, hHeI, hHeII) = uvb_rates(fg, 0.0)
+        @test k24v ≈ 3.620e-14 rtol=1e-3                         # Γ_HI(z=0)
+        @test k26v ≈ 1.191e-14 rtol=1e-3                         # Γ_HeI(z=0)
+        @test k25v ≈ 2.842e-16 rtol=1e-3                         # Γ_HeII(z=0)
+        @test hHI > 0 && hHeI > 0 && hHeII > 0                   # photoheating present
+    end
+    @test uvb_rates(fg, 20.0)[1] == 0.0                          # off above FG20 z_max
+    # FG20 drives the low-z He equilibrium (the debug handle): in cool, low-density
+    # gas it pins He to photoionisation equilibrium n_HeII/n_HeI = Γ_HeI/(k4·nₑ).
+    let ne=1e-4, nHe=0.08, T=1.0e4, k4=CK.k4(T), k6=CK.k6(T)
+        (k24v, k25v, k26v, _, _, _) = uvb_rates(fg, 0.0)
+        (nI, nII, nIII) = helium_equilibrium(0.0, 0.0, 0.0, k4, 0.0, k6, ne, nHe;
+                                             GamHeI=k26v, GamHeII=k25v)
+        @test nII/nI   ≈ k26v/(k4*ne) rtol=1e-8
+        @test nIII/nII ≈ k25v/(k6*ne) rtol=1e-8
+        @test nII > nI                                           # FG20 keeps He ionised at z=0
+    end
+end
+
 end # @testset "recombination_mixing"

@@ -1,20 +1,19 @@
 # recombination.jl — the v2026 RECFAST/Peebles H recombination override.
 #
-# When cmb_recombination is on (always, in the reduced model), grackle replaces
-# the case-B rate k2 by a per-cell value suppressed by the Peebles C-factor — the
-# probability that a fresh recombination to an excited state cascades to ground
-# rather than being re-ionized by a redshifting Lyα photon.  This is what makes
-# the network reproduce the recfast x_e(z) freeze-out for z ≲ 1000.
+# When cmb_recombination is on (always, in the reduced model), the network
+# replaces the case-B rate k2 by a per-cell value suppressed by the Peebles
+# C-factor — the probability that a fresh recombination to an excited state
+# cascades to ground rather than being re-ionized by a redshifting Lyα photon.
+# This is what makes the network reproduce the recfast x_e(z) freeze-out for
+# z ≲ 1000.
 #
-# Direct transcription of solve_rate_cool_g.F:1385-1409 (the inline block) in
-# physical CGS — k2 [cm³/s] = α_B·10⁶·C, dropping grackle's `·dom·tbase1` code-
-# unit conversion.  The C-factor needs H(z) (Sobolev escape K = λ³/(8πH)),
-# computed exactly as solve_chemistry.c:170-180.  Pure & allocation-free.
+# k2 [cm³/s] = α_B·10⁶·C, in physical CGS.  The C-factor needs H(z) (Sobolev
+# escape K = λ³/(8πH)).  Pure & allocation-free.
 
 export hubble_z_of, recfast_alpha, peebles_k2, beta1s_freq, helium_saha_pair
 export total_electron_fraction, helium_HeI_rate_AB
 
-# RECFAST constants (solve_rate_cool_g.F:1387-1391); rec_fu = 1 (pure Peebles).
+# RECFAST constants; rec_fu = 1 (pure Peebles).
 const _REC_CR  = 1.799920e14
 const _REC_CDB = 3.945150e4
 const _REC_LAM = 1.215668e-7        # Lyα wavelength [m] (formula is in SI)
@@ -23,16 +22,16 @@ const _CHI_H_K = 157807.0           # H(1s) ionisation energy / k_B [K] (13.6 eV
 # Helium ionisation energies / k_B [K] (CODATA: He I 24.5874 eV, He II 54.4178 eV)
 const _CHI_HEI  = 285335.0          # He I  → He II   (24.5874 eV)
 const _CHI_HEII = 631515.0          # He II → He III  (54.4178 eV)
-# Hubble unit conversion (solve_chemistry.c:177): km/s/Mpc → s⁻¹.
+# Hubble unit conversion: km/s/Mpc → s⁻¹.
 const _MPC_CM  = 3.0856775807e24
 const _OR_FAC  = 4.15e-5            # Ω_r·h² (CMB photons + 3 ν, T_cmb=2.725 K)
 
 """
     hubble_z_of(z; hubble, Om, OL)
 
-Hubble rate H(z) [s⁻¹] from the cosmology, exactly as solve_chemistry.c:177-180
-(radiation Ω_r = 4.15e-5/h² from T_cmb=2.725 K photons + 3 ν; curvature closes
-the budget). `hubble` = H₀ [km/s/Mpc]. Pure.
+Hubble rate H(z) [s⁻¹] from the cosmology (radiation Ω_r = 4.15e-5/h² from
+T_cmb=2.725 K photons + 3 ν; curvature closes the budget). `hubble` = H₀
+[km/s/Mpc]. Pure.
 """
 @inline function hubble_z_of(z; hubble = 71.0, Om = 0.27, OL = 0.73)
     R   = typeof(z)
@@ -64,7 +63,7 @@ end
 
 CaseB H recombination rate k2 [cm³/s] with the Peebles C-factor suppression, at
 temperature `T` [K], neutral-H number density `nHI` [cm⁻³], and Hubble rate `Hz`
-[s⁻¹]. (solve_rate_cool_g.F:1393-1407.) Pure.
+[s⁻¹]. Pure.
 """
 @inline function peebles_k2(T, nHI, Hz)
     R   = typeof(T)

@@ -1,27 +1,26 @@
 # network_step.jl — ONE linearly-implicit backward-Euler sweep of the v2026
-# reduced primordial+D network: the per-subcycle update grackle performs in
-# step_rate_g (solve_rate_cool_g.F:2128-2604), specialized to the reduced flags
-#   ieq=1 (H⁻,H2⁺,D⁺ algebraic),  ineutralhe=1 (helium forced neutral, nₑ from
-#   charge conservation),  no radiation / dust / self-shielding (only the CMB
-#   photo-rates k27,k28 survive).
+# reduced primordial+D network: one backward-Euler sweep of the network, with
+#   H⁻, H₂⁺, D⁺ as algebraic-equilibrium intermediaries; helium in collisional-
+#   radiative ionisation equilibrium (or, optionally, advected He⁺ — see the He
+#   block below); nₑ from charge conservation; no dust / self-shielding (only the
+#   CMB photo-rates k27,k28 and any supplied external photoionisation survive).
 #
 # Each provisional Xⁿ⁺¹ = (s·dt + Xⁿ)/(1 + a·dt) with s = formation, a =
-# destruction frequency.  Species use grackle's MASS-EQUIVALENT convention (same
-# as equilibrium.jl): yHI=n_HI, yHII=n_HII, yde=n_e, yHM=n_HM, yHeI=n_HeI, and
-# yH2I=2·n(H2), yH2II=2·n(H2⁺), yHDI=3·n(HD) — so every literal /2,/3,2× matches
-# the Fortran verbatim.  Pure & allocation-free (AD-friendly); the per-cell KA
-# launcher lives in solve.jl.
+# destruction frequency.  Species use the network's mass-equivalent convention
+# (same as equilibrium.jl): yHI=n_HI, yHII=n_HII, yde=n_e, yHM=n_HM, yHeI=n_HeI, and
+# yH2I=2·n(H2), yH2II=2·n(H2⁺), yHDI=3·n(HD) — so every literal /2,/3,2× is
+# consistent with that convention.  Pure & allocation-free (AD-friendly); the
+# per-cell KA launcher lives in solve.jl.
 #
-# Gauss-Seidel ordering faithfully reproduced (it matters for bit-parity with the
-# reduced lib in Wave 5): HIp/HIIp/dep/H2Ip from the OLD state; HMp from OLD;
+# Gauss-Seidel ordering: HIp/HIIp/dep/H2Ip from the OLD state; HMp from OLD;
 # H2IIp from the NEW provisionals (uses dep for its e⁻ destruction); the
 # deuterium block from OLD; and the charge-conservation nₑ at the end uses the
-# NEW HII but the OLD HM/H2II (exactly solve_rate_cool_g.F:2566-2570).
+# NEW HII but the OLD HM/H2II.
 
 export network_step
 
-# grackle's `tiny` species floor (absolute, code units — negligible vs real
-# abundances in any cosmological density_units; see the temperature.jl test note).
+# The species floor (absolute, code units — negligible vs real abundances in any
+# cosmological density_units; see the temperature.jl test note).
 const _NET_TINY = 1.0e-20
 
 """
@@ -35,30 +34,36 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
 """
 @inline function network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
                               yDI, yDII, yHDI, K, dt; deuterium::Bool = false,
-                              yHeII_in = nothing, yHeIII_in = nothing)
+                              yHeII_in = nothing, yHeIII_in = nothing,
+                              GamHeI = 0.0, GamHeII = 0.0)
     R    = typeof(yHI)
     tiny = R(_NET_TINY)
     two  = R(2); half = R(0.5); four = R(4)
 
     # Helium ionisation.  Two modes (both in the mass-equivalent ×4 convention,
     # yHeX = 4·n(HeX)):
-    #   • Saha (default, yHeII_in===nothing): instantaneous Saha equilibrium with
-    #     the CMB (K.she1 = n_HeII·n_e/n_HeI, K.she2 = n_HeIII·n_e/n_HeII, at T_rad),
-    #     solved semi-implicitly off the OLD n_e.  Exact at z≳3000 and z≲1700; ~3%
-    #     low in the He⁺→He⁰ freeze-out (z≈2000-2500).  Cold CMB ⇒ He neutral ⇒ no
-    #     cost at late times.
+    #   • Equilibrium (default, yHeII_in===nothing): collisional-radiative ionisation
+    #     equilibrium — every up/down channel balanced.  For each stage the ratio of
+    #     successive ions is  (collisional ion·nₑ + photo) / (recombination·nₑ):
+    #         n_HeII /n_HeI  = K.she1/nₑ + k3/k4 + Γ_HeI /(k4·nₑ)
+    #         n_HeIII/n_HeII = K.she2/nₑ + k5/k6 + Γ_HeII/(k6·nₑ)
+    #     The radiation/CMB term is the Saha factor (K.she*, detailed balance at
+    #     T_rad — exact at z≳3000 & z≲1700, ~3% low only in the He⁺→He⁰ freeze-out);
+    #     k3/k5 = collisional ionisation, k4/k6 = recombination (Abel/Hui-Gnedin, at
+    #     T_matter); Γ = optional external photoionisation rate [s⁻¹] (e.g. a UV
+    #     background, 0 by default).  Cold CMB + cold matter ⇒ He neutral ⇒ no cost
+    #     at late times; hot gas ⇒ collisional-ionisation equilibrium.  Solved
+    #     semi-implicitly off the OLD nₑ.
     #   • Evolved (yHeII_in given): the caller (evolve_cell_mixing) has integrated
-    #     He⁺ with the full He I recombination (helium_HeI_rate_AB), capturing the
-    #     freeze-out; we just consume its yHeII/yHeIII here for the electron balance.
+    #     He⁺ with the full rate equation (incl. the He I radiative-transfer
+    #     freeze-out); we just consume its yHeII/yHeIII for the electron balance.
     nHe4 = (one(R) - R(fh)) * d                  # total He in ×4 convention
     if yHeII_in === nothing
-        nHe_tot = nHe4 / four
-        ne_old  = max(yde, tiny)
-        rHe1    = K.she1 / ne_old
-        rHe2    = K.she2 / ne_old
-        Heden   = one(R) + rHe1 + rHe1 * rHe2
-        yHeII   = four * nHe_tot * rHe1        / Heden
-        yHeIII  = four * nHe_tot * rHe1 * rHe2 / Heden
+        _, nHeII, nHeIII = helium_equilibrium(K.she1, K.she2, K.k3, K.k4, K.k5, K.k6,
+                                              max(yde, tiny), nHe4 / four;
+                                              GamHeI = GamHeI, GamHeII = GamHeII)
+        yHeII  = four * nHeII                     # back to ×4 convention
+        yHeIII = four * nHeIII
     else
         yHeII   = R(yHeII_in)
         yHeIII  = R(yHeIII_in)
@@ -74,18 +79,20 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
     # H⁻ and H₂⁺ are fast algebraic-equilibrium intermediaries. We evaluate them
     # from the OLD state FIRST and substitute the equilibrium H₂⁺ (H2IIeq) into the
     # HI/HII/e⁻/H2 source terms — INCLUDING the CMB photodissociation return k28
-    # (H₂⁺+γ → HI + HII) that grackle's step_rate_g omits in the HI/HII equations.
+    # (H₂⁺+γ → HI + HII) in the HI/HII equations.
     #
-    # DELIBERATE DEVIATION FROM grackle (solve_rate_cool_g.F): grackle drops the
-    # k28 return and uses the lagged H₂⁺ density because H₂⁺ is trace at z<100, its
-    # validated regime.  During recombination (z≈1000-1200), however, the radiative
+    # DELIBERATE EXTENSION beyond the original network (Abel, Anninos, Zhang &
+    # Norman 1997): it drops the H₂⁺ photodissociation (k28) return to HI/HII and
+    # uses the lagged H₂⁺ density because H₂⁺ is trace at z<100, its galaxy-
+    # formation regime.  During recombination (z≈1000-1200), however, the radiative
     # association k9 (HI+HII→H₂⁺) reaches ~1.5% of the net recombination rate; the
     # CMB then photodissociates that H₂⁺ straight back (k28≈330 s⁻¹), so the cycle
     # is very nearly null for HII.  Without crediting the k28/k10 return, the k9
-    # term leaks HII and biases x_e ~1-1.5% low at z≈1000-1100.  Closing the cycle
-    # (the only net HII sink via H₂⁺ is the dissociative k18·de branch) recovers the
-    # full network to <0.25% of HyRec across z=700-1100.  H₂⁺ being trace at low z,
-    # the change is negligible for grackle's original galaxy-formation regime.
+    # term leaks HII and biases x_e ~1-1.5% low at z≈1000-1100.  We add it for the
+    # recombination epoch.  Closing the cycle (the only net HII sink via H₂⁺ is the
+    # dissociative k18·de branch) recovers the full network to <0.25% of HyRec
+    # across z=700-1100.  H₂⁺ being trace at low z, the change is negligible in the
+    # original galaxy-formation regime.
     HMp    = equilibrium_HM(yHI, yHII, yde, yH2II, k7, k8, k14, k15, k16, k17, k19, k27)
     H2IIeq = equilibrium_H2II(yHI, yHII, yH2I, yde, HMp,
                               k9, k10, k11, k17, k18, k19, k28)
@@ -121,7 +128,7 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
     # 8,9) store the consistent old-state equilibrium H₂⁺ (H⁻ already in HMp above)
     H2IIp = H2IIeq
 
-    # ── (D) deuterium (OLD state)  (:2484-2536) ──────────────────────────────
+    # ── (D) deuterium (OLD state) ────────────────────────────────────────────
     if deuterium
         k50=K.k50; k51=K.k51; k52=K.k52; k53=K.k53; k54=K.k54; k55=K.k55; k56=K.k56
         three = R(3)
@@ -141,10 +148,10 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
         DIp = yDI; DIIp = yDII; HDIp = yHDI
     end
 
-    # ── (E) field assignment + charge-conservation nₑ  (:2549-2581) ──────────
+    # ── (E) field assignment + charge-conservation nₑ ────────────────────────
     HI_n   = max(HIp,  tiny)
     HII_n  = max(HIIp, tiny)
-    # nₑ from charge conservation: NEW HII, He neutral, but OLD HM/H2II (Fortran).
+    # nₑ from charge conservation: NEW HII, He neutral, but OLD HM/H2II.
     de_n   = HII_n + yHeII/four + yHeIII/two - yHM + yH2II/two
     HM_n   = max(HMp,   tiny)
     H2I_n  = max(H2Ip,  tiny)

@@ -2,20 +2,21 @@
 #
 # Assembles the volumetric energy-change rate ė [erg cm⁻³ s⁻¹] (negative ⇒
 # cooling) from the Wave-1 cooling coefficients and physical number densities,
-# exactly as cool1d_multi_g.F builds `edot`, specialized to the reduced model:
+# as in the Abel/Anninos et al. 1997 network's `edot`, specialized to the
+# reduced model:
 #   helium forced neutral ⇒ every He cooling channel (ce/ci/re of He, and the
 #   He terms of bremsstrahlung) is ∝ n_HeII or n_HeIII = tiny ≈ 0 and DROPS OUT,
 #   leaving only HI/HII/e atomic cooling, H2, HD, and CMB-Compton.
 #
-# Written in physical CGS (number densities [cm⁻³], T [K]); grackle's `dom`/
-# `coolunit` code-unit bookkeeping cancels in the physical form (the H2/HD
-# two-level functions and Compton are textbook).  Pure & allocation-free.
+# Written in physical CGS (number densities [cm⁻³], T [K]); the `dom`/`coolunit`
+# code-unit bookkeeping cancels in the physical form (the H2/HD two-level
+# functions and Compton are textbook).  Pure & allocation-free.
 #
-# Reference lines (cool1d_multi_g.F):
-#   atomic       417-447   (ceHI/ciHI·n_HI·n_e, reHII·n_HII·n_e, brem·n_HII·n_e)
-#   H2 (GP2008)  490-549   (galdl low-density limit, H2LTE high-density, CMB floor)
-#   HD           681-711   (two-level with collider n_HI, CMB-gated)
-#   Compton      1053-1063 (comp1·(T−T_cmb)·n_e)
+# Channels:
+#   atomic       (ceHI/ciHI·n_HI·n_e, reHII·n_HII·n_e, brem·n_HII·n_e)
+#   H2 (GP2008)  (galdl low-density limit, H2LTE high-density, CMB floor)
+#   HD           (two-level with collider n_HI, CMB-gated)
+#   Compton      (comp1·(T−T_cmb)·n_e)
 
 export cooling_edot
 
@@ -25,7 +26,7 @@ export cooling_edot
 Net volumetric energy rate ė [erg cm⁻³ s⁻¹] (cooling ⇒ negative) for the reduced
 network at gas temperature `T` [K] and redshift `z`. Number densities are
 physical [cm⁻³]; `nH2`/`nHD` are H2 and HD *molecule* densities. The H2 optical-
-depth fudge (grackle's `h2_optical_depth_approximation`, default off) needs the
+depth fudge (the optical-depth approximation, default off) needs the
 total H-nucleus density `nH`. Pure.
 """
 @inline function cooling_edot(nHI, nHII, nHeI, nde, nH2, nHD, T, z;
@@ -54,7 +55,7 @@ total H-nucleus density `nH`. Pure.
     end
     h2 = fudge * nH2 * (cool_gas - cool_cmb)
 
-    # ── HD (two-level, collider = HI, CMB-gated as in grackle) ───────────────
+    # ── HD (two-level, collider = HI, CMB-gated) ─────────────────────────────
     hd = zero(R)
     if T > Tc
         hdlte  = HDlte(T)

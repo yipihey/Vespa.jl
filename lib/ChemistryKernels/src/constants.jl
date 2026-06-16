@@ -1,7 +1,7 @@
-# Physical constants in CGS — byte-identical to grackle's src/clib/phys_constants.h
-# so the ported analytic formulas reproduce grackle's `kN_rate(T, 1.0, cd)` values
-# to floating-point round-off.  Stored as Float64 literals; convert with `T(...)`
-# at the point of use (never round the literal itself).
+# Physical constants in CGS, so the analytic rate formulas of the Abel/Anninos
+# et al. 1997 network are evaluated consistently to floating-point round-off.
+# Stored as Float64 literals; convert with `T(...)` at the point of use (never
+# round the literal itself).
 
 const KBOLTZ   = 1.3806504e-16      # Boltzmann constant [erg/K]
 const MH       = 1.67262171e-24     # hydrogen mass [g]
@@ -15,17 +15,17 @@ const KPC      = 3.0857e21
 const PC       = 3.0857e18
 
 # eV ↔ K conversion used pervasively in the rate fits (T_ev = T / TEV_PER_K).
-# grackle uses the literal 11605.0 in rate_functions.c (NOT kboltz/eV) — match it.
+# The rate fits use the literal 11605.0 (NOT kboltz/eV).
 const TEV_PER_K = 11605.0
 
-# Hydrogen mass fraction default (grackle HydrogenFractionByMass); the reduced
-# network uses fh passed from the host, but this is the cosmic default.
+# Hydrogen mass fraction default (HydrogenFractionByMass); the reduced network
+# uses fh passed from the host, but this is the cosmic default.
 const FH_DEFAULT = 0.76
 
 # Deuterium-to-hydrogen seeding ratio used by the reduced wrapper (2 * 3.4e-5).
 const DTOH_SEED = 6.8e-5
 
-# A tiny floor mirroring grackle's `tiny` (1e-20) for species/abundances.
+# A tiny floor (1e-20) for species/abundances.
 const TINY = 1e-20
 
 # Lyα mixing recombination constants (recombination_clumping.jl).

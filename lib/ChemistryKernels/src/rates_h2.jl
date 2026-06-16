@@ -1,15 +1,14 @@
 # H₂/H⁻ reaction-rate kernels — table-free, precision-generic.
 #
-# Each function is a direct port of the corresponding grackle `kN_rate(T, 1.0, cd)`
-# formula evaluated with units=1.  The oracle in test/oracle.jl calls the same C
-# functions via ccall, so Layer-A rtol ≤ 1e-11 is achievable.
+# Each function evaluates the corresponding rate coefficient kN(T) of the
+# Abel/Anninos et al. 1997 network with CGS units (units=1.0 convention).
 #
-# Default grackle flags assumed (set_default_chemistry_parameters):
+# Channel choices assumed:
 #   h2_charge_exchange_rate = 1  (Savin 2004)
 #   three_body_rate         = 0  (Abel et al.)
 #
 # Every numeric literal is wrapped in R(...) so the math is fully generic in T.
-# `TINY` is imported from ChemistryKernels (= 1e-20, matches grackle's `tiny`).
+# `TINY` is imported from ChemistryKernels (= 1e-20).
 
 export k7, k8, k9, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19, k22
 export k7_grid, k8_grid, k9_grid, k10_grid, k11_grid, k12_grid, k13_grid,

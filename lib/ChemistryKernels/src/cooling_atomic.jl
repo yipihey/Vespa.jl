@@ -1,12 +1,13 @@
 # Precision-generic atomic cooling/heating coefficient kernels.
 #
-# Every function is a direct transcription of the corresponding `*_rate` body in
-# grackle/src/clib/rate_functions.c, evaluated at units=1.0 and with
-# CaseBRecombination=1 (CaseB branch selected for reHII/reHeII2/reHeIII).
-# The collisional_excitation_rates, collisional_ionisation_rates,
-# recombination_cooling_rates, and bremsstrahlung_cooling_rates flags are all
-# assumed to be 1 (the reduced network always sets them on), so only the active
-# branch is transcribed — the "else return tiny" branches are omitted.
+# These coefficients implement the primordial atomic cooling/heating rates of the
+# Abel, Anninos, Zhang & Norman (1997) and Anninos, Zhang, Abel & Norman (1997)
+# network, evaluated with CaseB recombination (CaseB branch selected for
+# reHII/reHeII2/reHeIII).
+# The collisional excitation, collisional ionization, recombination cooling, and
+# bremsstrahlung cooling channels are all assumed active (the reduced network
+# always enables them), so only the active branch is transcribed — the "else
+# return tiny" branches are omitted.
 #
 # Pattern:
 #   R = typeof(T)          — the precision type (Float64 or Float32 or any Real)
@@ -16,10 +17,10 @@
 # The ciHI/ciHeI/ciHeII coefficients call the ionization rate k1/k3/k5 internally.
 # Those degree-8 polynomials in log(Tev) are evaluated using Horner's method for
 # numerical stability on Metal f32 (avoids catastrophic cancellation of large x^k
-# powers at extreme T). The f64 result is bit-identical to the grackle C formula
-# (same IEEE-754 ops in a different order, within 1e-11 relative).
+# powers at extreme T). The f64 result is bit-identical to the closed-form
+# coefficient (same IEEE-754 ops in a different order, within 1e-11 relative).
 #
-# grackle's `dhuge` guard: fmin(log(1e30), X/T).  log(1e30) = 69.0775527898...
+# `dhuge` guard: fmin(log(1e30), X/T).  log(1e30) = 69.0775527898...
 # We inline it as a literal so Metal doesn't see a log(Float64) call.
 const _LOG_DHUGE = 69.07755278982137    # log(1e30), precomputed
 
@@ -27,7 +28,7 @@ const _LOG_DHUGE = 69.07755278982137    # log(1e30), precomputed
 
 @inline function ceHI(T::Real)
     R = typeof(T)
-    # ceHI_rate: 7.5e-19 * exp(-fmin(log(dhuge), 118348/T)) / (1 + sqrt(T/1e5))
+    # ceHI: 7.5e-19 * exp(-fmin(log(dhuge), 118348/T)) / (1 + sqrt(T/1e5))
     exponent = min(R(_LOG_DHUGE), R(118348.0) / T)
     return R(7.5e-19) * exp(-exponent) / (R(1.0) + sqrt(T / R(1.0e5)))
 end
@@ -35,8 +36,8 @@ end
 
 @inline function ceHeI(T::Real)
     R = typeof(T)
-    # ceHeI_rate: 9.1e-27 * exp(-fmin(log(dhuge), 13179/T)) * T^(-0.1687)
-    #             / (1 + sqrt(T/1e5))
+    # ceHeI: 9.1e-27 * exp(-fmin(log(dhuge), 13179/T)) * T^(-0.1687)
+    #        / (1 + sqrt(T/1e5))
     exponent = min(R(_LOG_DHUGE), R(13179.0) / T)
     return R(9.1e-27) * exp(-exponent) * T^R(-0.1687) / (R(1.0) + sqrt(T / R(1.0e5)))
 end
@@ -44,8 +45,8 @@ end
 
 @inline function ceHeII(T::Real)
     R = typeof(T)
-    # ceHeII_rate: 5.54e-17 * exp(-fmin(log(dhuge), 473638/T)) * T^(-0.3970)
-    #              / (1 + sqrt(T/1e5))
+    # ceHeII: 5.54e-17 * exp(-fmin(log(dhuge), 473638/T)) * T^(-0.3970)
+    #         / (1 + sqrt(T/1e5))
     exponent = min(R(_LOG_DHUGE), R(473638.0) / T)
     return R(5.54e-17) * exp(-exponent) * T^R(-0.3970) / (R(1.0) + sqrt(T / R(1.0e5)))
 end
@@ -53,9 +54,9 @@ end
 
 # ── collisional ionization ─────────────────────────────────────────────────────
 
-# Inline k1_rate(T,1,cd): Abel et al (1997) degree-8 fit in logTev.
+# Inline k1 rate: Abel et al (1997) degree-8 fit in logTev.
 # Horner form for best f32 stability.
-# grackle: polynomial always evaluated; if (T_ev <= 0.8) k1 = fmax(tiny, k1).
+# Polynomial always evaluated; if (T_ev <= 0.8) k1 = fmax(tiny, k1).
 @inline function _k1_inline(T::Real)
     R = typeof(T)
     Tev = T / R(11605.0)
@@ -65,7 +66,7 @@ end
            x*(R(1.563154982022) + x*(R(-0.2877056004391) + x*(R(0.03482559773736999) +
            x*(R(-0.00263197617559) + x*(R(0.0001119543953861) + x*R(-2.039149852002e-6))))))))
     k1 = exp(poly)
-    # grackle: if (T_ev <= 0.8) k1 = fmax(tiny, k1)
+    # if (T_ev <= 0.8) k1 = fmax(tiny, k1)
     if Tev <= R(0.8)
         k1 = max(R(1.0e-20), k1)
     end
@@ -78,7 +79,7 @@ end
 end
 @scalarkernel ciHI
 
-# Inline k3_rate(T,1,cd): Abel et al (1997), degree-8 fit. Tev <= 0.8 → tiny.
+# Inline k3 rate: Abel et al (1997), degree-8 fit. Tev <= 0.8 → tiny.
 @inline function _k3_inline(T::Real)
     R = typeof(T)
     Tev = T / R(11605.0)
@@ -96,7 +97,7 @@ end
 end
 @scalarkernel ciHeI
 
-# Inline k5_rate(T,1,cd): Abel et al (1997), degree-8 fit. Tev <= 0.8 → tiny.
+# Inline k5 rate: Abel et al (1997), degree-8 fit. Tev <= 0.8 → tiny.
 @inline function _k5_inline(T::Real)
     R = typeof(T)
     Tev = T / R(11605.0)
@@ -127,7 +128,7 @@ end
 
 @inline function reHII(T::Real)
     R = typeof(T)
-    # reHII_rate CaseB branch:
+    # reHII CaseB branch:
     # lambdaHI = 2 * 157807 / T
     # 3.435e-30 * T * lambdaHI^1.970 / (1 + (lambdaHI/2.25)^0.376)^3.720
     lambdaHI = R(2.0) * R(157807.0) / T
@@ -138,7 +139,7 @@ end
 
 @inline function reHeII1(T::Real)
     R = typeof(T)
-    # reHeII1_rate CaseB branch:
+    # reHeII1 CaseB branch:
     # lambdaHeII = 2 * 285335 / T
     # 1.26e-14 * kboltz * T * lambdaHeII^0.75
     # kboltz = 1.3806504e-16
@@ -149,7 +150,7 @@ end
 
 @inline function reHeII2(T::Real)
     R = typeof(T)
-    # reHeII2_rate (dielectronic, no CaseA/B branch):
+    # reHeII2 (dielectronic, no CaseA/B branch):
     # 1.24e-13 * T^(-1.5) * exp(-fmin(log(dhuge), 470000/T))
     #          * (1 + 0.3 * exp(-fmin(log(dhuge), 94000/T)))
     exp1 = min(R(_LOG_DHUGE), R(470000.0) / T)
@@ -160,7 +161,7 @@ end
 
 @inline function reHeIII(T::Real)
     R = typeof(T)
-    # reHeIII_rate CaseB branch:
+    # reHeIII CaseB branch:
     # lambdaHeIII = 2 * 631515 / T
     # 8 * 3.435e-30 * T * lambdaHeIII^1.970
     #   / (1 + (lambdaHeIII/2.25)^0.376)^3.720
@@ -174,7 +175,7 @@ end
 
 @inline function brem(T::Real)
     R = typeof(T)
-    # brem_rate: 1.43e-27 * sqrt(T) * (1.1 + 0.34 * exp(-(5.5 - log10(T))^2 / 3))
+    # brem: 1.43e-27 * sqrt(T) * (1.1 + 0.34 * exp(-(5.5 - log10(T))^2 / 3))
     gaunt = R(1.1) + R(0.34) * exp(-(R(5.5) - log10(T))^2 / R(3.0))
     return R(1.43e-27) * sqrt(T) * gaunt
 end

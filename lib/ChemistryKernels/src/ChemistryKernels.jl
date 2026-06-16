@@ -1,11 +1,14 @@
 """
     ChemistryKernels
 
-A table-free, KernelAbstractions.jl reimplementation of the **v2026 reduced
-primordial + deuterium** chemistry/cooling network — the exact model wrapped by
-`lib/MultiCode/deps/grackle_reduced.c` (advect HII, H2I, HDI; helium forced
-neutral; H⁻/H₂⁺/D⁺ in algebraic equilibrium; nₑ = n_HII; primordial only, no
-metals, no UV background).
+A table-free, KernelAbstractions.jl implementation of the primordial +
+deuterium chemistry/cooling network of **Abel, Anninos, Zhang & Norman (1997,
+New Astronomy 2, 181)** and **Anninos, Zhang, Abel & Norman (1997, New Astronomy
+2, 209)** — the original Enzo primordial chemistry (the same physics later
+packaged as the `grackle` library).  Reduced model: advect HII, H2I, HDI;
+H⁻/H₂⁺/D⁺ in algebraic equilibrium; helium in ionisation equilibrium (or advected
+He⁺); nₑ from charge conservation; primordial only, no metals, no UV background
+(unless photo-ionisation rates are supplied).
 
 Also implements density-dependent Lyα-mixing recombination (`solve_chem_mixing!`)
 for early-Universe / PMF science, where the Peebles C-factor escape rate uses a
@@ -14,14 +17,14 @@ host-supplied smoothed neutral density instead of the cell-local value.
 Design contract (mirrors `PPMKernels`/`PoissonKernels`):
 
   * **One source, two devices.** Every compute kernel is a precision-generic
-    `@kernel` parameterised on `T = eltype(output)`. The CPU backend runs f64
-    (the parity oracle, certified against grackle's own analytic rate functions)
-    and f32; Metal runs f32-only. f32 CPU↔Metal agreement is the parity gate.
+    `@kernel` parameterised on `T = eltype(output)`. The CPU backend runs f64 and
+    f32; Metal runs f32-only. f32 CPU↔Metal agreement is the parity gate. Rate and
+    cooling coefficients are checked against the published Abel/Anninos et al.
+    (1997) analytic fits (and, for recombination, against HyRec-2).
 
-  * **No tables.** grackle tabulates each rate on a log-T grid then interpolates;
-    here every rate/cooling coefficient is evaluated DIRECTLY from its analytic
-    fit. The per-rate oracle is grackle's `kN_rate(T, 1.0, cd)` C function, which
-    returns the exact CGS formula value — so the port is bit-checkable.
+  * **No tables.** Every rate/cooling coefficient is evaluated DIRECTLY from its
+    analytic fit (Abel/Anninos et al. 1997 and the references therein), not
+    interpolated from a precomputed log-T grid.
 
   * **f32-safe representation.** State is carried as physical abundances relative
     to the hydrogen number density (`x_i = n_i/n_H`, dimensionless and O(1) for
@@ -87,6 +90,7 @@ end
 # ── component sources (added as each Wave lands) ─────────────────────────────
 include("constants.jl")
 include("kernelgen.jl")
+include("uv_background.jl")
 include("representation.jl")
 # Wave 1 — table-free rate + cooling formula kernels.
 include("rates_atomic.jl")
