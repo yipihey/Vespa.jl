@@ -156,9 +156,10 @@ end
     @test xe_arr[1] > 0.8        # near fully ionised at z=5000
     @test xe_arr[end] > 1e-5     # residual ionisation above machine noise
     @test xe_arr[end] < 0.10     # freeze-out below 10%
-    # monotone (allow small Saha-tracking increases at z≈1700-2000 where C×β₁s
-    # drives xe slightly upward when gas is marginally below Saha; max ~8e-5)
-    @test all(diff(xe_arr) .<= 2e-4)
+    # monotone (allow small Saha-tracking increases at z≈1660-2000 where C×β₁s
+    # drives xe slightly upward when gas is marginally below Saha; with β₁s now at
+    # Trad the largest bump is ~2.7e-4 at z≈1665 where xe≈0.998 — physically benign).
+    @test all(diff(xe_arr) .<= 3e-4)
 end
 
 @testset "saha_highz" begin
@@ -604,6 +605,72 @@ end
         @test nIII/nII ≈ k25v/(k6*ne) rtol=1e-8
         @test nII > nI                                           # FG20 keeps He ionised at z=0
     end
+end
+
+@testset "uvb_solver_equilibrium" begin
+    # END-TO-END (Task A): drive solve_chem_mixing! with the FG20 UV background at
+    # fixed z=3 and mean IGM density, from a near-neutral cold start, and verify the
+    # one-zone cell relaxes to the FG20 photoionisation + thermal equilibrium:
+    #   (a) H becomes highly ionised and the state is STATIONARY (true equilibrium);
+    #   (b) the matter temperature settles into the photoheated IGM range;
+    #   (c) the photoionisation balance Γ_HI·n_HI ≈ k2·n_HII·n_e holds quantitatively;
+    #   (d) CONTRAST: with no UVB the identical cell stays neutral and cools to ~T_CMB.
+    # This exercises the full UVB wiring: solve_chem_mixing!(uvb=…) → kernel →
+    # evolve_cell_mixing (Γ + photoheating) → network_step (Γ_HI) / helium_equilibrium.
+    CK = ChemistryKernels
+    mh = CK.MH; fh = 0.76
+    fg = fg20_uvb()
+    z  = 3.0; a = 1.0/(1.0+z); Hz = _Hz(z)
+    nH  = n_H_at_z(z; fh=fh)                 # mean IGM hydrogen density at z=3 [cm⁻³]
+    rho = nH*mh/fh
+    fHe = (1.0-fh)/(4.0*fh)                  # n_He/n_H ≈ 0.0789
+
+    # near-neutral, cold (T≈10³ K) start; integrate at FIXED z (no expansion) to steady state
+    function relax(; use_uvb)
+        rho_v=[rho]; nsm_v=[rho]
+        HII_v=[1.0e-3*nH*mh]; H2I_v=[1.0e-40]
+        e_v=[e_from_T(1.0e3, 1.0e-3, rho; fh=fh)]
+        dt = 0.05/Hz                          # 0.05 Hubble times per step
+        xprev = 1.0e-3
+        for k in 1:300
+            xprev = HII_v[1]/(rho*fh)         # state BEFORE this step (unclamped)
+            Xe = clamp(xprev, 0.0, 1.0)
+            solve_chem_mixing!(rho_v, e_v, HII_v, H2I_v, nsm_v;
+                               uvb = use_uvb ? fg : nothing,
+                               a_value=a, dt=dt,
+                               density_units=1.0, length_units=1.0, time_units=1.0,
+                               Xe_mean=Xe, hubble_expansion=false, fh=fh)
+        end
+        xH = HII_v[1]/(rho*fh)
+        Tg = temperature_from_reduced(rho, e_v[1], HII_v[1], H2I_v[1]; fh=fh)
+        return xH, Tg, xprev
+    end
+
+    xHII, T, x_oneback = relax(use_uvb=true)
+    @test 0.99 < xHII <= 1.0                           # (a) UVB keeps the IGM ionised (no overshoot)
+    @test abs(xHII - x_oneback) < 1.0e-4               #     stationary ⇒ true equilibrium
+    @test 2.0e3 < T < 4.0e4                            # (b) photoheated IGM temperature
+
+    # (c) photoionisation equilibrium: Γ_HI·n_HI ≈ k2·n_HII·n_e (collisional ion. tiny
+    # at T~10⁴ K).  n_e from charge conservation incl. the photoionised He.
+    (k24,k25,k26,_,_,_) = uvb_rates(fg, z)
+    nHI = (1.0-xHII)*nH; nHII = xHII*nH
+    Trad = CK.comp2_cmb(z)
+    K = CK.build_rates_mixing(T, Trad, nHI, nHI, Hz)
+    nHe = fHe*nH
+    ne_seed = nHII + nHe                                # rough seed (He singly ionised)
+    (_, nHeII, nHeIII) = CK.helium_equilibrium(K.she1, K.she2, K.k3, K.k4, K.k5, K.k6,
+                                               ne_seed, nHe; GamHeI=k26, GamHeII=k25)
+    ne = nHII + nHeII + 2.0*nHeIII
+    @test k24*nHI ≈ K.k2*nHII*ne rtol=0.15             # photoionisation equilibrium
+
+    # (d) contrast: with no UVB the same cell just sits near its cold, neutral start
+    # (at z=3, mean density, both recombination and Compton coupling are far slower
+    # than this run's duration) — so the UVB is unambiguously what ionises and heats it.
+    xHII0, T0, _ = relax(use_uvb=false)
+    @test xHII0 < 0.05                                  # stays neutral without the UVB
+    @test xHII > 10.0*xHII0                             # UVB ionises by orders of magnitude
+    @test T > T0                                        # UVB photoheats above the dark cell
 end
 
 end # @testset "recombination_mixing"

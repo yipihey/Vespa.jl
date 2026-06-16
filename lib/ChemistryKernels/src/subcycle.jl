@@ -41,7 +41,12 @@ all others are the Wave-1 analytic fits. Pure.
     # C-weighted β₁s: matches k2=α_B×C so equilibrium gives true Saha (C cancels).
     # At high z (xe≈1, nHI≈0): C→1, k_beta1s→β₁s (drives Saha).
     # At z≈1200 (C≈0.006): k_beta1s negligible vs recombination → freeze-out preserved.
-    k_b1s = beta1s_freq(T) * k2_val / (recfast_alpha(T) * R(1.0e6))
+    # β₁s is CMB photoionisation of H(1s) → evaluate at the RADIATION temperature Trad,
+    # not the matter T.  At recombination T≈Trad so this is unchanged; under a low-z UV
+    # background the gas heats to T≫Trad, and beta1s_freq(T) would otherwise spuriously
+    # drive H to Saha equilibrium at the hot matter temperature (no CMB photons exist to
+    # do that — Trad is cold).  The Peebles C-factor (k2/α_B) stays at the matter T.
+    k_b1s = beta1s_freq(Trad) * k2_val / (recfast_alpha(T) * R(1.0e6))
     # Helium Saha factors at the CMB temperature (cosmological photoionisation
     # equilibrium; → fully neutral He at low z, costing nothing for late-time gas).
     she1, she2 = helium_saha_pair(Trad)
@@ -58,19 +63,22 @@ end
 
 # Net rate-of-change of n_e and n_HI (molecular branch, reduced: no
 # radiation/dust/shielding).  Used only to size the chemistry sub-step.
-@inline function _de_hi_dot(yHI, yHII, yde, yH2I, yHM, yH2II, yHeI, yHeII, yHeIII, K)
+@inline function _de_hi_dot(yHI, yHII, yde, yH2I, yHM, yH2II, yHeI, yHeII, yHeIII, K;
+                            GamHI = zero(typeof(yHI)))
     R = typeof(yHI)
+    # Γ_HI (external UV-background photoionisation, 0 by default) destroys HI and
+    # frees an electron — include it so the sub-step limiter resolves photoionisation.
     HIdot = -K.k1*yHI*yde - K.k7*yHI*yde - K.k8*yHM*yHI - K.k9*yHII*yHI -
             K.k10*yH2II*yHI/R(2) - R(2)*K.k22*yHI^3 + K.k2*yHII*yde +
             R(2)*K.k13*yHI*yH2I/R(2) + K.k11*yHII*yH2I/R(2) +
             R(2)*K.k12*yde*yH2I/R(2) + K.k14*yHM*yde + K.k15*yHM*yHI +
             R(2)*K.k16*yHM*yHII + R(2)*K.k18*yH2II*yde/R(2) + K.k19*yH2II*yHM/R(2) -
-            K.k57*yHI*yHI - K.k58*yHI*yHeI/R(4) - K.k_beta1s*yHI
+            K.k57*yHI*yHI - K.k58*yHI*yHeI/R(4) - K.k_beta1s*yHI - R(GamHI)*yHI
     dedot = K.k1*yHI*yde + K.k3*yHeI*yde/R(4) + K.k5*yHeII*yde/R(4) +
             K.k8*yHM*yHI + K.k15*yHM*yHI + K.k17*yHM*yHII + K.k14*yHM*yde -
             K.k2*yHII*yde - K.k4*yHeII*yde/R(4) - K.k6*yHeIII*yde/R(4) -
             K.k7*yHI*yde - K.k18*yH2II*yde/R(2) + K.k57*yHI*yHI + K.k58*yHI*yHeI/R(4) +
-            K.k_beta1s*yHI
+            K.k_beta1s*yHI + R(GamHI)*yHI
     return dedot, HIdot
 end
 

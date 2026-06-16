@@ -1,7 +1,10 @@
 # ChemistryKernels — session handoff & plan
 
-Last updated: 2026-06-16. Branch `enzong-amr-subcycling-refluxing`, last commit
-`ffda32b6`. All work below is **pushed**.
+Last updated: 2026-06-16 (session 2). Branch `enzong-amr-subcycling-refluxing`.
+Commits `ffda32b6`/`55abef3a` are **pushed**; **Task A (UVB-into-solver) work below is
+committed locally? NO — it is UNCOMMITTED in the working tree** (staged only mentally:
+all changes are confined to `lib/ChemistryKernels/`). Run the suite, then commit
+`lib/ChemistryKernels` only (don't sweep the parallel WIP — see Notes).
 
 ## What this module is
 
@@ -59,8 +62,35 @@ equilibrium** (or optionally advected He⁺); nₑ from charge conservation.
    TREECOOL data under `data/`. `fg20_uvb()`; validated against published FG20
    z=0 rates; feeds the He Γ hooks → He photoionisation equilibrium at low z.
 
-**Test status: 96/96** in `test/test_recombination_mixing.jl` (the standalone,
-grackle-free suite). Run it with:
+5. **UVB wired into the solver (Task A, DONE this session, UNCOMMITTED)**: a UV
+   background now drives H photoionisation, He photoionisation equilibrium, and
+   photoheating end-to-end. Validated: a one-zone cell under `fg20_uvb()` at z=3 mean
+   IGM density relaxes to **T≈1.5×10⁴ K and x_HI≈3×10⁻⁶** (textbook IGM), with the
+   photoionisation balance Γ_HI·n_HI ≈ k2·n_HII·n_e holding to ~3% and no x_HII>1
+   overshoot. Changes (all in `lib/ChemistryKernels`):
+   - `solve_chem_mixing!(...; uvb::Union{Nothing,UVBackground}=nothing)`. When given,
+     `(k24,k25,k26,piHI,piHeI,piHeII)=uvb_rates(uvb,z)` once per step → threaded through
+     `_evolve_mixing_k!` → `evolve_cell_mixing` (new kwargs `uvb,GamHI,GamHeI,GamHeII,
+     piHI,piHeI,piHeII`) → `network_step` (new `GamHI` kwarg: Γ_HI in the HI `ac` /
+     HII `sc`).
+   - `evolve_cell_mixing`: when `uvb`, solves the He photoionisation equilibrium ONCE up
+     front (so cooling, photoheating and electrons share one He state) and hands it to
+     `network_step`; adds photoheating `piHI·nHI+piHeI·nHeI+piHeII·nHeII` to `edot`;
+     enforces H-nuclei conservation (`make_consistent`-style renormalisation) — all gated
+     on `uvb`, so the no-UVB path is **bit-identical** (the recombination suite is
+     unchanged).
+   - `_de_hi_dot` gained a `GamHI` kwarg (the sub-step limiter sees photoionisation).
+   - **β₁s bug fix (latent, important):** `k_beta1s` (CMB photoionisation of H 1s) was
+     evaluated at the MATTER temperature in `build_rates`/`build_rates_mixing`; it is a
+     *radiative* rate and must use **Trad**. At recombination T≈Trad so nothing changes
+     (CAMB-RECFAST-v2 accuracy preserved, still <0.1% at z=700–1100), but under a low-z
+     UVB the gas heats to T≫Trad and `beta1s_freq(T)` spuriously drove H to Saha
+     equilibrium at the hot matter T (x_HI→10⁻¹⁶, x_HII→thousands). Now `beta1s_freq(Trad)`.
+     (Only side effect: the benign z≈1665 Saha-tracking bump in the monotonicity test
+     grew 2e-4→2.7e-4; tolerance loosened to 3e-4.)
+
+**Test status: 103/103** in `test/test_recombination_mixing.jl` (the standalone,
+grackle-free suite; was 96, +7 in the new `uvb_solver_equilibrium` testset). Run it with:
 ```
 julia --project=lib/ChemistryKernels/test lib/ChemistryKernels/test/test_recombination_mixing.jl
 ```
@@ -69,26 +99,17 @@ and cannot run on Linux — see task C below.)
 
 ## PLAN — remaining work, in priority order
 
-### A. Wire the UVB into the solver (makes FG20 functional in production)
-Same 4-layer threading pattern already used for deuterium (`HDI`) and advected He⁺
-(`HeII`) — mirror it.
-1. `solve_chem_mixing!` gains `uvb::Union{Nothing,UVBackground}=nothing`. When
-   given, compute `(k24,k25,k26,piHI,piHeI,piHeII)=uvb_rates(uvb, z)` once per step
-   and thread the three Γ + three heating scalars down.
-2. Thread Γ_HI(=k24), Γ_HeI(=k26), Γ_HeII(=k25) through `_evolve_mixing_k!` →
-   `evolve_cell_mixing` → `network_step` (the latter already has `GamHeI/GamHeII`;
-   add `GamHI`). evolve_cell_mixing currently does NOT pass GamHeI/GamHeII — add it.
-3. **H photoionisation** (new physics in `network_step`): add `Γ_HI` to the HI
-   destruction `ac` and `Γ_HI·yHI` to the HII production `sc`. (Electrons follow
-   from charge conservation automatically.) Mirror in `subcycle.jl::evolve_cell`
-   non-mixing path + `_de_hi_dot` if you want the timestep limiter to see it.
-4. **Photoheating into `edot`**: add `piHI·n_HI + piHeI·n_HeI + piHeII·n_HeII`
-   [erg/s/cm³] as a heating term in `cooling_edot` (edot.jl) or in the energy step
-   of `evolve_cell_mixing`/`evolve_cell`. Sign: heating is +edot.
-5. **Validation test**: run the one-zone integrator under `fg20_uvb()` at low z and
-   check (a) ionisation settles to the FG20 photoionisation equilibrium, (b) the
-   matter temperature settles to the FG20 thermal equilibrium (heating vs
-   recombination/Compton/line cooling). This is the "debug He at low z" payoff.
+### A. Wire the UVB into the solver — ✅ DONE (this session, uncommitted). See item 5
+above. Residual follow-ups (optional, lower priority):
+- The non-mixing `solve_chem!`/`subcycle.jl::evolve_cell` path was left UVB-free
+  (production UVB goes through `solve_chem_mixing!`). `network_step` already accepts
+  `GamHI`, so wiring `evolve_cell` is a small mirror if a UVB is ever needed there.
+- Performance: with a UVB the sub-cycle still uses the net-rate 10% limiter; very
+  optically-thin cells reach photoionisation equilibrium in a few sub-steps, but a
+  coupled implicit HI⇌HII solve (vs the current operator-split + conservation
+  renormalisation) would be cheaper and exactly conservative if profiling flags it.
+- Validate He photoheating in the z≲3 HeII-reionisation regime (piHeII·n_HeII), and
+  consider self-shielding for dense gas (currently optically thin only).
 
 ### B. Generalise the advected He path / non-equilibrium detection
 Currently `helium_HeI_rate_AB` (advected He⁺) is the radiative-transfer He I

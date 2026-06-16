@@ -153,7 +153,9 @@ for k2. All other rates are identical. Pure.
                                     deuterium::Bool = false)
     R      = typeof(T)
     k2_val = peebles_k2_mixing(T, nHI, nHI_eff, Hz; fudge=fudge, gauss=gauss)
-    k_b1s  = beta1s_freq(T) * k2_val / (recfast_alpha(T) * R(1.0e6))
+    # β₁s = CMB photoionisation of H(1s): evaluate at Trad (see build_rates) so it does
+    # NOT spuriously Saha-ionise UV-heated low-z gas where T≫Trad.
+    k_b1s  = beta1s_freq(Trad) * k2_val / (recfast_alpha(T) * R(1.0e6))
     she1, she2 = helium_saha_pair(Trad)
     base = (; k1=k1(T), k2=k2_val,
             k3=k3(T), k4=k4(T), k5=k5(T),
@@ -194,7 +196,12 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
                                     deuterium::Bool = false,
                                     helium::Bool = false,
                                     HeII_m = zero(typeof(e)),
-                                    hubble_expansion::Bool = false) where {SN}
+                                    hubble_expansion::Bool = false,
+                                    uvb::Bool = false,
+                                    GamHI = zero(typeof(e)), GamHeI = zero(typeof(e)),
+                                    GamHeII = zero(typeof(e)),
+                                    piHI = zero(typeof(e)), piHeI = zero(typeof(e)),
+                                    piHeII = zero(typeof(e))) where {SN}
     R    = typeof(e)
     mh   = R(MH); tiny = R(_SUB_TINY)
     d    = rho / mh
@@ -224,6 +231,10 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
     nsm = R(n_sm_cgs)
     fud = R(fudge)
     gss = R(gauss)
+    # UV-background photoionisation [s⁻¹] and photoheating [erg s⁻¹ per ion] for this
+    # step (all 0 unless a UVB was supplied to solve_chem_mixing!).
+    gHI = R(GamHI); gHeI = R(GamHeI); gHeII = R(GamHeII)
+    pHI = R(piHI); pHeI = R(piHeI); pHeII = R(piHeII)
 
     ttot = zero(R)
     iter = 0
@@ -240,17 +251,43 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
         K = build_rates_mixing(T, Trad, yHI, nHI_eff, Hz;
                                fudge = fud, gauss = gss, deuterium = deuterium)
 
+        # UV-background He photoionisation equilibrium (default He path).  Solve the
+        # collisional-radiative + photo He equilibrium ONCE, up front, so this substep's
+        # cooling, photoheating and electron balance all see the SAME He state (and we
+        # hand it to network_step instead of letting it re-solve).  helium=true carries
+        # its own advected He⁺ (Task B will add Γ there); with no UVB this branch is
+        # skipped → the original default path is bit-identical.
+        uvb_eq    = uvb && !helium
+        nHeII_now = zero(R)
+        yHeII_eq  = zero(R); yHeIII_eq = zero(R)
+        if uvb_eq
+            ne0 = max(yde, tiny)
+            _, nHeII_e, nHeIII_e =
+                helium_equilibrium(K.she1, K.she2, K.k3, K.k4, K.k5, K.k6, ne0, nHe;
+                                   GamHeI = gHeI, GamHeII = gHeII)
+            yHeII_eq  = R(4) * nHeII_e                 # ×4 mass-equiv convention
+            yHeIII_eq = R(4) * nHeIII_e
+            yHeI      = max(nHe4 - yHeII_eq - yHeIII_eq, tiny)
+            nHeII_now = nHeII_e
+        elseif helium
+            nHeII_now = nHeII                          # carried (start-of-substep) He⁺
+        end
+
         nHD  = yHDI / R(3)
         edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, R(z))
         if T <= R(1.01)*R(MIN_TEMPERATURE) && edot < zero(R)
             edot = zero(R)
         end
+        # UV-background photoheating [erg cm⁻³ s⁻¹], a +edot source (energy per
+        # photoionisation × number density of that species; n_HeI = yHeI/4).  Applied
+        # after the floor shutoff so heating can lift gas off the temperature floor.
+        edot += pHI*yHI + pHeI*(yHeI/R(4)) + pHeII*nHeII_now
         if hubble_expansion
             edot -= R(2) * Hz * e * rho
         end
 
         dedot, HIdot = _de_hi_dot(yHI, yHII, yde, yH2I, yHM, yH2II,
-                                  yHeI, tiny, tiny, K)
+                                  yHeI, tiny, tiny, K; GamHI = gHI)
         dtit = min(_step10(yde, dedot), _step10(yHI, HIdot), rem, R(0.5)*dt)
 
         edot_c    = -c1 * (T - Tc) * yde
@@ -290,13 +327,31 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
             yHeI     = max(nHe4 - yHeII_x - yHeIII_x, tiny)   # for next substep's cooling/T
             s = network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
                              yDI, yDII, yHDI, K, dtit; deuterium = deuterium,
-                             yHeII_in = yHeII_x, yHeIII_in = yHeIII_x)
+                             yHeII_in = yHeII_x, yHeIII_in = yHeIII_x, GamHI = gHI)
+        elseif uvb_eq
+            # consume the up-front He equilibrium (already includes Γ_HeI/Γ_HeII)
+            s = network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
+                             yDI, yDII, yHDI, K, dtit; deuterium = deuterium,
+                             yHeII_in = yHeII_eq, yHeIII_in = yHeIII_eq, GamHI = gHI)
         else
             s = network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
-                             yDI, yDII, yHDI, K, dtit; deuterium = deuterium)
+                             yDI, yDII, yHDI, K, dtit; deuterium = deuterium,
+                             GamHI = gHI, GamHeI = gHeI, GamHeII = gHeII)
         end
         yHI=s.yHI; yHII=s.yHII; yde=s.yde; yH2I=s.yH2I; yHM=s.yHM
         yH2II=s.yH2II; yDI=s.yDI; yDII=s.yDII; yHDI=s.yHDI
+
+        # Enforce H-nuclei conservation (only with a UVB, so the validated no-UVB path
+        # is bit-identical).  The operator-split, Gauss-Seidel backward-Euler updates HI
+        # and HII as separate fixed points; under strong photoionisation their sum drifts
+        # a few % from the true H budget.  Renormalise the H species (each y counts H
+        # nuclei: yH2I=2·nH₂, yH2II=2·nH₂⁺) to the exact total — the standard
+        # `make_consistent` step.  nₑ is re-derived from charge balance next substep.
+        if uvb
+            SH = yHI + yHII + yH2I + yHM + yH2II
+            fH = (R(fh) * d) / max(SH, tiny)
+            yHI *= fH; yHII *= fH; yH2I *= fH; yHM *= fH; yH2II *= fH
+        end
 
         ttot += dtit
     end
@@ -311,6 +366,7 @@ end
                                    du, vu2, tu, dt, z,
                                    f_alpha, Xe_mean, fudge, gauss,
                                    hubble, Om, OL, fh, deut, hel, hub_exp,
+                                   uvb_on, GamHI, GamHeI, GamHeII, piHI, piHeI, piHeII,
                                    ::Val{SN}) where {SN}
     i = @index(Global)
     @inbounds begin
@@ -329,7 +385,10 @@ end
             fudge = T(fudge), gauss = T(gauss),
             hubble   = T(hubble), Om = T(Om), OL = T(OL),
             fh       = T(fh), deuterium = deut,
-            helium = hel, HeII_m = he_in, hubble_expansion = hub_exp)
+            helium = hel, HeII_m = he_in, hubble_expansion = hub_exp,
+            uvb = uvb_on,
+            GamHI = T(GamHI), GamHeI = T(GamHeI), GamHeII = T(GamHeII),
+            piHI = T(piHI), piHeI = T(piHeI), piHeII = T(piHeII))
         e[i]   = en  / vu2
         HII[i] = hii / du
         H2I[i] = h2  / du
@@ -355,6 +414,13 @@ positional argument:
   The kernel converts to H number density via `n_smoothed * density_units * fh / MH`.
 
 Keyword arguments:
+  `uvb`                 — optional metagalactic UV/X-ray background (`UVBackground`,
+                           e.g. `fg20_uvb()`).  When given, its rates at this step's `z`
+                           are threaded into the network: Γ_HI photoionises H (HI→HII+e
+                           in `network_step`), Γ_HeI/Γ_HeII drive the He ionisation
+                           equilibrium, and piHI/piHeI/piHeII photoheat the gas (a +edot
+                           source).  `nothing` (default) ⇒ primordial-only, bit-identical
+                           to the no-UVB path.
   `fa_table`            — `FAlphaTable` with f_α(z). Default: `FA_ZERO` (f_α ≡ 0,
                            no mixing, bit-identical to `solve_chem!`).
   `Xe_mean`             — global mean free-electron fraction n_e/n_H for this step.
@@ -402,6 +468,7 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
                             recfast_fudge::Real = 1.0,
                             recfast_hswitch::Bool = false,
                             hubble_expansion::Bool = false,
+                            uvb::Union{Nothing,UVBackground} = nothing,
                             hubble::Real = 71.0, Om::Real = 0.27, OL::Real = 0.73,
                             fh::Real = 0.76, deuterium::Bool = false,
                             helium::Bool = false,
@@ -431,6 +498,16 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
     fudge = P(recfast_hswitch ? _RECFAST_V2_FUDGE : recfast_fudge)
     gauss = P(recfast_hswitch ? recfast_gauss_factor(Float64(z)) : 1.0)
 
+    # UV-background rates for this step (scalars, evaluated once at z).  Mapping:
+    # uvb_rates → (k24=Γ_HI, k25=Γ_HeII, k26=Γ_HeI, piHI, piHeI, piHeII).
+    uvb_on = uvb !== nothing
+    gHI = gHeI = gHeII = zero(P); pHI = pHeI = pHeII = zero(P)
+    if uvb_on
+        (k24, k25, k26, qHI, qHeI, qHeII) = uvb_rates(uvb, Float64(z))
+        gHI = P(k24); gHeI = P(k26); gHeII = P(k25)
+        pHI = P(qHI); pHeI = P(qHeI); pHeII = P(qHeII)
+    end
+
     d_rho = to_device(be, collect(rho),        P)
     d_e   = to_device(be, collect(e_int),       P)
     d_HII = to_device(be, collect(HII),         P)
@@ -443,7 +520,8 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
     _evolve_mixing_k!(be)(d_e, d_HII, d_H2I, d_HDI, d_HeII, d_rho, d_nsm,
                           du, vu2, tu, P(dt), z,
                           f_alpha, P(Xe_mean), fudge, gauss,
-                          P(hubble), P(Om), P(OL), P(fh), deut, hel, hubble_expansion, Val(SN);
+                          P(hubble), P(Om), P(OL), P(fh), deut, hel, hubble_expansion,
+                          uvb_on, gHI, gHeI, gHeII, pHI, pHeI, pHeII, Val(SN);
                           ndrange = n)
 
     e_int      .= to_host(d_e)

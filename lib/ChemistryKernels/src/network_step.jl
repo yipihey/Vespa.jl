@@ -35,7 +35,7 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
 @inline function network_step(d, fh, yHI, yHII, yde, yH2I, yHM, yH2II,
                               yDI, yDII, yHDI, K, dt; deuterium::Bool = false,
                               yHeII_in = nothing, yHeIII_in = nothing,
-                              GamHeI = 0.0, GamHeII = 0.0)
+                              GamHI = 0.0, GamHeI = 0.0, GamHeII = 0.0)
     R    = typeof(yHI)
     tiny = R(_NET_TINY)
     two  = R(2); half = R(0.5); four = R(4)
@@ -98,18 +98,19 @@ CMB photo-rates `k27`,`k28` (all in the network's per-density-unit convention),
                               k9, k10, k11, k17, k18, k19, k28)
     nH2II  = H2IIeq / two          # n(H₂⁺); H2IIeq carries the 2× mass-equiv convention
 
-    # 1) HI  (+ β₁s CMB photoionisation of H(1s); + k28 H₂⁺ photodissociation return)
+    # 1) HI  (+ β₁s CMB photoionisation of H(1s); + k28 H₂⁺ photodissociation return;
+    #     + Γ_HI external UV-background photoionisation HI+γ→HII+e [s⁻¹], 0 by default)
     sc = k2*yHII*yde + two*k13*yHI*yH2I/two + k11*yHII*yH2I/two +
          two*k12*yde*yH2I/two + k14*yHM*yde + k15*yHM*yHI +
          two*k16*yHM*yHII + two*k18*H2IIeq*yde/two + k19*H2IIeq*yHM/two +
          k28*nH2II
     ac = k1*yde + k7*yde + k8*yHM + k9*yHII + k10*H2IIeq/two +
-         two*k22*yHI^2 + k57*yHI + k58*yHeI/four + k_beta1s
+         two*k22*yHI^2 + k57*yHI + k58*yHeI/four + k_beta1s + R(GamHI)
     HIp = (sc*dt + yHI) / (one(R) + ac*dt)
 
-    # 2) HII  (+ β₁s source; + k28 H₂⁺ photodissociation return)
+    # 2) HII  (+ β₁s source; + k28 H₂⁺ photodissociation return; + Γ_HI photoionisation)
     sc = k1*yHI*yde + k10*H2IIeq*yHI/two + k57*yHI*yHI + k58*yHI*yHeI/four +
-         k_beta1s*yHI + k28*nH2II
+         k_beta1s*yHI + k28*nH2II + R(GamHI)*yHI
     ac = k2*yde + k9*yHI + k11*yH2I/two + k16*yHM + k17*yHM
     HIIp = (sc*dt + yHII) / (one(R) + ac*dt)
 
