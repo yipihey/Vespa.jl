@@ -50,8 +50,6 @@ MusicLib = {path = "../../../../Music.jl/lib/MusicLib"}
 AthenaLib = {path = "../../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../../dfmm"}
 ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
-ChemistryKernels = {path = "../ChemistryKernels"}
-EmissionKernels = {path = "../EmissionKernels"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}
