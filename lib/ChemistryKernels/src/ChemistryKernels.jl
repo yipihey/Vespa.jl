@@ -44,7 +44,23 @@ module ChemistryKernels
 using KernelAbstractions
 const KA = KernelAbstractions
 
+# Radiative-channel physics (cooling coefficients, metal lines, CMB Compton) now lives
+# in the foundation package EmissionKernels; ChemistryKernels depends on it and its
+# `cooling_edot` delegates to `EmissionKernels.cooling_rate_total`.  Import the names the
+# network uses bare (comp*_cmb in the subcycle, MetalAbundances in the kernels) and the
+# cooling sum; the backend machinery is NOT imported (each package owns its own).
+using EmissionKernels: ceHI, ceHeI, ceHeII, ciHI, ciHeI, ciHeII, ciHeIS,
+      reHII, reHeII1, reHeII2, reHeIII, brem,
+      GAHI, GAH2, GAHe, GAHp, GAel, H2LTE, HDlte, HDlow,
+      comp1_cmb, comp2_cmb,
+      MetalAbundances, metal_abund, metal_cooling_rate, cooling_rate_total
+
 export backend, has_backend, device_zeros, to_device, to_host
+# re-export the cooling/metal surface so `using ChemistryKernels` still sees it
+export ceHI, ceHeI, ceHeII, ciHI, ciHeI, ciHeII, ciHeIS,
+       reHII, reHeII1, reHeII2, reHeIII, brem,
+       GAHI, GAH2, GAHe, GAHp, GAel, H2LTE, HDlte, HDlow, comp1_cmb, comp2_cmb,
+       MetalAbundances, metal_abund, metal_cooling_rate
 
 # ── backend registry ─────────────────────────────────────────────────────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -97,10 +113,8 @@ include("rates_atomic.jl")
 include("rates_h2.jl")
 include("rates_deuterium.jl")
 include("rates_cmb.jl")
-include("cooling_atomic.jl")
-include("cooling_h2.jl")
-include("cooling_hd.jl")
-include("cooling_compton.jl")
+# Wave 1 cooling coefficients (ceHI…brem, GA*, HD*, comp*_cmb) + the metal lines now
+# live in EmissionKernels (imported above).
 # Wave 2 — local composed: temperature (mmw/H2-γ) + algebraic equilibrium species.
 include("temperature.jl")
 include("equilibrium.jl")

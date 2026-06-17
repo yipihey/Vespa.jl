@@ -1,5 +1,4 @@
 [deps]
-ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
 EmissionKernels = "1a2b3c4d-0013-4000-8000-000000000013"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
@@ -8,5 +7,4 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-ChemistryKernels = {path = ".."}
-EmissionKernels = {path = "../../EmissionKernels"}
+EmissionKernels = { path = ".." }

@@ -8,7 +8,7 @@ module UnitCMB
   using ChemistryKernels, KernelAbstractions
   using ChemistryKernels: MH, TINY, TEV_PER_K
   include(joinpath(@__DIR__, "..", "src", "rates_cmb.jl"))
-  include(joinpath(@__DIR__, "..", "src", "cooling_compton.jl"))
+  include(joinpath(@__DIR__, "..", "..", "EmissionKernels", "src", "cooling_compton.jl"))  # moved to EmissionKernels
 end
 
 @testset "rates_cmb literal" begin

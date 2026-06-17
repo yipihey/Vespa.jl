@@ -1,0 +1,24 @@
+name = "EmissionKernels"
+uuid = "1a2b3c4d-0013-4000-8000-000000000013"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+# Per-channel / per-line radiative emissivity for the primordial+metal network — the
+# foundation layer beneath ChemistryKernels. Pure, precision-generic @inline kernels;
+# Metal/CUDA are weak deps behind package extensions so the core precompiles headless.
+[deps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+
+[weakdeps]
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+
+[extensions]
+EmissionKernelsMetalExt = "Metal"
+EmissionKernelsCUDAExt = "CUDA"
+
+[compat]
+KernelAbstractions = "0.9"
+Metal = "1"
+CUDA = "5"
+julia = "1.10"

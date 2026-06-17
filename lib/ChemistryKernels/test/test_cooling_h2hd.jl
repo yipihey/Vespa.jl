@@ -4,10 +4,10 @@ include(joinpath(@__DIR__, "oracle.jl")); using .ChemOracle
 include(joinpath(@__DIR__, "harness.jl"))
 
 module UnitCoolMol
-  using ChemistryKernels, KernelAbstractions
-  using ChemistryKernels: MH, TINY, TEV_PER_K
-  include(joinpath(@__DIR__, "..", "src", "cooling_h2.jl"))
-  include(joinpath(@__DIR__, "..", "src", "cooling_hd.jl"))
+  # cooling coefficients now live in EmissionKernels (re-included for the oracle check).
+  using EmissionKernels, KernelAbstractions
+  include(joinpath(@__DIR__, "..", "..", "EmissionKernels", "src", "cooling_h2.jl"))
+  include(joinpath(@__DIR__, "..", "..", "EmissionKernels", "src", "cooling_hd.jl"))
 end
 
 ChemOracle.set_flags!()

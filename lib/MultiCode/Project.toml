@@ -6,6 +6,7 @@ version = "0.1.0"
 [deps]
 ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
 ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
+EmissionKernels = "1a2b3c4d-0013-4000-8000-000000000013"
 CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -50,6 +51,7 @@ AthenaLib = {path = "../../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../../dfmm"}
 ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
 ChemistryKernels = {path = "../ChemistryKernels"}
+EmissionKernels = {path = "../EmissionKernels"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}

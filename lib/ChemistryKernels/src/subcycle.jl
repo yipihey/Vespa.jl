@@ -93,7 +93,7 @@ densities [g/cm³] (ρ·x).  Returns the updated `(e, HII_m, H2I_m, HDI_m)`. Pur
                              hubble = 71.0, Om = 0.27, OL = 0.73,
                              fh = FH_DEFAULT, deuterium::Bool = false,
                              hubble_expansion::Bool = false,
-                             adot_over_a = NaN)
+                             adot_over_a = NaN, metals = nothing)
     R    = typeof(e)
     mh   = R(MH); tiny = R(_SUB_TINY)
     d    = rho / mh                       # network density (∝ n)
@@ -145,7 +145,8 @@ densities [g/cm³] (ρ·x).  Returns the updated `(e, HII_m, H2I_m, HDI_m)`. Pur
         # cooling rate (volumetric, signed) + temstart shutoff (no cooling at
         # the temperature floor — set to exactly 0, not a spurious-sign tiny).
         nHD  = yHDI / R(3)
-        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, zt)
+        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, zt;
+                            nH = R(fh)*d, metals = metals)
         if T <= R(1.01)*R(MIN_TEMPERATURE) && edot < zero(R)
             edot = zero(R)
         end

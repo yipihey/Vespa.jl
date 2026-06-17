@@ -4,9 +4,10 @@ include(joinpath(@__DIR__, "oracle.jl")); using .ChemOracle
 include(joinpath(@__DIR__, "harness.jl"))
 
 module UnitCoolAtom
-  using ChemistryKernels, KernelAbstractions
-  using ChemistryKernels: MH, TINY, TEV_PER_K
-  include(joinpath(@__DIR__, "..", "src", "cooling_atomic.jl"))
+  # cooling coefficients now live in EmissionKernels; re-include them here (re-runs
+  # @scalarkernel against EmissionKernels' backend) for the grackle-oracle parity check.
+  using EmissionKernels, KernelAbstractions
+  include(joinpath(@__DIR__, "..", "..", "EmissionKernels", "src", "cooling_atomic.jl"))
 end
 
 ChemOracle.set_flags!()            # CaseB on

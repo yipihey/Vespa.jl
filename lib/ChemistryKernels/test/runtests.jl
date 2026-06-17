@@ -36,4 +36,5 @@ include("harness.jl")
     include("test_onezone.jl")
     include("test_recombination_mixing.jl")
     include("test_recombination_field.jl")
+    include("test_cooling_metal.jl")
 end

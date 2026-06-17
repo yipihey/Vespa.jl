@@ -201,7 +201,8 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
                                     GamHI = zero(typeof(e)), GamHeI = zero(typeof(e)),
                                     GamHeII = zero(typeof(e)),
                                     piHI = zero(typeof(e)), piHeI = zero(typeof(e)),
-                                    piHeII = zero(typeof(e))) where {SN}
+                                    piHeII = zero(typeof(e)),
+                                    metals = nothing) where {SN}
     R    = typeof(e)
     mh   = R(MH); tiny = R(_SUB_TINY)
     d    = rho / mh
@@ -274,7 +275,8 @@ global Xe_mean), or as n1s directly when `Val(true)`. Pure; allocation-free.
         end
 
         nHD  = yHDI / R(3)
-        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, R(z))
+        edot = cooling_edot(yHI, yHII, yHeI/R(4), yde, yH2I/R(2), nHD, T, R(z);
+                            nH = R(fh)*d, metals = metals)
         if T <= R(1.01)*R(MIN_TEMPERATURE) && edot < zero(R)
             edot = zero(R)
         end
@@ -367,6 +369,7 @@ end
                                    f_alpha, Xe_mean, fudge, gauss,
                                    hubble, Om, OL, fh, deut, hel, hub_exp,
                                    uvb_on, GamHI, GamHeI, GamHeII, piHI, piHeI, piHeII,
+                                   @Const(aC), @Const(aO), @Const(aSi), @Const(aFe), hasmetals,
                                    ::Val{SN}) where {SN}
     i = @index(Global)
     @inbounds begin
@@ -376,6 +379,8 @@ end
         # n_sm[i] is smoothed baryon mass density [code units] (same units as rho);
         # multiply by fh to extract the H fraction before converting to number density.
         n_sm_cgs = n_sm[i] * du * T(fh) / T(MH)
+        mab = hasmetals ? MetalAbundances{T}(aC[i], aO[i], aSi[i], aFe[i]) :
+                          MetalAbundances{T}()
         en, hii, h2, hd, he = evolve_cell_mixing(
             rho[i]*du, e[i]*vu2, HII[i]*du, H2I[i]*du, hd_in,
             n_sm_cgs, dt*tu, z;
@@ -388,7 +393,7 @@ end
             helium = hel, HeII_m = he_in, hubble_expansion = hub_exp,
             uvb = uvb_on,
             GamHI = T(GamHI), GamHeI = T(GamHeI), GamHeII = T(GamHeII),
-            piHI = T(piHI), piHeI = T(piHeI), piHeII = T(piHeII))
+            piHI = T(piHI), piHeI = T(piHeI), piHeII = T(piHeII), metals = mab)
         e[i]   = en  / vu2
         HII[i] = hii / du
         H2I[i] = h2  / du
@@ -469,6 +474,7 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
                             recfast_hswitch::Bool = false,
                             hubble_expansion::Bool = false,
                             uvb::Union{Nothing,UVBackground} = nothing,
+                            metals = nothing,
                             hubble::Real = 71.0, Om::Real = 0.27, OL::Real = 0.73,
                             fh::Real = 0.76, deuterium::Bool = false,
                             helium::Bool = false,
@@ -480,6 +486,11 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
     deut && @assert length(HDI) == n
     hel = helium && HeII !== nothing
     hel && @assert length(HeII) == n
+    hasmetals = metals !== nothing
+    if hasmetals
+        @assert length(metals.C)==n && length(metals.O)==n &&
+                length(metals.Si)==n && length(metals.Fe)==n
+    end
 
     P   = precision
     be  = ChemistryKernels.backend(backend)
@@ -516,12 +527,18 @@ function solve_chem_mixing!(rho::AbstractVector, e_int::AbstractVector,
     d_HeII = hel ? to_device(be, collect(HeII), P) : device_zeros(be, P, (n,))
     d_nsm = to_device(be, collect(n_smoothed),  P)
 
+    d_aC = hasmetals ? to_device(be, collect(metals.C),  P) : device_zeros(be, P, (n,))
+    d_aO = hasmetals ? to_device(be, collect(metals.O),  P) : device_zeros(be, P, (n,))
+    d_aSi= hasmetals ? to_device(be, collect(metals.Si), P) : device_zeros(be, P, (n,))
+    d_aFe= hasmetals ? to_device(be, collect(metals.Fe), P) : device_zeros(be, P, (n,))
+
     SN = smoothed_is_neutral
     _evolve_mixing_k!(be)(d_e, d_HII, d_H2I, d_HDI, d_HeII, d_rho, d_nsm,
                           du, vu2, tu, P(dt), z,
                           f_alpha, P(Xe_mean), fudge, gauss,
                           P(hubble), P(Om), P(OL), P(fh), deut, hel, hubble_expansion,
-                          uvb_on, gHI, gHeI, gHeII, pHI, pHeI, pHeII, Val(SN);
+                          uvb_on, gHI, gHeI, gHeII, pHI, pHeI, pHeII,
+                          d_aC, d_aO, d_aSi, d_aFe, hasmetals, Val(SN);
                           ndrange = n)
 
     e_int      .= to_host(d_e)
