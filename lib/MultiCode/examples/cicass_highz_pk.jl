@@ -22,7 +22,13 @@
 #     <julia> --project=lib/MultiCode/test lib/MultiCode/examples/cicass_highz_pk.jl
 
 using EnzoLib, MultiCode, CICASSLib, PoissonKernels, Printf, Statistics
-include(joinpath(@__DIR__, "..", "..", "EnzoLib", "examples", "sb_metal_amr.jl"))  # hydro!/helpers
+include(joinpath(@__DIR__, "..", "..", "EnzoLib", "examples", "sb_metal_amr.jl"))  # hydro!/helpers (defines BE)
+# CUDA pool reclaim: the GPU FFT/gravity allocate fresh N³ scratch each cycle and the
+# CUDA.jl pool never shrinks → footprint ratchets up (11→20 GB at 256³).  Periodic
+# CUDA.reclaim() returns the cached-but-free pool memory to the driver, bounding it to
+# the working set.  Interval via CIC_RECLAIM_EVERY (0 disables; default every cycle).
+BE === :cuda && @eval import CUDA
+const RECLAIM_EVERY = parse(Int, get(ENV, "CIC_RECLAIM_EVERY", "1"))
 
 # ── parameters ──
 const BOX    = parse(Float64, get(ENV, "CIC_BOX",   "0.128"))   # Mpc/h  (128 kpc/h)
@@ -373,13 +379,14 @@ function main_cic()
     maxexp   = parse(Float64, get(ENV, "CIC_MAXEXP",   "0.1"))    # = RAMSES da/a cap (0.1/hexp)
     courant  = parse(Float64, get(ENV, "CIC_COURANT",  "0.8"))    # = RAMSES courant_factor
     pcourant = parse(Float64, get(ENV, "CIC_PCOURANT", "0.8"))    # = RAMSES courant_factor (particles)
+    use_grackle = get(ENV, "CIC_USE_GRACKLE", "1") == "1" ? 1 : 0
     chem = """
     CosmologyMaxExpansionRate    = $(maxexp)
     CourantSafetyNumber          = $(courant)
     ParticleCourantSafetyNumber  = $(pcourant)
-    RadiativeCooling             = 1
-    use_grackle                  = 1
-    with_radiative_cooling       = 1
+    RadiativeCooling             = $(use_grackle)
+    use_grackle                  = $(use_grackle)
+    with_radiative_cooling       = $(use_grackle)
     MultiSpecies                 = 3
     CaseBRecombination           = 1
     cmb_dissociation             = 1
@@ -406,8 +413,8 @@ function main_cic()
     # CIC_UNIFORM_BARYONS=1 → start baryons uniform (δb=0) at rest + Compton drag
     # (the physical recombination start; pair with CIC_COMPTON_DRAG=1 below).
     uniform_b = get(ENV, "CIC_UNIFORM_BARYONS", "0") == "1"
-    # CIC_BARYON_IC = particle (default) | smooth (raw CAMB/CLASS Fourier δb grid) | uniform
-    baryon_ic = Symbol(get(ENV, "CIC_BARYON_IC", "particle"))
+    # CIC_BARYON_IC = smooth (default) | particle (CIC from displaced grid) | uniform
+    baryon_ic = Symbol(get(ENV, "CIC_BARYON_IC", "smooth"))
     res = MultiCode.run_cicass_enzo(; vbc=VBC, boxlength=BOX, zstart=ZSTART, ngrid=NGRID,
                                     omega_m=OMEGA_M, param_extra=chem, zero_baryon_bulk=zero_bulk,
                                     uniform_baryons=uniform_b, baryon_ic=baryon_ic,
@@ -514,9 +521,15 @@ function main_cic()
             cprec = cbk === :metal ? Float32 : Float64
             # the hook feeds physical CGS to solve_chem! → _CHEM_CFG units = 1; the
             # cosmology (for Compton/Peebles H(z)) is the live Enzo cosmology.
+            # hubble_expansion=true: the chemistry kernel now does adiabatic expansion
+            # cooling (−2H·e) COUPLED with the stiff Compton term in its adaptive sub-
+            # cycle (ȧ/a sourced from Enzo's own cosmology per step in enzo_chem_step!).
+            # This replaces Enzo's separate operator-split energy expansion term (the
+            # comoving_expansion slot below is reduced to velocity drag only) so the gas
+            # stays at the true Compton–adiabatic balance even on short output steps.
             MultiCode.chem_init!(; hubble=snap.hconst*100, Om=OMEGA_M, OL=1-OMEGA_M,
                 a_value=1.0/(1+ZSTART), fh=0.76, density_units=1.0, length_units=1.0,
-                time_units=1.0, deuterium=true, engine=:kernels)
+                time_units=1.0, deuterium=true, engine=:kernels, hubble_expansion=true)
             hooks[:cooling] = (hh_, lev_, dt_) -> begin
                 _t = time()
                 r = MultiCode.enzo_chem_step!(hh_, lev_, dt_;
@@ -546,8 +559,32 @@ function main_cic()
             hooks[:particle_push] = (hh_,l_,d_)->(t=time(); MultiCode.particle_push_gpu!(respart, hh_, l_, d_; sync=sync_each); particlet[]+=time()-t)
             @printf("  particle push = :julia (GPU resident, backend=%s, N=%d, sync=%s)\n", BE, respart.N, psync)
         end
+        # Comoving expansion. With the :kernels chemistry, the gas-energy adiabatic
+        # term is now done (coupled with Compton) in the cooling slot, so this slot is
+        # reduced to a velocity-only Hubble drag via a :julia hook — using ENZO's own
+        # scale factor (time-centered at t−½dt, matching ComovingExpansionTerms.C's
+        # VELOCITY_METHOD3), so the velocity coefficient is byte-for-byte Enzo's. The
+        # cooling slot runs BEFORE session_advance_time and this slot AFTER it, so here
+        # session_time = t_end and the midpoint is session_time − ½dt. Native :enzo path
+        # (cmode=:enzo) keeps the full native energy+velocity term.
+        coexp = :enzo
+        if cmode === :kernels
+            coexp = :julia
+            hooks[:comoving_expansion] = (hh_, lev_, dt_) -> begin
+                am, adm = EnzoLib.session_expansion_factor(hh_, EnzoLib.session_time(hh_) - 0.5*dt_)
+                am <= 0 && return nothing
+                C = dt_ * adm / am
+                f = (1 - 0.5C) / (1 + 0.5C)          # semi-implicit Hubble drag (γ-independent)
+                for ft in (4, 5, 6)                  # Velocity1/2/3 field types
+                    vi = try EnzoLib.field_index(hh_, ft; grid=0) catch; -1 end
+                    vi < 0 && continue
+                    v = EnzoLib.problem_get_field(hh_, vi, 0); v .*= f
+                    EnzoLib.problem_set_field(hh_, vi, v; grid=0)
+                end
+            end
+        end
         eng = EnzoLib.EngineConfig(; hydro=hmode, gravity=gmode, cooling=coolmode,
-                                   comoving_expansion=:enzo, reflux=false,
+                                   comoving_expansion=coexp, reflux=false,
                                    particle_push=pmode, hooks=hooks, probe=probe)
         # CIC_COPYOLD=0 skips the per-cycle OldBaryonField copy (~8s/run) but is UNSAFE:
         # measured to change baryon large-scale P(k) ~2× (the comoving-expansion/gravity
@@ -619,6 +656,21 @@ function main_cic()
                     write(io, Tcell)                                 # gas temperature [K] (grackle μ)
                 end
             end
+            # ── DM particle dump (array order = grafic lattice m=x+y·N+z·N²), for
+            #    particle-by-particle Enzo-vs-RAMSES tracking.  pos in box-fraction
+            #    [0,1), vel in km/s.  Match to RAMSES by idp / initial position. ──
+            if get(ENV, "CIC_PDUMP", "0") == "1"
+                vku = 1.22475e7 * BOX * sqrt(OMEGA_M) * sqrt(1+ZSTART) / 1e5   # km/s per code vel
+                ppx = EnzoLib.problem_get_particle_pos(h, 0, 0); ppy = EnzoLib.problem_get_particle_pos(h, 1, 0)
+                ppz = EnzoLib.problem_get_particle_pos(h, 2, 0)
+                pvx = EnzoLib.problem_get_particle_vel(h, 0, 0); pvy = EnzoLib.problem_get_particle_vel(h, 1, 0)
+                pvz = EnzoLib.problem_get_particle_vel(h, 2, 0)
+                open(joinpath(REPORTS, "enzo_pdump$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(length(ppx)))
+                    write(io, ppx); write(io, ppy); write(io, ppz)
+                    write(io, pvx .* vku); write(io, pvy .* vku); write(io, pvz .* vku)
+                end
+            end
             # gas temperature diagnostic: e_int (code) × VelocityUnits² → T [K].
             # Enzo's VelocityUnits/TemperatureUnits are CONSTANT — defined once at the
             # INITIAL redshift (CosmologyGetUnits.C uses (1+InitialRedshift), not the
@@ -672,6 +724,20 @@ function main_cic()
         # res.v_cmb (= 0 boosted / streaming-bulk unboosted), so it is frame-correct.
         DO_DRAG = get(ENV, "CIC_COMPTON_DRAG", "0") == "1"
         DRAG_VCMB = hasproperty(res, :v_cmb) ? res.v_cmb : (0.0, 0.0, 0.0)
+        # CIC_PERDIR_CFL=1 → override Enzo's sum-over-dims CFL with the per-direction formula
+        # (matches RAMSES stepping; correct for Enzo's dimension-split PPM).
+        do_perdir = get(ENV, "CIC_PERDIR_CFL", "0") == "1"
+        dt_force_next = NaN
+        if do_perdir
+            tn0 = EnzoLib.session_time(h); ae0, _ = EnzoLib.session_expansion_factor(h, tn0)
+            gef0 = active_of(EnzoLib.problem_get_field(h, iGE, 0), dims, N)
+            v1f0 = active_of(EnzoLib.problem_get_field(h, iV1, 0), dims, N)
+            v2f0 = active_of(EnzoLib.problem_get_field(h, iV2, 0), dims, N)
+            v3f0 = active_of(EnzoLib.problem_get_field(h, iV3, 0), dims, N)
+            cs0  = sqrt.(max.(5/3 .* (2/3) .* gef0, 0.0))
+            s10  = maximum(abs.(v1f0) .+ cs0); s20 = maximum(abs.(v2f0) .+ cs0); s30 = maximum(abs.(v3f0) .+ cs0)
+            dt_force_next = ae0 * courant * (1.0/N) / max(s10, s20, s30)
+        end
         z_prev = ZSTART
         @printf("%-4s %-8s %-9s %-10s %-8s\n", "cyc", "a_phys", "z", "ρmax", "sec")
         for cyc in 0:MAXCYC-1
@@ -685,8 +751,9 @@ function main_cic()
                 aout_e = a_outs[ai]*(1.0+ZSTART)
                 (aout_e > ae && dadt > 0) && (mdt = (aout_e - ae)/dadt)
             end
-            EnzoLib.evolve_level!(h, 0, 0.0; engine=eng, regrid=false, copy_old=COPYOLD, max_dt=mdt)
+            EnzoLib.evolve_level!(h, 0, 0.0; engine=eng, regrid=false, copy_old=COPYOLD, max_dt=mdt, dt_force=dt_force_next)
             sec = time() - t0; evolvet[] += sec; ncyc[] += 1
+            BE === :cuda && RECLAIM_EVERY > 0 && (cyc % RECLAIM_EVERY == 0) && CUDA.reclaim()
             tr = time(); EnzoLib.session_rebuild(h, 0); rebuildt[] += time() - tr
             _, z = EnzoLib.session_cosmology(h)        # Enzo's a is normalized to 1 at z_start;
             a = 1.0 / (1.0 + z)                          # use the PHYSICAL scale factor
@@ -699,6 +766,37 @@ function main_cic()
                 (cyc % 10 == 0) && @printf("    [compton drag z=%.1f: Γ/H=%.2f  v×%.4f/cyc]\n",
                                            zmid, compton_drag_over_H(zmid), f)
                 EnzoLib.session_rebuild(h, 0)            # refresh derived quantities after the kick
+            end
+            if get(ENV, "CIC_DTDIAG", "0") == "1" || do_perdir
+                tn2 = EnzoLib.session_time(h); ae2, da2 = EnzoLib.session_expansion_factor(h, tn2)
+                # gas signal speed from current fields (active region only)
+                gef = active_of(EnzoLib.problem_get_field(h, iGE, 0), dims, N)
+                v1f = active_of(EnzoLib.problem_get_field(h, iV1, 0), dims, N)
+                v2f = active_of(EnzoLib.problem_get_field(h, iV2, 0), dims, N)
+                v3f = active_of(EnzoLib.problem_get_field(h, iV3, 0), dims, N)
+                cs  = sqrt.(max.(5/3 .* (2/3) .* gef, 0.0))   # sound speed in code vel units
+                dx  = 1.0 / N
+                s1 = maximum(abs.(v1f) .+ cs); s2 = maximum(abs.(v2f) .+ cs); s3 = maximum(abs.(v3f) .+ cs)
+                dt_hE = courant * dx / max(s1, s2, s3)                                       # per-dir (Enzo)
+                dt_hR = courant * dx / maximum(abs.(v1f) .+ abs.(v2f) .+ abs.(v3f) .+ 3 .* cs)  # sum-dir (RAMSES)
+                if do_perdir
+                    dt_force_next = ae2 * dt_hE    # per-direction for next step (Enzo code-time units)
+                end
+                if get(ENV, "CIC_DTDIAG", "0") == "1"
+                    a_prev_phys = 1.0 / (1.0 + z_prev)
+                    Δaa = 100.0 * (a - a_prev_phys) / a_prev_phys
+                    dt_nxt = EnzoLib.session_compute_dt(h, 0)
+                    dt_exp = maxexp * ae2 / da2
+                    vmax_p = max(maximum(abs.(EnzoLib.problem_get_particle_vel(h, 0, 0))),
+                                 maximum(abs.(EnzoLib.problem_get_particle_vel(h, 1, 0))),
+                                 maximum(abs.(EnzoLib.problem_get_particle_vel(h, 2, 0))))
+                    dt_p = pcourant * dx / vmax_p
+                    who = dt_hE <= dt_p && dt_hE <= dt_exp ? "HYDRO" :
+                          dt_p  <= dt_hE && dt_p  <= dt_exp ? "PART" : "EXPND"
+                    @printf("  [dt c%-3d z=%7.2f Δa/a=%5.2f%%  h_E=%.3e  h_R=%.3e  p=%.3e  e=%.3e  Enz=%.3e →%s]\n",
+                            cyc, z, Δaa, dt_hE, dt_hR, dt_p, dt_exp, dt_nxt, who)
+                    flush(stdout)
+                end
             end
             z_prev = z
             ρ = EnzoLib.problem_get_field(h, iD, 0)
@@ -715,6 +813,11 @@ function main_cic()
                 while ai <= NOUT_eff && a >= a_outs[ai] - 1e-12
                     record!(a, z); ai += 1
                 end
+                # The output diagnostics (3× power_spectrum_gpu FFTs) transiently balloon
+                # the CUDA.jl pool to ~20 GB; the per-cycle reclaim doesn't run here, so the
+                # pool stays at that high-water.  Reclaim after each output to keep the PEAK
+                # at the ~3 GB working set.  (BE/RECLAIM_EVERY gate as in the cycle loop.)
+                BE === :cuda && RECLAIM_EVERY > 0 && CUDA.reclaim()
             end
             z <= ZEND && break
         end

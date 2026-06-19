@@ -21,7 +21,8 @@ const _CHEM_DATA_FILE = Ref{String}(
 # (engine=:kernels) can be called per step with the same configuration grackle
 # was initialised with.  The default :grackle engine ignores this.
 const _CHEM_CFG = Ref{NamedTuple}((; hubble=71.0, Om=0.27, OL=0.73, fh=0.76,
-    density_units=1.0, length_units=1.0, time_units=1.0, deuterium=false))
+    density_units=1.0, length_units=1.0, time_units=1.0, deuterium=false,
+    hubble_expansion=false))
 
 """
     chem_init!(; hubble, Om, OL, a_value, fh, density_units, length_units,
@@ -33,11 +34,11 @@ Initialise the reduced primordial-chemistry service for a host's code units
 function chem_init!(; hubble::Real, Om::Real, OL::Real, a_value::Real, fh::Real=0.76,
         density_units::Real, length_units::Real, time_units::Real,
         data_file::AbstractString=_CHEM_DATA_FILE[], deuterium::Bool=false,
-        engine::Symbol=:grackle)
+        engine::Symbol=:grackle, hubble_expansion::Bool=false)
     _CHEM_CFG[] = (; hubble=Float64(hubble), Om=Float64(Om), OL=Float64(OL),
         fh=Float64(fh), density_units=Float64(density_units),
         length_units=Float64(length_units), time_units=Float64(time_units),
-        deuterium=deuterium)
+        deuterium=deuterium, hubble_expansion=hubble_expansion)
     # The native ChemistryKernels engine is pure Julia — no Grackle dylib / data
     # file / subprocess worker needed.  Only init the C reduced lib for :grackle.
     engine === :kernels && return nothing
@@ -61,7 +62,7 @@ the cosmology+units captured by `chem_init!`, on `backend` at `precision`.
 """
 function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
                     engine::Symbol=:grackle, backend::Symbol=:cpu,
-                    precision::Type=Float64)
+                    precision::Type=Float64, adot_over_a::Real=NaN)
     if engine === :grackle
         GrackleChem.grackle_reduced_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt)
     elseif engine === :kernels
@@ -71,6 +72,7 @@ function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
             length_units=cfg.length_units, time_units=cfg.time_units,
             hubble=cfg.hubble, Om=cfg.Om, OL=cfg.OL, fh=cfg.fh,
             deuterium=cfg.deuterium && HDI !== nothing,
+            hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
             backend=backend, precision=precision)
     else
         error("unknown chem engine :$engine (use :grackle or :kernels)")
@@ -95,9 +97,13 @@ energy, call `chem_step!`, and write back E_total and the two species via
 function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
         density_units::Real, length_units::Real, time_units::Real,
         iHII::Integer=6, iH2I::Integer=7, iHDI::Union{Nothing,Integer}=nothing,
+        ientropy::Union{Nothing,Integer}=nothing,
         lib::Symbol=:cpu, engine::Symbol=:grackle, backend::Symbol=:cpu,
         precision::Type=Float64)
+    _prof = get(ENV, "CIC_CHEMPROF", "0") == "1"
+    _t0 = _prof ? time() : 0.0
     ck, U = RamsesLib.get_hydro_all(h, :uold, lev; lib=lib)   # U :: noct × 8 × nvar
+    _prof && (println("    [chemprof] get_hydro_all = ", round(time()-_t0,digits=3), "s"); flush(stdout))
     nv = size(U, 3)
     need = iHDI === nothing ? max(iHII, iH2I) : max(iHII, iH2I, iHDI)
     nv >= need ||
@@ -137,16 +143,32 @@ function ramses_chem_step!(h, lev::Integer; dt::Real, a_value::Real,
         @info "chem_step extrema" rho=extrema(rho) eint=extrema(eint) HII=extrema(HII) H2I=extrema(H2I) HDI=(HDI===nothing ? nothing : extrema(HDI)) dt=dt a_value=a_value
         flush(stderr)
     end
+    _t1 = _prof ? time() : 0.0
     chem_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt,
                engine=engine, backend=backend, precision=precision)
+    _prof && (println("    [chemprof] solve_chem!  = ", round(time()-_t1,digits=3), "s"); flush(stdout))
 
+    _t2 = _prof ? time() : 0.0
     Etot_new = eint .* rho .+ kin                         # cooled internal + same kinetic
     noct = size(U, 1)
     reshape8(v) = reshape(v, noct, 8)
     RamsesLib.set_hydro!(h, :uold, 5,    lev, ck, reshape8(Etot_new); lib=lib)
+    if ientropy !== nothing
+        # Keep entropy consistent: s = eint*(γ-1)/ρ^(γ-1), matching RAMSES convention
+        # e_prim = uold[ientropy]*ρ^(γ-1)/(γ-1)  →  uold[ientropy] = eint*(γ-1)/ρ^(γ-1)
+        γm1 = 5/3 - 1
+        entropy_new = eint .* γm1 ./ (r .^ γm1)
+        RamsesLib.set_hydro!(h, :uold, ientropy, lev, ck, reshape8(entropy_new); lib=lib)
+    end
     RamsesLib.set_hydro!(h, :uold, iHII, lev, ck, reshape8(HII); lib=lib)
     RamsesLib.set_hydro!(h, :uold, iH2I, lev, ck, reshape8(H2I); lib=lib)
     iHDI === nothing || RamsesLib.set_hydro!(h, :uold, iHDI, lev, ck, reshape8(HDI); lib=lib)
+    _prof && (println("    [chemprof] set_hydro×N  = ", round(time()-_t2,digits=3), "s"); flush(stdout))
+    # Push the chem-updated uold to the device (no-op on CPU/Metal; required on CUDA,
+    # where the mesh is device-resident, so the GPU hydro sees the new energy+species).
+    _t3 = _prof ? time() : 0.0
+    RamsesLib.set_uold_device!(h; lib=lib)
+    _prof && (println("    [chemprof] set_uold_dev = ", round(time()-_t3,digits=3), "s"); flush(stdout))
     return (; ncells = length(rho))
 end
 
@@ -183,9 +205,26 @@ Pass as `hooks[:cooling] = (h,lev,dt)->enzo_chem_step!(h,lev,dt; …)` with
 function enzo_chem_step!(h, level, dt; Om::Real, OL::Real, hub::Real, box::Real,
         zri::Real, fh::Real=0.76, deuterium::Bool=true, ng::Integer=3,
         engine::Symbol=:kernels, backend::Symbol=:cpu, precision::Type=Float64)
-    z = EnzoLib.session_cosmology(h)[2]
+    z = EnzoLib.session_cosmology(h)[2]                       # z at step BEGIN
     DU, VU, TU = _enzo_units(z; Om=Om, hub=hub, box=box, zri=zri)
     VU2 = VU^2
+
+    # Adiabatic-cooling rate for the coupled adiabatic+Compton kernel, sourced from
+    # ENZO's OWN CosmologyComputeExpansionFactor (not an analytic H(z)).  The cooling
+    # slot runs BEFORE session_advance_time, so session_time = t_begin; with a0=a(t0),
+    # a1=a(t0+dt), ȧ/a_eff = ln(a1/a0)/Δt_s integrates de/dt=-2(ȧ/a)e to e·(a0/a1)²
+    # EXACTLY over the step (γ=5/3).  The kernel evolves the redshift across the step
+    # from this z_start using aoa (z(t)=(1+z_start)exp(-aoa·t)−1), so the Compton
+    # target T_cmb(z) and rates are NOT frozen at z_start — accurate for Enzo's large
+    # CIC_MAXEXP steps in both the Compton-locked (high-z) and decoupled (low-z) limits.
+    aoa = NaN
+    if _CHEM_CFG[].hubble_expansion
+        t0  = EnzoLib.session_time(h)
+        a0  = EnzoLib.session_expansion_factor(h, t0)[1]
+        a1  = EnzoLib.session_expansion_factor(h, t0 + dt)[1]
+        dt_s = dt * TU
+        (a0 > 0 && a1 > 0 && dt_s > 0) && (aoa = log(a1/a0) / dt_s)
+    end
 
     # iterate the grids resident on this level (NOT a hardcoded grid 0) and use the
     # 0-based BaryonField slots from field_index — exactly the hydro!/gravity! slots.
@@ -239,13 +278,15 @@ function enzo_chem_step!(h, level, dt; Om::Real, OL::Real, hub::Real, box::Real,
         dbg = get(ENV, "CHEM_DEBUG", "0") == "1" && gi == 0
         if dbg
             j = na÷2
-            @info "enzo_chem pre" z dt_s=dt*TU na rho_j=rho[j] eint_j=eint[j] HII_j=HII[j] H2I_j=H2I[j] HDI_j=(haveD ? HDI[j] : 0.0) nH=0.76*rho[j]/1.6726e-24 xHII_in=HII[j]/rho[j]/0.76 Tj=(5/3-1)*1.22*1.6726e-24*eint[j]/1.380649e-16
+            Hana = 71.0*1e5/3.0856775807e24*sqrt(Om*(1+z)^3 + OL)   # analytic ΛCDM H(z) [1/s]
+            @info "enzo_chem pre" z dt_s=dt*TU na rho_j=rho[j] eint_j=eint[j] HII_j=HII[j] H2I_j=H2I[j] HDI_j=(haveD ? HDI[j] : 0.0) nH=0.76*rho[j]/1.6726e-24 xHII_in=HII[j]/rho[j]/0.76 Tj=(5/3-1)*1.22*1.6726e-24*eint[j]/1.380649e-16 aoa=aoa Hana=Hana aoa_over_Hana=(isnan(aoa) ? NaN : aoa/Hana)
             flush(stderr)
         end
 
         # physical CGS in → solve_chem! with unit=1 (cosmology from _CHEM_CFG).
         chem_step!(rho, eint, HII, H2I, HDI; a_value=1.0/(1+z), dt=dt*TU,
-                   engine=engine, backend=backend, precision=precision)
+                   engine=engine, backend=backend, precision=precision,
+                   adot_over_a=aoa)
 
         dbg && (@info "enzo_chem post" xHII_out=(HII[na÷2]/rho[na÷2])/0.76 T_out=eint[na÷2]; flush(stderr))
 

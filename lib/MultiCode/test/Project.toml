@@ -32,6 +32,12 @@ path = "../../../../../Athena.jl/lib/AthenaLib"
 [sources.CICASSLib]
 path = "../../../../../CICASS.jl/lib/CICASSLib"
 
+[sources.ChemistryKernels]
+path = "../../../../../ChemistryKernels.jl"
+
+[sources.EmissionKernels]
+path = "../../../../../EmissionKernels.jl"
+
 [sources.CodeBridge]
 path = "../../CodeBridge"
 

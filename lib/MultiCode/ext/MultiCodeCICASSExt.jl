@@ -160,7 +160,7 @@ function MultiCode.run_cicass_enzo(; vbc::Real = 30.0, boxlength::Real = 0.2,
                                    ngrid::Integer = 128, param_extra::AbstractString = "",
                                    zero_baryon_bulk::Bool = false,
                                    uniform_baryons::Bool = false,
-                                   baryon_ic::Symbol = :particle,
+                                   baryon_ic::Symbol = :smooth,
                                    init_temperature::Real = 0.0, mu_init::Real = 1.22,
                                    workdir::AbstractString = mktempdir())
     CICASSLib.available() || error("libcicass_capi not found")
@@ -390,8 +390,8 @@ function _cicass_ramses_namelist(n::Integer, level::Integer; courant::Real = 0.8
     &AMR_PARAMS
     levelmin=$(level)
     levelmax=$(level)
-    ngridtot=5000000
-    ncachemax=400000
+    ngridtot=$(parse(Int, get(ENV, "CIC_NGRIDTOT", string(round(Int, 1.6 * n^3 / 8)))))
+    ncachemax=$(parse(Int, get(ENV, "CIC_NCACHEMAX", string(max(50000, n^3 ÷ 32)))))
     npartmax=$(2 * n^3)
     nexpand=1
     boxlen=1.0
@@ -417,6 +417,7 @@ function _cicass_ramses_namelist(n::Integer, level::Integer; courant::Real = 0.8
 
     &POISSON_PARAMS
     epsilon=1.d-5
+    epsilon_base=$(get(ENV,"CIC_EPS_BASE","2.d-3"))
     /
 
     &REFINE_PARAMS
@@ -427,8 +428,9 @@ end
 
 function MultiCode.run_cicass_ramses(; vbc::Real = 30.0, boxlength::Real = 0.2,
                                      zstart::Real = 100.0, omega_m::Real = 0.27,
+                                     ngrid::Integer = 128,
                                      courant::Real = 0.8, zero_baryon_bulk::Bool = false,
-                                     uniform_baryons::Bool = false, baryon_ic::Symbol = :particle,
+                                     uniform_baryons::Bool = false, baryon_ic::Symbol = :smooth,
                                      workdir::AbstractString = mktempdir())
     CICASSLib.available() || error("libcicass_capi not found")
     CodeBridge.available(RamsesLib.BRIDGE, :cosmo) ||
@@ -446,7 +448,7 @@ function MultiCode.run_cicass_ramses(; vbc::Real = 30.0, boxlength::Real = 0.2,
     end
     physical = mode == :smooth || mode == :uniform
 
-    spec = CICASSSpec(boxlength = boxlength, zstart = zstart, ngrid = 128,
+    spec = CICASSSpec(boxlength = boxlength, zstart = zstart, ngrid = ngrid,
                       vbc = vbc, Omega_m = omega_m, filename = "cic_ramses")
     res = CICASSLib.generate(spec; workdir = workdir)
     snap = CICASSLib.read_snapshot(res.output)

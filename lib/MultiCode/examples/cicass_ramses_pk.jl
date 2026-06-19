@@ -12,6 +12,8 @@ using EnzoLib, MultiCode, CICASSLib, RamsesLib, PoissonKernels, Printf, Statisti
 import CodeBridge
 if Symbol(get(ENV, "BACKEND", "metal")) === :metal
     using Metal                       # activates PoissonKernels' Metal backend (GPU P(k) FFT)
+elseif Symbol(get(ENV, "BACKEND", "metal")) === :cuda
+    using CUDA                        # activates PoissonKernels'/ChemistryKernels' CUDA backend
 end
 
 const BOX    = parse(Float64, get(ENV, "CIC_BOX",   "0.128"))
@@ -21,17 +23,27 @@ const NGRID  = parse(Int,     get(ENV, "CIC_NGRID", "128"))
 const NOUT   = parse(Int,     get(ENV, "CIC_NOUT",  "7"))
 const OMEGA_M = parse(Float64, get(ENV, "CIC_OMEGAM","0.27"))
 const VBC    = parse(Float64, get(ENV, "CIC_VBC",   "30.0"))
-# Dual-energy (entropy) RAMSES build: NVAR=9 puts the internal-energy variable at
-# uold(6)=ientropy and shifts the chem species to 7,8,9 (was 6,7,8 at NVAR=8). With
-# it on, RAMSES keeps uold(5) consistent via the e_trunc switch → robust e_int/T even
-# under the supersonic streaming.  CIC_DUAL_ENERGY=0 reverts to the NVAR=8 layout.
-const DEF    = get(ENV, "CIC_DUAL_ENERGY", "1") == "1"
-const IHII   = DEF ? 7 : 6
-const IH2I   = DEF ? 8 : 7
-const IHDI   = DEF ? 9 : 8
+# Dual-energy RAMSES build (CIC_DUAL_ENERGY=1): NENER=1 adds internal energy at uold(6);
+# entropy=.true. then occupies the first passive scalar slot at uold(7)=ientropy (requires
+# NPSCAL=4, NVAR=10), shifting chemistry to ichem=8: HII=8, H2I=9, HDI=10.
+# CIC_DUAL_ENERGY=0: no NENER, chemistry starts at uold(6): HII=6, H2I=7, HDI=8 (NVAR=8).
+const DEF      = get(ENV, "CIC_DUAL_ENERGY", "1") == "1"
+const IHII     = DEF ? 8 : 6
+const IH2I     = DEF ? 9 : 7
+const IHDI     = DEF ? 10 : 8
+const IENTROPY = DEF ? 7 : nothing   # entropy=.true. slot; nothing when dual energy is off
+# CIC_DEUT=0 → H2-only chemistry (no HDI): NPSCAL drops by 1 (HDI slot unused), so the
+# RAMSES lib must be built one NPSCAL lower.  Default on (full H+D).
+const DEUT   = get(ENV, "CIC_DEUT", "1") == "1"
 const BE     = Symbol(get(ENV, "BACKEND", "metal"))
 const T      = Float32
 const REPORTS = joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
+# Zero-copy device-resident chem (CUDA only): run ChemistryKernels directly on RAMSES's
+# device uold (CUDA.jl wraps the nvfortran device pointer — same primary context), with
+# NO host get_hydro_all / set_hydro / set_uold_device round-trip.  Needs the CUDA lib.
+const CHEM_ZEROCOPY = get(ENV, "CIC_CHEM_ZEROCOPY", "0") == "1"
+CHEM_ZEROCOPY && @eval import CUDA
+CHEM_ZEROCOPY && @eval import ChemistryKernels
 
 dev(be, a) = PoissonKernels.to_device(be, a, T)
 
@@ -146,11 +158,17 @@ end
 function ramses_compton_drag!(h, lev, z_mid, dlna; v_cmb=nothing)
     γH = compton_drag_over_H(z_mid); f = exp(-γH*dlna)
     f >= 0.999999 && return f
+    # CUDA: collapse the 5 per-var device→host syncs into one (managed-memory ~0.9s each).
+    _os = get(ENV, "RAMSES_ONE_SYNC", "0") == "1"
+    if _os
+        RamsesLib.set_autosync!(false; lib=:cosmo); RamsesLib.sync_to_host!(h; lib=:cosmo)
+    end
     ck, ρ = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)
     _, mx = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
     _, my = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
     _, mz = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
     _, E  = RamsesLib.get_hydro(h, :uold, 5, lev; lib=:cosmo)
+    _os && RamsesLib.set_autosync!(true; lib=:cosmo)
     ke0 = 0.5 .* (mx.^2 .+ my.^2 .+ mz.^2) ./ max.(ρ, eps())
     # Damp the PECULIAR velocity toward the mass-weighted bulk (≡ CMB/streaming frame):
     # frame-agnostic (bulk=0 boosted, =v_bc unboosted), so it never damps the bulk
@@ -164,6 +182,53 @@ function ramses_compton_drag!(h, lev, z_mid, dlna; v_cmb=nothing)
     RamsesLib.set_hydro!(h, :uold, 4, lev, ck, mz; lib=:cosmo)
     RamsesLib.set_hydro!(h, :uold, 5, lev, ck, E;  lib=:cosmo)
     return f
+end
+
+# ── ZERO-COPY device-resident chem step ───────────────────────────────────────
+# Run ChemistryKernels on RAMSES's device-resident uold IN PLACE: CUDA.jl wraps the
+# nvfortran device pointer (verified same primary context, bit-exact), so there is NO
+# get_hydro_all (D→H sync + marshal), no set_hydro, no set_uold_device.  Extraction,
+# eint, clamping and scatter are all device broadcasts; only the chem kernel runs.
+# Mirrors ramses_chem_step! semantics (vars 1-5 hydro, IENTROPY dual-energy, species)
+# but at Float64 (uold precision) — so it matches the CPU path even more closely.
+function chem_step_zerocopy!(h, lev, dtc, a_value, uc)
+    dp = RamsesLib.uold_devptr(h, lev; lib=:cosmo)
+    dp.addr == 0 && error("zero-copy chem: null uold devptr (need the CUDA RAMSES lib)")
+    nv  = RamsesLib.nvar(lib=:cosmo)
+    # storage element type = the lib's `dp` (f32 when built NPRE=4, else f64).  We still
+    # do the stiff chem math in Float64 (promote on extract, narrow on scatter) so f32
+    # storage doesn't degrade the network — matches the f64 chem of the host path.
+    Ts  = RamsesLib.precision_bytes(lib=:cosmo)[1] == 4 ? Float32 : Float64
+    cu  = unsafe_wrap(CUDA.CuArray, reinterpret(CUDA.CuPtr{Ts}, dp.addr), (8, nv, dp.noct))
+    noct = dp.noct
+    # extract contiguous device copies, promoted to Float64 (column-major (8,noct) → vec)
+    rho = Float64.(vec(cu[:, 1, :])); Et = Float64.(vec(cu[:, 5, :]))
+    mx  = Float64.(vec(cu[:, 2, :])); my = Float64.(vec(cu[:, 3, :])); mz = Float64.(vec(cu[:, 4, :]))
+    HII = Float64.(vec(cu[:, IHII, :])); H2I = Float64.(vec(cu[:, IH2I, :]))
+    HDI = DEUT ? Float64.(vec(cu[:, IHDI, :])) : CUDA.zeros(Float64, length(rho))
+    # robustness clamps + specific internal energy (all on device)
+    mh = 1.6726e-24; kB = 1.380649e-16; velu = uc.scale_l/uc.scale_t
+    Tunits = mh*velu^2/kB; ec = 1.0/(Tunits*(5/3-1)*1.22)
+    rfloor = maximum(rho)*1e-20 + eps(); emin = 1.0*ec; emax = 1e8*ec
+    r   = max.(rho, rfloor)
+    kin = 0.5 .* (mx.^2 .+ my.^2 .+ mz.^2) ./ r
+    eint = (Et .- kin) ./ r
+    eint = ifelse.(isfinite.(eint) .& (eint .> emin), min.(eint, emax), emin)
+    HII = clamp.(HII, 0.0, r); H2I = clamp.(H2I, 0.0, r); HDI = clamp.(HDI, 0.0, r)
+    # chem IN PLACE on device (eint/HII/H2I/HDI updated; r read-only)
+    ChemistryKernels.solve_chem_device!(r, eint, HII, H2I, (DEUT ? HDI : nothing);
+        a_value=a_value, dt=dtc, density_units=uc.scale_d, length_units=uc.scale_l,
+        time_units=uc.scale_t, hubble=71.0, Om=OMEGA_M, OL=1-OMEGA_M, fh=0.76,
+        deuterium=DEUT, backend=:cuda, precision=Float64)
+    # scatter back into uold (device); kinetic energy unchanged (drag handles bulk)
+    γ = 5/3
+    cu[:, 5, :] .= Ts.(reshape(eint .* r .+ kin, 8, noct))
+    IENTROPY === nothing || (cu[:, IENTROPY, :] .= Ts.(reshape(eint .* (γ-1) ./ (r .^ (γ-1)), 8, noct)))
+    cu[:, IHII, :] .= Ts.(reshape(HII, 8, noct))
+    cu[:, IH2I, :] .= Ts.(reshape(H2I, 8, noct))
+    DEUT && (cu[:, IHDI, :] .= Ts.(reshape(HDI, 8, noct)))
+    CUDA.synchronize()
+    return nothing
 end
 
 # ── Grackle chemistry SUBPROCESS worker (isolates Grackle from the live RAMSES,
@@ -227,11 +292,11 @@ function main_ramses()
     # CIC_ZERO_BARYON_BULK=1 → boost to the baryon rest frame (subtract the coherent
     # gas bulk velocity from BOTH gas and DM); preserves the relative streaming offset.
     zero_bulk = get(ENV, "CIC_ZERO_BARYON_BULK", "0") == "1"
-    # SAME baryon-IC modes as Enzo: CIC_BARYON_IC = particle|smooth|uniform (+ CIC_UNIFORM_BARYONS=1).
+    # SAME baryon-IC modes as Enzo: CIC_BARYON_IC = smooth (default)|particle|uniform (+ CIC_UNIFORM_BARYONS=1).
     uniform_b = get(ENV, "CIC_UNIFORM_BARYONS", "0") == "1"
-    baryon_ic = Symbol(get(ENV, "CIC_BARYON_IC", "particle"))
+    baryon_ic = Symbol(get(ENV, "CIC_BARYON_IC", "smooth"))
     res = MultiCode.run_cicass_ramses(; vbc=VBC, boxlength=BOX, zstart=ZSTART, omega_m=OMEGA_M,
-                                      courant=COURANT, zero_baryon_bulk=zero_bulk,
+                                      ngrid=NGRID, courant=COURANT, zero_baryon_bulk=zero_bulk,
                                       uniform_baryons=uniform_b, baryon_ic=baryon_ic)
     h = res.handle; lev = res.lev; N = res.n
     if res.physical
@@ -248,7 +313,7 @@ function main_ramses()
     # the native ChemistryKernels Julia port (always in-proc, GPU-capable).
     CHEM_ENG = Symbol(get(ENV, "CIC_CHEM_ENGINE", "grackle"))
     CHEM_BK  = Symbol(get(ENV, "CIC_CHEM_BACKEND", "metal"))
-    CHEM_PREC = CHEM_BK === :metal ? Float32 : Float64
+    CHEM_PREC = (CHEM_BK === :metal || CHEM_BK === :cuda) ? Float32 : Float64
     INPROC = get(ENV, "CIC_CHEM_INPROC", "0") == "1" || CHEM_ENG === :kernels
     local dens_u, len_u, time_u, gw, gwp
     chem_nstep = 0; chem_accum_dt = 0.0
@@ -267,35 +332,68 @@ function main_ramses()
         try; s = CICASSLib.thermal_state(ZSTART); catch; end
         xHII0 = s===nothing ? 0.047 : s.x_e
         Tgas0 = s===nothing ? 2728.0 : s.T_gas
+        # Read ALL fields FIRST, then write, then push to device once.  On the CUDA
+        # build every get_hydro does a FULL uold device→host sync, so a set_hydro
+        # followed by a later get_hydro would be silently clobbered back to the stale
+        # device values; batch reads → writes → upload to avoid that.
         ck, rr = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)   # density (noct×8)
-        RamsesLib.set_hydro!(h, :uold, IHII, lev, ck, rr .* xHII0; lib=:cosmo)      # HII = ρ·x_e
-        RamsesLib.set_hydro!(h, :uold, IH2I, lev, ck, rr .* 1e-6;  lib=:cosmo)      # H2I
-        RamsesLib.set_hydro!(h, :uold, IHDI, lev, ck, rr .* (6.8e-5*xHII0); lib=:cosmo) # HDI
+        _, mx = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
+        _, my = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
+        _, mz = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
         # initialize the gas ENERGY from the CICASS thermal T (grafic had no ic_tempb,
         # so RAMSES left e~0 → Grackle saw T≈0 → out-of-bounds cooling-table segfault)
         mh = 1.6726e-24; kB = 1.380649e-16; vel_u = len_u/time_u
         Tunits = mh*vel_u^2/kB; eint0 = Tgas0/Tunits/(5/3-1)/1.22       # specific eint (code)
-        _, mx = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
-        _, my = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
-        _, mz = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
         kin = 0.5 .* (mx.^2 .+ my.^2 .+ mz.^2) ./ max.(rr, eps())
+        RamsesLib.set_hydro!(h, :uold, IHII, lev, ck, rr .* xHII0; lib=:cosmo)      # HII = ρ·x_e
+        RamsesLib.set_hydro!(h, :uold, IH2I, lev, ck, rr .* 1e-6;  lib=:cosmo)      # H2I
+        RamsesLib.set_hydro!(h, :uold, IHDI, lev, ck, rr .* (6.8e-5*xHII0); lib=:cosmo) # HDI
         RamsesLib.set_hydro!(h, :uold, 5, lev, ck, eint0 .* rr .+ kin; lib=:cosmo)
+        # Push the initial species + energy to the device (no-op on CPU/Metal).  On
+        # CUDA the mesh is device-resident and the boot-time host→device upload ran
+        # BEFORE these IC edits, so without this the first output/chem read syncs the
+        # stale device uold back (species=0, wrong initial T → xHII=0, T off ~6×).
+        RamsesLib.set_uold_device!(h; lib=:cosmo)
         @printf("init gas T=%.1f K (eint=%.3e code), Tunits=%.3e, x_HII=%.3e\n", Tgas0, eint0, Tunits, xHII0); flush(stdout)
         # sanity: what density/temperature does Grackle SEE for cell 1?
         nH1 = Float64(rr[1,1])*dens_u*0.76/mh
         @printf("  cell1: rho_code=%.3e → n_H=%.3e cm^-3,  T_init≈%.1f K\n", rr[1,1], nH1, eint0*Tunits*(5/3-1)*1.22); flush(stdout)
         gwp = (; hubble=71.0, Om=OMEGA_M, OL=1-OMEGA_M, a0=a0, fh=0.76,
-               du=dens_u, lu=len_u, tu=time_u, deut=true, data_file=GD)
+               du=dens_u, lu=len_u, tu=time_u, deut=DEUT, data_file=GD)
         if INPROC
             MultiCode.chem_init!(; hubble=71.0, Om=OMEGA_M, OL=1-OMEGA_M, a_value=a0, fh=0.76,
                 density_units=dens_u, length_units=len_u, time_units=time_u, data_file=GD,
-                deuterium=true, engine=CHEM_ENG)
+                deuterium=DEUT, engine=CHEM_ENG)
             @printf("H+D chemistry IN-PROCESS engine=%s backend=%s (cosmo NPSCAL=3): x_HII0=%.3e\n",
                     CHEM_ENG, CHEM_BK, xHII0)
         else
             gw = spawn_grackle_worker(; gwp...)
             @printf("H+D chemistry via worker (cosmo NPSCAL=3): x_HII0=%.3e\n", xHII0)
         end
+    end
+    # ── zero-copy probe: can CUDA.jl wrap RAMSES's device uold pointer? ──
+    if get(ENV, "CIC_DEVPTR_PROBE", "0") == "1"
+        Core.eval(Main, :(import CUDA)); CU = Main.CUDA
+        dp = RamsesLib.uold_devptr(h, lev; lib=:cosmo)
+        @printf("[devptr] addr=%#x noct=%d head=%d  CUDA.functional=%s\n",
+                dp.addr, dp.noct, dp.head, CU.functional()); flush(stdout)
+        if dp.addr != 0
+            twotondim = 8; nv = RamsesLib.nvar(lib=:cosmo)
+            try
+                cu = unsafe_wrap(CU.CuArray, reinterpret(CU.CuPtr{Float64}, dp.addr),
+                                 (twotondim, nv, dp.noct))
+                ng = min(200, dp.noct)
+                rd = Array(@view cu[:, 1, 1:ng])              # (8, ng) device→host via CUDA.jl
+                _, rho_host = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)  # (noct,8)
+                rh = permutedims(rho_host[1:ng, :])           # (8, ng)
+                err = maximum(abs.(rd .- rh)) / max(maximum(abs.(rh)), eps())
+                @printf("[devptr] WRAP OK  rho dev[1,1]=%.6e host[1,1]=%.6e  max rel err(%d octs)=%.3e → %s\n",
+                        rd[1,1], rh[1,1], ng, err, err < 1e-6 ? "CONTEXTS SHARED ✓" : "MISMATCH ✗"); flush(stdout)
+            catch e
+                @printf("[devptr] WRAP FAILED: %s\n", sprint(showerror, e)); flush(stdout)
+            end
+        end
+        exit(0)
     end
     pk_results = NamedTuple[]
     TAG = get(ENV, "CIC_TAG", "")
@@ -360,6 +458,18 @@ function main_ramses()
                     write(io, vec(rg)); write(io, xHIIv); write(io, fH2v); write(io, vec(hd)./rv); write(io, Tcell)
                 end
             end
+            # ── DM particle dump (idp-keyed) for particle-by-particle Enzo-vs-RAMSES
+            #    tracking.  pos in box-fraction [0,1), vel in km/s.  idp is the
+            #    layout-independent key; match to Enzo by idp / initial position. ──
+            if get(ENV, "CIC_PDUMP", "0") == "1"
+                np = size(p.xp, 1); uvk = res.unit_v_kms
+                open(joinpath(REPORTS, "ramses_pdump$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(np))
+                    write(io, Vector{Int64}(p.idp))
+                    write(io, Float64.(p.xp[:,1])); write(io, Float64.(p.xp[:,2])); write(io, Float64.(p.xp[:,3]))
+                    write(io, Float64.(p.vp[:,1]).*uvk); write(io, Float64.(p.vp[:,2]).*uvk); write(io, Float64.(p.vp[:,3]).*uvk)
+                end
+            end
             # ── per-cell physical phase dump (ρ/ρ̄, n_H[cm⁻³], T[K], f_H2, x_HII) ──
             # matched μ=1.22 + γ=5/3 + X_H=0.76 with the Enzo run for a direct comparison.
             let γ=5/3, XH=0.76
@@ -373,12 +483,13 @@ function main_ramses()
                 r=max.(rho,eps()); eint=(Et .- 0.5.*(mx.^2 .+ my.^2 .+ mz.^2)./r)./r
                 rrel = rho./(sum(rho)/length(rho))
                 nH   = rho .* u.scale_nH                       # cm⁻³ at current a
-                Tcell= eint .* ((γ-1)*1.22*u.scale_T2)         # K (T2=T/μ; ×μ=1.22)
-                fH2  = (H2I./r)./XH
-                xHIIc= (HII./r)./XH
+                fH2v  = (H2I./r)./XH
+                xHIIv = (HII./r)./XH
+                muv   = 1.0 ./ ((XH+(1-XH)/4) .+ XH.*(xHIIv .- 0.5.*fH2v))
+                Tcell = eint .* (γ-1) .* muv .* u.scale_T2     # K (T2=T/μ; ×μ from species)
                 open(joinpath(REPORTS, "ramses_phase_z$(round(Int,z)).bin"), "w") do io
                     write(io, Int64(length(rrel)))
-                    write(io, rrel); write(io, nH); write(io, Tcell); write(io, fH2); write(io, xHIIc)
+                    write(io, rrel); write(io, nH); write(io, Tcell); write(io, fH2v); write(io, xHIIv)
                 end
             end
             write_tables()
@@ -390,7 +501,10 @@ function main_ramses()
         chemt = 0.0; steptot = 0.0       # wall-time breakdown accumulators
         for step in 0:100000
             z = znow(); a = 1.0/(1.0+z)
-            while ai <= NOUT_eff && a >= a_outs[ai] - 1e-12; record!(z); ai += 1; end
+            # 1e-6 tolerance catches the initial step where znow() is fractionally above
+            # z_start due to Friedman table float, so a < a_outs[1] by ~1e-9 in scale factor.
+            # At z=20 the tolerance is ~4e-9 in z — irrelevant since set_time_cap! lands exactly.
+            while ai <= NOUT_eff && a >= a_outs[ai] - 1e-6; record!(z); ai += 1; end
             z <= ZEND && break
             # Cap the step to land EXACTLY on the next output a (RAMSES's capi_time_cap,
             # with the code time from the Friedman table) — the consistent cross-code list.
@@ -431,19 +545,23 @@ function main_ramses()
                     uc = RamsesLib.get_units(h; lib=:cosmo)
                     MultiCode.chem_init!(; hubble=71.0, Om=OMEGA_M, OL=1-OMEGA_M, a_value=1.0/(1.0+znew),
                         fh=0.76, density_units=uc.scale_d, length_units=uc.scale_l,
-                        time_units=uc.scale_t, data_file=GD, deuterium=true, engine=CHEM_ENG)
+                        time_units=uc.scale_t, data_file=GD, deuterium=DEUT, engine=CHEM_ENG)
                     _ct = time()
-                    MultiCode.ramses_chem_step!(h, lev; dt=dtc, a_value=1.0/(1.0+znew),
-                        density_units=uc.scale_d, length_units=uc.scale_l, time_units=uc.scale_t,
-                        iHII=IHII, iH2I=IH2I, iHDI=IHDI, lib=:cosmo,
-                        engine=CHEM_ENG, backend=CHEM_BK, precision=CHEM_PREC)
+                    if CHEM_ZEROCOPY
+                        chem_step_zerocopy!(h, lev, dtc, 1.0/(1.0+znew), uc)
+                    else
+                        MultiCode.ramses_chem_step!(h, lev; dt=dtc, a_value=1.0/(1.0+znew),
+                            density_units=uc.scale_d, length_units=uc.scale_l, time_units=uc.scale_t,
+                            iHII=IHII, iH2I=IH2I, iHDI=(DEUT ? IHDI : nothing), ientropy=IENTROPY, lib=:cosmo,
+                            engine=CHEM_ENG, backend=CHEM_BK, precision=CHEM_PREC)
+                    end
                     chemt += time() - _ct
                 else
                     ok = false
                     for attempt in 1:6
                         try
                             worker_chem_step!(gw, h, lev, N; a_value=1.0/(1.0+znew), dt=dtc,
-                                du=dens_u, lu=len_u, tu=time_u, deut=true)
+                                du=dens_u, lu=len_u, tu=time_u, deut=DEUT)
                             ok = true; break
                         catch e
                             e isa EOFError || rethrow()
@@ -456,6 +574,40 @@ function main_ramses()
                 chem_nstep += 1
             end
             sec = time()-t0; steptot += sec
+            if get(ENV, "CIC_DTDIAG", "0") == "1"
+                znew = znow(); a_new = 1.0/(1.0+znew); a_old = 1.0/(1.0+z)
+                Δaa = 100.0 * (a_new - a_old) / a_old
+                dt_info = RamsesLib.get_dt(h, lev; lib=:cosmo)
+                aexp = dt_info.aexp; dtnxt = dt_info.dtnew
+                # hexp = dadtau/aexp, dadtau = sqrt(a³*(OmegaM + OmegaL*a³)) for flat ΛCDM
+                hexp = sqrt(OMEGA_M*aexp + (1-OMEGA_M)*aexp^4)
+                dt_exp = 0.1 / hexp
+                # gas signal speed from uold: 1=ρ, 2=ρvx, 3=ρvy, 4=ρvz, 5=E_tot
+                _, rho_r = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)
+                _, mx_r  = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
+                _, my_r  = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
+                _, mz_r  = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
+                _, Et_r  = RamsesLib.get_hydro(h, :uold, 5, lev; lib=:cosmo)
+                r  = max.(vec(rho_r), eps())
+                vx = vec(mx_r)./r; vy = vec(my_r)./r; vz = vec(mz_r)./r
+                eint = max.(0.0, (vec(Et_r) .- 0.5.*(vx.^2 .+ vy.^2 .+ vz.^2).*r)./r)
+                cs_r = sqrt.(max.(5/3 .* (2/3) .* eint, 0.0))
+                dx_r = 1.0 / N
+                ctot_R = maximum(abs.(vx) .+ abs.(vy) .+ abs.(vz) .+ 3 .* cs_r)
+                ctot_E = max(maximum(abs.(vx) .+ cs_r), maximum(abs.(vy) .+ cs_r), maximum(abs.(vz) .+ cs_r))
+                dt_hR = COURANT * dx_r / ctot_R    # RAMSES sum-over-dims formula
+                dt_hE = COURANT * dx_r / ctot_E    # Enzo per-direction formula
+                # particle Courant
+                p_r = RamsesLib.get_particles(h, N^3; lib=:cosmo)
+                vmax_p = maximum(abs.(p_r.vp))
+                dt_p = COURANT * dx_r / vmax_p
+                who = dt_hR <= dt_p && dt_hR <= dt_exp ? "HYDRO_R" :
+                      dt_hE <= dt_p && dt_hE <= dt_exp ? "HYDRO_E" :
+                      dt_p  <= dt_exp ? "PART" : "EXPND"
+                @printf("  [dt s%-3d z=%7.2f Δa/a=%5.2f%%  h_R=%.3e  h_E=%.3e  p=%.3e  e=%.3e  RAM=%.3e →%s]\n",
+                        step, znew, Δaa, dt_hR, dt_hE, dt_p, dt_exp, dtnxt, who)
+                flush(stdout)
+            end
             if step % 20 == 0
                 gas = ramses_gas_grid(h, lev, N)
                 @printf("%-5d %-9.3f %-10.3f %-8.2f\n", step, z, maximum(gas), sec); flush(stdout)

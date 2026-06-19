@@ -74,6 +74,16 @@ include("gravity_slot.jl")
 include("grackle_service.jl")     # code-neutral reduced primordial chemistry (HII,H2I)
 include("grackle_slot.jl")        # wire the service onto RAMSES / Arepo hosts
 include("enzo_resident.jl")        # GPU-resident particle push (replaces session_update_particles)
+include("patchgrid.jl")            # in-process topgrid decomposition into sibling patches (GPU hydro+chem)
+include("global_gravity.jl")       # global CPU-FFT top-grid gravity coupling the patches
+include("patch_cosmo.jl")          # super-comoving cosmology (units, Friedmann, drag, particle push)
+
+export PatchGrid, Patch, build_patchgrid, scatter_global!, gather_global
+export exchange_ghosts!, exchange_ghosts_axis!, patch_step!, total_mass
+export assemble_global_density!, solve_global_poisson!, patch_accel, patch_accel_gpu, global_gravity_accel
+export particle_accel_field, assemble_global_density_gpu!, particle_accel_field_gpu, global_gravity_gpu
+export Cosmo, cosmo_units, dadtau, dtau_for_dlna, Hofa, growth_D, compton_drag_over_H
+export compton_drag_patches!, push_particles!, z_to_a, a_to_z
 
 """
     run_dfmm_sod(spec = SodSpec(gamma = 5/3, t = 0.2); N = 200, tau = 1e-3,
@@ -161,7 +171,7 @@ activates it.
 function run_cicass_enzo end
 
 """
-    run_cicass_ramses(; vbc=30.0, boxlength=0.2, zstart=100.0) -> (; ...)
+    run_cicass_ramses(; vbc=30.0, boxlength=0.2, zstart=100.0, ngrid=128) -> (; ...)
 
 Boot a LIVE RAMSES (UNITS=COSMO, hydro on) purely on the CICASS grafic streaming
 set — gas from `ic_deltab`/`ic_velb*`, DM particles from `ic_velc*` — then read
