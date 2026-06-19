@@ -1,6 +1,9 @@
 # Julia
 Manifest.toml
 lib/*/Manifest.toml
+# machine-local Preferences (e.g. CUDA_Runtime_jll version pin)
+LocalPreferences.toml
+**/LocalPreferences.toml
 /docs/build/
 *.jl.cov
 *.jl.*.cov

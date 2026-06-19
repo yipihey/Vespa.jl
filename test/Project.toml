@@ -16,5 +16,5 @@ EnzoNG = {path = ".."}
 MeshInterface = {path = "../lib/MeshInterface"}
 RefMesh = {path = "../lib/RefMesh"}
 HGBackend = {path = "../lib/HGBackend"}
-HierarchicalGrids = {path = "/Users/tabel/Projects/HierarchicalGrids.jl"}
+HierarchicalGrids = {path = "/home/tabel/Projects/HierarchicalGrids.jl"}
 R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}
