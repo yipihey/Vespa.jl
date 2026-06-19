@@ -18,6 +18,7 @@
 
 using EnzoLib, PPMKernels, PoissonKernels, Dates, Printf
 try; @eval using Metal; catch; end
+try; @eval using CUDA; catch; end
 
 const SB = "/Users/tabel/Projects/enzo-dev/run/CosmologySimulation/SantaBarbaraCluster"
 const NG = 4                       # ppm_step_3d! ghost zones (set NumberOfGhostZones=4)
@@ -25,7 +26,7 @@ const GAMMA = 5/3
 const OMEGA_B = 0.1; const OMEGA_CDM = 0.9
 const iD, iV1, iV2, iV3, iTE, iGE = 0, 1, 2, 3, 4, 5
 const BE = Symbol(get(ENV, "BACKEND", "cpu"))
-const T  = BE === :metal ? Float32 : Float32          # CPU-f32 = faithful comparison
+const T  = (BE === :metal || BE === :cuda) ? Float32 : Float32  # GPU backends use f32
 const _step = Ref(0)
 
 envbool(name, default=false) = lowercase(get(ENV, name, string(default))) in ("1", "true", "yes", "on")

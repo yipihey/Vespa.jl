@@ -908,7 +908,8 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
                        radiation::Bool = false, star_sources::Bool = false,
                        star_formation::Bool = false, cosmology::Bool = false,
                        mhdct::Bool = false, maxsub::Int = 100000,
-                       copy_old::Bool = true, max_dt::Float64 = Inf)
+                       copy_old::Bool = true, max_dt::Float64 = Inf,
+                       dt_force::Float64 = NaN)
     eng = engine !== nothing ? engine :
           engine_from_flags(; hydro = hydro! === nothing ? :enzo : :julia,
                             gravity = gravity, cooling = cooling, radiation = radiation,
@@ -931,7 +932,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
     done = 0.0; n = 0
     while n < maxsub
         run_slot(:boundary, eng, h, level, 0.0)              # interpolate from parent (root: periodic ghost fill)
-        dt = session_compute_dt(h, level)
+        dt = isnan(dt_force) ? session_compute_dt(h, level) : dt_force
         dt_above > 0.0 && (dt = min(dt, dt_above - done))
         dt = min(dt, max_dt)             # cap to hit the next output time (EvolveHierarchy parity)
         session_set_dt(h, dt, level)
