@@ -17,12 +17,15 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 
 [weakdeps]
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 
 [extensions]
 PoissonKernelsMetalExt = "Metal"
+PoissonKernelsCUDAExt = "CUDA"
 
 [compat]
 KernelAbstractions = "0.9"
 FFTW = "1"
 Metal = "1"
+CUDA = "5"
 julia = "1.10"

@@ -11,7 +11,18 @@
 # (Metal) arrays are accepted and staged to the host around the transform. The solve
 # is spectral, so it is EXACT for resolved modes — certified against analytic φ.
 
-using FFTW: rfft, irfft, plan_rfft, plan_irfft
+using FFTW: rfft, irfft, plan_rfft, plan_irfft, set_num_threads
+
+"""
+    fft_set_num_threads!(n) -> n
+
+Set the number of CPU threads FFTW uses for the (real) transforms in
+`fft_poisson_root!` — the "parallel CPU FFT" for a top-grid Poisson solve.  Call
+ONCE before the first `fft_poisson_root!` of a given size: plans are built lazily
+on first use and cached per `(eltype,dims,boxsize,greens)`, baking in the thread
+count at creation.  Returns `n`.
+"""
+fft_set_num_threads!(n::Integer) = (set_num_threads(Int(n)); Int(n))
 
 # real-to-complex Green's function on the rfft grid (N1÷2+1, N2, N3), built on the
 # host (it feeds the host FFT). Frequencies use the standard (physically correct)
@@ -122,4 +133,44 @@ function fft_poisson_root!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
     phi_h = P.inv * chat                       # back to real space (normalized)
     copyto!(phi, phi_h)                        # host→host or host→device
     return phi
+end
+
+# ── array-generic rfft Poisson (FFTW for Array, cuFFT for CuArray) ─────────────
+# Solves ∇²φ = (G/a)·ρ on `ρ`'s OWN device via the AbstractFFTs `plan_rfft`/`plan_irfft`
+# interface, which dispatches to FFTW (host) or cuFFT (CuArray/MtlArray) automatically.
+# Real-to-complex (rfft) ⇒ half the spectral storage of a c2c transform, and cuFFT
+# supports ARBITRARY sizes (best for 2^a·3^b·5^c·7^d) — no power-of-two restriction.
+# Plans + the −1/k² Green's function (rfft half-grid) are cached per (array-type,T,N,L,greens).
+struct _RFFTPlan{PF,PI,A}
+    fwd::PF; inv::PI; Gk::A      # Gk lives on ρ's device (real, rfft shape)
+end
+const _RFFT_CACHE = Dict{Any,Any}()
+
+"""
+    fft_poisson_rfft!(φ, ρ; G=1.0, a=1.0, boxsize=1.0, greens=:spectral) -> φ
+
+In-place periodic Poisson solve `∇²φ = (G/a)·ρ` on `ρ`'s native device using the real
+FFT (`plan_rfft`).  `φ`,`ρ` are 3-D arrays of the SAME type (host `Array` → FFTW; `CuArray`
+→ cuFFT — no host staging).  Arbitrary (non-power-of-two) sizes are allowed.  DC mode
+dropped (RHS should be mean-zero; the cosmological source already is).
+"""
+function fft_poisson_rfft!(φ::AbstractArray{T,3}, ρ::AbstractArray{T,3};
+                           G::Real=1.0, a::Real=1.0, boxsize=1.0, greens::Symbol=:spectral) where {T}
+    N = size(ρ)
+    L = boxsize isa Number ? ntuple(_->Float64(boxsize),3) : ntuple(d->Float64(boxsize[d]),3)
+    P = get!(_RFFT_CACHE, (typeof(ρ), T, N, L, greens)) do
+        fwd = plan_rfft(ρ)                       # device plan (cuFFT) or host (FFTW)
+        chat = fwd * ρ
+        inv = plan_irfft(chat, N[1])
+        gh  = greens === :spectral ? _greens_periodic(T, N, L) :
+              greens === :discrete7 ? _greens_discrete7(T, N, L) :
+              error("fft_poisson_rfft!: greens must be :spectral or :discrete7")
+        gk  = ρ isa Array ? gh : copyto!(similar(ρ, T, size(gh)), gh)   # Green's onto ρ's device
+        _RFFTPlan(fwd, inv, gk)
+    end::_RFFTPlan
+    coef = T(G) / T(a)
+    chat = P.fwd * ρ                             # rfft(ρ) — complex, (N₁÷2+1,N₂,N₃)
+    @. chat = coef * P.Gk * chat                 # φ̂ = coef·G(k)·ρ̂
+    φ .= P.inv * chat                            # inverse rfft (normalized)
+    return φ
 end

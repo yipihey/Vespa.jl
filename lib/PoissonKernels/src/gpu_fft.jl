@@ -25,11 +25,18 @@ function _bitrev_table(N::Int)
     br
 end
 
-@kernel function _bitrev_k!(yr, yi, @Const(xr), @Const(xi), @Const(br))
+# IN-PLACE bit-reversal along axis 1: swap element i with r=bitrev(i), guarded by
+# i<r so each pair is touched exactly once (bit-reversal is an involution ⇒ the
+# partner workitem's guard is false ⇒ no concurrent write, race-free on CPU & GPU).
+# Avoids the out-of-place scratch write + full copy-back (≈3 array passes/axis).
+@kernel function _bitrev_inplace_k!(xr, xi, @Const(br))
     i, j, k = @index(Global, NTuple)
     @inbounds begin
-        s = br[i] + 1
-        yr[i, j, k] = xr[s, j, k]; yi[i, j, k] = xi[s, j, k]
+        r = br[i] + 1
+        if i < r
+            t = xr[i, j, k]; xr[i, j, k] = xr[r, j, k]; xr[r, j, k] = t
+            t = xi[i, j, k]; xi[i, j, k] = xi[r, j, k]; xi[r, j, k] = t
+        end
     end
 end
 
@@ -50,11 +57,10 @@ end
     end
 end
 
-# in-place 1-D FFT along axis 1 of a 3-D (re,im) pair; scratch sr,si same shape.
-function _fft_axis1!(xr, xi, sr, si, brdev, sgn::Int)
+# in-place 1-D FFT along axis 1 of a 3-D (re,im) pair (no scratch — in-place bitrev).
+function _fft_axis1!(xr, xi, brdev, sgn::Int)
     be = KA.get_backend(xr); T = eltype(xr); N1, N2, N3 = size(xr)
-    _bitrev_k!(be)(sr, si, xr, xi, brdev; ndrange = (N1, N2, N3))
-    copyto!(xr, sr); copyto!(xi, si)
+    _bitrev_inplace_k!(be)(xr, xi, brdev; ndrange = (N1, N2, N3))
     twopi = T(2) * T(pi)
     s = 1
     while (1 << s) <= N1
@@ -65,16 +71,58 @@ function _fft_axis1!(xr, xi, sr, si, brdev, sgn::Int)
     return xr, xi
 end
 
-# 3-D FFT (sgn=-1 fwd, +1 inv) — axis 1, then permute axes 2,3 to the front.
+# Per-(backend,T,N) cached transpose targets tr,ti (the bit-reversal is now in-place,
+# so no sr,si scratch).  Reused across all three axes AND across calls, so a 3-D FFT
+# allocates NOTHING after the first.  Cubic grid ⇒ every buffer shares one N³ shape.
+const _FFT_SCRATCH = Dict{Any,Any}()
+_fft_scratch(be, ::Type{T}, N) where {T} =
+    get!(_FFT_SCRATCH, (typeof(be), T, N)) do
+        (KA.zeros(be, T, N...), KA.zeros(be, T, N...))
+    end
+
+# ── axis transposes ───────────────────────────────────────────────────────────
+# The 3-D FFT brings each axis to the front (axis 1) before the 1-D transform. On
+# the GPU `permutedims!` is already a tuned device kernel; on the CPU it is Base's
+# SERIAL transpose — the only non-KA, non-threaded step in the host FFT. So on the
+# CPU KA backend we transpose with a threaded `@kernel` (one workitem per element,
+# split over `Threads.nthreads()`), keeping the whole host FFT "purely KA + host
+# threads"; on every other backend we keep the optimized `permutedims!`.
+@kernel function _transpose12_k!(dst, @Const(src))      # perm (2,1,3): swap axes 1,2
+    i, j, k = @index(Global, NTuple)
+    @inbounds dst[i, j, k] = src[j, i, k]
+end
+@kernel function _transpose13_k!(dst, @Const(src))      # perm (3,2,1): swap axes 1,3
+    i, j, k = @index(Global, NTuple)
+    @inbounds dst[i, j, k] = src[k, j, i]
+end
+
+# out-of-place transpose dst ← permutedims(src, perm); KA-threaded on CPU, permutedims! else
+@inline function _transpose!(dst, src, perm::NTuple{3,Int}, be)
+    if be isa KA.CPU
+        if perm === (2, 1, 3)
+            _transpose12_k!(be)(dst, src; ndrange = size(dst))
+        else
+            _transpose13_k!(be)(dst, src; ndrange = size(dst))
+        end
+    else
+        permutedims!(dst, src, perm)
+    end
+    return dst
+end
+
+# 3-D FFT (sgn=-1 fwd, +1 inv) — transform axis 1, then bring axes 2,3 to the front via
+# out-of-place transposes into cached buffers (no per-call allocation).  On the CPU
+# the transposes are threaded KA kernels (see `_transpose!`); on the GPU, permutedims!.
 function _fft3d!(xr, xi, brdev, sgn::Int)
-    sr = similar(xr); si = similar(xi)
-    _fft_axis1!(xr, xi, sr, si, brdev, sgn)
-    xr = permutedims(xr, (2, 1, 3)); xi = permutedims(xi, (2, 1, 3))
-    sr = similar(xr); si = similar(xi); _fft_axis1!(xr, xi, sr, si, brdev, sgn)
-    xr = permutedims(xr, (2, 1, 3)); xi = permutedims(xi, (2, 1, 3))
-    xr = permutedims(xr, (3, 2, 1)); xi = permutedims(xi, (3, 2, 1))
-    sr = similar(xr); si = similar(xi); _fft_axis1!(xr, xi, sr, si, brdev, sgn)
-    xr = permutedims(xr, (3, 2, 1)); xi = permutedims(xi, (3, 2, 1))
+    be = KA.get_backend(xr); T = eltype(xr); N = size(xr)
+    tr, ti = _fft_scratch(be, T, N)
+    _fft_axis1!(xr, xi, brdev, sgn)                               # axis 1
+    _transpose!(tr, xr, (2, 1, 3), be); _transpose!(ti, xi, (2, 1, 3), be)
+    _fft_axis1!(tr, ti, brdev, sgn)                               # axis 2
+    _transpose!(xr, tr, (2, 1, 3), be); _transpose!(xi, ti, (2, 1, 3), be)
+    _transpose!(tr, xr, (3, 2, 1), be); _transpose!(ti, xi, (3, 2, 1), be)
+    _fft_axis1!(tr, ti, brdev, sgn)                               # axis 3
+    _transpose!(xr, tr, (3, 2, 1), be); _transpose!(xi, ti, (3, 2, 1), be)
     return xr, xi
 end
 

@@ -114,7 +114,56 @@ function interp_accel_to_particles!(axp::AbstractVector{T}, ayp, azp,
     return axp, ayp, azp
 end
 
-# ── semi-implicit comoving kick (Grid_UpdateParticleVelocity.C, METHOD3) ──────
+# ── CIC force interp straight from the POTENTIAL (no stored accel field) ──────
+# Same difference-then-interpolate as _interp_accel_kernel! (so momentum-conserving,
+# self-force-free), but g = −∇φ is central-differenced inline at each of the 8 CIC cells
+# from the padded potential `φ` — needs ≥2 ghost cells so cell±1 is in bounds for all 8.
+@kernel function _interp_force_phi_kernel!(axp, ayp, azp,
+                                           @Const(px), @Const(py), @Const(pz),
+                                           @Const(vx), @Const(vy), @Const(vz), @Const(φ),
+                                           dcoef, invcell, lex, ley, lez,
+                                           half, c05, c1, e1, e2, e3, hc)
+    p = @index(Global)
+    @inbounds begin
+        xq = px[p] + dcoef*vx[p]; yq = py[p] + dcoef*vy[p]; zq = pz[p] + dcoef*vz[p]
+        xpos = min(max((xq-lex)*invcell, half), e1)
+        ypos = min(max((yq-ley)*invcell, half), e2)
+        zpos = min(max((zq-lez)*invcell, half), e3)
+        i1 = unsafe_trunc(Int, xpos+c05); j1 = unsafe_trunc(Int, ypos+c05); k1 = unsafe_trunc(Int, zpos+c05)
+        dxr = oftype(xpos,i1)+c05-xpos; dyr = oftype(ypos,j1)+c05-ypos; dzr = oftype(zpos,k1)+c05-zpos
+        ex = c1-dxr; ey = c1-dyr; ez = c1-dzr
+        gxc(i,j,k) = -hc*(φ[i+1,j,k]-φ[i-1,j,k])
+        gyc(i,j,k) = -hc*(φ[i,j+1,k]-φ[i,j-1,k])
+        gzc(i,j,k) = -hc*(φ[i,j,k+1]-φ[i,j,k-1])
+        w(a,b,c) = a*b*c
+        axp[p] = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ayp[p] = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        azp[p] = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+    end
+end
+
+"""
+    interp_force_from_potential!(axp,ayp,azp, px,py,pz, vx,vy,vz, φ;
+                                 dcoef, cellsize, leftedge) -> (axp,ayp,azp)
+
+Like [`interp_accel_to_particles!`], but reads the padded **potential** `φ` and forms
+`g = −∇φ` (central difference) inline at the 8 CIC cells — no precomputed accel grids.
+`cellsize = dx` and the central-difference uses the same `1/(2dx)`; `φ` must carry ≥2
+ghost cells.  Mathematically identical (difference-then-interpolate) to the stored-accel path.
+"""
+function interp_force_from_potential!(axp::AbstractVector{T}, ayp, azp,
+                                      px, py, pz, vx, vy, vz, φ::AbstractArray{<:Any,3};
+                                      dcoef::Real, cellsize::Real, leftedge) where {T}
+    be = KA.get_backend(axp); d1,d2,d3 = size(φ)
+    half = T(0.5001); e1 = T(d1)-half; e2 = T(d2)-half; e3 = T(d3)-half
+    _interp_force_phi_kernel!(be)(axp, ayp, azp, px, py, pz, vx, vy, vz, φ,
+                                  T(dcoef), T(1)/T(cellsize), T(leftedge[1]), T(leftedge[2]), T(leftedge[3]),
+                                  half, T(0.5), T(1), e1, e2, e3, T(0.5)/T(cellsize); ndrange = length(axp))
+    return axp, ayp, azp
+end
 @kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),
                                ts, coef1, coef2)
     p = @index(Global)
