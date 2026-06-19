@@ -1,8 +1,12 @@
 # Vespa.jl
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/enzo-project/enzo-dev/blob/main/LICENSE)
+<p align="center">
+  <img src="docs/assets/vespa-logo.png" alt="Vespa.jl" width="360">
+</p>
+
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/yipihey/Vespa.jl/blob/main/LICENSE)
 [![Julia Version](https://img.shields.io/badge/Julia-1.10%2B-blue.svg)](https://julialang.org/downloads/)
-[![Build Status](https://github.com/enzo-project/enzo-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/enzo-project/enzo-dev/actions/workflows/ci.yml)
+[![Build Status](https://github.com/yipihey/Vespa.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/yipihey/Vespa.jl/actions/workflows/ci.yml)
 
 Next-generation Enzo: a shared-memory AMR astrophysics code with **orchestration in Julia** and a small, stable kernel surface, built on a **swappable AMR substrate behind one interface**. See [`docs/adr/0001-architecture.md`](docs/adr/0001-architecture.md) for the full architecture decision record.
 

@@ -7,7 +7,7 @@ guide for developing in this tree. Read `docs/adr/0001-architecture.md` for the
 
 ## What exists (status)
 
-- **Hydro, two backends, 70/70 tests green.** Ghost-free finite-volume HLLC +
+- **Hydro, two backends, 203/203 core tests green.** Ghost-free finite-volume HLLC +
   PLM + SSP-RK2, run identically on `RefMesh` (pure-Julia oracle) and
   `HGBackend` (HierarchicalGrids.jl adapter). Cross-backend agreement test
   proves identical physics.
@@ -16,13 +16,28 @@ guide for developing in this tree. Read `docs/adr/0001-architecture.md` for the
   sub-face fluxes. Validated by refined Sod (conservation + convergence vs a
   uniform-fine RefMesh) and the 2D Sedov blast (conservation, symmetry,
   R∝t^½ growth).
+- **Self-gravity + cosmology.** `lib/PoissonKernels` (FFT + multigrid Poisson,
+  CPU/CUDA/Metal via KernelAbstractions); super-comoving cosmology integration
+  validated against the exact Zel'dovich growth (`test_zeldovich_pancake.jl`).
+- **Chemistry & cooling.** The primordial+D network and radiative cooling now live
+  in the standalone, VespaRegistry-registered `ChemistryKernels.jl` /
+  `EmissionKernels.jl` (GPU, with opt-in log–log rate/cooling tables ≈3.4× on the
+  stiff network). `lib/MultiCode` wires them into the hydro step.
+- **GPU hydro/Poisson** (`lib/PPMKernels`, `lib/PoissonKernels`): KernelAbstractions
+  kernels with CUDA + Metal extensions; the in-process **patch decomposition**
+  (`lib/MultiCode/patchgrid.jl`) runs GPU hydro+chem per patch with a global
+  CPU/GPU-FFT gravity solve.
+- **Live-Enzo bridge + multi-code framework.** `lib/EnzoLib` drives a live Enzo
+  hierarchy; `lib/CodeBridge`/`lib/MultiCode` federate Enzo + RAMSES + Arepo +
+  Athena++ + GADGET-4 + MUSIC (the `*Lib` sibling repos). See the EnzoLib and
+  CodeBridge/MultiCode sections below.
 - **Inline visualization (`lib/EnzoViz`).** Taps `evolve!`'s callback, rasterizes
   snapshots, renders via the veusz fork's GPU Vello painter, emits a
   self-contained interactive web page per problem. 15/15 EnzoViz tests green.
 
-Not yet done (per ADR build sequence): MHD constrained transport (next, highest
-risk), self-gravity, cooling/Grackle, cosmology; then Rust/GPU backends where
-measured; Metal milestone-2.
+Not yet done (per ADR build sequence): MHD constrained transport (the next major
+physics milestone, highest risk); broader Rust/GPU backends where measured;
+Metal milestone-2.
 
 ## Layout
 
