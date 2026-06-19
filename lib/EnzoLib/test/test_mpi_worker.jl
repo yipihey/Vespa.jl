@@ -18,7 +18,7 @@
 # bridge in-process; the worker is handed the MPI bridge path explicitly.)
 
 using Test
-using EnzoLib, EnzoFixtures, EnzoNG, MeshInterface, RefMesh, EnzoBackend
+using EnzoLib, EnzoFixtures, Vespa, MeshInterface, RefMesh, EnzoBackend
 
 const MPIEXEC     = get(ENV, "ENZONG_MPIEXEC", "/opt/homebrew/bin/mpiexec")
 const NRANKS      = parse(Int, get(ENV, "ENZONG_MPI_NRANKS", "2"))

@@ -4,7 +4,7 @@
 # H2-suppression rates) through Enzo's GrackleWrapper. The initial gas temperature and
 # electron fraction come from CICASS's RECFAST recombination table (thermal_state(z)),
 # loaded into Enzo's CosmologySimulationInitial* params. This is the end-to-end
-# "EnzoNG GPU path uses the Grackle table at high z" demonstration.
+# "Vespa GPU path uses the Grackle table at high z" demonstration.
 #
 # Run (GPU):  BACKEND=metal ENZOMODULES_GRID_LIB=.../libenzomodules_grid_f32.dylib \
 #             DYLD_LIBRARY_PATH=~/grackle_install_f32/lib:/opt/homebrew/opt/hdf5/lib \

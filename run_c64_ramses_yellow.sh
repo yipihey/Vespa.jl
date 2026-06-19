@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-cd /home/tabel/Projects/enzo-dev/EnzoNG.jl
+cd /home/tabel/Projects/Vespa.jl
 export BACKEND=cuda
 # CUDA GPU build (NVHPC/nvfortran, sm_86, hydro+gravity on A6000) — set as the :cosmo flavor
 export RAMSES_LIB_COSMO=/home/tabel/Projects/mini-ramses-metal/bin64sc_cuda/libramses3d.so

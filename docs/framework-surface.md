@@ -1,4 +1,4 @@
-# The EnzoNG multi-code framework — full code surface
+# The Vespa multi-code framework — full code surface
 
 The one-page registry of everything the federated framework (ADR-0006) now
 wraps, certifies, and runs. Updated 2026-06-10 after the Next-list close-out
@@ -13,7 +13,7 @@ and the Music/Athena/Gadget4/DiscoDJ wrapper integration audit.
 | `lib/PPMKernels` | KernelAbstractions hydro: Enzo PPM (certified bit-tight vs live Fortran), MUSCL-Hancock (PLM/PPM × HLL/HLLC/two-shock, `fluxrec` flux recording for AMR registers), HD_RK MUSCL, PPML. CPU f64/f32 + Metal f32. |
 | `lib/PoissonKernels` | KernelAbstractions gravity: Enzo multigrid (bit-tight), periodic FFT root solve (`greens = :spectral` Enzo / `:discrete7` — the exact solution of the 7-point system RAMSES MG iterates on), Dirichlet V/W-cycle, and `masked_cg!` (irregular-domain Dirichlet solve, CPU f64 + Metal f32). |
 | `lib/EnzoLib` | Live Enzo through the EnzoModules C-ABI bridge: certified EvolveLevel slots, `:julia` slot swaps, particle injection, flux registers, MPI worker. |
-| `EnzoNG.jl` core | The native ghost-free FV driver (RefMesh + HGBackend), `EquationSet` model seam, cosmology units, reflux. |
+| `Vespa.jl` core | The native ghost-free FV driver (RefMesh + HGBackend), `EquationSet` model seam, cosmology units, reflux. |
 
 ## The wrapper registry (sibling repositories, all `[sources]` → this CodeBridge)
 

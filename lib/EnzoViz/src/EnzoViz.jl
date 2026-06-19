@@ -1,15 +1,15 @@
 """
     EnzoViz
 
-Inline visualization for EnzoNG: as a simulation runs, capture field snapshots
+Inline visualization for Vespa: as a simulation runs, capture field snapshots
 and render them through the **yipihey/veusz** fork's GPU **Vello** painter,
 producing for each problem a self-contained, interactive web page (time slider,
 play/pause, live-editable colormap / vmin / vmax / log-color) powered by the
 fork's `<veusz-figure>` WASM component.
 
 This package is deliberately isolated under `lib/` (like the mesh backends): it
-carries the heavy Python/Vello/WASM toolchain so the core `EnzoNG` package and
-its headless test suite stay dependency-clean. EnzoNG exposes only a generic
+carries the heavy Python/Vello/WASM toolchain so the core `Vespa` package and
+its headless test suite stay dependency-clean. Vespa exposes only a generic
 `callback` hook in `evolve!`; EnzoViz supplies a writer callback.
 
 ## Pipeline (verified against the local fork)
@@ -27,7 +27,7 @@ its headless test suite stay dependency-clean. EnzoNG exposes only a generic
 ## Usage
 
 ```julia
-using EnzoNG, RefMesh, EnzoViz
+using Vespa, RefMesh, EnzoViz
 prob = sod_problem_defaults(n = 256)
 sim  = Simulation(UniformMesh(prob.dims, prob.domain), prob)
 viz  = VizSession(sim; outdir = "out/Sod", every = 5)
@@ -52,7 +52,7 @@ module EnzoViz
 
 using PythonCall
 using JSON3
-using EnzoNG
+using Vespa
 using MeshInterface
 
 export VizSession, writer, snapshot!, finalize!, recapture, serve, python_interpreter

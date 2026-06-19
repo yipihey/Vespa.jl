@@ -1,8 +1,8 @@
-# E5 — the full seam-level EnzoBackend. EnzoNG's UNCHANGED Simulation/driver
+# E5 — the full seam-level EnzoBackend. Vespa's UNCHANGED Simulation/driver
 # (`step!` → accumulate_flux! → HLLC/PLM/SSP-RK2) runs through the MeshInterface
 # seam on an `EnzoGridMesh` that represents the live Enzo grid, with the conserved
 # state synced to/from Enzo's BaryonField around each step. Enzo owns init / BC /
-# CFL / advance; EnzoNG's full driver owns the hydro, via the seam.
+# CFL / advance; Vespa's full driver owns the hydro, via the seam.
 #
 # Guarded on grid_available() (needs the heavy Session bridge library).
 
@@ -12,7 +12,7 @@ const SEAM_PROB = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
                                     "run", "Hydro", "Hydro-1D", "Toro-1-ShockTube",
                                     "Toro-1-ShockTube.enzo"))
 
-# Hydro slot: run EnzoNG's full driver through the seam on the live Enzo grid.
+# Hydro slot: run Vespa's full driver through the seam on the live Enzo grid.
 # Lazily builds the EnzoGridMesh + Simulation from the live handle on first call.
 function enzo_seam_hydro_slot(; γ = 1.4, nghost = 3)
     cache = Ref{Any}(nothing)
@@ -32,7 +32,7 @@ function enzo_seam_hydro_slot(; γ = 1.4, nghost = 3)
         end
         mesh, sim = cache[]
         sync_from_enzo!(sim.sv, mesh)      # Enzo → conserved (model-driven roles)
-        step!(sim, dt)                     # EnzoNG's unchanged driver, through the seam
+        step!(sim, dt)                     # Vespa's unchanged driver, through the seam
         sync_to_enzo!(mesh, sim.sv)        # conserved → Enzo
         return nothing
     end
@@ -41,20 +41,20 @@ end
 if !EnzoLib.grid_available()
     @info "Session bridge not built — skipping seam-level EnzoBackend test"
 else
-    @testset "E5: EnzoNG driver through the seam on a live Enzo grid" begin
+    @testset "E5: Vespa driver through the seam on a live Enzo grid" begin
         dj = EnzoLib.session_evolve_density(SEAM_PROB, enzo_seam_hydro_slot())
         N = length(dj); dx = 1.0 / N
         x = [(k - 0.5) * dx for k in 1:N]
         WL = (1.0, 0.75, 1.0); WR = (0.125, 0.0, 0.1)        # Toro-1, disc at 0.3, t=0.2
         ρexact(xi) = exact_riemann_sample(WL, WR, 1.4, (xi - 0.3) / 0.2)[1]
         l1 = sum(abs(dj[i] - ρexact(x[i])) for i in 1:N) / N
-        @info "EnzoNG-through-seam vs exact Riemann" cells = N L1_density = l1
+        @info "Vespa-through-seam vs exact Riemann" cells = N L1_density = l1
         @test all(isfinite, dj) && all(>(0), dj)
-        @test l1 < 0.03                                       # EnzoNG's driver on Enzo memory matches truth
+        @test l1 < 0.03                                       # Vespa's driver on Enzo memory matches truth
     end
 
     # ND single-grid: the seam adapter over a 2D Enzo grid. The column-major
-    # flat-index map must be exact (round-trip identity) and EnzoNG's unchanged
+    # flat-index map must be exact (round-trip identity) and Vespa's unchanged
     # 2D driver must run on it conservatively.
     @testset "EnzoBackend 2D single-grid (NohProblem2D)" begin
         pf = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
@@ -76,7 +76,7 @@ else
                 @test EnzoLib.problem_get_field(h, mesh.di, 0) == ρ0          # round-trip identity, bit-for-bit
                 di = density_index(model)
                 m0 = sum(sim.sv[di][I] for I in CartesianIndices(mesh.active))
-                step!(sim, 1e-4)                                              # EnzoNG's 2D driver on the live grid
+                step!(sim, 1e-4)                                              # Vespa's 2D driver on the live grid
                 d = [sim.sv[di][I] for I in CartesianIndices(mesh.active)]
                 m1 = sum(d)
                 @test all(isfinite, d) && all(>(0), d)

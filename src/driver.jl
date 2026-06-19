@@ -488,7 +488,7 @@ function evolve!(sim::Simulation; verbose::Bool = false,
 end
 
 # ─────────────────────── AMR time subcycling (P1 science) ───────────────────
-# Classic-Enzo level subcycling on EnzoNG's composite (leaf-only) mesh: each
+# Classic-Enzo level subcycling on Vespa's composite (leaf-only) mesh: each
 # refinement level advances at its own CFL-stable dt, and a finer level takes the
 # integer number of substeps needed to catch up to the coarse step
 # (`EvolveLevel.C` / `SetLevelTimeStep.C`). This is a PERFORMANCE change (coarse

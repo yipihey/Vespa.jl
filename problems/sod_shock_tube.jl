@@ -13,7 +13,7 @@
 #   sim  = Simulation(mesh, prob)
 #   evolve!(sim; verbose = true)
 
-using EnzoNG
+using Vespa
 
 """
     sod_problem(; n = 128) -> Problem

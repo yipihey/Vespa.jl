@@ -9,7 +9,7 @@ HG is the substrate the architecture targets: integer-exact relative geometry,
 a DFS-ordered octree with O(1) navigation, BC-aware face-neighbor queries with
 hanging-node enumeration (`face_fine_neighbors`), and an `AdaptiveField` that
 conservatively remaps field data on refinement/coarsening. This adapter is thin
-— it maps EnzoNG's handle-based, ghost-free seam onto HG's native operations and
+— it maps Vespa's handle-based, ghost-free seam onto HG's native operations and
 does no physics.
 
 ## Field storage

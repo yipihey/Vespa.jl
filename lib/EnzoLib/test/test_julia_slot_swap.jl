@@ -1,5 +1,5 @@
 # E3 — the :julia slot swap: a Julia physics method running on LIVE Enzo grid
-# memory. In the Julia-driven EvolveLevel, the hydro slot is replaced by EnzoNG's
+# memory. In the Julia-driven EvolveLevel, the hydro slot is replaced by Vespa's
 # certified HLLC+PLM+SSP-RK2 kernels, which read the live grid's BaryonField
 # (Density, Velocity1, TotalEnergy via problem_get_field), advance one step, and
 # write it back (problem_set_field) — mutating the same Enzo memory Enzo's own
@@ -13,7 +13,7 @@ const SWAP_PROB = normpath(joinpath(@__DIR__, "..", "..", "..", "..",
                                     "Toro-1-ShockTube.enzo"))
 const SWAP_NGHOST = 3   # PPM ghost zones (Enzo default for this problem)
 
-# One SSP-RK2 HLLC+PLM step on the live Enzo grid arrays, reusing EnzoNG kernels.
+# One SSP-RK2 HLLC+PLM step on the live Enzo grid arrays, reusing Vespa kernels.
 function julia_hydro_step!(h, dt; γ = 1.4)
     T  = EnzoLib.problem_grid_size(h)
     di = EnzoLib.field_index(h, 0)            # Density
@@ -26,17 +26,17 @@ function julia_hydro_step!(h, dt; γ = 1.4)
     dx = 1.0 / N                              # domain [0,1]
     i1, i2 = SWAP_NGHOST + 1, SWAP_NGHOST + N
     prim(k) = (d[k], v[k], 0.0, 0.0, (γ - 1) * d[k] * (e[k] - 0.5 * v[k]^2))
-    U  = [EnzoNG.prim2cons(prim(k), γ) for k in 1:T]
+    U  = [Vespa.prim2cons(prim(k), γ) for k in 1:T]
     U0 = copy(U)
     # net flux-divergence update of the active cells, src → dst (ghosts held)
     function fluxdiv!(Us, Ud, hdt)
-        Wp = [EnzoNG.cons2prim(Us[k], γ) for k in 1:T]
-        slope(k) = ntuple(c -> EnzoNG.limited_slope(Wp[k-1][c], Wp[k][c], Wp[k+1][c]), 5)
+        Wp = [Vespa.cons2prim(Us[k], γ) for k in 1:T]
+        slope(k) = ntuple(c -> Vespa.limited_slope(Wp[k-1][c], Wp[k][c], Wp[k+1][c]), 5)
         for k in i1:i2
             sm, s0, sp = slope(k - 1), slope(k), slope(k + 1)
-            FL = EnzoNG.hllc_flux(ntuple(c -> Wp[k-1][c] + 0.5sm[c], 5),
+            FL = Vespa.hllc_flux(ntuple(c -> Wp[k-1][c] + 0.5sm[c], 5),
                                   ntuple(c -> Wp[k][c]   - 0.5s0[c], 5), γ, 1)
-            FR = EnzoNG.hllc_flux(ntuple(c -> Wp[k][c]   + 0.5s0[c], 5),
+            FR = Vespa.hllc_flux(ntuple(c -> Wp[k][c]   + 0.5s0[c], 5),
                                   ntuple(c -> Wp[k+1][c] - 0.5sp[c], 5), γ, 1)
             Ud[k] = ntuple(c -> Us[k][c] - hdt / dx * (FR[c] - FL[c]), 5)
         end
@@ -45,7 +45,7 @@ function julia_hydro_step!(h, dt; γ = 1.4)
     U2 = copy(U1); fluxdiv!(U1, U2, dt)       # stage 2
     for k in i1:i2
         U[k] = ntuple(c -> 0.5 * U0[k][c] + 0.5 * U2[k][c], 5)
-        W = EnzoNG.cons2prim(U[k], γ)
+        W = Vespa.cons2prim(U[k], γ)
         d[k] = W[1]; v[k] = W[2]
         e[k] = W[5] / ((γ - 1) * W[1]) + 0.5 * W[2]^2   # back to specific total energy
     end

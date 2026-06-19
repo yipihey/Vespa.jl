@@ -9,7 +9,7 @@
    field_data arrays use gr_float (double for an f64 grackle build, float for
    f32).  We convert double<->gr_float at the boundary, so this same source links
    against EITHER ~/grackle_install (f64) or ~/grackle_install_f32 (f32 -- the
-   precision the rest of the EnzoNG stack uses).  HII, H2I are MASS densities
+   precision the rest of the Vespa stack uses).  HII, H2I are MASS densities
    rho*x, in the code_units passed to _init. */
 #include <stdlib.h>
 #include <stdio.h>

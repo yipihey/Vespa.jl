@@ -2,7 +2,7 @@
 # its [sources] authoritative, so the path-dev'd subpackages and the unregistered
 # R3D git dependency resolve directly — no Pkg.test sandbox, fully reproducible.
 [deps]
-EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
+Vespa = "1a2b3c4d-0000-4000-8000-000000000000"
 MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
 RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
 HGBackend = "1a2b3c4d-0003-4000-8000-000000000003"
@@ -12,9 +12,9 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-EnzoNG = {path = ".."}
+Vespa = {path = ".."}
 MeshInterface = {path = "../lib/MeshInterface"}
 RefMesh = {path = "../lib/RefMesh"}
 HGBackend = {path = "../lib/HGBackend"}
-HierarchicalGrids = {path = "/home/tabel/Projects/HierarchicalGrids.jl"}
+HierarchicalGrids = {path = "../../HierarchicalGrids.jl"}
 R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}

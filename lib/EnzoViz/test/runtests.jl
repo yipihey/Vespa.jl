@@ -18,7 +18,7 @@ ENV["JULIA_PYTHONCALL_EXE"] = PY
 ENV["QT_QPA_PLATFORM"] = "offscreen"
 
 using Test
-using EnzoNG, MeshInterface, RefMesh, HGBackend, EnzoViz
+using Vespa, MeshInterface, RefMesh, HGBackend, EnzoViz
 using Downloads, Sockets
 
 @testset "EnzoViz inline visualization" begin

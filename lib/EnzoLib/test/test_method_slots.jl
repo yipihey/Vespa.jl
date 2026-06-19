@@ -2,15 +2,15 @@
 # (gravity :julia slot) run through the registry on the LIVE Enzo hierarchy.
 #
 # Phase B: EngineConfig(hydro=:julia) routes the hydro step to a hook that runs
-# EnzoNG's unchanged driver on the live grid (via EnzoBackend); certified vs the
-# exact Riemann oracle (EnzoNG HLLC ≠ Enzo PPM, so physics-level not bit-for-bit).
+# Vespa's unchanged driver on the live grid (via EnzoBackend); certified vs the
+# exact Riemann oracle (Vespa HLLC ≠ Enzo PPM, so physics-level not bit-for-bit).
 #
 # Guarded on grid_available() (needs the Session bridge library).
 
 using EnzoBackend
 import MeshInterface
 
-# Phase B hook: an EnzoNG-driver hydro slot, (h, level, dt) as the registry wants.
+# Phase B hook: an Vespa-driver hydro slot, (h, level, dt) as the registry wants.
 # Lazily builds the EnzoGridMesh + Simulation on the live handle; the EquationSet
 # model supplies the conserved-role field map (variable choice is the model's).
 function julia_hydro_hook(; γ = 1.4, nghost = 3, domain = ((0.0, 1.0),))
@@ -30,7 +30,7 @@ function julia_hydro_hook(; γ = 1.4, nghost = 3, domain = ((0.0, 1.0),))
         end
         mesh, sim = cache[]
         sync_from_enzo!(sim.sv, mesh)     # Enzo → conserved
-        step!(sim, dt)                    # EnzoNG's unchanged driver, through the seam
+        step!(sim, dt)                    # Vespa's unchanged driver, through the seam
         sync_to_enzo!(mesh, sim.sv)       # conserved → Enzo
         return nothing
     end
@@ -53,7 +53,7 @@ else
         @test_throws ErrorException EnzoLib.run_slot(:hydro, bad, Ptr{Cvoid}(0), 0, 1.0)
     end
 
-    @testset "Phase B: hydro=:julia slot (EnzoNG driver on live Enzo grid)" begin
+    @testset "Phase B: hydro=:julia slot (Vespa driver on live Enzo grid)" begin
         pf = joinpath(SLOT_RUN, "Hydro", "Hydro-1D", "Toro-1-ShockTube", "Toro-1-ShockTube.enzo")
         engine = EnzoLib.EngineConfig(; hydro = :julia,
                                       hooks = Dict{Symbol,Function}(:hydro => julia_hydro_hook()))
@@ -68,7 +68,7 @@ else
         @test l1 < 0.03
     end
 
-    # Phase C gravity slot: EnzoNG's matrix-free CG Poisson solver runs on the LIVE
+    # Phase C gravity slot: Vespa's matrix-free CG Poisson solver runs on the LIVE
     # Enzo grid's baryon density. Returns the convergence record + the solved field
     # so the test can certify it. (Full coupling into :enzo hydro needs a
     # set-AccelerationField bridge — ADR-0002's remaining integration step; here we
@@ -92,14 +92,14 @@ else
             end
             mesh, sim, grav = cache[]
             sync_from_enzo!(sim.sv, mesh)                 # live Enzo ρ → conserved state
-            iters, relres = solve_poisson!(sim, grav)     # EnzoNG CG on live density
+            iters, relres = solve_poisson!(sim, grav)     # Vespa CG on live density
             rec[] = (iters = iters, relres = relres, sim = sim, grav = grav, mesh = mesh)
             return nothing
         end
         return hook, rec
     end
 
-    @testset "Phase C: gravity=:julia slot (EnzoNG Poisson on live Enzo density)" begin
+    @testset "Phase C: gravity=:julia slot (Vespa Poisson on live Enzo density)" begin
         # ZeldovichPancake = a 1D single-grid self-gravitating baryon field; its IC
         # carries the Zel'dovich density perturbation, so the Poisson RHS is nontrivial.
         pf = abspath(joinpath(SLOT_RUN, "Cosmology", "ZeldovichPancake", "ZeldovichPancake.enzo"))
@@ -122,7 +122,7 @@ else
         # Pearson correlation ρ↔φ: gravity puts potential WELLS (low φ) at overdensities.
         ρc = ρv .- sum(ρv) / N; φc = φv .- sum(φv) / N
         corr = sum(ρc .* φc) / sqrt(sum(abs2, ρc) * sum(abs2, φc) + 1e-300)
-        @info "Phase C: EnzoNG Poisson on live Enzo density" cells = N iters = r.iters relres = r.relres ρ_φ_corr = corr
+        @info "Phase C: Vespa Poisson on live Enzo density" cells = N iters = r.iters relres = r.relres ρ_φ_corr = corr
         @test r.relres < 1e-6                 # CG converged on the live Enzo density
         @test r.iters < 500
         @test maximum(ρv) - minimum(ρv) > 1e-6  # the live density really is perturbed

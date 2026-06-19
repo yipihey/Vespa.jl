@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Baryon & dark-matter density power spectra from the CICASS high-z EnzoNG GPU run,
+"""Baryon & dark-matter density power spectra from the CICASS high-z Vespa GPU run,
 overlaid on the CICASS linear-theory prediction (IC power grown by D(a)^2), at
 logarithmic intervals in scale factor z=1000 -> 20.  Markers = measured (GPU FFT of
 the live Enzo gas density / CIC of the live DM particles); solid lines = linear theory."""
@@ -8,7 +8,7 @@ matplotlib.use("Agg"); import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 datafile = sys.argv[1] if len(sys.argv) > 1 else \
-    "/Users/tabel/Projects/enzo-dev/EnzoNG.jl/reports/multicode/cicass_highz_pk.dat"
+    "/Users/tabel/Projects/Vespa.jl/reports/multicode/cicass_highz_pk.dat"
 
 # parse blocks "@ z=<z> <tag>" then rows "k P"
 blocks = {}   # (z, tag) -> (k[], P[])
@@ -58,7 +58,7 @@ for ax, comp, th, thc, title in (
 axb.set_ylabel(r"$P(k)\ [(h^{-1}{\rm Mpc})^3]$")
 axb.legend(title="○ Enzo GPU (measured)\n— IC×D(a)²   -- CICASS analytic×D(a)²",
            fontsize=8, ncol=2, loc="lower left", title_fontsize=8)
-fig.suptitle("CICASS streaming box, EnzoNG GPU (PPM+Poisson Metal) + H+D chemistry: "
+fig.suptitle("CICASS streaming box, Vespa GPU (PPM+Poisson Metal) + H+D chemistry: "
              "measured vs linear-theory $P(k)$", fontsize=12)
 fig.tight_layout()
 out = datafile.replace(".dat", ".png")

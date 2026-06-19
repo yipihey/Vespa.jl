@@ -1,4 +1,4 @@
-# EnzoNG.jl
+# Vespa.jl
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/enzo-project/enzo-dev/blob/main/LICENSE)
 [![Julia Version](https://img.shields.io/badge/Julia-1.10%2B-blue.svg)](https://julialang.org/downloads/)
@@ -8,7 +8,7 @@ Next-generation Enzo: a shared-memory AMR astrophysics code with **orchestration
 
 ## Overview
 
-EnzoNG.jl is a modern astrophysics simulation framework that provides:
+Vespa.jl is a modern astrophysics simulation framework that provides:
 
 - **Shared-memory AMR**: Adaptive mesh refinement for efficient computation
 - **Julia orchestration**: High-level control and flexibility using Julia
@@ -25,7 +25,7 @@ This repository runs an end-to-end finite-volume hydro stack (spec → mesh → 
 
 ## The multi-code framework
 
-Beyond the native stack, EnzoNG.jl is the umbrella of a **federated multi-code
+Beyond the native stack, Vespa.jl is the umbrella of a **federated multi-code
 framework** (ADR-0006): live Enzo, mini-RAMSES, Arepo, Athena++, GADGET-4,
 MUSIC, DISCO-DJ, and dfmm all drive through one Julia session — shared ICs,
 cross-code comparison gates against exact solutions, and mix-and-match guest
@@ -102,7 +102,7 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 
 #### Using RefMesh backend:
 ```julia
-using EnzoNG
+using Vespa
 prob = sod_problem_defaults(n = 256)
 
 using RefMesh                       # reference backend
@@ -113,7 +113,7 @@ d = dump_fields(sim)                # primitive fields + coordinates (1D), sorte
 
 #### Using HGBackend (HierarchicalGrids.jl):
 ```julia
-using EnzoNG
+using Vespa
 prob = sod_problem_defaults(n = 256)
 
 using HGBackend                     # HierarchicalGrids.jl backend
@@ -125,7 +125,7 @@ d = dump_fields(sim)                # primitive fields + coordinates (1D), sorte
 ### Adaptive Run Example
 
 ```julia
-using EnzoNG, HGBackend
+using Vespa, HGBackend
 include("problems/sedov_blast.jl")
 prob = sedov_problem(n = 48, tfinal = 0.04)
 sim  = Simulation(HGMesh(prob.dims, prob.domain), prob)

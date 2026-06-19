@@ -1,8 +1,8 @@
 # ADR-0003 part B: conservative `:julia` hydro under Enzo AMR (the SubgridFluxes
-# bridge). A :julia hydro slot (EnzoNG's driver on the live grid) is made
-# conservative across coarse–fine boundaries by writing EnzoNG's recorded face
+# bridge). A :julia hydro slot (Vespa's driver on the live grid) is made
+# conservative across coarse–fine boundaries by writing Vespa's recorded face
 # fluxes into Enzo's flux registers, so Enzo's own UpdateFromFinerGrids /
-# CorrectForRefinedFluxes restore conservation — the same machinery, EnzoNG's
+# CorrectForRefinedFluxes restore conservation — the same machinery, Vespa's
 # numbers. Two flux sets are filled (exactly what SolveHydroEquations fills):
 #   • each grid's BoundaryFluxes  = the RefinedFluxes a finer grid carried, and
 #   • the parent's SubgridFluxesEstimate[level][i][sub] = the coarse InitialFluxes.
@@ -10,16 +10,16 @@
 # The DECISIVE gate (per the ADR): a refined Sod whose waves stay interior (no
 # boundary outflow) conserves total mass/energy to ~round-off WITH the flux
 # correction, and drifts to ~1e-3 (the documented reflux signature) WITHOUT it.
-# `test_reflux.jl` (EnzoNG's native composite reflux) is the template.
+# `test_reflux.jl` (Vespa's native composite reflux) is the template.
 #
 # Guarded on grid_available() (needs the Session bridge library).
 
 using EnzoBackend
 import MeshInterface
 
-# EnzoNG conserved component for Enzo BaryonField `fld` (the inverse of the mesh's
+# Vespa conserved component for Enzo BaryonField `fld` (the inverse of the mesh's
 # conserved-role → Enzo-field map), or -1 if `fld` is not a hydro conserved field
-# (e.g. a colour/species the EnzoNG model does not carry — its flux stays 0).
+# (e.g. a colour/species the Vespa model does not carry — its flux stays 0).
 @inline function _engng_comp_of(mesh::EnzoGridMesh, fld::Int)
     fld == mesh.di && return mesh.cdi
     fld == mesh.ei && return mesh.cei
@@ -82,7 +82,7 @@ function _apply_parent_ghost!(sim, mesh, model, level)
     dl, dr = EnzoLib.problem_grid_edge(h, g0)
     cons = enzo_parent_ghost(mesh)
     pg = MeshInterface.ParentGhost((axis, side, cell) ->
-             EnzoNG.cons2prim(model, cons(axis, side, cell)))
+             Vespa.cons2prim(model, cons(axis, side, cell)))
     # Per axis: (lo, hi) pair — ParentGhost on coarse–fine faces, the original
     # domain BC where the grid edge is the domain edge.
     orig = sim.bcs
@@ -100,32 +100,32 @@ end
 # Write one (dim, side) flux plane of an Enzo flux register (subgrid OR boundary)
 # for ALL Enzo baryon fields (the consumers — CorrectForRefinedFluxes,
 # AddToBoundaryFluxes — loop every field and deref each, so unmapped fields must
-# still be allocated/zeroed). `lookup(I)` returns EnzoNG's recorded flux NTuple for
+# still be allocated/zeroed). `lookup(I)` returns Vespa's recorded flux NTuple for
 # active cell `I` (or nothing ⇒ zeros). The plane is rasterized in Enzo's exact
-# linearization by `EnzoNG.bflux_plane` (ND-general; 1D ⇒ a single cell). `setter`
+# linearization by `Vespa.bflux_plane` (ND-general; 1D ⇒ a single cell). `setter`
 # pushes one field's `Vector{Float64}` plane (subgrid vs own-boundary destination).
 function _write_plane!(::Val{R}, setter, mesh, nf, dim::Int, start, stop, g0,
                        flux_off::Int, Vcell, lookup) where {R}
     s = ntuple(d -> start[d], Val(R)); e = ntuple(d -> stop[d], Val(R)); g = ntuple(d -> g0[d], Val(R))
     for fld in 0:nf-1
         comp = _engng_comp_of(mesh, fld)
-        plane = EnzoNG.bflux_plane(Val(R), dim, s, e, g, flux_off, comp, Vcell, lookup)
+        plane = Vespa.bflux_plane(Val(R), dim, s, e, g, flux_off, comp, Vcell, lookup)
         setter(fld, plane)
     end
     return nothing
 end
 
-# Write EnzoNG's recorded fluxes for grid (level, i, flat gi) into Enzo's flux
+# Write Vespa's recorded fluxes for grid (level, i, flat gi) into Enzo's flux
 # registers (the SubgridFluxesEstimate the AMR machinery consumes):
 #   • proper subgrids sub=0..nsub-2  → the coarse InitialFluxes at the subgrid's
-#     coarse–fine boundary faces (EnzoNG's INTERIOR flux there), and
+#     coarse–fine boundary faces (Vespa's INTERIOR flux there), and
 #   • the last entry sub=nsub-1      → the grid's own outer-boundary flux; Enzo's
 #     FinalizeFluxes accumulates THIS into the grid's BoundaryFluxes (the
 #     RefinedFluxes its parent projects), giving the correct temporal accumulation
 #     across subcycles for free.
 # `conservative=false` writes ZEROS (arrays still allocated, but zero correction) —
 # the non-conservative baseline that isolates the reflux effect. ND face planes are
-# rasterized cell-by-cell from EnzoNG's per-cell flux registers (ADR-0003 follow-up
+# rasterized cell-by-cell from Vespa's per-cell flux registers (ADR-0003 follow-up
 # #2): the orthogonal dims sweep the (D−1)-plane, the flux dim is the single
 # interface/boundary cell (the verified 1D mapping, generalized).
 function _write_fluxes!(h, level, i, gi, mesh::EnzoGridMesh{R}, sim, breg, model; conservative::Bool) where {R}
@@ -173,7 +173,7 @@ function _write_fluxes!(h, level, i, gi, mesh::EnzoGridMesh{R}, sim, breg, model
     return nothing
 end
 
-# The conservative :julia hydro hook: per grid on `level`, run EnzoNG's driver on
+# The conservative :julia hydro hook: per grid on `level`, run Vespa's driver on
 # the live state and write its fluxes into Enzo's registers.
 function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Bool = true,
                                        parent_ghost::Bool = true)
@@ -188,7 +188,7 @@ function conservative_julia_hydro_hook(; γ = 1.4, nghost = 3, conservative::Boo
             # SolveHydroEquations).  No-op filter in the serial flavor (all local).
             EnzoLib.problem_grid_processor(h, gi) == me || continue
             mesh, sim = _build_grid_sim(h, gi, model, nghost)
-            breg = EnzoNG._bflux_register(sim; record_interior = true)
+            breg = Vespa._bflux_register(sim; record_interior = true)
             sync_from_enzo!(sim.sv, mesh)
             # Consume Enzo's parent-interpolated ghost zones at this subgrid's
             # coarse–fine faces (ADR-0003 follow-up #1) instead of Outflow.
@@ -272,7 +272,7 @@ else
         # (A) THE FLUX BRIDGE IS EXACTLY CONSERVATIVE. On a static multi-level
         # hierarchy, while the waves are still interior to the refined region (so the
         # coarse–fine flux balance is the only conservation term), the recorded
-        # EnzoNG fluxes written into Enzo's registers conserve the composite mass/
+        # Vespa fluxes written into Enzo's registers conserve the composite mass/
         # energy to ROUND-OFF — and disabling the correction (zeros) drifts to ~1e-4,
         # the documented reflux signature. This is the decisive part-B gate
         # (test_reflux.jl is the template): a wrong index/sign/unit shows here.
@@ -295,7 +295,7 @@ else
         @test e_on.mass < 1e-3                        # conserves well end-to-end
         @test e_off.mass > 50 * e_on.mass             # reflux is decisive
 
-        # (C) PARENT-GHOST COUPLING (ADR-0003 follow-up #1). EnzoNG now consumes
+        # (C) PARENT-GHOST COUPLING (ADR-0003 follow-up #1). Vespa now consumes
         # Enzo's parent-interpolated ghost zones at a subgrid's coarse–fine faces
         # (a ParentGhost BC reading the live grid's ghosts) instead of an Outflow
         # (zero-gradient) copy. The Outflow ghost is the residual end-to-end drift:

@@ -1,4 +1,4 @@
-# Santa Barbara cluster: enzo-f32 CPU reference  vs  EnzoNG (Julia PPM + FFT gravity).
+# Santa Barbara cluster: enzo-f32 CPU reference  vs  Vespa (Julia PPM + FFT gravity).
 #
 # Drives the SAME SB cosmology problem through the SAME Julia EvolveLevel
 # (`evolve_level!`) twice, from identical initial conditions, swapping ONLY the
@@ -30,7 +30,7 @@ const OMEGA_B = 0.1; const OMEGA_CDM = 0.9
 const iD, iV1, iV2, iV3, iTE, iGE = 0, 1, 2, 3, 4, 5
 const FIELDS = [(iD,"ρ"), (iV1,"v1"), (iV2,"v2"), (iV3,"v3"), (iTE,"TE"), (iGE,"GE")]
 const BE = Symbol(get(ENV, "BACKEND", "cpu"))
-const T  = Float32                                  # EnzoNG kernels are f32
+const T  = Float32                                  # Vespa kernels are f32
 
 active_of(flat, gd, N) = Array(reshape(Float64.(flat), gd[1], gd[2], gd[3])[NG+1:NG+N, NG+1:NG+N, NG+1:NG+N])
 
@@ -57,7 +57,7 @@ cic!(rho, pos, N) = begin
     end; rho
 end
 
-# ── EnzoNG :julia slots (root grid; subgrids deferred to the composite-gravity task) ──
+# ── Vespa :julia slots (root grid; subgrids deferred to the composite-gravity task) ──
 const _step = Ref(0)
 function ng_gravity!(h, level, dt)
     level == 0 || return nothing

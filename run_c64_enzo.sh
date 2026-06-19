@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt NULL_GLOB; cd /Users/tabel/Projects/enzo-dev/EnzoNG.jl
+setopt NULL_GLOB; cd /Users/tabel/Projects/Vespa.jl
 export BACKEND=metal
 export ENZOMODULES_GRID_LIB=/Users/tabel/Projects/enzo-dev/EnzoModules/deps/libenzomodules_grid_f32.dylib
 export DYLD_LIBRARY_PATH=$HOME/grackle_install_f32/lib:/opt/homebrew/opt/hdf5/lib

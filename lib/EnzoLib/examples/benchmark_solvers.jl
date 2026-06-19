@@ -14,13 +14,13 @@
 #   - normalize by cells (µs/cell-update) so resolutions are comparable + extrapolate.
 #   - record provenance (CPU, threads, float precision of each side).
 
-using EnzoLib, EnzoNG, MeshInterface, RefMesh, EnzoBackend
+using EnzoLib, Vespa, MeshInterface, RefMesh, EnzoBackend
 using Printf
 
 const RUN = normpath(joinpath(@__DIR__, "..", "..", "..", "..", "run"))
 ms(ns) = ns / 1e6
 
-# ── :julia hooks (EnzoNG kernels on the live grid, via EnzoBackend) ────────────
+# ── :julia hooks (Vespa kernels on the live grid, via EnzoBackend) ────────────
 function julia_hydro_hook(; γ = 1.4, nghost = 3, domain = ((0.0, 1.0),), precision = Float64)
     cache = Ref{Any}(nothing); model = IdealHydro(γ)
     return function (h, level, dt)
@@ -162,9 +162,9 @@ function print_table(title, rows)
     @printf("(accuracy column = %s)\n\n", rows[1].acclabel)
 end
 
-# ── precision study: PURE EnzoNG (no Enzo), state persists in T ───────────────
+# ── precision study: PURE Vespa (no Enzo), state persists in T ───────────────
 # The guest-on-Enzo runs above round-trip the state through Enzo's f64 BaryonField
-# every step, so f32 barely shows. Here EnzoNG owns the state in T across the whole
+# every step, so f32 barely shows. Here Vespa owns the state in T across the whole
 # run, so the precision effect on BOTH accuracy and speed is real. Sweeping
 # resolution shows the regime: at small N the cost is compute/overhead-bound (f32
 # ≈ f64); f32's bandwidth win only appears once the field arrays stop fitting cache.
@@ -180,7 +180,7 @@ function l1_density(sim)
 end
 
 function bench_precision(; resolutions = (256, 1024, 4096), reps = 3)
-    println("### Precision study — pure EnzoNG Sod to t=0.2 (state persists in T)")
+    println("### Precision study — pure Vespa Sod to t=0.2 (state persists in T)")
     @printf("%-8s %7s %14s %8s %10s %9s %8s\n",
             "prec", "cells", "L1 vs exact", "cycles", "time ms", "µs/cell", "MB live")
     for N in resolutions
@@ -218,4 +218,4 @@ else
     end
 end
 
-bench_precision(; resolutions = (256, 1024, 4096), reps = 2)   # pure EnzoNG; no Enzo bridge needed
+bench_precision(; resolutions = (256, 1024, 4096), reps = 2)   # pure Vespa; no Enzo bridge needed

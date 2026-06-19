@@ -1,12 +1,12 @@
-# EnzoViz — inline AMR visualization for EnzoNG
+# EnzoViz — inline AMR visualization for Vespa
 
-EnzoViz turns a running EnzoNG simulation into a **self-contained interactive web
+EnzoViz turns a running Vespa simulation into a **self-contained interactive web
 page** per problem: a time slider, play/pause, and live-editable colormap / min /
 max / log-color, rendered through the [yipihey/veusz](https://github.com/yipihey/veusz)
 fork's GPU **Vello** painter and its `<veusz-figure>` WASM component.
 
-It lives under `lib/` like the mesh backends, so the core `EnzoNG` package stays
-headless and dependency-clean. EnzoNG exposes only a generic `callback` hook in
+It lives under `lib/` like the mesh backends, so the core `Vespa` package stays
+headless and dependency-clean. Vespa exposes only a generic `callback` hook in
 `evolve!`; EnzoViz supplies a writer that snapshots field data each cadence step.
 
 ## How it works
@@ -53,7 +53,7 @@ is already built in the fork.)
 ## Usage
 
 ```julia
-using EnzoNG, RefMesh, EnzoViz
+using Vespa, RefMesh, EnzoViz
 prob = sod_problem_defaults(n = 256)
 sim  = Simulation(UniformMesh(prob.dims, prob.domain), prob)
 viz  = VizSession(sim; outdir = "out/Sod", every = 5)        # fields default: ρ, p, |v|

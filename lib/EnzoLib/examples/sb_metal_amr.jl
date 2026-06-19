@@ -40,7 +40,7 @@ end
 
 function _write_summary(path; rows, backend, precision, maxcyc, stop_on_refinement, status)
     open(path, "w") do io
-        println(io, "# Santa Barbara EnzoNG slot campaign")
+        println(io, "# Santa Barbara Vespa slot campaign")
         println(io)
         println(io, "- backend: `$backend`")
         println(io, "- precision: `$precision`")

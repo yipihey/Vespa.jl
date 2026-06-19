@@ -1,4 +1,4 @@
-# CICASS high-z cosmology on the EnzoNG GPU path, with H+D reduced chemistry.
+# CICASS high-z cosmology on the Vespa GPU path, with H+D reduced chemistry.
 #
 # Sets up a CICASS streaming-velocity box (default 128 kpc/h, 128³ cells+particles)
 # at z=1000, injects the baryon overdensity + bulk velocity + DM particles into a
@@ -427,7 +427,7 @@ function main_cic()
     datafile = joinpath(REPORTS, "cicass_highz_pk$(TAG).dat")
     function write_tables()                          # rewrite the full table (cheap; ≤NOUT outputs)
         open(datafile, "w") do io
-            println(io, "# CICASS z=$ZSTART→$ZEND box=$BOX Mpc/h N=$NGRID  (GPU EnzoNG, H+D chem)")
+            println(io, "# CICASS z=$ZSTART→$ZEND box=$BOX Mpc/h N=$NGRID  (GPU Vespa, H+D chem)")
             println(io, "# theory_* = IC realization grown by D(a)²; theory_*_cic = CICASS analytic linear theory grown by D(a)²")
             println(io, "# block: z  comp  then  k[h/Mpc] P[(Mpc/h)^3] rows")
             for r in pk_results

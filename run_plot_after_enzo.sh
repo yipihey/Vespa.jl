@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt NULL_GLOB; cd /Users/tabel/Projects/enzo-dev/EnzoNG.jl
+setopt NULL_GLOB; cd /Users/tabel/Projects/Vespa.jl
 EL=reports/multicode/c64_enzo.log
 PY=$HOME/Projects/disco-dj-fem/.venv/bin/python
 # wait for Enzo's sentinel (file may not exist yet)

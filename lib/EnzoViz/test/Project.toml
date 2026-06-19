@@ -3,7 +3,7 @@
 # git dep pulled in transitively by HGBackend) resolves directly.
 [deps]
 EnzoViz = "1a2b3c4d-0004-4000-8000-000000000004"
-EnzoNG = "1a2b3c4d-0000-4000-8000-000000000000"
+Vespa = "1a2b3c4d-0000-4000-8000-000000000000"
 MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
 RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
 HGBackend = "1a2b3c4d-0003-4000-8000-000000000003"
@@ -17,9 +17,9 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 EnzoViz = {path = ".."}
-EnzoNG = {path = "../../.."}
+Vespa = {path = "../../.."}
 MeshInterface = {path = "../../MeshInterface"}
 RefMesh = {path = "../../RefMesh"}
 HGBackend = {path = "../../HGBackend"}
-HierarchicalGrids = {path = "/Users/tabel/Projects/HierarchicalGrids.jl"}
+HierarchicalGrids = {path = "../../../../HierarchicalGrids.jl"}
 R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}

@@ -24,7 +24,7 @@ ENV["ENZONG_ENZO_MPI"] = "1"          # select the MPI bridge dylib (before any 
 using MPI
 using Test
 using EnzoLib, EnzoFixtures
-using EnzoNG, MeshInterface, RefMesh, EnzoBackend
+using Vespa, MeshInterface, RefMesh, EnzoBackend
 
 MPI.Init()
 const COMM = MPI.COMM_WORLD

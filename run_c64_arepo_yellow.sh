@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-cd /home/tabel/Projects/enzo-dev/EnzoNG.jl
+cd /home/tabel/Projects/Vespa.jl
 export AREPO_LIB=/home/tabel/Projects/arepo/libarepo3d_cosmo.so
 export LD_LIBRARY_PATH=/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export BACKEND=cpu

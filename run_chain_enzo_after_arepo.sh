@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt NULL_GLOB; cd /Users/tabel/Projects/enzo-dev/EnzoNG.jl
+setopt NULL_GLOB; cd /Users/tabel/Projects/Vespa.jl
 AL=reports/multicode/c64_arepo.log
 # wait for Arepo's sentinel
 until grep -q "===== EXIT" "$AL" 2>/dev/null; do sleep 15; done

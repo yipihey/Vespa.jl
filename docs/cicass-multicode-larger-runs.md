@@ -53,7 +53,7 @@ missing input). NB the Enzo file is `cicass_highz_pk_c64.dat`, *not*
   directly (`P_dm(z)/P_dm(z_init)` per code vs the linear D(a)²) before reading
   δb/δc.
 
-The cross-code DM-growth divergence is the known **EnzoNG GPU DM under-growth**
+The cross-code DM-growth divergence is the known **Vespa GPU DM under-growth**
 issue (gravity / leapfrog-timestep / PM-resolution), now visible across all
 three solvers. It must be understood independently of the baryon physics.
 
@@ -126,7 +126,7 @@ the codes the CICASS run doesn't exercise. All are under `github.com/yipihey`:
 
 | local dir (`~/Projects/…`) | clone | branch | needed for |
 |---|---|---|---|
-| `enzo-dev` | `yipihey/enzo-dev` | `enzong-amr-subcycling-refluxing` | Enzo + EnzoNG.jl (this tree) |
+| `enzo-dev` | `yipihey/enzo-dev` | `enzong-amr-subcycling-refluxing` | Enzo + Vespa.jl (this tree) |
 | `Arepo.jl` | `yipihey/Arepo.jl` | `main` | ArepoLib wrapper |
 | `RamsesNG.jl` | `yipihey/RamsesNG.jl` | `main` | RamsesLib wrapper |
 | `CICASS.jl` | `yipihey/CICASS.jl` | `main` | CICASSLib (IC wrapper) |

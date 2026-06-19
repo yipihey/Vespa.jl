@@ -7,7 +7,7 @@
   Supersedes the in-process embedding approach of ADR-0004 for the multi-rank case.
 - **Date:** 2026-06-04
 - **Builds on:** ADR-0004 (optional MPI for the Enzo substrate). The C-ABI bridge
-  (`EnzoModules/src/enzomodules_problem_bridge.C` ↔ `EnzoNG.jl/lib/EnzoLib/src/session.jl`).
+  (`EnzoModules/src/enzomodules_problem_bridge.C` ↔ `Vespa.jl/lib/EnzoLib/src/session.jl`).
 
 ---
 
@@ -44,7 +44,7 @@ descriptions of one interface, so the design keeps exactly **one** contract plus
 2. **Transport swapped behind one seam — zero API churn.** Every call already goes through
    `_gsym` + `ccall`. Abstract that into `_invoke(fn_id, sig, args...)` with two backends:
    **local = ccall** (the serial path, byte-identical to today) and **remote = RPC**. All of
-   EnzoNG above `session.jl` is unchanged and agnostic to which it talks to. Chosen by config
+   Vespa above `session.jl` is unchanged and agnostic to which it talks to. Chosen by config
    (e.g. `EngineConfig`/env), defaulting to local.
 
 3. **POSIX shared memory for bulk field/flux arrays (zero-copy).** Each node runs its own
@@ -53,7 +53,7 @@ descriptions of one interface, so the design keeps exactly **one** contract plus
    subgrid/boundary flux planes) are passed by `mmap`'d shared region + a descriptor
    `(dtype, rank, dims, nbytes)`; only the descriptor crosses the control channel. The
    control channel (unix socket/pipe) carries scalars and descriptors. Precision is explicit
-   in the descriptor and routed through EnzoNG's existing convert-at-boundary pattern.
+   in the descriptor and routed through Vespa's existing convert-at-boundary pattern.
 
 4. **Self-describing, validated frames.** Every buffer carries its descriptor; the receiver
    validates it against the manifest's declared signature. A dtype/shape/size mismatch is a
@@ -74,7 +74,7 @@ descriptions of one interface, so the design keeps exactly **one** contract plus
 The worker is "a process that holds the grid, runs a physics backend, does its own inter-node
 communication, and speaks the manifest protocol over shm + control channel." Enzo+MPI is the
 first worker; Legion/Regent or a Rust backend slot in behind the same protocol and the same
-parity oracle, with no change to EnzoNG above `session.jl`.
+parity oracle, with no change to Vespa above `session.jl`.
 
 ## Consequences / non-goals
 

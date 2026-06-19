@@ -80,7 +80,7 @@ function VizSession(sim; outdir::AbstractString,
                     record::Bool = false)
     mods = _pymods()
     mkpath(outdir)
-    R = EnzoNG.rank(sim.backend)
+    R = Vespa.rank(sim.backend)
     R in (1, 2) || error("EnzoViz supports 1D and 2D problems (got rank $R)")
     be = _choose_backend(backend)
     flds = Tuple(Symbol.(collect(fields)))
@@ -95,7 +95,7 @@ function VizSession(sim; outdir::AbstractString,
 
     doc = mods[:document].Document()
     ci = mods[:document].CommandInterface(doc)
-    nlev = R == 2 ? EnzoNG.max_level(sim.backend) + 1 : 0
+    nlev = R == 2 ? Vespa.max_level(sim.backend) + 1 : 0
     if R == 1
         _build_doc_1d!(ci, flds, sim, ranges)
     else
@@ -116,7 +116,7 @@ end
 # ── document builders (run ONCE) ────────────────────────────────────────────
 
 function _build_doc_1d!(ci, fields, sim, ranges)
-    dom = EnzoNG.domain(sim.backend)[1]
+    dom = Vespa.domain(sim.backend)[1]
     ci.To("/")
     ci.Add("page", name = "page1")
     ci.To("/page1")
@@ -166,7 +166,7 @@ function _stack_canvas(size::Tuple{Int,Int}, nf::Integer)
 end
 
 function _build_doc_2d!(ci, fields, sim, ranges, nlev)
-    dom = EnzoNG.domain(sim.backend)
+    dom = Vespa.domain(sim.backend)
     ci.To("/")
     ci.Add("page", name = "page1")
     ci.To("/page1")
@@ -297,7 +297,7 @@ function snapshot!(viz::VizSession)
             raster = (kind = :d1, x = x, cols = cols)
         else
             # If AMR added levels since the doc was built, extend the template.
-            nlev_now = EnzoNG.max_level(viz.sim.backend) + 1
+            nlev_now = Vespa.max_level(viz.sim.backend) + 1
             if nlev_now > viz.nlevels
                 _extend_levels_2d!(viz, viz.nlevels, nlev_now)
                 viz.nlevels = nlev_now

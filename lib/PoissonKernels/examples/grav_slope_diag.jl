@@ -1,4 +1,4 @@
-# Pin down the ~0.84 gravity-amplitude slope (EnzoNG accel ~19% stronger than Enzo)
+# Pin down the ~0.84 gravity-amplitude slope (Vespa accel ~19% stronger than Enzo)
 # by decomposing the root Poisson source against Enzo's own root acceleration.
 # Tests the "OmegaB / gas not correctly integrated" hypothesis: compare slopes for
 # gas+DM, DM-only, gas-only, and physical-sum source compositions.

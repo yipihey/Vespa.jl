@@ -1,7 +1,7 @@
 """
     MeshInterface
 
-The load-bearing boundary of EnzoNG (ADR-0001, P2/P10): the single interface
+The load-bearing boundary of Vespa (ADR-0001, P2/P10): the single interface
 that the driver, solvers, problem specs, and analysis are written against. It
 defines **everything** the project requires of an AMR substrate and **nothing**
 about any concrete backend.

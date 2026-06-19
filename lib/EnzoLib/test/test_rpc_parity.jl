@@ -13,7 +13,7 @@
 # hosting is #3, orthogonal to this protocol).
 
 using Test
-using EnzoLib, EnzoFixtures, EnzoNG, MeshInterface, RefMesh, EnzoBackend
+using EnzoLib, EnzoFixtures, Vespa, MeshInterface, RefMesh, EnzoBackend
 
 const RPC_PF = abspath(joinpath(@__DIR__, "..", "..", "..", "..",
                                 "run", "Hydro", "Hydro-1D", "SodShockTube", "SodShockTubeAMR.enzo"))

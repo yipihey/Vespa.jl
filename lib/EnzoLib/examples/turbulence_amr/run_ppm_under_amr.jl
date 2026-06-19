@@ -53,7 +53,7 @@ include(joinpath(@__DIR__, "ic_inject.jl"))            # inject_turbulence!  (sh
 # grid cell c; the plane fixes the flux-dim grid coordinate at `ng + m` and sweeps the
 # two orthogonal dims over the global extent (st,en). The value is scaled to Enzo's
 # register units (enzo_value = F·dt/dx, matching the certified `bflux/Vcell` path).
-# Mirrors EnzoNG.bflux_plane's column-major (dim-0 fastest) linearization.
+# Mirrors Vespa.bflux_plane's column-major (dim-0 fastest) linearization.
 function frec_plane(frec, slot, dims, ng, dim, m, st, en, g0, dtdx)
     nx, ny, _ = dims
     Dim = ntuple(d -> en[d] - st[d] + 1, 3)
@@ -87,7 +87,7 @@ function write_ppm_fluxes!(h, level, gi, g, dims, frec, dt, dxd)
     end
     # proper subgrids: the coarse interior flux at each coarse–fine interface face. The
     # flux-dim cell `m` is the −axis face of the boundary coarse cell (Left) or of the
-    # cell just past it (Right) — m = (st−g0) + side + 1 (the verified EnzoNG mapping).
+    # cell just past it (Right) — m = (st−g0) + side + 1 (the verified Vespa mapping).
     for sub in 0:nsub-2, dim in 0:2, side in 0:1
         st, en = EnzoLib.problem_subgrid_flux_extent(h, level, gi, sub, dim, side)
         setp(sub, dim, side, (st[dim+1] - g0[dim+1]) + side + 1, st, en)

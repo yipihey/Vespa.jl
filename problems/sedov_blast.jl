@@ -10,7 +10,7 @@
 # domain, so the refined region must track it dynamically. The spec runs on any
 # backend; on HGBackend with a RefinementPolicy the mesh follows the shock.
 
-using EnzoNG
+using Vespa
 
 """
     sedov_problem(; n=64, E0=1.0, ρ0=1.0, p0=1e-5, γ=1.4,

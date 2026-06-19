@@ -1,4 +1,4 @@
-# EnzoNG framework — planned next steps
+# Vespa framework — planned next steps
 
 The recorded, already-scoped directions beyond the completed program
 (ADR-0006 phases 0–7, Next-1…14, Phase C). Each item is grounded in work that
@@ -133,12 +133,12 @@ The `f32` Enzo bridge flavor (p4_b4, `ENZOMODULES_GRID_LIB`-selected) is the
 faithful-precision CPU reference for the Metal kernels (ρ parity 4e-4 on SB).
 With Phase C's level>0 gravity hook now done (it was the open TODO in the f32
 notes), a from-ICs structure-formation run becomes the end-to-end science gate:
-EnzoNG-Metal vs enzo-f32 trajectories on a real cosmological volume.
+Vespa-Metal vs enzo-f32 trajectories on a real cosmological volume.
 Implementation status: the short f32 structure-formation gate has run for 6
 cycles from the Santa Barbara ICs with native `enzo-f32` as the reference and
-EnzoNG Metal-f32 as the candidate. See
+Vespa Metal-f32 as the candidate. See
 `reports/multicode/santa_barbara_structure_f32.md`: both reach `t=0.933129`,
-rho relL2 is `3.766e-04`, TE/GE relL2 are about `2.6e-04`, and EnzoNG Metal is
+rho relL2 is `3.766e-04`, TE/GE relL2 are about `2.6e-04`, and Vespa Metal is
 8.28× faster per cycle (15.18× in hydro, 4.10× in gravity).
 
 ---

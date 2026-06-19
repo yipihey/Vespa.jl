@@ -4,7 +4,7 @@
 Native (`ccall`) Julia binding to the **EnzoModules C-ABI** — the stable
 `extern "C"` surface (`EnzoModules/src/enzomodules_bridge.h`) over selected
 legacy Enzo compute kernels, compiled into a shared library. This is the FFI
-floor of the EnzoNG↔Enzo integration: it reuses the *reference legacy kernel*
+floor of the Vespa↔Enzo integration: it reuses the *reference legacy kernel*
 directly so a Julia rewrite can run in full-replication mode and be certified
 against it (see EnzoFixtures + the parity tests).
 

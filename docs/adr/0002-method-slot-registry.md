@@ -21,13 +21,13 @@ constrained-transport MHD and AMR+CT+cosmology.
 
 One slot is **already swappable**: `evolve_level!(…; hydro!)` takes the hydro
 step as a function — the default calls the legacy bridge, and a `:julia` closure
-runs EnzoNG's HLLC/PLM/SSP-RK2 on the live grid (proved in E3/E5 via
+runs Vespa's HLLC/PLM/SSP-RK2 on the live grid (proved in E3/E5 via
 `EnzoBackend`). Every *other* step is hard-wired to the legacy bridge and gated
 by a boolean flag (`gravity`, `cooling`, `radiation`, `cosmology`, `mhdct`, …).
 
 The goal of ADR-0001's "careful, certified incremental rewrite" needs this
 generalized: **each physics step becomes a slot that resolves to `:enzo`
-(legacy bridge) or `:julia` (EnzoNG kernel) on the shared live hierarchy**, with
+(legacy bridge) or `:julia` (Vespa kernel) on the shared live hierarchy**, with
 per-slot certification against the legacy reference. That is the method-slot
 registry.
 
@@ -59,7 +59,7 @@ way on the live grid:
 ```julia
 run_slot(::Val{:gravity}, impl, h, level, cfg) =
     impl === ENZO  ? session_gravity(h, level) :
-    impl === JULIA ? julia_gravity!(h, level, cfg.model) :   # EnzoNG CG Poisson on Enzo memory
+    impl === JULIA ? julia_gravity!(h, level, cfg.model) :   # Vespa CG Poisson on Enzo memory
                      nothing                                  # OFF
 ```
 
@@ -72,19 +72,19 @@ fluxes, advance_time, the AMR conservation machinery, regrid) that calls
 
 | Slot | `:enzo` (today) | `:julia` source | Notes |
 |---|---|---|---|
-| `hydro` | `session_solve_hydro` | EnzoNG HLLC+PLM+SSP-RK2 (E3/E5, done) | the proof of concept |
-| `gravity` | `session_gravity` | EnzoNG matrix-free CG Poisson | EnzoNG already has the solver |
-| `comoving_expansion` | `session_comoving_expansion` | EnzoNG `apply_expansion_terms!` | role-driven via EquationSet |
+| `hydro` | `session_solve_hydro` | Vespa HLLC+PLM+SSP-RK2 (E3/E5, done) | the proof of concept |
+| `gravity` | `session_gravity` | Vespa matrix-free CG Poisson | Vespa already has the solver |
+| `comoving_expansion` | `session_comoving_expansion` | Vespa `apply_expansion_terms!` | role-driven via EquationSet |
 | `cooling` | `session_solve_cooling` | (future) | needs chemistry port |
 | `mhd_ct` | EMF refluxing (done) | (far future) | face-B CT in Julia is a large port |
 | `radiation`/`star_*` | bridge | (out of scope) | |
 
 ### What a `:julia` slot requires
 
-A `:julia` slot must run an EnzoNG kernel **on Enzo-owned memory** and leave the
+A `:julia` slot must run an Vespa kernel **on Enzo-owned memory** and leave the
 state in exactly the layout the *next* (possibly `:enzo`) step expects:
 
-1. **Read** the live grid fields (`problem_get_field`) and assemble EnzoNG
+1. **Read** the live grid fields (`problem_get_field`) and assemble Vespa
    conserved state via the `EquationSet` role indices (the `EnzoBackend` sync).
 2. **Run** the kernel through the `MeshInterface` seam (`EnzoBackend` aliases the
    grid) — the same unchanged `Simulation`/`step!` path RefMesh/HGBackend use.
@@ -121,7 +121,7 @@ quicksuite harness is the per-run gate.
   quicksuite must stay green bit-for-bit (pure refactor).
 - **Phase B — hydro slot via the registry.** Wire the existing E5 `EnzoBackend`
   hydro path in as `hydro=JULIA`; certify Sod/Toro through the registry.
-- **Phase C — first *new* port: `gravity=JULIA`.** Run EnzoNG's CG Poisson on the
+- **Phase C — first *new* port: `gravity=JULIA`.** Run Vespa's CG Poisson on the
   live grid, fill `AccelerationField`, certify vs `gravity=ENZO` on a
   self-gravity problem (per-step first, then per-run). This is the template every
   later port reuses.
@@ -161,10 +161,10 @@ quicksuite harness is the per-run gate.
   conservation bookkeeping, so it is gated to `eng.hydro === :enzo` — a `:julia`
   hydro owns its own conservation (single-grid per scope).
 - **Phase B — done.** `EngineConfig(hydro=:julia)` routes hydro to an EnzoBackend
-  hook running EnzoNG's unchanged driver on the live grid; Toro-1 via the registry
+  hook running Vespa's unchanged driver on the live grid; Toro-1 via the registry
   matches the exact Riemann oracle to L1=0.012 (`test_method_slots.jl`).
 - **Phase C — done (solver port certified on live memory).** `gravity=:julia`
-  runs EnzoNG's matrix-free CG Poisson on the **live Enzo grid's baryon density**
+  runs Vespa's matrix-free CG Poisson on the **live Enzo grid's baryon density**
   (ZeldovichPancake, 256 cells): converges to relres 8.4e-9 in 75 iters, potential
   anti-correlates with density at −0.997 (wells at overdensities). This is the
   first NEW physics solver running on live Enzo memory through the registry.

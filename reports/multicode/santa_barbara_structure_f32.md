@@ -11,16 +11,16 @@ BACKEND=metal \
 
 Both configurations start from the same Santa Barbara ICs through the f32 Enzo
 bridge.  The reference uses native Enzo PPM + FFT gravity; the candidate uses
-EnzoNG PPMKernels/PoissonKernels on Metal-f32.
+Vespa PPMKernels/PoissonKernels on Metal-f32.
 
 | quantity | value |
 |---|---:|
 | cycles | 6 |
 | final time, reference | 0.933129 |
-| final time, EnzoNG-Metal | 0.933129 |
+| final time, Vespa-Metal | 0.933129 |
 | relative time difference | 0.00e+00 |
 | reference median cycle | 4139.7 ms |
-| EnzoNG-Metal median cycle | 500.2 ms |
+| Vespa-Metal median cycle | 500.2 ms |
 | total speedup | 8.28 |
 | gravity speedup | 4.10 |
 | hydro speedup | 15.18 |
@@ -34,7 +34,7 @@ EnzoNG PPMKernels/PoissonKernels on Metal-f32.
 | TE | 2.675e-04 | 2.753e-07 | 1.821e-04 |
 | GE | 2.512e-04 | 2.724e-07 | 1.820e-04 |
 
-This is the short structure-formation science gate: EnzoNG-Metal and the native
+This is the short structure-formation science gate: Vespa-Metal and the native
 enzo-f32 reference reach the same epoch from the same cosmological ICs, with
 rho/energy parity at the expected f32 SB floor and velocity relative errors
 dominated by the very small absolute velocity scale.

@@ -8,11 +8,14 @@
 # final link of build_pilot.sh. We locate it via `gfortran -print-file-name` and
 # put it on LIBRARY_PATH (honored by clang for -l search). Harmless on Linux.
 
-const REPO = normpath(joinpath(@__DIR__, "..", "..", "..", ".."))
+# EnzoModules lives in the sibling enzo-dev repo (Vespa.jl was extracted from it).
+# Default to the sibling layout ~/Projects/{Vespa.jl,enzo-dev}; override with ENV["ENZO_DEV_REPO"].
+const REPO = get(ENV, "ENZO_DEV_REPO",
+                 normpath(joinpath(@__DIR__, "..", "..", "..", "..", "enzo-dev")))
 const SCRIPT = joinpath(REPO, "EnzoModules", "deps", "build_pilot.sh")
 const SO = joinpath(REPO, "EnzoModules", "deps", "libenzomodules_pilot.so")
 
-isfile(SCRIPT) || error("build_pilot.sh not found at $SCRIPT (is EnzoModules present?)")
+isfile(SCRIPT) || error("build_pilot.sh not found at $SCRIPT (set ENV[\"ENZO_DEV_REPO\"] to the enzo-dev checkout)")
 
 fc = get(ENV, "FC", "gfortran")
 gflib = try

@@ -43,19 +43,19 @@ MultiCodeCICASSExt = "CICASSLib"
 MultiCodeDfmmExt = "dfmm"
 
 [sources]
-CICASSLib = {path = "../../../../CICASS.jl/lib/CICASSLib"}
-Gadget4Lib = {path = "../../../../Gadget4.jl/lib/Gadget4Lib"}
-DiscoDJLib = {path = "../../../../DiscoDJ.jl/lib/DiscoDJLib"}
-MusicLib = {path = "../../../../Music.jl/lib/MusicLib"}
-AthenaLib = {path = "../../../../Athena.jl/lib/AthenaLib"}
-dfmm = {path = "../../../../dfmm"}
-ArepoLib = {path = "../../../../Arepo.jl/lib/ArepoLib"}
+CICASSLib = {path = "../../../CICASS.jl/lib/CICASSLib"}
+Gadget4Lib = {path = "../../../Gadget4.jl/lib/Gadget4Lib"}
+DiscoDJLib = {path = "../../../DiscoDJ.jl/lib/DiscoDJLib"}
+MusicLib = {path = "../../../Music.jl/lib/MusicLib"}
+AthenaLib = {path = "../../../Athena.jl/lib/AthenaLib"}
+dfmm = {path = "../../../dfmm"}
+ArepoLib = {path = "../../../Arepo.jl/lib/ArepoLib"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}
 PoissonKernels = {path = "../PoissonKernels"}
-R3D = {path = "../../../../r3djl/R3D.jl"}
-RamsesLib = {path = "../../../../RamsesNG.jl/lib/RamsesLib"}
+R3D = {path = "../../../r3djl/R3D.jl"}
+RamsesLib = {path = "../../../RamsesNG.jl/lib/RamsesLib"}
 
 [compat]
 julia = "1.10"

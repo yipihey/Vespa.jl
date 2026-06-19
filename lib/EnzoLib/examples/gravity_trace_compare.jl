@@ -1,4 +1,4 @@
-# Per-substep CPU(Enzo)-vs-GPU(EnzoNG) gravity divergence tracer.
+# Per-substep CPU(Enzo)-vs-GPU(Vespa) gravity divergence tracer.
 #
 # Reads an evolved SB state (warm up WARM cycles with pure Enzo), then traces ONE
 # top-grid step through the live recursive evolve_level!. At EVERY level/subcycle the

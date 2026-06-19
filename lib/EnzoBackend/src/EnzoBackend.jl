@@ -1,16 +1,16 @@
 """
     EnzoBackend
 
-A `MeshInterface` backend over a **live Enzo grid**, so EnzoNG's *unchanged*
+A `MeshInterface` backend over a **live Enzo grid**, so Vespa's *unchanged*
 `Simulation`/driver runs through the seam on Enzo-owned state — the full
-seam-level integration (vs the E3 slot, which reused EnzoNG kernels directly).
+seam-level integration (vs the E3 slot, which reused Vespa kernels directly).
 
 `EnzoGridMesh` satisfies the seam by delegating the (uniform) geometry/topology to
 a `RefMesh.UniformMesh` over the grid's ACTIVE region, and links the live Enzo
-handle + field map. Because EnzoNG stores **conserved** `(ρ, ρv, E)` while Enzo
+handle + field map. Because Vespa stores **conserved** `(ρ, ρv, E)` while Enzo
 stores `(Density, Velocity1, TotalEnergy_specific)`, the field state cannot be a
 zero-copy alias — `sync_from_enzo!`/`sync_to_enzo!` transform between them around
-each EnzoNG step. ND single-grid (1D/2D/3D); AMR drives it per-grid per-level via
+each Vespa step. ND single-grid (1D/2D/3D); AMR drives it per-grid per-level via
 the Julia EvolveLevel (the `:julia` hydro slot iterates the grids on a level).
 """
 module EnzoBackend
@@ -25,7 +25,7 @@ export EnzoGridMesh, sync_from_enzo!, sync_to_enzo!, enzo_parent_ghost
 # CONSERVED-state role indices (which sv component is density / momentum / energy).
 # The role indices are supplied by the caller FROM the EquationSet model
 # (`density_index`/`momentum_indices`/`energy_index`), so the variable choice is
-# the model's, not hardcoded here — and EnzoBackend stays free of any EnzoNG dep.
+# the model's, not hardcoded here — and EnzoBackend stays free of any Vespa dep.
 # T is the FIELD-STATE precision (Float64 default, Float32 for the precision/perf
 # benchmark). GEOMETRY stays Float64 (`geom`) — the hydro kernels take `area::Float64`,
 # and widths/areas are O(N) and uniform — while the conserved-state ARRAYS the
@@ -114,12 +114,12 @@ MI.field_view(m::EnzoGridMesh, args...)             = MI.field_view(m.alloc, arg
 MI.for_each_cell(f, m::EnzoGridMesh; kw...) = MI.for_each_cell(f, m.geom; kw...)
 MI.for_each_face(f, m::EnzoGridMesh; kw...) = MI.for_each_face(f, m.geom; kw...)
 
-# ── field sync: live Enzo grid ↔ EnzoNG conserved views (ND) ──────────────────
+# ── field sync: live Enzo grid ↔ Vespa conserved views (ND) ──────────────────
 # Each active cell (CartesianIndex over the active region) maps to a column-major
 # flat index of the ghost-zoned Enzo field via `_enzo_flat`. Enzo stores
-# (Density, Velocity1..k, TotalEnergy_specific); EnzoNG stores conserved
+# (Density, Velocity1..k, TotalEnergy_specific); Vespa stores conserved
 # (ρ, ρv, E_density). Velocity components absent on the grid contribute 0 momentum.
-"Pull the live Enzo grid state into EnzoNG's conserved views `sv` (Enzo → conserved)."
+"Pull the live Enzo grid state into Vespa's conserved views `sv` (Enzo → conserved)."
 function sync_from_enzo!(sv, m::EnzoGridMesh{N,T}) where {N,T}
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)     # specific total energy
@@ -137,7 +137,7 @@ function sync_from_enzo!(sv, m::EnzoGridMesh{N,T}) where {N,T}
     return nothing
 end
 
-"Push EnzoNG's conserved views `sv` back into the live Enzo grid (conserved → Enzo)."
+"Push Vespa's conserved views `sv` back into the live Enzo grid (conserved → Enzo)."
 function sync_to_enzo!(m::EnzoGridMesh{N,T}, sv) where {N,T}
     d  = EnzoLib.problem_get_field(m.h, m.di, m.grid)
     es = EnzoLib.problem_get_field(m.h, m.ei, m.grid)
@@ -161,7 +161,7 @@ end
 
 # ── parent-ghost coupling (ADR-0003 follow-up #1) ─────────────────────────────
 # Enzo fills a subgrid's ghost zones from its parent (InterpolateBoundaryFromParent,
-# via session_set_boundary) BEFORE the hydro solve. EnzoNG's driver is ghost-free
+# via session_set_boundary) BEFORE the hydro solve. Vespa's driver is ghost-free
 # and otherwise synthesizes an Outflow (zero-gradient) ghost at a subgrid's outer
 # faces — wrong when a wave sits ON the coarse–fine interface (rel-error × flux =
 # the residual ~1e-3 per-step / ~1e-5 end-to-end drift). This reads Enzo's ALREADY-
@@ -170,7 +170,7 @@ end
 # (via a ParentGhost BC) uses the parent value instead of an Outflow copy.
 #
 # Snapshot the field arrays ONCE (they are valid at hook entry, right after
-# session_set_boundary, and EnzoNG only writes ACTIVE cells back within a step) and
+# session_set_boundary, and Vespa only writes ACTIVE cells back within a step) and
 # capture them in the returned closure `(axis, side, cell) -> U_cons::NTuple{NV,T}`.
 # The ghost cell adjacent to active boundary cell `I` is one Enzo zone outward of
 # `_enzo_flat(m, I)` along `axis`: −strides[axis] for :lo, +strides[axis] for :hi.
@@ -203,7 +203,7 @@ end
 Snapshot grid `m`'s live Enzo ghost zones (parent-interpolated by Enzo's
 `session_set_boundary` before the solve) and return a closure giving the CONSERVED
 role-ordered ghost state at any outer boundary face. Wrap it in a `ParentGhost` BC
-(after `cons2prim`) so EnzoNG's driver consumes Enzo's parent ghosts at coarse–fine
+(after `cons2prim`) so Vespa's driver consumes Enzo's parent ghosts at coarse–fine
 interfaces instead of an Outflow copy. Call ONCE per step, after `sync_from_enzo!`.
 """
 function enzo_parent_ghost(m::EnzoGridMesh{N,T}) where {N,T}

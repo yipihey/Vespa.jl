@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-cd /home/tabel/Projects/enzo-dev/EnzoNG.jl
+cd /home/tabel/Projects/Vespa.jl
 export BACKEND=cpu
 export ENZOMODULES_GRID_LIB=/home/tabel/Projects/enzo-dev/EnzoModules/deps/libenzomodules_grid.so
 export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/26.3/cuda/13.1/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/26.3/compilers/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

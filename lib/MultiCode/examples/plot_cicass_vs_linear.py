@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Simulation P(k) (EnzoNG GPU, Metal hydro+gravity, H+D chemistry) vs CICASS
+"""Simulation P(k) (Vespa GPU, Metal hydro+gravity, H+D chemistry) vs CICASS
 linear theory AT THE SAME output redshifts.  Markers = measured; solid lines =
 CICASS analytic linear P(k) generated at each z (2-fluid transfer, so the baryon
 catch-up after recombination is included).  Left = baryons, right = DM."""
@@ -20,7 +20,7 @@ def load(fn):
         else: a,b=line.split();ks.append(float(a));Ps.append(float(b))
     flush();return B
 
-R="/Users/tabel/Projects/enzo-dev/EnzoNG.jl/reports/multicode/"
+R="/Users/tabel/Projects/Vespa.jl/reports/multicode/"
 sim=load(R+"cicass_highz_pk.dat"); lin=load(R+"cicass_linear_pk.dat")
 simz=sorted({k[0] for k in sim},reverse=True)
 linz=sorted({k[0] for k in lin},reverse=True)
@@ -37,8 +37,8 @@ for ax,comp,title in ((axb,"baryon","Baryons (gas density)"),(axd,"dm","Dark mat
     ax.set_title(title,fontsize=11); ax.set_xlabel(r"$k\ [h\,{\rm Mpc}^{-1}]$")
     ax.grid(which="both",alpha=0.15)
 axb.set_ylabel(r"$P(k)\ [(h^{-1}{\rm Mpc})^3]$")
-axb.legend(title="markers = EnzoNG GPU sim\nlines = CICASS linear (same z)",fontsize=8,ncol=2,loc="lower left",title_fontsize=8)
-fig.suptitle("CICASS 128 kpc/h box: EnzoNG GPU sim vs CICASS linear theory at matched redshifts (z=1000→75)",fontsize=12)
+axb.legend(title="markers = Vespa GPU sim\nlines = CICASS linear (same z)",fontsize=8,ncol=2,loc="lower left",title_fontsize=8)
+fig.suptitle("CICASS 128 kpc/h box: Vespa GPU sim vs CICASS linear theory at matched redshifts (z=1000→75)",fontsize=12)
 fig.tight_layout()
 out=R+"cicass_vs_linear.png"; fig.savefig(out,dpi=140); print("wrote",out)
 

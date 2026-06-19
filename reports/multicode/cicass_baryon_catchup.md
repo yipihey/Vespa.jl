@@ -72,6 +72,6 @@ per-step-tiny-but-cumulative convention mismatch) is **not yet pinned — deferr
 ## Decision
 
 The production Enzo CICASS campaign uses **`hydro=:enzo, gravity=:enzo`** (native
-Enzo kernels driven by the Julia `evolve_level!` loop — still EnzoNG). This is
+Enzo kernels driven by the Julia `evolve_level!` loop — still Vespa). This is
 verified to match two-fluid linear theory. Data: `cicass_highz_pk_natenzo.dat`.
 The `:julia` GPU-hydro path is an orthogonal optimization to repair later.

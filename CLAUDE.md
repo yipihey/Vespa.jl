@@ -1,4 +1,4 @@
-# CLAUDE.md — EnzoNG.jl
+# CLAUDE.md — Vespa.jl
 
 Next-generation Enzo: shared-memory AMR astrophysics, **orchestration in Julia**
 over a **swappable AMR substrate behind one interface**. This file is the working
@@ -50,8 +50,15 @@ The seam is enforced by package boundaries: `src/` cannot name a concrete backen
 ## How to run things (environment is non-obvious)
 
 - **Julia is `juliaup`-managed; the binary is NOT on the non-interactive PATH.**
-  Use the absolute path:
-  `~/.julia/juliaup/julia-1.12.6+0.aarch64.apple.darwin14/bin/julia`
+  Use the juliaup shim `~/.juliaup/bin/julia` (resolves the channel on every
+  platform), or the absolute versioned path under `~/.julia/juliaup/` for the host.
+- **Vespa.jl was extracted from `enzo-dev`** and is now a SIBLING of it
+  (`~/Projects/{Vespa.jl,enzo-dev}`). The live-Enzo C++ tree (`src/enzo/`) and the
+  C-ABI bridge (`EnzoModules/`) stay in `enzo-dev`; `lib/EnzoLib` finds the built
+  bridge dylib at the sibling `../enzo-dev/EnzoModules/deps` by default (override
+  with `ENV["ENZOMODULES_GRID_LIB"]` / `ENV["ENZO_DEV_REPO"]`). The cross-code
+  sibling wrappers (RamsesLib, ArepoLib, …) and `HierarchicalGrids.jl` are also
+  `~/Projects` siblings, reached by relative `[sources]` paths.
 - **Core tests:** `<julia> --project=test test/runtests.jl` (≈7 min; the 256-cell
   Sod and 2D Sedov dominate).
 - **EnzoViz tests:** `<julia> --project=lib/EnzoViz/test lib/EnzoViz/test/runtests.jl`

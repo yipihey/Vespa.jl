@@ -17,7 +17,7 @@
 Seven threads now exist, developed separately but converging on the same
 idioms:
 
-1. **EnzoNG.jl** — orchestration-in-Julia over the `AbstractMeshBackend` seam;
+1. **Vespa.jl** — orchestration-in-Julia over the `AbstractMeshBackend` seam;
    three backends (`RefMesh` oracle, `HGBackend` on HierarchicalGrids.jl,
    `EnzoBackend` on the *live* legacy hierarchy); the `EquationSet` variable
    model; the `EngineConfig` method-slot registry (`:enzo` | `:julia` per
@@ -67,7 +67,7 @@ The scientific goal that forces the unification:
   Enzo, RAMSES, and Arepo on the same problem, with common diagnostics and one
   report.
 - **Mix and match:** run RAMSES-RT inside an Enzo simulation; use Enzo's Moray
-  ray tracing inside an Arepo run; drive RAMSES's hydro with EnzoNG's `:julia`
+  ray tracing inside an Arepo run; drive RAMSES's hydro with Vespa's `:julia`
   gravity; replace any code's hydro with the PPMKernels Metal sweep.
 - **Converge:** use the experience to rewrite solvers one at a time into a
   portable, code-agnostic library (the PPMKernels pattern), until the legacy
@@ -76,7 +76,7 @@ The scientific goal that forces the unification:
 
 ## Decision
 
-EnzoNG.jl becomes the umbrella of a **federated framework**. Its code-neutral
+Vespa.jl becomes the umbrella of a **federated framework**. Its code-neutral
 seams are promoted to shared substrates; the per-code wrappers become
 interchangeable implementations of two small contracts; and a canonical-state
 layer with conservative remap operators makes cross-code exchange a defined
@@ -238,22 +238,22 @@ project.
 ## Package topology
 
 Federation, not a monorepo merge. Repos keep their owners, tests, and release
-cadence; EnzoNG.jl composes them via Julia package extensions (weak deps), so
-`using EnzoNG, RamsesLib` activates the Ramses provider with zero cost when
+cadence; Vespa.jl composes them via Julia package extensions (weak deps), so
+`using Vespa, RamsesLib` activates the Ramses provider with zero cost when
 absent.
 
 ```
-EnzoNG.jl                      # umbrella: driver, slots, exchange, problems, harness
+Vespa.jl                      # umbrella: driver, slots, exchange, problems, harness
 ├── lib/MeshInterface          # the mesh seam (unchanged)
 ├── lib/CodeBridge             # NEW (D1): loading, handles, contracts, @xcall+worker
 ├── lib/EnzoLib                # Enzo bridge       → CodeBridge client
 ├── lib/RefMesh, lib/HGBackend, lib/EnzoBackend
 ├── lib/PPMKernels, lib/PoissonKernels   # portable KA solver library
 ├── lib/EnzoViz                # in-situ viz
-├── ext/EnzoNGRamsesExt        # activated by RamsesLib  (RamsesNG.jl repo)
-├── ext/EnzoNGArepoExt         # activated by ArepoLib   (Arepo.jl repo)
-├── ext/EnzoNGVeuszExt         # activated by Veusz.jl
-└── ext/EnzoNGDfmmExt          # activated by dfmm
+├── ext/VespaRamsesExt        # activated by RamsesLib  (RamsesNG.jl repo)
+├── ext/VespaArepoExt         # activated by ArepoLib   (Arepo.jl repo)
+├── ext/VespaVeuszExt         # activated by Veusz.jl
+└── ext/VespaDfmmExt          # activated by dfmm
 External, unchanged owners:
 RamsesNG.jl/lib/RamsesLib · Arepo.jl/lib/ArepoLib · HierarchicalGrids.jl ·
 Veusz.jl · dfmm · legacy checkouts (enzo-dev, mini-ramses, arepo)
@@ -589,7 +589,7 @@ never forks of their cores.
   rule): `using dfmm` activates `run_dfmm_sod`; dfmm's heavy dependency
   tree (Makie, Enzyme) never burdens a legacy-only user — this IS the
   extension-ifying pattern for MultiCode.  The full EquationSet
-  embedding in EnzoNG's FV driver is deliberately NOT claimed: dfmm is
+  embedding in Vespa's FV driver is deliberately NOT claimed: dfmm is
   not a flux-form method (its state is per-segment moments and its
   integrator is variational), so it enters as an ENGINE; an EquationSet
   facade would misrepresent the seam.  Revisit when dfmm-2d's Eulerian

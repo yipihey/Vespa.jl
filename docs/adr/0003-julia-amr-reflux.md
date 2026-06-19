@@ -1,6 +1,6 @@
 # ADR-0003: Conservative `:julia` hydro under Enzo AMR (the SubgridFluxes contract)
 
-- **Status:** DONE (1D) — Part A (EnzoNG boundary-flux recording) + Part B (the
+- **Status:** DONE (1D) — Part A (Vespa boundary-flux recording) + Part B (the
   bridge write + orchestration) implemented and proven exactly conservative. The
   flux bridge conserves the composite mass/energy to **round-off** on a static
   multi-level (5-level) hierarchy while the waves are interior to the refined
@@ -8,7 +8,7 @@
   `lib/EnzoLib/test/test_julia_reflux.jl`. **Follow-up #2 (ND face planes) is now
   DONE** — the Julia plane assembly rasterizes 2D/3D coarse–fine face planes
   (`test_julia_reflux_2d.jl`: 2D Sod-AMR strip conserves to round-off `5.9e-15`).
-  **Parent-ghost coupling is DONE in 1D AND ND** — EnzoNG consumes Enzo's
+  **Parent-ghost coupling is DONE in 1D AND ND** — Vespa consumes Enzo's
   parent-interpolated ghosts at a subgrid's coarse–fine faces; the ND fix selects
   ParentGhost per (axis, side) so a subgrid's real domain-boundary faces keep their
   domain BC (2D subtest C: parent-ghost ON `1.47e-6` vs broken blanket `1.5e-4` vs
@@ -22,7 +22,7 @@
 
 ## Context
 
-ND single-grid is done: EnzoNG's unchanged driver runs on a live 2D/3D Enzo grid
+ND single-grid is done: Vespa's unchanged driver runs on a live 2D/3D Enzo grid
 (round-trip identity exact, validated on NohProblem2D). The remaining piece for
 "`:julia` physics under AMR" is **conservative coarse–fine coupling** when a
 `:julia` hydro slot replaces `SolveHydroEquations` on a refined hierarchy.
@@ -48,15 +48,15 @@ contract to lift that gate **conservatively** — not a non-conservative half-ve
   - each grid's outer-boundary flux → its `BoundaryFluxes` (the `RefinedFluxes`,
     accumulated over the fine grid's subcycles via the register `scale`).
 
-So conservative `:julia` AMR requires EnzoNG to produce **both** flux sets in
+So conservative `:julia` AMR requires Vespa to produce **both** flux sets in
 Enzo's exact format and extents.
 
 ## Design
 
-Two halves: (A) EnzoNG records per-face boundary fluxes; (B) a bridge writes them
+Two halves: (A) Vespa records per-face boundary fluxes; (B) a bridge writes them
 into Enzo's `fluxes` at matched global-index extents.
 
-### A. EnzoNG-side flux recording — DONE
+### A. Vespa-side flux recording — DONE
 
 `BoundaryFluxRegister{NV,T}` (`src/reflux.jl`): `accumulate_flux!`/`step!` accept a
 `bflux` sink; the two boundary `_flux_face!` methods call `_bflux_capture!` with
@@ -76,7 +76,7 @@ is untouched. Validated by the conservation identity `Δ(total mass) == Σ_lo bf
 - `Grid_SolveHydroEquations.C:328-348` is the exact format to match: per `(field,
   dim)`, `LeftFluxes[field][dim] = new float[plane_size]` over the face plane, with
   `Left/RightFluxStartGlobalIndex[dim][j]` the plane corner in **global** zone index
-  at this level. EnzoNG's `bflux` (axis,side,cell)→∫F·area dt maps to it as
+  at this level. Vespa's `bflux` (axis,side,cell)→∫F·area dt maps to it as
   axis=dim, :lo→Left, :hi→Right, cell→(plane index, global-offset by the grid's
   GridStartIndex/GridLeftEdge). Need bridges for the grid's global start + the
   subgrid boxes to compute the extents.
@@ -90,7 +90,7 @@ is untouched. Validated by the conservation identity `Δ(total mass) == Σ_lo bf
 
 Grid methods + bridge fns + bindings:
 - `problem_grid_left/right_edge(h, gi)` and `problem_grid_start_index(h, gi)` →
-  the grid's global-index origin + ghost offset, so EnzoNG can compute the global
+  the grid's global-index origin + ghost offset, so Vespa can compute the global
   `Left/RightFluxStartGlobalIndex` for each boundary plane.
 - `problem_num_subgrids(h, level, gi)` + `problem_subgrid_box(h, level, gi, si)` →
   the coarse grid's subgrid extents (which boundary planes are coarse–fine
@@ -107,8 +107,8 @@ Replace the blanket `ef = eng.hydro === :enzo` gate with: for `:julia` hydro,
 still run `create_fluxes`/`finalize_fluxes`/`update_from_finer`, but the `:julia`
 hydro hook (after its per-grid solve) writes the recorded boundary + subgrid
 fluxes via (B). Then Enzo's `update_from_finer`/`CorrectForRefinedFluxes` does the
-projection AND the conservation correction using EnzoNG's fluxes — identical
-machinery, EnzoNG's numbers.
+projection AND the conservation correction using Vespa's fluxes — identical
+machinery, Vespa's numbers.
 
 ### Prerequisite (cheap): grid→level + multi-grid slot
 
@@ -122,7 +122,7 @@ per grid index (the benchmark hooks already do handle-aware rebuilds).
 A 2-level refined Sod / Sedov with `hydro=:julia` must conserve mass/energy to the
 same `~1e-13` the `:enzo` AMR path does (`test_reflux.jl` is the template). The
 decisive check: disabling (B) takes the drift from round-off to ~1e-3 (the same
-signature reflux has on EnzoNG's own composite AMR), proving the correction is what
+signature reflux has on Vespa's own composite AMR), proving the correction is what
 restores conservation.
 
 ## What was built (the implementation, verified)
@@ -139,7 +139,7 @@ assertion (not by eyeballing):
   subgrid_flux_extent,subgrid_flux_size,set/get_subgrid_flux,grid_index_on_level}`.
 - **Two flux sets filled** (exactly what `SolveHydroEquations` fills): the coarse
   `SubgridFluxesEstimate[level][i][sub]` — proper subgrids = the coarse
-  InitialFluxes at the coarse–fine faces (EnzoNG's INTERIOR flux there, looked up
+  InitialFluxes at the coarse–fine faces (Vespa's INTERIOR flux there, looked up
   by the subgrid's coarse-index extents), and the **last** entry = the grid's own
   outer flux, which `FinalizeFluxes`→`AddToBoundaryFluxes` accumulates into the
   grid's `BoundaryFluxes` (giving the correct temporal accumulation across
@@ -148,36 +148,36 @@ assertion (not by eyeballing):
   zero) — the segfault the old gate avoided.
 - **Units / sign / field map** (verified): Enzo stores `F·dt/dx` (a conserved-
   density change), so `enzo_value = bflux/V_cell` (bflux = `∫F·area dt`); +axis
-  sign throughout; EnzoNG conserved component → Enzo BaryonField via the mesh's
+  sign throughout; Vespa conserved component → Enzo BaryonField via the mesh's
   role map (`cdi→di`, `cei→ei`, `cmom[d]→vi[d]`).
 - **Orchestration** (`session.jl`): `EngineConfig(reflux=true)` lifts the
   `ef = hydro===:enzo` gate to also run `clear/create/update_from_finer/finalize`
   for a conservative `:julia` hydro; the hook (`test_julia_reflux.jl`) iterates the
-  grids on each level, runs EnzoNG's driver, and writes the fluxes. Enzo's own
+  grids on each level, runs Vespa's driver, and writes the fluxes. Enzo's own
   `UpdateFromFinerGrids`/`CorrectForRefinedFluxes` then restore conservation —
-  identical machinery, EnzoNG's numbers.
+  identical machinery, Vespa's numbers.
 
 **Result:** static 5-level Sod, waves interior — composite mass drift `7.9e-16`
 (WITH) vs `1.3e-3` (WITHOUT). Per-step: round-off every step until a wave sits ON a
 coarse–fine boundary, where it jumps to ~1e-3 — the signature of a small *relative*
-flux error scaled by flux magnitude, i.e. EnzoNG's Outflow ghost at the fine
+flux error scaled by flux magnitude, i.e. Vespa's Outflow ghost at the fine
 boundary, not the bridge.
 
 ## Follow-ups
 
 - **ND face planes — DONE.** The C++ bridge was already ND-general (sizes/extents
-  over `GridRank`). The Julia plane assembly is now ND too: `EnzoNG.bflux_plane`
+  over `GridRank`). The Julia plane assembly is now ND too: `Vespa.bflux_plane`
   (`src/reflux.jl`) rasterizes one `(dim, side)` face plane in Enzo's exact
   linearization (column-major over the orthogonal dims, dim-0 fastest, flux dim
   collapsed — the `Grid_CorrectForRefinedFluxes.C:460` `FluxIndex`), mapping each
-  plane cell's global index to EnzoNG's per-cell boundary/interior flux register
+  plane cell's global index to Vespa's per-cell boundary/interior flux register
   (orthogonal dims map straight `g−g0+1`; the flux-dim key follows the verified 1D
   mapping). `test_julia_reflux.jl`'s `_write_fluxes!` is now `EnzoGridMesh{R}`
   generic. **Result (2D Sod-AMR strip, `test_julia_reflux_2d.jl`, waves interior):**
   composite mass drift `5.9e-15` / energy `3.3e-14` (WITH) vs `1.2e-3` / `3.0e-3`
   (WITHOUT) — round-off, on genuine 60-cell and 4-cell face planes. 1D unchanged
   (bit-identical `7.9e-16`).
-- **Parent-ghost coupling (accuracy + the residual conservation). — DONE.** EnzoNG
+- **Parent-ghost coupling (accuracy + the residual conservation). — DONE.** Vespa
   now consumes Enzo's parent-interpolated ghost zones at a subgrid's coarse–fine
   faces instead of an Outflow copy. Mechanism: a `ParentGhost{F}` BC
   (`MeshInterface`) carrying a closure `(axis, side, cell) -> W_prim`; the driver's
@@ -194,7 +194,7 @@ boundary, not the bridge.
   boundary-ACCURACY half, not the conservation half. The sign/index is gated
   honestly: the negative control (reading the ghost on the WRONG side) makes drift
   WORSE than Outflow (`2.63e-5`), so a wrong index/sign FAILS the assertion. (The
-  residual `~8e-6` is the coarse↔fine interpolation accuracy itself — EnzoNG reads
+  residual `~8e-6` is the coarse↔fine interpolation accuracy itself — Vespa reads
   the innermost interpolated layer; Enzo's multi-layer ghost + its own boundary
   reconstruction differ at higher order. Reaching round-off would require matching
   Enzo's reconstruction exactly, which is beyond consuming the parent ghost.)
@@ -218,7 +218,7 @@ boundary, not the bridge.
   `1.87e-6` — `~100×` better than the broken blanket version (`1.5e-4`) and `~800×`
   below the no-reflux signature (`1.2e-3`). NOT round-off (the raster-only path stays
   `5.9e-15`): the residual is the same coarse↔fine interpolation accuracy the 1D
-  end-to-end parent-ghost shows — EnzoNG reads the innermost interpolated layer,
+  end-to-end parent-ghost shows — Vespa reads the innermost interpolated layer,
   Enzo's multi-layer reconstruction differs at higher order. The flux bridge stays
   EXACTLY conservative; this is the boundary-ACCURACY half in ND.
 
@@ -226,7 +226,7 @@ boundary, not the bridge.
 
 The flux extents are in **global** index space with per-(dim,side) planes and a
 coarse/fine role split; an off-by-one in the `*GlobalIndex` mapping yields *silent*
-non-conservation, not a crash. It needs the EnzoNG recording side, ~4 bridge
+non-conservation, not a crash. It needs the Vespa recording side, ~4 bridge
 functions + a dylib rebuild, and the reflux-conservation test as the gate. Doing it
 right is worth a focused pass; a non-conservative shortcut is worse than not doing
 it.

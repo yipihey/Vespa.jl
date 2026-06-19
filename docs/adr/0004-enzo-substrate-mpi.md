@@ -12,21 +12,21 @@
   zero impact.
 - **Date:** 2026-06-04
 - **Builds on:** ADR-0002 (method-slot registry), ADR-0003 (conservative `:julia` AMR),
-  the EnzoNG↔Enzo C-ABI bridge (`EnzoModules/src/enzomodules_problem_bridge.C` ↔
-  `EnzoNG.jl/lib/EnzoLib/src/session.jl`).
+  the Vespa↔Enzo C-ABI bridge (`EnzoModules/src/enzomodules_problem_bridge.C` ↔
+  `Vespa.jl/lib/EnzoLib/src/session.jl`).
 
 ---
 
 ## Context
 
-EnzoNG drives a live Enzo hierarchy through a C-ABI bridge. That bridge was
+Vespa drives a live Enzo hierarchy through a C-ABI bridge. That bridge was
 **deliberately serial-only**: it hardcoded `NumberOfProcessors=1` / `MyProcessorNumber=0`,
 forced `UnigridTranspose=0`, and every accessor assumed all grids were local and resident.
 That blocked (1) running original Enzo under MPI, and (2) multi-host capability in general —
-even though EnzoNG-native solvers target shared-memory / GPU / Rust per node.
+even though Vespa-native solvers target shared-memory / GPU / Rust per node.
 
 This ADR makes the **Enzo substrate** MPI-capable, **optionally** and with the serial path
-unchanged. It does NOT distribute the EnzoNG-native seam (the `RemoteNeighbor` case that
+unchanged. It does NOT distribute the Vespa-native seam (the `RemoteNeighbor` case that
 ADR-0001 deferred remains future work — see "Amends ADR-0001").
 
 ## Key enabling fact
@@ -43,9 +43,9 @@ local grids.
 ## Decisions
 
 1. **Scope:** Enzo substrate + bridge become MPI-capable; under MPI each rank runs its own
-   EnzoNG on its **local** grids (mirroring Enzo's `SolveHydroEquations`, which skips grids
+   Vespa on its **local** grids (mirroring Enzo's `SolveHydroEquations`, which skips grids
    whose `ProcessorNumber != MyProcessorNumber`), and Enzo's existing machinery moves
-   grid/flux data between ranks. EnzoNG-native solvers stay shared-memory.
+   grid/flux data between ranks. Vespa-native solvers stay shared-memory.
 
 2. **Build model — dual artifacts, serial default.** Both a serial and an MPI `libenzo` +
    matching bridge dylib coexist; serial stays the default so the current dev/test loop is
@@ -76,10 +76,10 @@ local grids.
   `CommunicationMinValue` (`#ifdef USE_MPI`); new `session_my_rank` / `session_num_ranks` /
   `problem_grid_processor` accessors (return 0/1/0 in serial). No init-partition or
   load-balance code needed (Enzo already does both).
-- **`EnzoNG.jl/lib/EnzoLib/src/session.jl`**: `enzo_mpi_enabled()` + `_mpi`-suffixed dylib
+- **`Vespa.jl/lib/EnzoLib/src/session.jl`**: `enzo_mpi_enabled()` + `_mpi`-suffixed dylib
   selection (serial default); `session_my_rank`/`session_num_ranks`/`problem_grid_processor`
   bindings; `local_grids_on_level` (== `grids_on_level` in serial).
-- **`EnzoNG.jl/lib/EnzoLib/test/test_julia_reflux.jl`**: the `:julia` hydro hook skips grids
+- **`Vespa.jl/lib/EnzoLib/test/test_julia_reflux.jl`**: the `:julia` hydro hook skips grids
   not resident on this rank (no-op in serial).
 - **`EnzoModules/deps/build_grid_darwin.sh`**: `serial`|`mpi` flavor parameter.
 
@@ -97,7 +97,7 @@ local grids.
 ## Amends ADR-0001
 
 ADR-0001 lists "Non-goals. MPI / distributed memory." That non-goal is **narrowed** to the
-EnzoNG-**native** seam (RefMesh/HGBackend and the `RemoteNeighbor` distributed backend remain
+Vespa-**native** seam (RefMesh/HGBackend and the `RemoteNeighbor` distributed backend remain
 future work). MPI now lives in the **Enzo substrate path** only: the native solvers stay
 shared-memory (chunk-based → Rust/Rayon/GPU), while distribution across hosts is provided by
 Enzo's existing communication under the optional MPI build flavor.

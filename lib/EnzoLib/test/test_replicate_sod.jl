@@ -3,7 +3,7 @@
 # core of Enzo's Eulerian PPM), looped from Julia. Mirrors EnzoModules'
 # examples/ppm_sod.py, but via the native ccall binding.
 #
-# E1d (pilot) — mix-and-match parity: the SAME Sod problem run with EnzoNG's
+# E1d (pilot) — mix-and-match parity: the SAME Sod problem run with Vespa's
 # native Julia HLLC+PLM scheme. Both the legacy-PPM and the Julia-HLLC solutions
 # match the exact Riemann solution, i.e. a Julia method and the legacy method are
 # interchangeable on the same physics. (Running the Julia kernel directly on Enzo
@@ -61,8 +61,8 @@ end
     @test all(>(0), ρ)                                # positive, finite
 end
 
-@testset "E1d: EnzoNG Julia HLLC ≡ legacy PPM (both match exact Riemann)" begin
-    # Native EnzoNG run, same problem.
+@testset "E1d: Vespa Julia HLLC ≡ legacy PPM (both match exact Riemann)" begin
+    # Native Vespa run, same problem.
     prob = sod_problem_defaults(n = 200)
     sim = Simulation(UniformMesh(prob.dims, prob.domain), prob)
     evolve!(sim)

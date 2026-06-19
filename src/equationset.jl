@@ -1,6 +1,6 @@
 # The EQUATION SET — the swappable physics/variable model (ADR: physics is data).
 #
-# EnzoNG's conservative finite-volume driver (flux accumulation, SSP-RK2,
+# Vespa's conservative finite-volume driver (flux accumulation, SSP-RK2,
 # refluxing) is generic over the *equation set*: it asks the model for the
 # variable count, the conserved-field names, the role indices (which components
 # are density / momentum / energy — for gravity & cosmology source terms), and

@@ -3,11 +3,11 @@
 # Without --serve: generates the static page under out/Sedov2D_demo and exits.
 # With    --serve: also starts the live server and blocks until Ctrl-C.
 ENV["JULIA_CONDAPKG_BACKEND"]="Null"
-const ROOT = "/Users/tabel/Projects/enzo-dev/EnzoNG.jl"
+const ROOT = normpath(joinpath(@__DIR__, "..", "..", ".."))   # Vespa.jl repo root
 ENV["JULIA_PYTHONCALL_EXE"]=strip(read(joinpath(ROOT,"lib/EnzoViz/.python-path"),String))
 ENV["QT_QPA_PLATFORM"]="offscreen"
 
-using EnzoNG, MeshInterface, HGBackend, EnzoViz
+using Vespa, MeshInterface, HGBackend, EnzoViz
 include(joinpath(ROOT, "problems", "sedov_blast.jl"))
 
 doserve = "--serve" in ARGS

@@ -5,7 +5,7 @@ mode-by-mode cross-correlation r(k) of the DM density and the gravitational
 potential between the two codes (same realization -> r->1 on shared scales)."""
 import numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-N=128; L=0.128; R="/Users/tabel/Projects/enzo-dev/EnzoNG.jl/reports/multicode/"
+N=128; L=0.128; R="/Users/tabel/Projects/Vespa.jl/reports/multicode/"
 
 def load_pk(fn):
     B={};cur=None;ks=[];Ps=[]

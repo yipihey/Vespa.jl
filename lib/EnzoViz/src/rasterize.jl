@@ -1,4 +1,4 @@
-# Turn a live `Simulation` into plottable arrays, reading only through EnzoNG's
+# Turn a live `Simulation` into plottable arrays, reading only through Vespa's
 # public per-cell surface (`for_each_cell`, `cell_center`, `cell_width`,
 # `level_of`, `max_level`, `rank`, `domain`, `primitive_at`). No backend internals.
 #
@@ -28,8 +28,8 @@ requested field. For 1D problems.
 function raster1d(sim, fields)
     b = sim.backend
     pts = Tuple{Float64,NTuple{5,Float64}}[]
-    EnzoNG.for_each_cell(b) do c
-        push!(pts, (EnzoNG.cell_center(b, c)[1], EnzoNG.primitive_at(sim, c)))
+    Vespa.for_each_cell(b) do c
+        push!(pts, (Vespa.cell_center(b, c)[1], Vespa.primitive_at(sim, c)))
     end
     sort!(pts; by = first)
     x = Float64[p[1] for p in pts]
@@ -68,8 +68,8 @@ guarantees.
 """
 function raster2d_levels(sim, fields)
     b = sim.backend
-    EnzoNG.rank(b) == 2 || error("raster2d_levels: only rank-2 meshes (got rank $(EnzoNG.rank(b)))")
-    dom = EnzoNG.domain(b)
+    Vespa.rank(b) == 2 || error("raster2d_levels: only rank-2 meshes (got rank $(Vespa.rank(b)))")
+    dom = Vespa.domain(b)
     (x0, x1) = dom[1]
     (y0, y1) = dom[2]
     Lx, Ly = x1 - x0, y1 - y0
@@ -80,7 +80,7 @@ function raster2d_levels(sim, fields)
     nx0 = max(1, round(Int, Lx / w0[1]))
     ny0 = max(1, round(Int, Ly / w0[2]))
 
-    maxlev = EnzoNG.max_level(b)
+    maxlev = Vespa.max_level(b)
     grids = LevelGrid[]
     for lev in 0:maxlev
         r = 2^lev
@@ -89,12 +89,12 @@ function raster2d_levels(sim, fields)
         xcent = Float64[x0 + (i - 0.5) * dx for i in 1:nx]
         ycent = Float64[y0 + (j - 0.5) * dy for j in 1:ny]
         data = Dict{Symbol,Matrix{Float64}}(f => fill(NaN, ny, nx) for f in fields)
-        EnzoNG.for_each_cell(b) do c
-            EnzoNG.level_of(b, c) == lev || return
-            ctr = EnzoNG.cell_center(b, c)
+        Vespa.for_each_cell(b) do c
+            Vespa.level_of(b, c) == lev || return
+            ctr = Vespa.cell_center(b, c)
             ix = clamp(floor(Int, (ctr[1] - x0) / dx) + 1, 1, nx)
             iy = clamp(floor(Int, (ctr[2] - y0) / dy) + 1, 1, ny)
-            W = EnzoNG.primitive_at(sim, c)
+            W = Vespa.primitive_at(sim, c)
             for f in fields
                 @inbounds data[f][iy, ix] = _field_value(W, f)
             end
@@ -110,11 +110,11 @@ function _level0_width(sim)
     b = sim.backend
     minlev = typemax(Int)
     w = (0.0, 0.0)
-    EnzoNG.for_each_cell(b) do c
-        l = EnzoNG.level_of(b, c)
+    Vespa.for_each_cell(b) do c
+        l = Vespa.level_of(b, c)
         if l < minlev
             minlev = l
-            wc = EnzoNG.cell_width(b, c)
+            wc = Vespa.cell_width(b, c)
             w = (wc[1], wc[2])
         end
     end
@@ -125,8 +125,8 @@ end
 function field_range(sim, field)
     b = sim.backend
     lo = Inf; hi = -Inf
-    EnzoNG.for_each_cell(b) do c
-        v = _field_value(EnzoNG.primitive_at(sim, c), field)
+    Vespa.for_each_cell(b) do c
+        v = _field_value(Vespa.primitive_at(sim, c), field)
         v < lo && (lo = v); v > hi && (hi = v)
     end
     return (lo, hi)

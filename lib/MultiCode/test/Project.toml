@@ -24,37 +24,37 @@ dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
 
 [sources.ArepoLib]
-path = "../../../../../Arepo.jl/lib/ArepoLib"
+path = "../../../../Arepo.jl/lib/ArepoLib"
 
 [sources.AthenaLib]
-path = "../../../../../Athena.jl/lib/AthenaLib"
+path = "../../../../Athena.jl/lib/AthenaLib"
 
 [sources.CICASSLib]
-path = "../../../../../CICASS.jl/lib/CICASSLib"
+path = "../../../../CICASS.jl/lib/CICASSLib"
 
 [sources.ChemistryKernels]
-path = "../../../../../ChemistryKernels.jl"
+path = "../../../../ChemistryKernels.jl"
 
 [sources.EmissionKernels]
-path = "../../../../../EmissionKernels.jl"
+path = "../../../../EmissionKernels.jl"
 
 [sources.CodeBridge]
 path = "../../CodeBridge"
 
 [sources.DiscoDJLib]
-path = "../../../../../DiscoDJ.jl/lib/DiscoDJLib"
+path = "../../../../DiscoDJ.jl/lib/DiscoDJLib"
 
 [sources.EnzoLib]
 path = "../../EnzoLib"
 
 [sources.Gadget4Lib]
-path = "../../../../../Gadget4.jl/lib/Gadget4Lib"
+path = "../../../../Gadget4.jl/lib/Gadget4Lib"
 
 [sources.MultiCode]
 path = ".."
 
 [sources.MusicLib]
-path = "../../../../../Music.jl/lib/MusicLib"
+path = "../../../../Music.jl/lib/MusicLib"
 
 [sources.PPMKernels]
 path = "../../PPMKernels"
@@ -63,10 +63,10 @@ path = "../../PPMKernels"
 path = "../../PoissonKernels"
 
 [sources.R3D]
-path = "../../../../../r3djl/R3D.jl"
+path = "../../../../r3djl/R3D.jl"
 
 [sources.RamsesLib]
-path = "../../../../../RamsesNG.jl/lib/RamsesLib"
+path = "../../../../RamsesNG.jl/lib/RamsesLib"
 
 [sources.dfmm]
-path = "../../../../../dfmm"
+path = "../../../../dfmm"

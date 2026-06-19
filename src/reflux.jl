@@ -1,5 +1,5 @@
 # Coarse–fine flux refluxing for AMR time subcycling (ADR P5: the solver builds
-# refluxing on the substrate's conservative transfer). On EnzoNG's composite
+# refluxing on the substrate's conservative transfer). On Vespa's composite
 # (leaf-only) mesh there is no coarse-under-fine cell to "project down"; instead
 # we correct the *coarse leaf adjacent to a refinement boundary* so that the flux
 # it saw over its big step equals the time-integrated flux the fine leaves on the
@@ -153,7 +153,7 @@ end
 #   FluxIndex = Σ_d (g[d] − StartGlobalIndex[dim][d]) · Π_{e<d} Dim[e]
 # i.e. column-major over the orthogonal dims, dim-0 fastest. In 1D the plane is a
 # single cell; in ND it is the (D−1)-plane of the face. `bflux_plane` rasterizes
-# one (dim, side) plane: it walks the plane offsets, maps each to EnzoNG's active
+# one (dim, side) plane: it walks the plane offsets, maps each to Vespa's active
 # CartesianIndex (1-based), looks up the recorded flux NTuple, and returns the
 # `Vector{Float64}` in Enzo's units (`enzo_value = bflux/Vcell`) for component `comp`.
 #

@@ -1,4 +1,4 @@
-# ADR-0003 part A: EnzoNG records the per-stage flux through each domain-boundary
+# ADR-0003 part A: Vespa records the per-stage flux through each domain-boundary
 # face (∫F·area dt) into a BoundaryFluxRegister. On the EnzoBackend a grid's outer
 # faces ARE the coarse–fine interface, so this is the fine grid's RefinedFluxes (and
 # a coarse grid's InitialFluxes at a subgrid) that Enzo's CorrectForRefinedFluxes
@@ -13,7 +13,7 @@ function _bflux_conservation_run()
     sim = Simulation(UniformMesh(prob.dims, prob.domain), prob)
     di = density_index(sim.model); V = 1 / 64
     mass() = sum(sim.sv[di][I] for I in CartesianIndices((64,))) * V
-    breg = EnzoNG._bflux_register(sim)
+    breg = Vespa._bflux_register(sim)
     m0 = mass(); tot_lo = 0.0; tot_hi = 0.0; nonzero = false
     for _ in 1:20
         empty!(breg.flux)

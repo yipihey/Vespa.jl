@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-cd /home/tabel/Projects/enzo-dev/EnzoNG.jl
+cd /home/tabel/Projects/Vespa.jl
 export BACKEND=cuda
 export RAMSES_LIB_COSMO=/home/tabel/Projects/mini-ramses-metal/bin64sc_chem/libramses3d.so
 export RAMSES_LIB=$RAMSES_LIB_COSMO

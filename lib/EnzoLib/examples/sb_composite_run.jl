@@ -1,4 +1,4 @@
-# Santa Barbara cluster with EnzoNG composite gravity (root FFT + per-subgrid
+# Santa Barbara cluster with Vespa composite gravity (root FFT + per-subgrid
 # multigrid) AND PPM hydro as :julia slots, under Enzo's OWN AMR hierarchy.
 # This is the validated composite-gravity path (sb_subgrid_gravity_check.jl: corr
 # 0.95 vs Enzo on 737 real subgrids) wired into the live time loop.
@@ -271,7 +271,7 @@ function ppm_hydro!(h, level, dt)
     return nothing
 end
 
-# MODE=enzong (default): EnzoNG :julia composite gravity + PPM (on BACKEND).
+# MODE=enzong (default): Vespa :julia composite gravity + PPM (on BACKEND).
 # MODE=enzo: the all-:enzo reference (native PPM + FFT gravity). Same evolve_level!,
 # same AMR — isolates the swapped kernels for the parity/perf comparison.
 const MODE = Symbol(get(ENV, "MODE", "enzong"))
@@ -289,11 +289,11 @@ function main()
     pf = joinpath(rundir,"run.enzo")
     write(pf, replace(read(joinpath(SBDIR,"SB_amr.enzo"),String),
                       r"GreensFunctionMaxNumber.*"=>"GreensFunctionMaxNumber   = 30\nNumberOfGhostZones        = 4"))
-    # MODE=enzo: pure Enzo (native PPM + FFT gravity). MODE=enzong: EnzoNG GPU PPM
+    # MODE=enzo: pure Enzo (native PPM + FFT gravity). MODE=enzong: Vespa GPU PPM
     # hydro with Enzo's OWN gravity (option C) — identical gravity+AMR removes gravity
     # as a confound and isolates the hydro port + the GPU win (the launch-bound tiny-
     # subgrid GPU gravity is a perf loss anyway; the real GPU win is PPM on the root).
-    # MODE=enzong_g: the experimental EnzoNG composite gravity too (parity ~0.87 under AMR).
+    # MODE=enzong_g: the experimental Vespa composite gravity too (parity ~0.87 under AMR).
     prb = EnzoLib.SlotProbe()
     eng = MODE === :enzo ?
         EnzoLib.EngineConfig(; hydro=:enzo, gravity=:enzo, comoving_expansion=:enzo, probe=prb) :

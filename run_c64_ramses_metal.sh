@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt NULL_GLOB; cd /Users/tabel/Projects/enzo-dev/EnzoNG.jl
+setopt NULL_GLOB; cd /Users/tabel/Projects/Vespa.jl
 export BACKEND=metal
 export RAMSES_LIB_COSMO=/Users/tabel/Projects/mini-ramses/bin64sc_chem_metal/libramses3d_metal.dylib
 export RAMSES_LIB=$RAMSES_LIB_COSMO

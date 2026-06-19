@@ -15,7 +15,13 @@ enzo_mpi_enabled() = get(ENV, "ENZONG_ENZO_MPI", "") == "1"
 function grid_libpath()
     env = get(ENV, "ENZOMODULES_GRID_LIB", "")
     isempty(env) || return abspath(env)
-    base = normpath(joinpath(@__DIR__, "..", "..", "..", "..", "EnzoModules", "deps"))
+    # EnzoModules (the C++ bridge that links the full Enzo .so) lives in the sibling
+    # enzo-dev repo, NOT inside Vespa.jl. Default to the sibling layout
+    # ~/Projects/{Vespa.jl,enzo-dev}; override with ENV["ENZOMODULES_GRID_LIB"] (full
+    # dylib path) or ENV["ENZO_DEV_REPO"] (the enzo-dev checkout root).
+    enzo_dev = get(ENV, "ENZO_DEV_REPO",
+                   normpath(joinpath(@__DIR__, "..", "..", "..", "..", "enzo-dev")))
+    base = joinpath(enzo_dev, "EnzoModules", "deps")
     # Default is the serial bridge; the MPI flavor (built by build_grid_darwin.sh mpi)
     # is opt-in and carries an _mpi suffix so both artifacts coexist.
     names = enzo_mpi_enabled() ?
@@ -365,7 +371,7 @@ end
 
 Write / read the cell-centered `AccelerationField[dim]` (0-based dim) — the gravity
 source `SolveHydroEquations` reads. The enabling primitive for a `:julia` gravity
-slot: EnzoNG solves Poisson on the live density, computes `g = −∇φ`, and writes it
+slot: Vespa solves Poisson on the live density, computes `g = −∇φ`, and writes it
 here, so Enzo's hydro applies the Julia-computed gravity. `set` allocates if the
 field is absent (a Julia slot replaces `ComputeAccelerations`, which normally does).
 """
@@ -424,7 +430,7 @@ function problem_get_potential(h::Handle, grid::Integer = 0)
 end
 
 # ── ADR-0003 part B: BoundaryFluxes bridge (conservative :julia hydro under AMR) ──
-# Write EnzoNG's recorded face fluxes (in Enzo's F·dt/dx units, BaryonField order)
+# Write Vespa's recorded face fluxes (in Enzo's F·dt/dx units, BaryonField order)
 # into Enzo's flux registers so UpdateFromFinerGrids/CorrectForRefinedFluxes restore
 # conservation across coarse–fine boundaries. `side`: 0 = Left face, 1 = Right face.
 
@@ -771,9 +777,9 @@ end
 # ── method-slot registry (ADR-0002) ──────────────────────────────────────────
 # Each physics step in the EvolveLevel skeleton is a SLOT resolving to
 # :off (skip), :enzo (the certified legacy bridge step), or :julia (an injected
-# EnzoNG kernel running on the live grid). EnzoLib has no EnzoNG dependency, so a
+# Vespa kernel running on the live grid). EnzoLib has no Vespa dependency, so a
 # :julia slot is supplied as a hook closure `(h, level, dt)` by the integration
-# layer (which has EnzoNG/EnzoBackend). The AMR/conservation plumbing (boundaries,
+# layer (which has Vespa/EnzoBackend). The AMR/conservation plumbing (boundaries,
 # flux registers, projection, regrid) is NOT a slot — it always runs.
 
 # ── performance probe (ADR-0002 reporting) ───────────────────────────────────
@@ -923,7 +929,7 @@ function evolve_level!(h::Handle, level::Integer, dt_above::Float64;
     # conservation bookkeeping — SolveHydroEquations fills SubgridFluxes, finalize/
     # project consume them. A plain :julia hydro slot does NOT fill them (so the
     # registers stay gated off, single-grid). But a CONSERVATIVE :julia slot
-    # (engine.reflux=true, ADR-0003 part B) writes EnzoNG's recorded fluxes into the
+    # (engine.reflux=true, ADR-0003 part B) writes Vespa's recorded fluxes into the
     # registers from its hook, so the machinery runs and Enzo's UpdateFromFinerGrids/
     # CorrectForRefinedFluxes restore conservation across coarse–fine boundaries.
     ef = eng.hydro === :enzo || (eng.hydro === :julia && eng.reflux)

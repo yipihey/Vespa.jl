@@ -36,7 +36,7 @@ julia --project=lib/PowerFoam lib/PowerFoam/examples/tessellator_backend_parity_
 
 ## Observed result on 2026-06-15
 
-Ran in the `EnzoNG.jl` checkout with the `lib/PowerFoam` project environment.
+Ran in the `Vespa.jl` checkout with the `lib/PowerFoam` project environment.
 
 - CPU probe: passed.
 - Metal probe: skipped.

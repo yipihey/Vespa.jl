@@ -1,5 +1,5 @@
 """
-    EnzoNG
+    Vespa
 
 The science / orchestration layer of next-generation Enzo (ADR-0001). All code
 here is written **only** against `MeshInterface`; it never names a concrete
@@ -18,7 +18,7 @@ Contents:
   * conservation diagnostics and a small field dump;
   * an exact Riemann solver used to verify the Sod shock tube.
 """
-module EnzoNG
+module Vespa
 
 using MeshInterface
 using Printf

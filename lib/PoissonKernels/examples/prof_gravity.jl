@@ -1,4 +1,4 @@
-# Profile the EnzoNG :gravity slot sub-steps on the live SB hierarchy, to find
+# Profile the Vespa :gravity slot sub-steps on the live SB hierarchy, to find
 # where the ~145 ms/call goes (FFT? CIC deposit of 2M particles? bridge I/O?).
 # Run: BACKEND=cpu|metal <jl> --project=lib/PoissonKernels/test lib/PoissonKernels/examples/prof_gravity.jl
 using PoissonKernels, EnzoLib, Printf

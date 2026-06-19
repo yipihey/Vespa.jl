@@ -1,6 +1,6 @@
 # ADR-0003 follow-up #2 (ND face-plane raster): the 2D conservation gate. The
 # C++ flux bridge is ND-general; this exercises the ND Julia plane assembly
-# (`EnzoNG.bflux_plane` + the ND `_write_fluxes!`) — in 2D each coarse–fine face
+# (`Vespa.bflux_plane` + the ND `_write_fluxes!`) — in 2D each coarse–fine face
 # is a 1D plane of cells, not a single cell, so a wrong orthogonal-dim raster /
 # index / sign shows up as a conservation drift jumping from round-off to ~1e-3.
 #
@@ -28,7 +28,7 @@ elseif !EnzoLib.grid_available()
 else
     @testset "ADR-0003 follow-up #2: ND face-plane raster — 2D conservation" begin
         # Static 2D hierarchy, blast interior to the refined region. The ND plane
-        # raster writes the (D−1)-plane of each coarse–fine face from EnzoNG's
+        # raster writes the (D−1)-plane of each coarse–fine face from Vespa's
         # per-cell flux registers; Enzo's UpdateFromFinerGrids/CorrectForRefined-
         # Fluxes then restore conservation. nsteps capped so the blast stays
         # interior (centred energy injection, refined center 0.4–0.6).
@@ -68,7 +68,7 @@ else
         @test d_pg.energy < 1e-4                       #   (a wrong ghost plane ⇒ ~1.5e-4, gated out)
         @test d_pg.mass   < 0.1 * d_off.mass           # and well below the no-reflux signature (~1.2e-3)
         # The residual (≈1.5e-6, NOT round-off like the raster-only path) is the
-        # coarse↔fine interpolation accuracy: EnzoNG reads the innermost interpolated
+        # coarse↔fine interpolation accuracy: Vespa reads the innermost interpolated
         # layer; Enzo's multi-layer reconstruction differs at higher order — the same
         # accuracy-limited residual the 1D end-to-end parent-ghost shows (~8e-6). The
         # flux bridge itself stays EXACTLY conservative (the raster-only subtest above

@@ -11,7 +11,7 @@
 # against the original Enzo IC (h5ls/h5dump). VELOCITIES are passed through with the
 # SWIFT→Enzo unit factor left as `VEL_FACTOR` — the gadget→Enzo cosmology velocity
 # convention (peculiar v, the a^½ factor, and Enzo's VelocityUnits) MUST be verified
-# before a dynamical Enzo run. The EnzoNG Metal-gravity performance test does NOT use
+# before a dynamical Enzo run. The Vespa Metal-gravity performance test does NOT use
 # this converter (it reads the SWIFT file directly; velocities are irrelevant there).
 #
 # Run in its OWN process (HDF5.jl only — never alongside EnzoLib, see sb256_deposit.jl):

@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt NULL_GLOB; cd /Users/tabel/Projects/enzo-dev/EnzoNG.jl
+setopt NULL_GLOB; cd /Users/tabel/Projects/Vespa.jl
 export AREPO_LIB=$HOME/Projects/arepo/libarepo3d_cosmo.dylib
 export DYLD_LIBRARY_PATH=/opt/homebrew/lib:$HOME/grackle_install_f32/lib
 export BACKEND=metal

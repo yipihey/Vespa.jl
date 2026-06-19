@@ -1,6 +1,6 @@
 # Santa Barbara campaign harness
 
-Track C1 now has a repeatable EnzoNG-local runner:
+Track C1 now has a repeatable Vespa-local runner:
 
 ```sh
 BACKEND=cpu SB_MAXCYC=64 SB_STOP_ON_REFINEMENT=1 \

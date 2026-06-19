@@ -156,7 +156,7 @@ function _index_html(viz::VizSession, name::AbstractString, pngs, vszs, can_vsz:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EnzoNG — $(name)</title>
+  <title>Vespa — $(name)</title>
   <style>
     body { font: 15px system-ui, sans-serif; margin: 1.5rem; color:#222; }
     h1 { font-size: 1.3rem; }
@@ -176,7 +176,7 @@ function _index_html(viz::VizSession, name::AbstractString, pngs, vszs, can_vsz:
   $(embedscript)
 </head>
 <body>
-  <h1>EnzoNG — $(name) <span class="tag">$(length(pngs)) frames · Vello flipbook</span></h1>
+  <h1>Vespa — $(name) <span class="tag">$(length(pngs)) frames · Vello flipbook</span></h1>
   <div class="bar">
     <button id="play" type="button">▶ Play</button>
     <input id="slider" type="range" min="1" max="$(length(pngs))" value="1">
@@ -311,7 +311,7 @@ function _serve_html(viz::VizSession, name::AbstractString)
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EnzoNG (live) — $(name)</title>
+  <title>Vespa (live) — $(name)</title>
   <style>
     body { font: 15px system-ui, sans-serif; margin: 1.5rem; color:#222; }
     h1 { font-size: 1.3rem; }
@@ -323,7 +323,7 @@ function _serve_html(viz::VizSession, name::AbstractString)
   </style>
 </head>
 <body>
-  <h1>EnzoNG — $(name) <span class="tag">live serve · server-side Vello re-render</span></h1>
+  <h1>Vespa — $(name) <span class="tag">live serve · server-side Vello re-render</span></h1>
   <div class="bar">
     <button id="play" type="button">▶ Play</button>
     <input id="slider" type="range" min="1" max="$(nf)" value="1">

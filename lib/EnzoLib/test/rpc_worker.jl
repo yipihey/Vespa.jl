@@ -8,6 +8,6 @@
 # worker's cwd is set by the launcher (Enzo reads problem files relative to cwd).
 #
 # Usage:  julia --project=<test> rpc_worker.jl <shm_path>
-using EnzoLib, EnzoFixtures, EnzoNG, MeshInterface, RefMesh, EnzoBackend
+using EnzoLib, EnzoFixtures, Vespa, MeshInterface, RefMesh, EnzoBackend
 
 EnzoLib.serve(; shm = ARGS[1])

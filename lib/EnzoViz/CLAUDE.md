@@ -1,7 +1,7 @@
 # CLAUDE.md — lib/EnzoViz
 
 Inline visualization: PythonCall → veusz fork (GPU Vello) → `<veusz-figure>` WASM
-page. See the root `EnzoNG.jl/CLAUDE.md` "EnzoViz / veusz gotchas" — that section
+page. See the root `Vespa.jl/CLAUDE.md` "EnzoViz / veusz gotchas" — that section
 is the canonical reference. This file is the local file map.
 
 ## Files

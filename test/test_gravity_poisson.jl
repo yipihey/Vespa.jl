@@ -33,8 +33,8 @@ end
     Ax = grav.Apv; Ay = grav.bv
     apply_laplacian!(sim, grav, grav.phiv, Ax)
     apply_laplacian!(sim, grav, grav.rv, Ay)
-    xAy = EnzoNG.dot_cells(sim, grav.phiv, Ay)
-    yAx = EnzoNG.dot_cells(sim, grav.rv, Ax)
+    xAy = Vespa.dot_cells(sim, grav.phiv, Ay)
+    yAx = Vespa.dot_cells(sim, grav.rv, Ax)
     @test isapprox(xAy, yAx; rtol = 1e-12, atol = 1e-12)   # symmetry
 
     # A·1 = 0 (constant null space of the periodic Laplacian)
@@ -46,7 +46,7 @@ end
     # negative-semidefinite: ⟨x, Ax⟩ ≥ 0 for A=−∇²·V (energy of the gradient)
     setf(grav.phiv, x -> sin(2π * x))
     apply_laplacian!(sim, grav, grav.phiv, Ax)
-    @test EnzoNG.dot_cells(sim, grav.phiv, Ax) > 0
+    @test Vespa.dot_cells(sim, grav.phiv, Ax) > 0
 end
 
 # Analytic periodic Poisson: ρ = ρ̄ + A cos(kx), k = 2πm/L on [0,L].
