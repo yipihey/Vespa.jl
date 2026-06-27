@@ -126,4 +126,77 @@ else
             @test relerr(fv1.Tau, pp.Tau) < 0.05
         end
     end
+
+    # ── passive species (colours) carried as EulerColors extra conserved vars ──────────
+    # species ρ·xᵢ ride the hydro mass flux: x₁ uniform (CMA: stays uniform), x₂ a blob (advects).
+    function make_ic_sp(nc, nsp)
+        b = make_ic(nc); ρ = b.D; sp = Vector{Array{Float32,3}}()
+        for q in 1:nsp
+            x = similar(ρ)
+            @inbounds for k in 1:nc[3], j in 1:nc[2], i in 1:nc[1]
+                frac = q == 1 ? 0.40f0 :
+                       0.10f0 + 0.05f0*q + 0.20f0*exp(-(Float32(i-nc[1]÷2)^2 + Float32(j-nc[2]÷2)^2)/8f0)
+                x[i,j,k] = ρ[i,j,k] * frac      # store ρ·xᵢ
+            end
+            push!(sp, x)
+        end
+        return (D=b.D, S1=b.S1, S2=b.S2, S3=b.S3, Tau=b.Tau, Ge=b.Ge, species=sp)
+    end
+    function run_patch_sp(np, nsp)
+        pg = build_patchgrid(; ng=NG, ncell=NC, np=np, dx=DXC, gamma=GAM, nspecies=nsp,
+                             besym=:cuda, T=Float32, deut=false)
+        ic = make_ic_sp(NC, nsp); scatter_global!(pg, ic)
+        for _ in 1:K
+            patch_step!(pg, DT; a_value=1.0, order=(1,2,3), accel=nothing, chem=false, solver=:fvgk)
+        end
+        return gather_global(pg), ic
+    end
+
+    @testset "FVGK passive species (EulerColors colours)" begin
+        nsp = 2
+        g1, ic = run_patch_sp((1,1,1), nsp)
+        for q in 1:nsp
+            @test all(isfinite, g1.species[q])
+            @test isapprox(sum(Float64.(g1.species[q])), sum(Float64.(ic.species[q])); rtol=1e-4)  # conservation
+        end
+        @test g1.species[2] != ic.species[2]                                    # x₂ actually advected
+        @test maximum(abs.(g1.species[1] ./ g1.D .- 0.40f0)) < 1f-4             # x₁ uniform stays uniform (CMA)
+        # decomposition invariance: np=2×2×2 ≡ np=1×1×1 bit-identically, hydro AND species
+        g2, _ = run_patch_sp((2,2,2), nsp)
+        for f in (:D, :S1, :S2, :S3, :Tau)
+            @test maximum(abs.(getfield(g2, f) .- getfield(g1, f))) == 0f0
+        end
+        for q in 1:nsp
+            @test maximum(abs.(g2.species[q] .- g1.species[q])) == 0f0
+        end
+    end
+
+    # ── persistent UInt16 packed-species storage (build_patchgrid packed_species=true) ──
+    function run_patch_sp_packed(np, nsp)
+        pg = build_patchgrid(; ng=NG, ncell=NC, np=np, dx=DXC, gamma=GAM, nspecies=nsp,
+                             besym=:cuda, T=Float32, deut=false, packed_species=true)
+        ic = make_ic_sp(NC, nsp); scatter_global!(pg, ic)
+        for _ in 1:K
+            patch_step!(pg, DT; a_value=1.0, order=(1,2,3), accel=nothing, chem=false, solver=:fvgk)
+        end
+        return gather_global(pg), ic
+    end
+
+    @testset "FVGK packed UInt16 species advection ≡ f32 (within quantum)" begin
+        nsp = 2
+        gp, ic = run_patch_sp_packed((1,1,1), nsp)
+        gf, _  = run_patch_sp((1,1,1), nsp)                     # f32-storage reference, same IC
+        for q in 1:nsp
+            @test all(isfinite, gp.species[q])
+            @test isapprox(sum(Float64.(gp.species[q])), sum(Float64.(ic.species[q])); rtol=3e-3)   # conservation
+            xp = gp.species[q] ./ gp.D; xf = gf.species[q] ./ gf.D     # compare FRACTIONS
+            @test maximum(abs.(xp .- xf) ./ (xf .+ eps())) < 2f-2      # per-step repack quantum, K steps
+        end
+        @test maximum(abs.(gp.species[1] ./ gp.D .- 0.40f0)) < 2f-3    # x₁ uniform stays uniform (CMA)
+        # packed storage is decomposition-invariant too (np=2 ≡ np=1, bit-identical UInt16)
+        gp2, _ = run_patch_sp_packed((2,2,2), nsp)
+        for q in 1:nsp
+            @test maximum(abs.(gp2.species[q] .- gp.species[q])) == 0f0
+        end
+    end
 end

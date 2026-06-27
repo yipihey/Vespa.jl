@@ -22,19 +22,22 @@
 #     BEFORE each axis sweep — honoring the split integrator's per-sweep ghost
 #     contract (PPMKernels.muscl_hancock_step_3d! refills ghosts before every sweep).
 
-"One sibling patch: flat conserved fields (length nd³) + species, ghost shell, neighbors."
-struct Patch{A}
+"One sibling patch: flat conserved fields (length nd³) + species, ghost shell, neighbors.
+`A` is the conserved-field array type; `S` the species array type — `A` (f32 ρ·xᵢ) for the default
+storage, or a `UInt16` device array when `packed_species` (then the stored value is the log2-packed mass
+FRACTION Xᵢ=ρxᵢ/ρ; see ChemistryKernels log2_species.jl / FiniteVolumeGodunovKA colors.jl)."
+struct Patch{A,S}
     idx     ::NTuple{3,Int}              # block coords, each in 0:np[d]-1
     D       ::A                          # ρ
     S1      ::A; S2::A; S3::A            # momenta ρv
     Tau     ::A                          # total energy density ρ·etot
     Ge      ::A                          # gas energy density ρ·eint (dual energy)
-    species ::Vector{A}                  # passive species mass densities ρ·xᵢ
+    species ::Vector{S}                  # passive species: ρ·xᵢ (default) or packed UInt16 fraction Xᵢ
     nbr     ::NTuple{3,NTuple{2,Int}}    # per axis: (lo_neighbor_lin, hi_neighbor_lin)
 end
 
 "The decomposition: a uniform periodic ncell³ grid tiled into np patches, GPU-resident."
-mutable struct PatchGrid{A}
+mutable struct PatchGrid{A,S}
     backend                              # PPMKernels backend handle
     besym   ::Symbol                     # backend name (:cpu/:cuda/:metal) for ChemistryKernels
     T       ::DataType                   # element type (Float64 on cpu, Float32 on gpu)
@@ -47,7 +50,8 @@ mutable struct PatchGrid{A}
     gamma   ::Float64
     du      ::Float64; lu::Float64; tu::Float64   # chem cgs unit factors
     deut    ::Bool                       # H+D chemistry (3 species) vs H-only (2)
-    patches ::Vector{Patch{A}}
+    packed  ::Bool                       # species stored as packed UInt16 fractions (vs f32 ρ·xᵢ)
+    patches ::Vector{Patch{A,S}}
     fvgk    ::Any                        # nothing, or per-patch FiniteVolumeGodunovKA grids (solver=:fvgk)
 end
 
@@ -65,14 +69,18 @@ an initial condition.
 """
 function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                          dx::Real, gamma::Real, nspecies::Int, besym::Symbol, T::DataType,
-                         du::Real=1.0, lu::Real=1.0, tu::Real=1.0, deut::Bool=true)
+                         du::Real=1.0, lu::Real=1.0, tu::Real=1.0, deut::Bool=true,
+                         packed_species::Bool=false)
     backend = PPMKernels.backend(besym)
     all(ncell .% np .== 0) || error("build_patchgrid: ncell $ncell not divisible by np $np")
     pdim = ncell .÷ np
     nd   = pdim .+ 2ng
     n    = prod(nd)
-    zeros_dev() = PPMKernels.device_zeros(backend, T, (n,))
-    patches = Vector{Patch{typeof(zeros_dev())}}(undef, prod(np))
+    zeros_dev()  = PPMKernels.device_zeros(backend, T, (n,))
+    # packed species: UInt16 fractions (UInt16(0) = the log2 floor ≈ 0); else f32 ρ·xᵢ
+    spec_zeros() = packed_species ? PPMKernels.device_zeros(backend, UInt16, (n,)) : zeros_dev()
+    A  = typeof(zeros_dev()); SA = typeof(spec_zeros())
+    patches = Vector{Patch{A,SA}}(undef, prod(np))
     for iz in 0:np[3]-1, iy in 0:np[2]-1, ix in 0:np[1]-1
         lin = _lin(ix, iy, iz, np)
         # periodic lo/hi neighbor linear ids per axis
@@ -80,10 +88,10 @@ function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                 ( _lin(ix, mod(iy-1,np[2]), iz, np), _lin(ix, mod(iy+1,np[2]), iz, np) ),
                 ( _lin(ix, iy, mod(iz-1,np[3]), np), _lin(ix, iy, mod(iz+1,np[3]), np) ) )
         patches[lin] = Patch((ix,iy,iz), zeros_dev(), zeros_dev(), zeros_dev(), zeros_dev(),
-                             zeros_dev(), zeros_dev(), [zeros_dev() for _ in 1:nspecies], nbr)
+                             zeros_dev(), zeros_dev(), SA[spec_zeros() for _ in 1:nspecies], nbr)
     end
     PatchGrid(backend, besym, T, ng, np, ncell, pdim, nd, Float64(dx), Float64(gamma),
-              Float64(du), Float64(lu), Float64(tu), deut, patches, nothing)
+              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing)
 end
 
 # Hydro-solver hook for `solver=:fvgk`: overridden by `MultiCodeFVGKExt` when
@@ -155,7 +163,18 @@ function scatter_global!(pg::PatchGrid, gfields)
         end
         load!(p.D, gfields.D); load!(p.S1, gfields.S1); load!(p.S2, gfields.S2)
         load!(p.S3, gfields.S3); load!(p.Tau, gfields.Tau); load!(p.Ge, gfields.Ge)
-        for (sd, gs) in zip(p.species, gfields.species); load!(sd, gs); end
+        if pg.packed
+            # IC species are ρ·xᵢ (host); store as the packed UInt16 mass fraction Xᵢ = ρxᵢ/ρ
+            ρoct = gfields.D[gi, gj, gk]; ubuf = fill(UInt16(0), pg.nd)
+            for (sd, gs) in zip(p.species, gfields.species)
+                fill!(ubuf, UInt16(0))
+                @views ubuf[li, lj, lk] .= ChemistryKernels.encode_log2sp.(
+                    Float32.(gs[gi, gj, gk] ./ max.(ρoct, eps())))
+                copyto!(sd, vec(ubuf))
+            end
+        else
+            for (sd, gs) in zip(p.species, gfields.species); load!(sd, gs); end
+        end
     end
     exchange_ghosts!(pg)
     return pg
@@ -179,7 +198,16 @@ function gather_global(pg::PatchGrid)
                               @views gdst[gi, gj, gk] .= h[li, lj, lk])
         store!(g.D, p.D); store!(g.S1, p.S1); store!(g.S2, p.S2)
         store!(g.S3, p.S3); store!(g.Tau, p.Tau); store!(g.Ge, p.Ge)
-        for s in 1:nsp; store!(g.species[s], p.species[s]); end
+        if pg.packed
+            # stored species are packed UInt16 fractions Xᵢ; return ρ·xᵢ = unpack(Xᵢ)·ρ (host)
+            Dh = _r3(PPMKernels.to_host(p.D), pg.nd)
+            for s in 1:nsp
+                Xh = ChemistryKernels.decode_log2sp.(pg.T, _r3(PPMKernels.to_host(p.species[s]), pg.nd))
+                @views g.species[s][gi, gj, gk] .= pg.T.(Xh[li, lj, lk] .* Dh[li, lj, lk])
+            end
+        else
+            for s in 1:nsp; store!(g.species[s], p.species[s]); end
+        end
     end
     return g
 end
@@ -240,6 +268,8 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             # cross-patch exchange (FVGK is unsplit). See MultiCodeFVGKExt.
             _fvgk_patch_hydro!(pg, dt)
         else
+            pg.packed && error("patch_step!: packed_species (UInt16) storage requires solver=:fvgk — " *
+                               "the PPM sweep advects f32 colours; rebuild without packed_species for :ppm")
             ngs = pg.ng - 1
             ngs >= 1 || error("patch_step!: need ng ≥ 2 for the compute-with-overlap halo (got ng=$(pg.ng))")
             for axis in order
@@ -279,7 +309,32 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             haveHD = pg.deut && length(pg.patches[1].species) >= 3
             oncpu = chem_backend === :cpu && pg.besym !== :cpu     # run chem on the HOST
             for p in pg.patches
-                if oncpu
+                if pg.packed
+                    # species are packed UInt16 fractions Xᵢ; ChemistryKernels.solve_chem_device_u16!
+                    # unpacks Xᵢ·ρ → ρxᵢ, evolves the f64 network, and repacks IN PLACE — no f32 round-trip.
+                    r64 = Float64.(p.D); e64 = Float64.(p.Ge ./ p.D); e0 = copy(e64)
+                    hdc = haveHD ? p.species[3] : nothing
+                    if oncpu
+                        sp1 = Array(p.species[1]); sp2 = Array(p.species[2])
+                        sp3 = haveHD ? Array(p.species[3]) : nothing
+                        rh  = Float64.(Array(p.D)); eh = Float64.(Array(p.Ge)) ./ rh; eh0 = copy(eh)
+                        ChemistryKernels.solve_chem_device_u16!(rh, eh, sp1, sp2, sp3;
+                            a_value=a_value, dt=dt, density_units=du, length_units=lu,
+                            time_units=tu, deuterium=pg.deut, backend=:cpu, precision=Float64,
+                            rate_tables=rate_tables, cool_tables=cool_tables)
+                        p.Tau .+= p.D .* PPMKernels.to_device(be, T.(eh .- eh0), T)
+                        p.Ge  .= p.D .* PPMKernels.to_device(be, T.(eh), T)
+                        copyto!(p.species[1], sp1); copyto!(p.species[2], sp2)
+                        haveHD && copyto!(p.species[3], sp3)
+                    else
+                        ChemistryKernels.solve_chem_device_u16!(r64, e64, p.species[1], p.species[2], hdc;
+                            a_value=a_value, dt=dt, density_units=du, length_units=lu,
+                            time_units=tu, deuterium=pg.deut, backend=pg.besym, precision=Float64,
+                            rate_tables=rate_tables, cool_tables=cool_tables)
+                        p.Tau .+= p.D .* T.(e64 .- e0)
+                        p.Ge  .= p.D .* T.(e64)
+                    end
+                elseif oncpu
                     # GPU/CPU role flip: download the patch state, solve the stiff network on
                     # the HOST (faster — no warp divergence; see patch_cicass CIC_CHEM_BACKEND),
                     # then upload the cooled energy + species back to the device.
