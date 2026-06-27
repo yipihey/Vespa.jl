@@ -29,6 +29,10 @@ include(joinpath(@__DIR__, "..", "..", "EnzoLib", "examples", "sb_metal_amr.jl")
 # the working set.  Interval via CIC_RECLAIM_EVERY (0 disables; default every cycle).
 BE === :cuda && @eval import CUDA
 const RECLAIM_EVERY = parse(Int, get(ENV, "CIC_RECLAIM_EVERY", "1"))
+# Optional :hydro slot = FiniteVolumeGodunovKA (CIC_HYDRO_SOLVER=fvgk): an UNSPLIT 2nd-order
+# CTU Godunov solver (CUDA f32).  Loaded only when selected (it transpiles+builds a CUDA lib).
+const _USE_FVGK = get(ENV, "CIC_HYDRO_SOLVER", "ppm") == "fvgk"
+_USE_FVGK && @eval import FiniteVolumeGodunovKA as FV
 
 # ── parameters ──
 const BOX    = parse(Float64, get(ENV, "CIC_BOX",   "0.128"))   # Mpc/h  (128 kpc/h)
@@ -336,6 +340,84 @@ function hydro_localppm!(h, level, dt)
     return nothing
 end
 
+# ── alternative :hydro slot — FiniteVolumeGodunovKA (CIC_HYDRO_SOLVER=fvgk) ───────────
+# FVGK is an UNSPLIT 2nd-order CTU Godunov solver (CUDA f32) that owns its own periodic
+# boundary on a SINGLE active grid (no ghosts).  The CICASS box is single-level periodic,
+# so it maps directly: gather the active region (strip Enzo's NG ghosts) into FVGK's
+# var-major device buffer (D,S1,S2,S3,Tau, then species as ρ·xᵢ "colours"), step once
+# (sub-cycling to FVGK's CTU CFL), and scatter back.  Cosmology is coupled exactly like
+# the PPM slots: comoving cell width dx·a(t) (set per step), an operator-split ½+½ KDK
+# gravity kick on the gas (same AccelerationField), and species riding the mass flux.
+# Single-grid only (asserts level 0, one grid) — no AMR flux correction.  The FVGK grid is
+# built once (it transpiles+compiles a CUDA kernel) and reused; dx is updated each step.
+const _FVGRID = Ref{Any}(nothing)     # cached Grid3DCuMarch
+const _FVNSP  = Ref(-1)               # species count it was built for
+function hydro_fvgk!(h, level, dt)
+    @assert level == 0 "FVGK hydro slot is single-grid; run with CIC_MAXLEVEL=0"
+    ng = EnzoLib.session_num_grids_on_level(h, level)
+    @assert ng == 1 "FVGK hydro slot expects one grid at level 0 (got $ng)"
+    g    = EnzoLib.problem_grid_index_on_level(h, level, 0)
+    gd   = Tuple(Int.(EnzoLib.problem_grid_dims(h, g)))
+    Nact = gd[1] - 2*NG
+    gl, gr = EnzoLib.problem_grid_edge(h, g)
+    acosmo = EnzoLib.session_cosmology(h)[1]
+    dxc    = Float32(acosmo * (gr[1] - gl[1]) / Nact)
+    chalf  = T(0.5 * dt)
+    A      = (NG+1):(NG+Nact)                                  # active slice (strip ghosts)
+    act(fi) = Float32.(@view reshape(EnzoLib.problem_get_field(h, fi, g), gd)[A, A, A])
+    acc(d)  = Float32.(@view reshape(EnzoLib.problem_get_acceleration(h, d, g), gd)[A, A, A])
+
+    D = act(iD); S1 = D .* act(iV1); S2 = D .* act(iV2); S3 = D .* act(iV3); Tau = D .* act(iTE)
+    ax = acc(0); ay = acc(1); az = acc(2)
+    sp = _species_indices(h, g); nsp = length(sp)
+    cols = [act(fi) for fi in sp]                              # ρ_s densities = ρ·xᵢ colours
+    _grav_kick!(S1, S2, S3, Tau, D, ax, ay, az, chalf)        # ½ KDK (pre, pre-D)
+
+    # build/cache the FVGK grid (Euler + nsp passive colours), sized to the active region
+    if _FVGRID[] === nothing || _FVNSP[] != nsp
+        γ = Float32(GAMMA)
+        if nsp == 0
+            sys = FV.Euler(γ = γ);             z = (1f0, 0f0, 0f0, 0f0, 1f0)
+        else
+            sys = FV.EulerColors{nsp}(γ = γ);  z = (1f0, 0f0, 0f0, 0f0, 1f0, ntuple(_ -> 0f0, nsp)...)
+        end
+        U0 = [z for _ in 1:Nact, _ in 1:Nact, _ in 1:Nact]
+        _FVGRID[] = FV.Grid3DCuMarch(sys, U0; dx = dxc); _FVNSP[] = nsp
+    end
+    gv = _FVGRID[]; gv.dx = dxc
+    VOL = Nact^3; nv = 5 + nsp
+    Uh  = Vector{Float32}(undef, nv*VOL)
+    put(c, arr) = (Uh[(c-1)*VOL+1 : c*VOL] = vec(arr))
+    put(1, D); put(2, S1); put(3, S2); put(4, S3); put(5, Tau)
+    for (q, c) in enumerate(cols); put(5+q, c); end
+    copyto!(gv.R, Uh)
+
+    nsub = max(1, ceil(Int, Float32(dt) / FV.dt_cfl(gv; cfl = 0.45f0)))
+    if nsp > 0
+        FV.run_ctu!(gv, Float32(dt)/nsub, nsub)               # f32 (colours are primitives)
+    else
+        FV.run_ctus!(gv, Float32(dt)/nsub, nsub)              # f16-tiled fast path (pure hydro)
+    end
+
+    Rh = Array(gv.R)
+    getv(c) = reshape(Rh[(c-1)*VOL+1 : c*VOL], Nact, Nact, Nact)
+    D = getv(1); S1 = getv(2); S2 = getv(3); S3 = getv(4); Tau = getv(5)
+    cols = [getv(5+q) for q in 1:nsp]
+    _grav_kick!(S1, S2, S3, Tau, D, ax, ay, az, chalf)        # ½ KDK (post, post-D)
+    Ge = Tau .- 0.5f0 .* (S1.^2 .+ S2.^2 .+ S3.^2) ./ D       # re-derive gas energy (FVGK is single-energy)
+
+    # write the active region back into the full (ghosted) field; Enzo refills ghosts.
+    function wr(fi, active)
+        full = reshape(copy(EnzoLib.problem_get_field(h, fi, g)), gd)
+        @views full[A, A, A] .= Float64.(active)
+        EnzoLib.problem_set_field(h, fi, vec(full); grid=g)
+    end
+    wr(iD, D); wr(iV1, S1 ./ D); wr(iV2, S2 ./ D); wr(iV3, S3 ./ D)
+    wr(iTE, Tau ./ D); wr(iGE, Ge ./ D)
+    for (fi, c) in zip(sp, cols); wr(fi, c); end
+    return nothing
+end
+
 # CICASS analytic linear-theory input power.  Columns: k, Δ²(G1), Δ²(G5), Δ²(G3),
 # Δ²(G7) (dimensionless k³P/2π²) at z_init.  Per the G[] assignments in
 # makeCosICs/main.c (generateDisplacements: G[1]=DM density, G[5]=BARYON density),
@@ -508,7 +590,8 @@ function main_cic()
         hooks = Dict{Symbol,Function}()
         # CIC_HYDRO_SOLVER: :ppm (Enzo-PPM port, default) or :localppm (fast one-ghost Local PPM)
         hsolver = Symbol(get(ENV, "CIC_HYDRO_SOLVER", "ppm"))
-        hydrofn = hsolver === :localppm ? hydro_localppm! : hydro!
+        hydrofn = hsolver === :localppm ? hydro_localppm! :
+                  hsolver === :fvgk     ? hydro_fvgk!     : hydro!
         hmode === :julia && @printf("  hydro slot = :julia / %s\n", hsolver)
         hmode === :julia && (hooks[:hydro]   = (hh_,l_,d_)->(t=time(); hydrofn(hh_,l_,d_);       hydrot[]+=time()-t))
         # `respart` (the GPU-resident particle state, set below) lets the gravity slot
