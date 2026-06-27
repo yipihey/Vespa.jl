@@ -24,6 +24,7 @@ MusicLib = "24953f1b-bc07-41df-b160-2069462b055e"
 AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
+FiniteVolumeGodunovKA = "f5d0b1a2-3c4e-4b6a-9d8f-0a1b2c3d4e5f"
 
 [extras]
 Gadget4Lib = "f395cddf-e2ec-4c78-a2b4-52aaf06ca4c4"
@@ -32,6 +33,7 @@ MusicLib = "24953f1b-bc07-41df-b160-2069462b055e"
 AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
+FiniteVolumeGodunovKA = "f5d0b1a2-3c4e-4b6a-9d8f-0a1b2c3d4e5f"
 
 [extensions]
 MultiCodeGadget4Ext = "Gadget4Lib"
@@ -41,6 +43,7 @@ MultiCodeMusicDiscoDJExt = ["MusicLib", "DiscoDJLib"]
 MultiCodeAthenaExt = "AthenaLib"
 MultiCodeCICASSExt = "CICASSLib"
 MultiCodeDfmmExt = "dfmm"
+MultiCodeFVGKExt = "FiniteVolumeGodunovKA"
 
 [sources]
 CICASSLib = {path = "../../../CICASS.jl/lib/CICASSLib"}
@@ -50,6 +53,7 @@ MusicLib = {path = "../../../Music.jl/lib/MusicLib"}
 AthenaLib = {path = "../../../Athena.jl/lib/AthenaLib"}
 dfmm = {path = "../../../dfmm"}
 ArepoLib = {path = "../../../Arepo.jl/lib/ArepoLib"}
+FiniteVolumeGodunovKA = {path = "../../../FiniteVolumeGodunovKA.jl"}
 CodeBridge = {path = "../CodeBridge"}
 EnzoLib = {path = "../EnzoLib"}
 PPMKernels = {path = "../PPMKernels"}

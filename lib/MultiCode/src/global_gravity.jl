@@ -79,15 +79,20 @@ function solve_global_poisson!(φg::Array{Float64,3}, ρg::Array{Float64,3};
     return φg
 end
 
-# A patch's ghosted block maps to a CONTIGUOUS, periodically-wrapped run of the global
-# accel along each axis: local 1:nd ↔ global starting at (o-ng) mod nc, length nd.  A
-# wrapped run is ≤2 contiguous segments per axis, so the whole nd³ block is ≤8 contiguous
-# sub-blocks — copied with vectorized broadcasts instead of an nd³ scalar gather.
-@inline function _wrap_segments(o::Int, ng::Int, nd::Int, nc::Int)
-    s0 = mod(o - ng, nc)                       # 0-based global start of the run
-    f  = min(nd, nc - s0)                      # length up to the wrap
-    seg1 = (1:f, (s0+1):(s0+f))                # (local range, global range)
-    return nd > f ? (seg1, ((f+1):nd, 1:(nd-f))) : (seg1,)
+# A patch's ghosted block maps to periodically-wrapped contiguous runs of the global accel
+# along each axis: local 1:nd ↔ global starting at (o-ng) mod nc, length nd, wrapping mod nc.
+# Tiled into contiguous (local, global) segments and copied with vectorized broadcasts. Handles
+# nd > nc (e.g. np=1, where the ghosted block ncell+2ng exceeds the global grid → MULTIPLE wraps;
+# the old ≤2-segment form ran the global index out of bounds, yielding NaN ghosts on CUDA).
+function _wrap_segments(o::Int, ng::Int, nd::Int, nc::Int)
+    segs = Tuple{UnitRange{Int},UnitRange{Int}}[]
+    l = 1; g = mod(o - ng, nc)                 # local 1-based cursor, 0-based global cursor
+    while l <= nd
+        run = min(nc - g, nd - l + 1)          # cells until the wrap point or the block end
+        push!(segs, (l:(l+run-1), (g+1):(g+run)))
+        l += run; g = (g + run) % nc
+    end
+    return segs
 end
 
 # fill a patch's nd³ ghosted accel block from the global `src` by the segment copies.

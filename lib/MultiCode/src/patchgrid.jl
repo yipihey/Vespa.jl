@@ -34,7 +34,7 @@ struct Patch{A}
 end
 
 "The decomposition: a uniform periodic ncell³ grid tiled into np patches, GPU-resident."
-struct PatchGrid{A}
+mutable struct PatchGrid{A}
     backend                              # PPMKernels backend handle
     besym   ::Symbol                     # backend name (:cpu/:cuda/:metal) for ChemistryKernels
     T       ::DataType                   # element type (Float64 on cpu, Float32 on gpu)
@@ -48,6 +48,7 @@ struct PatchGrid{A}
     du      ::Float64; lu::Float64; tu::Float64   # chem cgs unit factors
     deut    ::Bool                       # H+D chemistry (3 species) vs H-only (2)
     patches ::Vector{Patch{A}}
+    fvgk    ::Any                        # nothing, or per-patch FiniteVolumeGodunovKA grids (solver=:fvgk)
 end
 
 _lin(ix, iy, iz, np) = ix + np[1]*iy + np[1]*np[2]*iz + 1
@@ -82,8 +83,13 @@ function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                              zeros_dev(), zeros_dev(), [zeros_dev() for _ in 1:nspecies], nbr)
     end
     PatchGrid(backend, besym, T, ng, np, ncell, pdim, nd, Float64(dx), Float64(gamma),
-              Float64(du), Float64(lu), Float64(tu), deut, patches)
+              Float64(du), Float64(lu), Float64(tu), deut, patches, nothing)
 end
+
+# Hydro-solver hook for `solver=:fvgk`: overridden by `MultiCodeFVGKExt` when
+# `FiniteVolumeGodunovKA` is loaded. Advances every patch one full step of `dt` with the
+# FiniteVolumeGodunovKA Godunov scheme (it owns the periodic boundary internally).
+function _fvgk_patch_hydro! end
 
 # ── periodic ghost exchange along one axis (the patch-patch coupling) ──────────
 # For np=2 (or 1) the lo and hi neighbor along an axis are the same partner, and
@@ -198,7 +204,7 @@ the gravity ½-kick is applied before and after the hydro (KDK), mirroring
 `hydro_localppm!`.  `a_value` is the expansion factor for chemistry units.
 """
 function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
-                     accel=nothing, chem::Bool=true,
+                     accel=nothing, chem::Bool=true, solver::Symbol=:ppm,
                      du::Real=pg.du, lu::Real=pg.lu, tu::Real=pg.tu,
                      do_hydro::Bool=true, do_chem::Bool=true, chem_backend::Symbol=pg.besym,
                      rate_tables=nothing, cool_tables=nothing)
@@ -227,22 +233,30 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
         # `overlap`); those overlap cells carry the boundary error and are discarded/refilled
         # by the next exchange, while every KEPT interior cell is computed with interior-only
         # interfaces ⇒ bit-identical to the undecomposed run.  (overlap=1 verified sufficient.)
-        ngs = pg.ng - 1
-        ngs >= 1 || error("patch_step!: need ng ≥ 2 for the compute-with-overlap halo (got ng=$(pg.ng))")
-        for axis in order
-            PPMKernels._pool_reset!()
-            exchange_ghosts_axis!(pg, axis)
-            for p in pg.patches
-                PPMKernels._hancock_sweep_axis!(p.D, p.S1, p.S2, p.S3, p.Tau, pg.nd, ngs, axis;
-                    dt=dt, gamma=pg.gamma, theta=1.5, dx=pg.dx, small_rho=1e-10,
-                    recon=:ppm_local, predictor=:trace, ge=p.Ge,
-                    colours=isempty(p.species) ? nothing : Tuple(p.species),
-                    riemann=:hll, face_periodic=false)
+        if solver === :fvgk
+            # FiniteVolumeGodunovKA (unsplit single-grid Godunov). Assembles the patch interiors
+            # into one global periodic grid, steps once, disperses back — decomposition-invariant
+            # for any np (bit-identical to the undecomposed run), then re-derives Ge. No per-axis
+            # cross-patch exchange (FVGK is unsplit). See MultiCodeFVGKExt.
+            _fvgk_patch_hydro!(pg, dt)
+        else
+            ngs = pg.ng - 1
+            ngs >= 1 || error("patch_step!: need ng ≥ 2 for the compute-with-overlap halo (got ng=$(pg.ng))")
+            for axis in order
+                PPMKernels._pool_reset!()
+                exchange_ghosts_axis!(pg, axis)
+                for p in pg.patches
+                    PPMKernels._hancock_sweep_axis!(p.D, p.S1, p.S2, p.S3, p.Tau, pg.nd, ngs, axis;
+                        dt=dt, gamma=pg.gamma, theta=1.5, dx=pg.dx, small_rho=1e-10,
+                        recon=:ppm_local, predictor=:trace, ge=p.Ge,
+                        colours=isempty(p.species) ? nothing : Tuple(p.species),
+                        riemann=:hll, face_periodic=false)
+                end
             end
-        end
-        # DEF reset (gas energy ↔ total energy) once per step, per patch
-        for p in pg.patches
-            PPMKernels.dual_energy_sync!(p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge; gamma=pg.gamma)
+            # DEF reset (gas energy ↔ total energy) once per step, per patch
+            for p in pg.patches
+                PPMKernels.dual_energy_sync!(p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge; gamma=pg.gamma)
+            end
         end
         # ½ gravity kick (post)
         if accel !== nothing

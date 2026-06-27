@@ -8,6 +8,7 @@ EmissionKernels = "1a2b3c4d-0013-4000-8000-000000000013"
 CodeBridge = "1a2b3c4d-0010-4000-8000-000000000010"
 DiscoDJLib = "5afedbe5-b79e-4f2e-a3b9-6aaab87d91a7"
 EnzoLib = "1a2b3c4d-0004-4000-8000-000000000004"
+FiniteVolumeGodunovKA = "f5d0b1a2-3c4e-4b6a-9d8f-0a1b2c3d4e5f"
 Gadget4Lib = "f395cddf-e2ec-4c78-a2b4-52aaf06ca4c4"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
@@ -18,6 +19,7 @@ PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
 R3D = "6888587b-6711-4ff3-8558-83329515e735"
 RamsesLib = "b7a3e9c2-1f4d-4e8a-9c5b-2a6f0d3e7c41"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Vespa = "1a2b3c4d-0000-4000-8000-000000000000"
 dfmm = "3fe8d9ee-2bda-457c-82d7-3afede950fc2"
 
 [extras]
@@ -47,6 +49,9 @@ path = "../../../../DiscoDJ.jl/lib/DiscoDJLib"
 [sources.EnzoLib]
 path = "../../EnzoLib"
 
+[sources.FiniteVolumeGodunovKA]
+path = "../../../../FiniteVolumeGodunovKA.jl"
+
 [sources.Gadget4Lib]
 path = "../../../../Gadget4.jl/lib/Gadget4Lib"
 
@@ -61,6 +66,9 @@ path = "../../PPMKernels"
 
 [sources.PoissonKernels]
 path = "../../PoissonKernels"
+
+[sources.Vespa]
+path = "../../.."
 
 [sources.R3D]
 path = "../../../../r3djl/R3D.jl"
