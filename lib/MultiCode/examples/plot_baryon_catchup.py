@@ -5,7 +5,7 @@
 #   ~/Projects/disco-dj-fem/.venv/bin/python plot_baryon_catchup.py
 import os, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode")
+R = os.environ.get("VESPA_RUN_DIR") or os.getcwd()  # run dir (set VESPA_RUN_DIR)
 
 def blocks(fn):
     d, cur = {}, None

@@ -3,7 +3,7 @@
 linear theory AT THE SAME output redshifts.  Markers = measured; solid lines =
 CICASS analytic linear P(k) generated at each z (2-fluid transfer, so the baryon
 catch-up after recombination is included).  Left = baryons, right = DM."""
-import numpy as np, matplotlib
+import os, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
@@ -20,7 +20,7 @@ def load(fn):
         else: a,b=line.split();ks.append(float(a));Ps.append(float(b))
     flush();return B
 
-R="/Users/tabel/Projects/Vespa.jl/reports/multicode/"
+R=(os.environ.get("VESPA_RUN_DIR") or os.getcwd())+"/"  # run dir (set VESPA_RUN_DIR)
 sim=load(R+"cicass_highz_pk.dat"); lin=load(R+"cicass_linear_pk.dat")
 simz=sorted({k[0] for k in sim},reverse=True)
 linz=sorted({k[0] for k in lin},reverse=True)

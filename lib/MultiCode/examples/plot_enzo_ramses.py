@@ -3,9 +3,9 @@
 Left: density P(k) (gas + DM) for both codes + CICASS linear DM.  Right:
 mode-by-mode cross-correlation r(k) of the DM density and the gravitational
 potential between the two codes (same realization -> r->1 on shared scales)."""
-import numpy as np, matplotlib
+import os, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-N=128; L=0.128; R="/Users/tabel/Projects/Vespa.jl/reports/multicode/"
+N=128; L=0.128; R=(os.environ.get("VESPA_RUN_DIR") or os.getcwd())+"/"  # run dir (set VESPA_RUN_DIR)
 
 def load_pk(fn):
     B={};cur=None;ks=[];Ps=[]

@@ -44,7 +44,7 @@ const DO_DRAG = get(ENV, "CIC_COMPTON_DRAG", "0") == "1"   # Compton momentum dr
 # the machine out of RAM.  Default 50 GB — well above the ~3.5 GB a healthy run
 # holds, low enough to catch a runaway long before it hurts the system.
 const RSS_CEIL_MB = parse(Float64, get(ENV, "CIC_RSS_CEIL_MB", "50000"))
-const REPORTS = joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
+const REPORTS = MultiCode.run_dir("arepo")   # scratch run dir (never the repo); see lib/MultiCode/src/runout.jl
 const GRACKLE_DATA = get(ENV, "GRACKLE_DATA_FILE",
     joinpath(homedir(), "Research", "codes", "grackle", "input", "CloudyData_noUVB.h5"))
 
@@ -507,16 +507,14 @@ function main()
             # spectra (same format as enzo_xspec/ramses_xspec: Int64 N, ρ_b[N³], ρ_d[N³],
             # Julia column-major x-fastest). Lets Arepo join plot_cicass_anisotropy/cellcmp.
             if get(ENV, "CIC_XSPEC", "0") == "1"
-                open(joinpath(REPORTS, "arepo_xspec$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(Na)); write(io, vec(gas)); write(io, vec(dm))
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "arepo_xspec$(TAG)_z$(round(Int,z)).bin");
+                    kind="arepo_xspec", n=Na, ndim=3, columns=["rho_b"=>gas, "rho_dm"=>dm])
             end
             # cell-by-cell dump (ρ, x_HII, f_H2, f_HD, T) → plot_cicass_cellcmp.py
             if cc !== nothing
-                open(joinpath(REPORTS, "arepo_cellcmp$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(Na))
-                    write(io, cc.rho); write(io, cc.xHII); write(io, cc.fH2); write(io, cc.fHD); write(io, cc.T)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "arepo_cellcmp$(TAG)_z$(round(Int,z)).bin");
+                    kind="arepo_cellcmp", n=Na, ndim=3,
+                    columns=["rho_b"=>cc.rho, "xHII"=>cc.xHII, "fH2"=>cc.fH2, "fHD"=>cc.fHD, "T"=>cc.T])
             end
             db = std(gas)/mean(gas); dd = std(dm)/mean(dm)
             @printf("  ● Arepo z=%.2f  δb_rms=%.3e δdm_rms=%.3e  [%d]  rss=%.0fMB\n",

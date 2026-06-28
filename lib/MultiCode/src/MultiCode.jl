@@ -58,6 +58,8 @@ export run_music_crosscheck, run_music_discodj_phase_report, run_discodj_growth
 export run_gadget4_halos
 export run_cicass_streaming, write_grafic_streaming, run_cicass_enzo, run_cicass_ramses
 
+include("runout.jl")              # where a run writes its outputs (scratch, never the repo)
+include("fieldio.jl")             # byte-identical field-dump writer + fields.toml side-car
 include("canonical.jl")
 include("exact_sod.jl")
 include("adapters.jl")

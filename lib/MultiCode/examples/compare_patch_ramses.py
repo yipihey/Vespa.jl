@@ -12,7 +12,7 @@
 import sys, os
 import numpy as np
 
-REPORTS = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode")
+REPORTS = os.environ.get("VESPA_RUN_DIR") or os.getcwd()  # run dir (set VESPA_RUN_DIR)
 FIELDS = ["rho_b", "x_HII", "f_H2", "f_HD", "T_K"]
 
 def read_cellcmp(path):

@@ -37,7 +37,7 @@ const IENTROPY = DEF ? 7 : nothing   # entropy=.true. slot; nothing when dual en
 const DEUT   = get(ENV, "CIC_DEUT", "1") == "1"
 const BE     = Symbol(get(ENV, "BACKEND", "metal"))
 const T      = Float32
-const REPORTS = joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
+const REPORTS = MultiCode.run_dir("ramses")   # scratch run dir (never the repo); see lib/MultiCode/src/runout.jl
 # Zero-copy device-resident chem (CUDA only): run ChemistryKernels directly on RAMSES's
 # device uold (CUDA.jl wraps the nvfortran device pointer — same primary context), with
 # NO host get_hydro_all / set_hydro / set_uold_device round-trip.  Needs the CUDA lib.
@@ -511,14 +511,13 @@ function main_ramses()
             phi = ramses_field_grid(h, lev, N, :phi)         # RAMSES gravitational potential
             push!(pk_results, (z=z, baryon=pk_of(gas), dm=pk_of(dm), phi=pk_field(phi)))
             # save the φ and density grids for cross-correlation vs Enzo (same realization)
-            open(joinpath(REPORTS, "ramses_fields$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                write(io, Float64.(vec(phi))); write(io, Float64.(vec(dm)))
-            end
+            MultiCode.write_grid(joinpath(REPORTS, "ramses_fields$(TAG)_z$(round(Int,z)).bin");
+                kind="ramses_fields", n=N, ndim=3, header=false,
+                columns=["phi"=>Float64.(vec(phi)), "rho_dm"=>Float64.(vec(dm))])
             # full 3D baryon+DM density for cross-spectra P_bc(k), r(k) — matches Enzo xspec
             if get(ENV, "CIC_XSPEC", "0") == "1"
-                open(joinpath(REPORTS, "ramses_xspec$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(N)); write(io, vec(gas)); write(io, vec(dm))
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "ramses_xspec$(TAG)_z$(round(Int,z)).bin");
+                    kind="ramses_xspec", n=N, ndim=3, columns=["rho_b"=>gas, "rho_dm"=>dm])
             end
             # per-cell density + chemistry on the SAME regular grid as Enzo (cell-by-cell).
             # uold: 1=ρ, 6=HII, 7=H2I, 8=HDI.  x_HII=HII/ρ/X_H, f_H2=H2I/ρ/X_H, f_HD=HDI/ρ.
@@ -536,22 +535,20 @@ function main_ramses()
                 # T is consistent with grackle's calculate_temperature and across codes.
                 muv = 1.0 ./ ((XH+(1-XH)/4) .+ XH.*(xHIIv .- 0.5.*fH2v))
                 Tcell = eint .* ((5/3-1).*muv.*uu.scale_T2)          # K
-                open(joinpath(REPORTS, "ramses_cellcmp$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(N))
-                    write(io, vec(rg)); write(io, xHIIv); write(io, fH2v); write(io, vec(hd)./rv); write(io, Tcell)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "ramses_cellcmp$(TAG)_z$(round(Int,z)).bin");
+                    kind="ramses_cellcmp", n=N, ndim=3,
+                    columns=["rho_b"=>rg, "xHII"=>xHIIv, "fH2"=>fH2v, "fHD"=>vec(hd)./rv, "T"=>Tcell])
             end
             # ── DM particle dump (idp-keyed) for particle-by-particle Enzo-vs-RAMSES
             #    tracking.  pos in box-fraction [0,1), vel in km/s.  idp is the
             #    layout-independent key; match to Enzo by idp / initial position. ──
             if get(ENV, "CIC_PDUMP", "0") == "1"
                 np = size(p.xp, 1); uvk = res.unit_v_kms
-                open(joinpath(REPORTS, "ramses_pdump$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(np))
-                    write(io, Vector{Int64}(p.idp))
-                    write(io, Float64.(p.xp[:,1])); write(io, Float64.(p.xp[:,2])); write(io, Float64.(p.xp[:,3]))
-                    write(io, Float64.(p.vp[:,1]).*uvk); write(io, Float64.(p.vp[:,2]).*uvk); write(io, Float64.(p.vp[:,3]).*uvk)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "ramses_pdump$(TAG)_z$(round(Int,z)).bin");
+                    kind="ramses_pdump", n=np, ndim=1,
+                    columns=("idp"=>Vector{Int64}(p.idp),   # tuple: keep Int64 idp + Float64 coords distinct
+                             "x"=>Float64.(p.xp[:,1]), "y"=>Float64.(p.xp[:,2]), "z"=>Float64.(p.xp[:,3]),
+                             "vx"=>Float64.(p.vp[:,1]).*uvk, "vy"=>Float64.(p.vp[:,2]).*uvk, "vz"=>Float64.(p.vp[:,3]).*uvk))
             end
             # ── per-cell physical phase dump (ρ/ρ̄, n_H[cm⁻³], T[K], f_H2, x_HII) ──
             # matched μ=1.22 + γ=5/3 + X_H=0.76 with the Enzo run for a direct comparison.
@@ -570,10 +567,9 @@ function main_ramses()
                 xHIIv = (HII./r)./XH
                 muv   = 1.0 ./ ((XH+(1-XH)/4) .+ XH.*(xHIIv .- 0.5.*fH2v))
                 Tcell = eint .* (γ-1) .* muv .* u.scale_T2     # K (T2=T/μ; ×μ from species)
-                open(joinpath(REPORTS, "ramses_phase_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(length(rrel)))
-                    write(io, rrel); write(io, nH); write(io, Tcell); write(io, fH2v); write(io, xHIIv)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "ramses_phase$(TAG)_z$(round(Int,z)).bin");
+                    kind="ramses_phase", n=length(rrel), ndim=1,
+                    columns=["rrel"=>rrel, "nH"=>nH, "T"=>Tcell, "fH2"=>fH2v, "xHII"=>xHIIv])
             end
             write_tables()
             @printf("  ● RAMSES output z=%.2f  [%d written]\n", z, length(pk_results)); flush(stdout)

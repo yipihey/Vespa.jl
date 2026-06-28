@@ -12,7 +12,7 @@ Run:  CIC_TAG=_c128 <anaconda python3> plot_cicass_phase.py
 import numpy as np, os, glob, re
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 TAG = os.environ.get("CIC_TAG", "_c128")
 
 def load(fn):

@@ -10,7 +10,7 @@ Run:  CIC_TAG=_c256 CIC_NGRID=256 [CIC_TAG2=_c128 CIC_N2=128] <anaconda python3>
 import numpy as np, os
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 L = float(os.environ.get("CIC_BOX", "0.128"))
 TAG = os.environ.get("CIC_TAG", "_c256"); N = int(os.environ.get("CIC_NGRID", "256"))
 TAG2 = os.environ.get("CIC_TAG2", ""); N2 = int(os.environ.get("CIC_N2", "128"))

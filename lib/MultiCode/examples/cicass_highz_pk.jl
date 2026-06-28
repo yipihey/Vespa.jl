@@ -47,7 +47,7 @@ const MAXCYC = envint("CIC_MAXCYC", 100000)
 const GRACKLE_DATA = get(ENV, "GRACKLE_DATA_FILE",
     joinpath(homedir(), "Research", "codes", "grackle", "input", "CloudyData_noUVB.h5"))
 const RECFAST = joinpath(CICASSLib.cicass_root(), "vbc_transfer", "recfast", "xeTrecfast.out")
-const REPORTS = joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
+const REPORTS = MultiCode.run_dir("enzo")   # scratch run dir (never the repo); see lib/MultiCode/src/runout.jl
 
 # ── ΛCDM linear growth factor D(a) (growing mode), normalized D(1)=1 ──
 # matter+Λ; at z≥20 this is EdS (D∝a) to <0.1%, but compute the exact integral.
@@ -836,17 +836,15 @@ function main_cic()
                 vkms = 1.22475e7 * BOX * sqrt(OMEGA_M) * sqrt(1+ZSTART) / 1e5   # km/s per code vel
                 vxf = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,4;grid=0), 0), dims, N)
                 vyf = active_of(EnzoLib.problem_get_field(h, EnzoLib.field_index(h,5;grid=0), 0), dims, N)
-                open(joinpath(REPORTS, "enzo_slice$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(N))
-                    write(io, vec(ρb[:, :, kmid]));           write(io, vec(ρd[:, :, kmid]))
-                    write(io, vec(vxf[:, :, kmid] .* vkms));  write(io, vec(vyf[:, :, kmid] .* vkms))
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "enzo_slice$(TAG)_z$(round(Int,z)).bin");
+                    kind="enzo_slice", n=N, ndim=2,
+                    columns=["rho_b"=>ρb[:, :, kmid], "rho_dm"=>ρd[:, :, kmid],
+                             "vx"=>vxf[:, :, kmid] .* vkms, "vy"=>vyf[:, :, kmid] .* vkms])
             end
             # ── full 3D baryon+DM density for cross-spectra P_bc(k), r(k) ──
             if get(ENV, "CIC_XSPEC", "0") == "1"
-                open(joinpath(REPORTS, "enzo_xspec$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(N)); write(io, vec(ρb)); write(io, vec(ρd))
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "enzo_xspec$(TAG)_z$(round(Int,z)).bin");
+                    kind="enzo_xspec", n=N, ndim=3, columns=["rho_b"=>ρb, "rho_dm"=>ρd])
             end
             # ── per-cell density + chemistry on the regular grid, for cell-by-cell vs RAMSES.
             #    x_HII=n_HII/n_H, f_H2=2n_H2/n_H, f_HD=n_HD/n_H (species fields 9,14,18; X_H=0.76). ──
@@ -863,14 +861,13 @@ function main_cic()
                 # and with the RAMSES/Arepo dumps (was a fixed μ=1.22).
                 muv = 1.0 ./ ((XH+(1-XH)/4) .+ XH.*(xHIIv .- 0.5.*fH2v))
                 Tcell = vec(geA) .* muv .* ((5/3-1)*1.6726e-24*vu_cgs^2/1.380649e-16)
-                open(joinpath(REPORTS, "enzo_cellcmp$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(N))
-                    write(io, vec(ρb))                               # gas density (mean Ωb/Ωm)
-                    write(io, xHIIv)                                 # x_HII
-                    write(io, fH2v)                                  # f_H2
-                    write(io, vec(HDI) ./ vec(ρb))                   # f_HD
-                    write(io, Tcell)                                 # gas temperature [K] (grackle μ)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "enzo_cellcmp$(TAG)_z$(round(Int,z)).bin");
+                    kind="enzo_cellcmp", n=N, ndim=3,
+                    columns=["rho_b"=>ρb,                 # gas density (mean Ωb/Ωm)
+                             "xHII"=>xHIIv,               # x_HII
+                             "fH2"=>fH2v,                 # f_H2
+                             "fHD"=>vec(HDI) ./ vec(ρb),  # f_HD
+                             "T"=>Tcell])                 # gas temperature [K] (grackle μ)
             end
             # ── DM particle dump (array order = grafic lattice m=x+y·N+z·N²), for
             #    particle-by-particle Enzo-vs-RAMSES tracking.  pos in box-fraction
@@ -881,11 +878,10 @@ function main_cic()
                 ppz = EnzoLib.problem_get_particle_pos(h, 2, 0)
                 pvx = EnzoLib.problem_get_particle_vel(h, 0, 0); pvy = EnzoLib.problem_get_particle_vel(h, 1, 0)
                 pvz = EnzoLib.problem_get_particle_vel(h, 2, 0)
-                open(joinpath(REPORTS, "enzo_pdump$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(length(ppx)))
-                    write(io, ppx); write(io, ppy); write(io, ppz)
-                    write(io, pvx .* vku); write(io, pvy .* vku); write(io, pvz .* vku)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "enzo_pdump$(TAG)_z$(round(Int,z)).bin");
+                    kind="enzo_pdump", n=length(ppx), ndim=1,
+                    columns=["x"=>ppx, "y"=>ppy, "z"=>ppz,
+                             "vx"=>pvx .* vku, "vy"=>pvy .* vku, "vz"=>pvz .* vku])
             end
             # gas temperature diagnostic: e_int (code) × VelocityUnits² → T [K].
             # Enzo's VelocityUnits/TemperatureUnits are CONSTANT — defined once at the
@@ -902,9 +898,9 @@ function main_cic()
             @printf("    [Enzo gas: T_gas=%.1f K  T_cmb=%.1f K  Tg/Tcmb=%.3f  x_HII=%.3e  δb_rms=%.3e δdm_rms=%.3e]\n",
                     Tg, 2.73*(1+z), Tg/(2.73*(1+z)), xHII,
                     std(ρb)/(sum(ρb)/length(ρb)), std(ρd)/(sum(ρd)/length(ρd))); flush(stdout)
-            open(joinpath(REPORTS, "enzo_fields$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                write(io, Float64.(vec(φ))); write(io, Float64.(vec(ρd)))   # φ, DM density (for x-corr)
-            end
+            MultiCode.write_grid(joinpath(REPORTS, "enzo_fields$(TAG)_z$(round(Int,z)).bin");
+                kind="enzo_fields", n=N, ndim=3, header=false,
+                columns=["phi"=>Float64.(vec(φ)), "rho_dm"=>Float64.(vec(ρd))])   # φ, DM density (for x-corr)
             # ── per-cell physical phase dump (ρ/ρ̄, n_H[cm⁻³], T[K], f_H2, x_HII) ──
             # for density PDF + T(ρ)/H2(ρ) phase diagrams vs RAMSES. Same μ=1.22 + γ=5/3
             # + X_H=0.76 conventions both codes use, so the physics is directly comparable.
@@ -918,10 +914,9 @@ function main_cic()
                 Tcell= vec(ge) .* ((γ-1)*1.22*mh*vu^2/kB)
                 fH2  = (vec(H2) ./ vec(ρb)) ./ XH                        # 2·n_H2/n_H
                 xHIIc= (vec(HI) ./ vec(ρb)) ./ XH
-                open(joinpath(REPORTS, "enzo_phase$(TAG)_z$(round(Int,z)).bin"), "w") do io
-                    write(io, Int64(length(rrel)))
-                    write(io, rrel); write(io, nH); write(io, Tcell); write(io, fH2); write(io, xHIIc)
-                end
+                MultiCode.write_grid(joinpath(REPORTS, "enzo_phase$(TAG)_z$(round(Int,z)).bin");
+                    kind="enzo_phase", n=length(rrel), ndim=1,
+                    columns=["rrel"=>rrel, "nH"=>nH, "T"=>Tcell, "fH2"=>fH2, "xHII"=>xHIIc])
             end
             g2 = (growth_D(a)/D_start)^2
             rec = (z=z, baryon=pk_of(ρb; box_mpc=BOX), dm=pk_of(ρd; box_mpc=BOX), phi=pk_field(φ),

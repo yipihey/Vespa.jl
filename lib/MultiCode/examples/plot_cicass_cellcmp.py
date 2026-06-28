@@ -7,7 +7,7 @@ ratio, cell correlation, and scatter at matched redshifts; writes scatter plots.
 import numpy as np, os, glob, re
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 
 XH = 0.76
 def grackle_mu(xHII, fH2):

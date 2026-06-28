@@ -13,7 +13,7 @@ nearest-z snapping.  Reads:
 import numpy as np, os
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 TAG = os.environ.get("CIC_TAG", "_c64")
 LSBINS = int(os.environ.get("LSBINS", "4")); SSBINS = int(os.environ.get("SSBINS", "8"))
 AREPO_DAT = os.environ.get("AREPO_DAT", R + f"cicass_arepo_pk{TAG}.dat")

@@ -16,7 +16,7 @@ Run:  ENZO_ZS=... RAMSES_ZS=... /usr/bin/python3 plot_cicass_anisotropy.py
 import numpy as np, os, glob, re
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 N = int(os.environ.get("CIC_NGRID", "128")); L = float(os.environ.get("CIC_BOX", "0.128"))
 # costh bin edges → centers matching CICASS nodes (0.125,0.375,0.625,0.875)
 MU_EDGES = np.array([0.0, 0.25, 0.5, 0.75, 1.0]); MU_CEN = 0.5*(MU_EDGES[:-1]+MU_EDGES[1:])

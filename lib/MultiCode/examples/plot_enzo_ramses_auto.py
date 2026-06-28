@@ -12,7 +12,7 @@ Also prints a text table of DM/gas P(k) ratios + r(k) so it works headless.
 import numpy as np, glob, re, os, sys
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 N = int(os.environ.get("CIC_NGRID", "128")); L = float(os.environ.get("CIC_BOX", "0.128"))
 
 def load_pk(fn):

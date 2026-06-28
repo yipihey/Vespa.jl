@@ -3,38 +3,17 @@
 overlaid on the CICASS linear-theory prediction (IC power grown by D(a)^2), at
 logarithmic intervals in scale factor z=1000 -> 20.  Markers = measured (GPU FFT of
 the live Enzo gas density / CIC of the live DM particles); solid lines = linear theory."""
-import sys, numpy as np, matplotlib
+import os, sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+sys.path.insert(0, os.path.dirname(__file__))
+from vespa_io import open_run
 
-datafile = sys.argv[1] if len(sys.argv) > 1 else \
-    "/Users/tabel/Projects/Vespa.jl/reports/multicode/cicass_highz_pk.dat"
+# Run dir on scratch/archive (set VESPA_RUN_DIR, or pass the dir as argv[1]).
+rd = open_run()
+blocks = rd.pk(pattern="cicass_highz_pk*.dat")   # {(z, tag) -> (k[], P[])}
 
-# parse blocks "@ z=<z> <tag>" then rows "k P"
-blocks = {}   # (z, tag) -> (k[], P[])
-z_order = []
-cur = None; ks = []; Ps = []
-def flush():
-    global cur, ks, Ps
-    if cur is not None and ks:
-        blocks[cur] = (np.array(ks), np.array(Ps))
-    ks, Ps = [], []
-for line in open(datafile):
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    if line.startswith("@"):
-        flush()
-        parts = line.split()
-        z = float(parts[1].split("=")[1]); tag = parts[2]
-        if z not in z_order: z_order.append(z)
-        cur = (z, tag)
-    else:
-        a, b = line.split()
-        ks.append(float(a)); Ps.append(float(b))
-flush()
-
-zs = sorted(z_order, reverse=True)   # high z first
+zs = sorted({z for (z, _t) in blocks}, reverse=True)   # high z first
 colors = cm.viridis(np.linspace(0, 0.9, len(zs)))
 
 fig, (axb, axd) = plt.subplots(1, 2, figsize=(12.5, 5.6), sharex=True, sharey=True)
@@ -61,7 +40,7 @@ axb.legend(title="○ Enzo GPU (measured)\n— IC×D(a)²   -- CICASS analytic×
 fig.suptitle("CICASS streaming box, Vespa GPU (PPM+Poisson Metal) + H+D chemistry: "
              "measured vs linear-theory $P(k)$", fontsize=12)
 fig.tight_layout()
-out = datafile.replace(".dat", ".png")
+out = os.path.join(rd.path, "cicass_highz_pk.png")
 fig.savefig(out, dpi=140); print("wrote", out)
 
 # agreement report over a robust large-scale band (mean of the lowest few k-bins,

@@ -14,7 +14,7 @@ Prints a headless table (DM + baryon) and writes a multi-panel PNG.
 import numpy as np, os, sys
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-R = os.path.join(os.path.dirname(__file__), "..", "..", "..", "reports", "multicode") + "/"
+R = (os.environ.get("VESPA_RUN_DIR") or os.getcwd()) + "/"  # run dir on scratch/archive (set VESPA_RUN_DIR)
 LSBINS = int(os.environ.get("LSBINS", "4"))
 SSBINS = int(os.environ.get("SSBINS", "8"))
 

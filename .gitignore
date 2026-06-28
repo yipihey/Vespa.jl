@@ -19,15 +19,7 @@ lib/EnzoViz/assets/wasm/
 # CondaPkg-provisioned env spec (generated; reproduced from CondaPkg.toml)
 **/.CondaPkg/
 
-# ── generated report/bench data (keep .md + small .csv summaries tracked) ──
-reports/multicode/*.dat
-reports/multicode/*.png
-reports/multicode/*.log
-reports/multicode/*.html
-reports/multicode/*.ppm
-reports/multicode/*.bin
-# legacy-code run scratch dirs (RAMSES/Arepo ics+output dumps)
-reports/multicode/arepo_mpi_run*/
+# ── generated bench data ──
 lib/PPMKernels/bench/kh_out/
 lib/PPMKernels/bench/turb_out/
 lib/PPMKernels/bench/contact_out/
@@ -39,11 +31,17 @@ lib/PowerFoam/examples/**/*.svg
 lib/PowerFoam/examples/**/*.md
 lib/PowerFoam/examples/**/*.ppm
 lib/PowerFoam/examples/**/*.txt
-reports/multicode/sb_campaign_cpu_f32/
-reports/multicode/sb_campaign_metal_f32/
 run/
+
+# run outputs now go to scratch via VESPA_RUN_DIR (see lib/MultiCode/src/runout.jl);
+# nothing under reports/ is written anymore. A stray reports/ is belt-and-suspenders.
+/reports/
 
 # legacy-code output dumps + scratch written at the repo root
 /backup_*/
 /cic.nml
 /CONTINUE_HERE.md
+
+# Python bytecode (analysis scripts)
+__pycache__/
+*.pyc
