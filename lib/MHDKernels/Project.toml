@@ -1,0 +1,32 @@
+name = "MHDKernels"
+uuid = "1a2b3c4d-0009-4000-8000-000000000009"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+# KernelAbstractions is the single-source seam: one precision-generic `@kernel`
+# compiles to the CPU and to CUDA / Metal GPUs. f32-FIRST: the default precision is
+# Float32 on every backend (CPU included) so CPU↔GPU is apples-to-apples; f64 is
+# opt-in for when a physical reason needs the range. CUDA and Metal are weak deps
+# loaded through package extensions, so the core precompiles headless and on non-GPU CI.
+#
+# Scheme: ideal MHD with Dedner mixed-GLM divergence cleaning (9th var ψ), NOT
+# constrained transport. MUSCL-Hancock + PLM(MonCen) + HLLD (LLF fallback). There is
+# no Fortran golden oracle here (unlike PPMKernels' Enzo parity), so `@fastmath` is
+# used throughout — correctness is certified by smooth-wave convergence + standard
+# MHD test problems, and by ref-kernel ≡ cube-kernel agreement.
+[deps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+
+[extensions]
+MHDKernelsCUDAExt = "CUDA"
+MHDKernelsMetalExt = "Metal"
+
+[compat]
+CUDA = "5"
+KernelAbstractions = "0.9"
+Metal = "1"
+julia = "1.10"
