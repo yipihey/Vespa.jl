@@ -29,8 +29,9 @@ def zof(pref):
         if m and "run" not in f: out[int(m.group(1))] = f
     return out
 
-enz = zof("enzo_cellcmp"); ram = zof("ramses_cellcmp")
-print(f"Enzo cellcmp z: {sorted(enz)}\nRAMSES cellcmp z: {sorted(ram)}\n")
+TAG = os.environ.get("CIC_TAG", "")
+enz = zof("enzo_cellcmp" + TAG); ram = zof("ramses_cellcmp" + TAG); arp = zof("arepo_cellcmp" + TAG)
+print(f"Enzo cellcmp z: {sorted(enz)}\nRAMSES cellcmp z: {sorted(ram)}\nArepo cellcmp z: {sorted(arp)}\n")
 
 def stats(a, b):
     m = np.isfinite(a) & np.isfinite(b) & (a > 0) & (b > 0)
@@ -39,30 +40,47 @@ def stats(a, b):
     cc = np.corrcoef(np.log(a[m]), np.log(b[m]))[0, 1]
     return np.median(r), np.exp(np.std(np.log(r))), cc, m.sum()
 
-print(f"{'z(E/R)':>9} | {'xHII RAM/ENZ':>12} {'scatter':>8} {'corr':>6} | {'T RAM/ENZ':>10} {'scatter':>8} {'corr':>6}")
+# Enzo is the reference; compare RAMSES and Arepo against it cell-by-cell (nearest-z match).
+others = [("RAM", ram), ("ARP", arp)]
+others = [(nm, zd) for nm, zd in others if zd]
+hdr = f"{'z(E)':>6} |"
+for nm, _ in others:
+    hdr += f" {'xHII '+nm+'/E':>11} {'sc':>5} {'cc':>5} | {'T '+nm+'/E':>9} {'sc':>5} {'cc':>5} |"
+print(hdr)
 pairs = []
 for zE in sorted(enz, reverse=True):
-    zR = min(ram, key=lambda x: abs(x - zE)) if ram else None
-    if zR is None: continue
-    E = load_cc(enz[zE]); M = load_cc(ram[zR])
-    sx = stats(E["xHII"], M["xHII"]); sT = stats(E["T"], M["T"])
-    if sx and sT:
-        print(f"{zE:4d}/{zR:<4d} | {sx[0]:12.3f} {sx[1]:8.3f} {sx[2]:6.3f} | "
-              f"{sT[0]:10.3f} {sT[1]:8.3f} {sT[2]:6.3f}")
-        pairs.append((zE, zR, E, M))
+    E = load_cc(enz[zE]); row = f"{zE:6d} |"; rec = {"zE": zE, "E": E}
+    ok = False
+    for nm, zd in others:
+        zO = min(zd, key=lambda x: abs(x - zE)); O = load_cc(zd[zO])
+        sx = stats(E["xHII"], O["xHII"]); sT = stats(E["T"], O["T"]); rec[nm] = O
+        if sx and sT:
+            row += f" {sx[0]:11.3f} {sx[1]:5.2f} {sx[2]:5.2f} | {sT[0]:9.3f} {sT[1]:5.2f} {sT[2]:5.2f} |"
+            ok = True
+        else:
+            row += f" {'--':>11} {'--':>5} {'--':>5} | {'--':>9} {'--':>5} {'--':>5} |"
+    if ok: print(row); pairs.append(rec)
 
-# scatter plots at a few z
+# scatter plots at a few z: rows = (x_HII, T), one column per selected z; RAMSES & Arepo vs Enzo.
 if pairs:
     sel = [pairs[0], pairs[len(pairs)//2], pairs[-1]]
     fig, ax = plt.subplots(2, len(sel), figsize=(4*len(sel), 8), squeeze=False)
-    for c, (zE, zR, E, M) in enumerate(sel):
+    colmap = {"RAM": "tab:blue", "ARP": "tab:green"}
+    for c, rec in enumerate(sel):
+        E = rec["E"]; zE = rec["zE"]
         for row, key, lab in ((0, "xHII", "x_HII"), (1, "T", "T [K]")):
-            a = E[key]; b = M[key]; m = np.isfinite(a)&np.isfinite(b)&(a>0)&(b>0)
-            ss = np.random.default_rng(0).choice(np.where(m)[0], min(4000, m.sum()), replace=False)
-            ax[row][c].loglog(a[ss], b[ss], ".", ms=1, alpha=0.3)
-            lo = min(a[ss].min(), b[ss].min()); hi = max(a[ss].max(), b[ss].max())
-            ax[row][c].plot([lo, hi], [lo, hi], "r-", lw=0.8)
+            a = E[key]
+            allv = [a]
+            for nm, _ in others:
+                if nm not in rec: continue
+                b = rec[nm][key]; m = np.isfinite(a)&np.isfinite(b)&(a>0)&(b>0)
+                if m.sum() < 10: continue
+                ss = np.random.default_rng(0).choice(np.where(m)[0], min(3000, m.sum()), replace=False)
+                ax[row][c].loglog(a[ss], b[ss], ".", ms=1, alpha=0.3, color=colmap[nm], label=nm)
+                allv += [a[ss], b[ss]]
+            allf = np.concatenate([v[np.isfinite(v)&(v>0)] for v in allv])
+            lo, hi = allf.min(), allf.max(); ax[row][c].plot([lo, hi], [lo, hi], "r-", lw=0.8)
             ax[row][c].set_title(f"{lab}  z={zE}"); ax[row][c].set_xlabel(f"Enzo {lab}")
-            if c == 0: ax[row][c].set_ylabel(f"RAMSES {lab}")
+            if c == 0: ax[row][c].set_ylabel(f"other {lab}"); ax[row][c].legend(fontsize=7, markerscale=6)
     fig.tight_layout(); out = R + "cicass_cellcmp.png"; fig.savefig(out, dpi=140)
     print("\nwrote", out)

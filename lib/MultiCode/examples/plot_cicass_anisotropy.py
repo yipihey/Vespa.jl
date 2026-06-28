@@ -110,8 +110,11 @@ def aniso_table(name, rows):
         print(f"{z:6d} | {aniso(Pg):9.3f} {lin_aniso('baryon'):11.3f} | {aniso(Pd):8.3f} {lin_aniso('dm'):10.3f}")
 
 print(f"CICASS-lin z: {lin_z}")
-codes = [("ENZO", measure("enzo_xspec", "ENZO_ZS")),
-         ("RAMSES", measure("ramses_xspec", "RAMSES_ZS"))]
+TAG = os.environ.get("CIC_TAG", "")
+codes = [("ENZO", measure("enzo_xspec" + TAG, "ENZO_ZS")),
+         ("RAMSES", measure("ramses_xspec" + TAG, "RAMSES_ZS")),
+         ("AREPO", measure("arepo_xspec" + TAG, "AREPO_ZS"))]
+codes = [(nm, rows) for nm, rows in codes if rows]   # skip codes with no dumps
 for name, rows in codes:
     if rows: aniso_table(name, rows)
 

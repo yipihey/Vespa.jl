@@ -122,11 +122,22 @@ end
 # loaded, so momentum and energy must stay consistent.  We keep the INTERNAL energy
 # fixed and swap the per-component kinetic energy old→new: E += ½(ρu_new²−ρu_old²)/ρ.
 function inject_gas_velocity!(h, lev, snap, unit_v, N; vboost=(0.0,0.0,0.0))
+    # CUDA HAZARD: every get_hydro does a FULL uold device→host sync, so a per-component
+    # get→set inside the loop lets each later component's sync CLOBBER the prior write,
+    # and without a final host→device push the next get_hydro reverts everything — i.e.
+    # the override silently does nothing and the baryons keep mini-ramses's scaled-CDM
+    # velocity (the bug that bit us before; symptom: CIC_GASVEL=0 ≡ 1, baryons trace DM).
+    # Fix: read ALL components first, compute, write all, then push to device ONCE
+    # (same discipline as the species/energy IC block below).
     ck, rho = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)
     _, Etot  = RamsesLib.get_hydro(h, :uold, 5, lev; lib=:cosmo)
+    _, m1 = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
+    _, m2 = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
+    _, m3 = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
+    moms = (m1, m2, m3)
     noct = size(ck,1); dx = 1.0/2^lev; gv = snap.gas_vel
     for d in 1:3
-        _, mom = RamsesLib.get_hydro(h, :uold, 1+d, lev; lib=:cosmo)
+        mom = moms[d]
         @inbounds for i in 1:noct, c in 1:8
             ix = mod(floor(Int,(2*ck[i,1]+((c-1)>>0&1)+0.5)*dx*N), N)
             iy = mod(floor(Int,(2*ck[i,2]+((c-1)>>1&1)+0.5)*dx*N), N)
@@ -136,9 +147,65 @@ function inject_gas_velocity!(h, lev, snap, unit_v, N; vboost=(0.0,0.0,0.0))
             Etot[i,c] += 0.5*(mnew^2 - mom[i,c]^2)/max(rho[i,c], eps())  # swap KE, keep e_int
             mom[i,c] = mnew
         end
-        RamsesLib.set_hydro!(h, :uold, 1+d, lev, ck, mom; lib=:cosmo)
+    end
+    for d in 1:3
+        RamsesLib.set_hydro!(h, :uold, 1+d, lev, ck, moms[d]; lib=:cosmo)
     end
     RamsesLib.set_hydro!(h, :uold, 5, lev, ck, Etot; lib=:cosmo)
+    RamsesLib.set_uold_device!(h; lib=:cosmo)   # push host→device, else the next get_hydro reverts it
+end
+
+# Zero the baryon peculiar velocity (true 'gas at rest'), removing the wrongly-loaded
+# ic_velc/CDM momentum and subtracting its kinetic energy (keep internal energy). Same
+# CUDA read-all→write→push discipline as inject_gas_velocity!.
+function zero_gas_velocity!(h, lev)
+    ck, rho = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)
+    _, Etot = RamsesLib.get_hydro(h, :uold, 5, lev; lib=:cosmo)
+    _, m1 = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
+    _, m2 = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
+    _, m3 = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
+    @inbounds for i in eachindex(Etot)
+        Etot[i] -= 0.5*(m1[i]^2 + m2[i]^2 + m3[i]^2)/max(rho[i], eps())  # drop KE, keep e_int
+    end
+    z = zeros(eltype(m1), size(m1))
+    for d in 1:3
+        RamsesLib.set_hydro!(h, :uold, 1+d, lev, ck, z; lib=:cosmo)
+    end
+    RamsesLib.set_hydro!(h, :uold, 5, lev, ck, Etot; lib=:cosmo)
+    RamsesLib.set_uold_device!(h; lib=:cosmo)
+end
+
+# Set the baryon velocity to a UNIFORM bulk stream v_kms (km/s/comp) — the physical
+# 'smooth recombination start': the gas has NO peculiar velocity/density structure (it
+# grows from DM gravity), it only streams coherently relative to the DM.  This is exactly
+# what the Enzo physical-unboosted run uses (gas_vel = repeat(gbulk)); the peculiar
+# snap.gas_vel field is NOT injected here.
+#   WHY THIS EXISTS: the previous physical branch called inject_gas_velocity!(vboost=gbulk),
+#   which sets gas = snap.gas_vel − gbulk = the peculiar fluctuations with the BULK REMOVED.
+#   With no bulk the gas never moves relative to the DM, so the v_bc streaming ANISOTROPY
+#   never develops — RAMSES gas P(k,cosθ) stayed isotropic (~1.0 at all z) while Enzo
+#   tracked the CICASS-linear 0.22 suppression.  Restoring the uniform bulk fixes it.
+# Sets the momentum ABSOLUTELY (idempotent regardless of any prior/CUDA-reverted state) and
+# swaps the per-cell kinetic energy old→new (internal energy unchanged); CUDA read-all→
+# write→push discipline (same as inject_gas_velocity!).
+function inject_gas_bulk_velocity!(h, lev, v_kms, unit_v)
+    ck, rho = RamsesLib.get_hydro(h, :uold, 1, lev; lib=:cosmo)
+    _, Etot = RamsesLib.get_hydro(h, :uold, 5, lev; lib=:cosmo)
+    _, m1 = RamsesLib.get_hydro(h, :uold, 2, lev; lib=:cosmo)
+    _, m2 = RamsesLib.get_hydro(h, :uold, 3, lev; lib=:cosmo)
+    _, m3 = RamsesLib.get_hydro(h, :uold, 4, lev; lib=:cosmo)
+    moms = (m1, m2, m3)
+    for d in 1:3
+        mom = moms[d]; vc = v_kms[d]/unit_v
+        @inbounds for i in eachindex(mom)
+            mnew = rho[i]*vc
+            Etot[i] += 0.5*(mnew^2 - mom[i]^2)/max(rho[i], eps())
+            mom[i] = mnew
+        end
+    end
+    for d in 1:3; RamsesLib.set_hydro!(h, :uold, 1+d, lev, ck, moms[d]; lib=:cosmo); end
+    RamsesLib.set_hydro!(h, :uold, 5, lev, ck, Etot; lib=:cosmo)
+    RamsesLib.set_uold_device!(h; lib=:cosmo)
 end
 
 # ── Compton momentum drag on the baryons (the same physics added to the Enzo driver) ──
@@ -302,6 +369,22 @@ function main_ramses()
     if res.physical
         @printf("RAMSES physical baryon start (:%s): gas at rest, DM streams; Compton drag = %s\n",
                 res.baryon_mode, get(ENV, "CIC_COMPTON_DRAG", "0")=="1" ? "ON" : "off")
+        # BUG FIX (streaming anisotropy): the physical 'smooth recombination start' must put
+        # the gas at rest (no peculiar structure) but streaming as a UNIFORM bulk relative to
+        # the DM (= Enzo's gas_vel = repeat(gbulk)).  The previous code injected the peculiar
+        # snap.gas_vel field MINUS the bulk (inject_gas_velocity!(vboost=gbulk)), removing the
+        # streaming → RAMSES gas P(k,cosθ) stayed isotropic (~1.0) while Enzo developed the
+        # CICASS-linear 0.22 suppression.  Set the uniform bulk instead (0 in the boosted/CMB-
+        # rest frame, gbulk km/s unboosted).  CIC_GASVEL=0 → true rest (no stream).
+        vtarget = res.boosted ? (0.0, 0.0, 0.0) : res.gas_bulk_boost
+        if get(ENV, "CIC_GASVEL", "1") == "1"
+            inject_gas_bulk_velocity!(h, lev, vtarget, res.unit_v_kms)
+            @printf("  → set RAMSES baryon to UNIFORM bulk stream v=%s km/s (physical smooth start; matches Enzo)\n",
+                    string(round.(vtarget, digits=4)))
+        else
+            zero_gas_velocity!(h, lev)
+            @printf("  → zeroed RAMSES baryon velocity (true rest, no stream)\n")
+        end
     elseif get(ENV, "CIC_GASVEL", "1") == "1"  # inject the proper baryon velocity field
         inject_gas_velocity!(h, lev, res.snap, res.unit_v_kms, N; vboost=res.gas_bulk_boost)
         @printf("injected CICASS gas_vel into RAMSES baryons (overriding ic_velc/CDM), vboost=%s\n",

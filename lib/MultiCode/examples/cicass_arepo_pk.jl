@@ -125,7 +125,11 @@ function arepo_compton_drag!(h, z_mid, dlna; hubble=0.71)
     mom = ArepoLib.get_cell_field(h, :momentum)                      # n×3 (Mass·v)
     E   = ArepoLib.get_cell_field(h, :energy)                        # n   (Mass·e_tot)
     mass = max.(rho .* vol, eps())
-    vbar = ntuple(d -> sum(@view mom[:, d]) / sum(mass), 3)          # mass-weighted bulk
+    # mass-weighted bulk velocity — GLOBAL across MPI ranks (each rank holds only
+    # its local cells, but the drag must damp toward the one global streaming frame)
+    msums = Float64[sum(@view mom[:,1]), sum(@view mom[:,2]), sum(@view mom[:,3]), sum(mass)]
+    ArepoLib.allreduce_sum!(msums)
+    vbar = ntuple(d -> msums[d] / msums[4], 3)                       # mass-weighted bulk
     ke0  = 0.5 .* vec(sum(abs2, mom; dims=2)) ./ mass
     @inbounds for d in 1:3, i in eachindex(mass)
         v = mom[i, d] / mass[i]
@@ -147,12 +151,23 @@ function build_gadget_ic(path, snap, a0, xHII0)
     mass = Array{Float64}(undef, ntot); ids = collect(1:ntot)
     u = Array{Float64}(undef, ng)
     # gas (type 0): mesh points on the uniform grid, mass-weighted by 1+δ_b
-    δ = snap.gas_delta; gv = snap.gas_vel; gt = snap.gas_temp
+    # CIC_UNIFORM_BARYONS=1 → δ_b=0 (uniform gas density at IC), to isolate whether the
+    # large-scale over-growth comes from the baryon IC structure vs Arepo's gravity/integration.
+    δ = get(ENV, "CIC_UNIFORM_BARYONS", "0") == "1" ? zero(snap.gas_delta) : snap.gas_delta
+    gv = snap.gas_vel; gt = snap.gas_temp
+    # CIC_ZERO_BARYON_BULK=1 → BOOST to the gas (baryon/CMB) rest frame: subtract the coherent
+    # gas bulk v_bc from BOTH species (Galilean; preserves the relative gas−DM streaming, which
+    # carries the anisotropy + the DM growth). Arepo uses a TOTAL-energy scheme (no dual energy),
+    # so with the gas streaming at v_bc~30 km/s, E_kin≈19×e_int and the per-step e_int=E_tot−E_kin
+    # extraction bleeds ~hundreds of K per step → runaway over-cooling. Gas-at-rest keeps E_kin
+    # small so e_int stays clean (DM, being N-body, carries the stream harmlessly).
+    boost = get(ENV, "CIC_ZERO_BARYON_BULK", "0") == "1"
+    gbulk = boost ? (sum(gv[:,1])/size(gv,1), sum(gv[:,2])/size(gv,1), sum(gv[:,3])/size(gv,1)) : (0.0,0.0,0.0)
     dxk = boxk / N; idx = 1
     @inbounds for k in 0:N-1, j in 0:N-1, i in 0:N-1
         c = i + N*(j + N*k) + 1                     # CICASS C-order (i fastest)
         pos[idx,1]=(i+0.5)*dxk; pos[idx,2]=(j+0.5)*dxk; pos[idx,3]=(k+0.5)*dxk
-        for d in 1:3; vel[idx,d] = gv[c,d]/sqa; end
+        for d in 1:3; vel[idx,d] = (gv[c,d]-gbulk[d])/sqa; end
         mass[idx] = snap.m_gas * (1.0 + δ[c])
         Tc = gt[c] > 0 ? gt[c] : snap.tavg
         u[idx] = (KB*Tc/((GAMMA-1)*MU*MH)) / UVEL^2 # specific internal energy (code)
@@ -162,7 +177,7 @@ function build_gadget_ic(path, snap, a0, xHII0)
     @inbounds for p in 1:ndm
         for d in 1:3
             pos[ng+p,d] = mod(snap.dm_pos[p,d],1.0)*boxk
-            vel[ng+p,d] = snap.dm_vel[p,d]/sqa
+            vel[ng+p,d] = (snap.dm_vel[p,d]-gbulk[d])/sqa   # DM streams at −v_bc in the gas-rest frame
         end
         mass[ng+p] = snap.m_dm
     end
@@ -176,7 +191,12 @@ end
 
 function arepo_param(dir, snap, a0, aend)
     boxk = snap.box*1000.0
-    soft = (boxk/snap.n)/5                            # 1/5 of mean spacing (comoving kpc/h)
+    # Gravitational softening = mean particle spacing / CIC_SOFT_DIV (default 5). Set
+    # CIC_SOFT_DIV=1 to match the Eulerian codes' ~1-cell gravity resolution (the /5
+    # default makes Arepo's softening 5× finer → excess small-scale clustering).
+    softdiv = parse(Float64, get(ENV, "CIC_SOFT_DIV", "5"))
+    soft = (boxk/snap.n)/softdiv                      # comoving kpc/h
+    maxdt = parse(Float64, get(ENV, "CIC_MAXDT", "0.02"))     # MaxSizeTimestep (Δln a cap)
     erracc = parse(Float64, get(ENV, "CIC_ERRACC", "0.04"))   # ErrTolIntAccuracy (bigger → bigger dt)
     # Arepo's OutputListOn=1 makes it write a full HDF5 snapshot (4M double-precision
     # particles, SnapFormat=3) at every output redshift.  That write path allocates
@@ -227,7 +247,7 @@ NumFilesWrittenInParallel 1
 TypeOfTimestepCriterion 0
 ErrTolIntAccuracy    $(erracc)
 CourantFac           0.3
-MaxSizeTimestep      $(min(0.02, 0.9*(aend-a0)))
+MaxSizeTimestep      $(min(maxdt, 0.9*(aend-a0)))
 MinSizeTimestep      1e-12
 InitGasTemp          $(round(snap.tavg, digits=2))
 MinGasTemp           2.7
@@ -260,8 +280,7 @@ SofteningTypeOfPartType4 1
 SofteningTypeOfPartType5 1
 MinimumComovingHydroSoftening $(soft/4)
 AdaptiveHydroSofteningSpacing 1.2
-CellShapingSpeed     0.5
-CellMaxAngleFactor   2.25
+$(get(ENV,"CIC_STATIC_MESH","0")=="1" ? "" : "CellShapingSpeed     0.5\nCellMaxAngleFactor   2.25")
 """
 end
 
@@ -292,14 +311,57 @@ end
 
 # gas density on N³ grid from live Arepo gas cells (CIC of cell mass at cell pos)
 function arepo_grids(h, N, boxk)
-    pos = ArepoLib.get_particle_field(h, :pos)      # ntot×3 (kpc/h)
-    mass = ArepoLib.get_particle_field(h, :mass)
-    ng = ArepoLib.num_gas(h)
-    xb = pos ./ boxk                                # → box-fraction
-    gas = cic_density(view(xb,1:ng,:), Float64.(view(mass,1:ng)), N)
-    ntot = size(pos,1)
-    dm  = cic_density(view(xb,ng+1:ntot,:), Float64.(view(mass,ng+1:ntot)), N)
+    # COLLECTIVE: gather the distributed particle state to rank 0 (every rank must
+    # call). Under N MPI ranks the per-rank P[] holds only local gas+DM, and the
+    # gas/DM split is per-rank, so we gather pos+mass+type globally and split by
+    # TYPE (0=gas, 1=DM) — robust to the cross-rank concatenation order. Single
+    # rank: the gather is a straight local copy.
+    pos  = ArepoLib.gather_particle_field(h, :pos)    # global on rank0, empty elsewhere
+    mass = ArepoLib.gather_particle_field(h, :mass)
+    typ  = ArepoLib.gather_particle_field(h, :type)
+    ArepoLib.this_task() == 0 || return nothing       # only rank 0 holds the data
+    xb = pos ./ boxk                                  # → box-fraction
+    isgas = typ .== 0; isdm = typ .== 1
+    gas = cic_density(xb[isgas, :], Float64.(mass[isgas]), N)
+    dm  = cic_density(xb[isdm,  :], Float64.(mass[isdm]),  N)
     return gas, dm
+end
+
+# Cell-by-cell ρ, x_HII, f_H2, f_HD, T on the N³ grid from the live Arepo Voronoi gas
+# cells — the Arepo counterpart of the Enzo/RAMSES cellcmp dumps (plot_cicass_cellcmp.py).
+# Distributed-safe with NO bridge change: each rank deposits its LOCAL gas cells (NGP by
+# cell center; mass-weighted for the intensive x_HII/T/fractions) into N³ accumulators,
+# then allreduce_sum! over ranks; rank 0 normalizes by the per-cell mass.  Indexing is
+# x-fastest (g = ix + N·iy + N²·iz), matching the RAMSES/Enzo grids cell-for-cell (same
+# physical grid → cell-by-cell aligned).  utherm is the specific internal energy
+# (density-scale-invariant) → physical T directly; μ = grackle species μ (the SAME
+# convention as the RAMSES/Enzo dumps so T is comparable across codes).
+function arepo_cellcmp_grids(h, N, boxk)
+    XH = 0.76
+    cen = ArepoLib.get_cell_field(h, :center)        # n×3 cell center (kpc/h, code length)
+    rho = ArepoLib.get_cell_field(h, :rho)
+    vol = ArepoLib.get_cell_field(h, :volume)
+    uth = ArepoLib.get_cell_field(h, :utherm)        # specific internal energy (UVEL² code)
+    sc  = ArepoLib.get_cell_field(h, :scalars)       # n×(2|3): HII, H2I[, HDI] mass fractions
+    nps = size(sc, 2); n = length(rho)
+    mass = max.(rho .* vol, eps())
+    xHII = Float64.(@view sc[:, 1]) ./ XH            # HII massfrac/X_H = ionization fraction
+    fH2  = Float64.(@view sc[:, 2]) ./ XH
+    fHD  = nps >= 3 ? Float64.(@view sc[:, 3]) : zeros(n)
+    muv  = 1.0 ./ ((XH + (1 - XH) / 4) .+ XH .* (xHII .- 0.5 .* fH2))
+    Tcell = uth .* UVEL^2 .* (GAMMA - 1) .* muv .* MH ./ KB        # K
+    Wm = zeros(N^3); Wx = zeros(N^3); Wh2 = zeros(N^3); Whd = zeros(N^3); WT = zeros(N^3)
+    @inbounds for i in 1:n
+        ix = mod(floor(Int, mod(cen[i,1]/boxk, 1.0) * N), N)
+        iy = mod(floor(Int, mod(cen[i,2]/boxk, 1.0) * N), N)
+        iz = mod(floor(Int, mod(cen[i,3]/boxk, 1.0) * N), N)
+        g = ix + N*(iy + N*iz) + 1; m = mass[i]
+        Wm[g] += m; Wx[g] += m*xHII[i]; Wh2[g] += m*fH2[i]; Whd[g] += m*fHD[i]; WT[g] += m*Tcell[i]
+    end
+    for v in (Wm, Wx, Wh2, Whd, WT); ArepoLib.allreduce_sum!(v); end
+    ArepoLib.this_task() == 0 || return nothing
+    Wd = max.(Wm, eps())
+    return (rho = Wm, xHII = Wx ./ Wd, fH2 = Wh2 ./ Wd, fHD = Whd ./ Wd, T = WT ./ Wd)
 end
 
 # ── Grackle chemistry SUBPROCESS worker (in-process Grackle co-resident with the
@@ -355,29 +417,51 @@ end
 
 function main()
     ArepoLib.available() || error("libarepo cosmo flavor not found (set AREPO_LIB)")
-    @printf("Arepo on CICASS ICs: box=%.4f Mpc/h, %d³, z=%.0f→%.0f, chem=%s\n",
-            BOX, NGRID, ZSTART, ZEND, CHEM); flush(stdout)
+    # ── MPI bootstrap (distributed mpiexec -n N runs) ────────────────────────
+    # The bridge inherits the mpiexec world; Arepo's hydro/gravity/mesh distribute
+    # natively. Only the IC write, the P(k) readback and the .dat write are not
+    # rank-parallel, so: rank 0 realizes the CICASS IC into a SHARED run dir and
+    # broadcasts the cosmology scalars (sum-reduce of a rank-0/zeros buffer — no
+    # MPI.jl needed); every rank boots from the shared IC; the readback gathers to
+    # rank 0 (see arepo_grids). Non-root ranks stay silent.
+    ArepoLib.mpi_init()
+    rank = ArepoLib.this_task(); nrank = ArepoLib.n_tasks(); root = rank == 0
+    root || redirect_stdout(devnull)
+    @printf("Arepo on CICASS ICs: box=%.4f Mpc/h, %d³, z=%.0f→%.0f, chem=%s  [%d MPI rank(s)]\n",
+            BOX, NGRID, ZSTART, ZEND, CHEM, nrank); flush(stdout)
     a0 = 1/(1+ZSTART); aend = 1/(1+ZEND)
-    workdir = mktempdir(); mkpath(joinpath(workdir,"output"))
-    spec = CICASSSpec(boxlength=BOX, zstart=ZSTART, ngrid=NGRID, vbc=VBC,
-                      Omega_m=OMEGA_M, filename="cic_arepo")
-    res = CICASSLib.generate(spec; workdir=workdir)
-    snap = CICASSLib.read_snapshot(res.output)
-    @printf("CICASS realized: m_dm=%.4e m_gas=%.4e (1e10 Msun/h) tavg=%.1f K\n",
-            snap.m_dm, snap.m_gas, snap.tavg); flush(stdout)
-    sth = try CICASSLib.thermal_state(ZSTART) catch; (x_e=0.047, T_gas=snap.tavg) end
-    SUB = parse(Int, get(ENV, "CIC_SUB", "1"))          # subsample CICASS→coarser Arepo load
-    asnap = subsample(snap, SUB)
-    SUB > 1 && @printf("subsampled CICASS %d³ → Arepo %d³ (sub=%d, m_dm=%.3e m_gas=%.3e)\n",
-                       snap.n, asnap.n, SUB, asnap.m_dm, asnap.m_gas)
-    Na = asnap.n
-    info = build_gadget_ic(joinpath(workdir,"ics"), asnap, a0, sth.x_e)
-    @printf("Gadget IC: %d gas + %d DM, box=%.2f kpc/h\n", info.ng, info.ndm, info.boxk); flush(stdout)
-    write(joinpath(workdir,"param.txt"), arepo_param(workdir, asnap, a0, aend))
+    workdir = joinpath(REPORTS, "arepo_mpi_run$(TAG)")  # SHARED across ranks (one node); TAG-keyed so concurrent runs don't clobber
+    scal = zeros(Float64, 9)   # hconst, omega_m, omega_l, tavg, box, n, m_dm, m_gas, x_e
+    if root
+        privdir = mktempdir()
+        spec = CICASSSpec(boxlength=BOX, zstart=ZSTART, ngrid=NGRID, vbc=VBC,
+                          Omega_m=OMEGA_M, filename="cic_arepo")
+        res = CICASSLib.generate(spec; workdir=privdir)
+        fs = CICASSLib.read_snapshot(res.output)
+        @printf("CICASS realized: m_dm=%.4e m_gas=%.4e (1e10 Msun/h) tavg=%.1f K\n",
+                fs.m_dm, fs.m_gas, fs.tavg); flush(stdout)
+        fsth = try CICASSLib.thermal_state(ZSTART) catch; (x_e=0.047, T_gas=fs.tavg) end
+        SUB = parse(Int, get(ENV, "CIC_SUB", "1"))      # subsample CICASS→coarser Arepo load
+        fas = subsample(fs, SUB)
+        SUB > 1 && @printf("subsampled CICASS %d³ → Arepo %d³ (sub=%d, m_dm=%.3e m_gas=%.3e)\n",
+                           fs.n, fas.n, SUB, fas.m_dm, fas.m_gas)
+        rm(workdir; force=true, recursive=true); mkpath(joinpath(workdir,"output"))
+        info = build_gadget_ic(joinpath(workdir,"ics"), fas, a0, fsth.x_e)
+        @printf("Gadget IC: %d gas + %d DM, box=%.2f kpc/h\n", info.ng, info.ndm, info.boxk); flush(stdout)
+        write(joinpath(workdir,"param.txt"), arepo_param(workdir, fas, a0, aend))
+        scal .= (fs.hconst, fs.omega_m, fs.omega_l, fs.tavg, fas.box, Float64(fas.n),
+                 fas.m_dm, fas.m_gas, fsth.x_e)
+    end
+    ArepoLib.allreduce_sum!(scal)        # broadcast scalars (non-root contributed 0)
+    ArepoLib.barrier()                   # shared IC/param now exist on disk
+    snap = (; hconst=scal[1], omega_m=scal[2], omega_l=scal[3], tavg=scal[4],
+              box=scal[5], n=Int(round(scal[6])), m_dm=scal[7], m_gas=scal[8])
+    sth  = (; x_e=scal[9], T_gas=scal[4])
+    Na = snap.n; boxk = snap.box * 1000.0
 
-    mkpath(REPORTS); datafile = joinpath(REPORTS, "cicass_arepo_pk$(TAG).dat")
+    datafile = joinpath(REPORTS, "cicass_arepo_pk$(TAG).dat")
     pk_results = NamedTuple[]
-    write_tables() = open(datafile,"w") do io
+    write_tables() = root && open(datafile,"w") do io
         println(io, "# Arepo on CICASS ICs z=$ZSTART→$ZEND box=$BOX Mpc/h N=$NGRID")
         println(io, "# block: '@ z=<z> <baryon|dm>' then k[h/Mpc] P[(Mpc/h)^3]")
         for r in pk_results, tag in (:baryon,:dm)
@@ -395,8 +479,10 @@ function main()
         if CHEM
             @printf("scalars init in IC: x_HII=%.3e (HII,H2I,HDI)\n", sth.x_e)
             if CHEM_INPROC
+                # density_units = UDENS·h²/a³ → PHYSICAL density from Arepo's comoving ρ
+                # (solve_chem! applies no a³). Re-set per-z in the step loop; this is the IC value.
                 MultiCode.chem_init!(; hubble=snap.hconst*100, Om=snap.omega_m,
-                    OL=snap.omega_l, a_value=a0, fh=0.76, density_units=UDENS*snap.hconst^2,
+                    OL=snap.omega_l, a_value=a0, fh=0.76, density_units=UDENS*snap.hconst^2/a0^3,
                     length_units=ULEN, time_units=UTIME, deuterium=true, engine=:kernels)
                 @printf("chemistry engine: ChemistryKernels (:kernels, backend=%s) IN-PROCESS\n", CHEM_BK)
             else
@@ -411,8 +497,27 @@ function main()
             sort([1.0/(1.0+parse(Float64,s)) for s in split(ENV["CIC_ZOUT"], ",")]) :
             exp.(range(log(a0), log(aend), length=NOUT)); ai = 1
         function record!(z)
-            gas, dm = arepo_grids(h, Na, info.boxk)
+            res = arepo_grids(h, Na, boxk)     # COLLECTIVE gather; rank 0 gets grids, nothing else
+            # COLLECTIVE (all ranks must call): cell-by-cell ρ/x_HII/f_H2/f_HD/T grids.
+            cc = get(ENV, "CIC_CELLCMP", "0") == "1" ? arepo_cellcmp_grids(h, Na, boxk) : nothing
+            root || return
+            gas, dm = res
             push!(pk_results, (z=z, baryon=pk_of(gas), dm=pk_of(dm)))
+            # full 3D baryon+DM density for the directional P(k,costh) anisotropy + cross-
+            # spectra (same format as enzo_xspec/ramses_xspec: Int64 N, ρ_b[N³], ρ_d[N³],
+            # Julia column-major x-fastest). Lets Arepo join plot_cicass_anisotropy/cellcmp.
+            if get(ENV, "CIC_XSPEC", "0") == "1"
+                open(joinpath(REPORTS, "arepo_xspec$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(Na)); write(io, vec(gas)); write(io, vec(dm))
+                end
+            end
+            # cell-by-cell dump (ρ, x_HII, f_H2, f_HD, T) → plot_cicass_cellcmp.py
+            if cc !== nothing
+                open(joinpath(REPORTS, "arepo_cellcmp$(TAG)_z$(round(Int,z)).bin"), "w") do io
+                    write(io, Int64(Na))
+                    write(io, cc.rho); write(io, cc.xHII); write(io, cc.fH2); write(io, cc.fHD); write(io, cc.T)
+                end
+            end
             db = std(gas)/mean(gas); dd = std(dm)/mean(dm)
             @printf("  ● Arepo z=%.2f  δb_rms=%.3e δdm_rms=%.3e  [%d]  rss=%.0fMB\n",
                     z, db, dd, length(pk_results), proc_rss_mb())
@@ -421,8 +526,10 @@ function main()
         achem = a0
         chemt = 0.0; steptot = 0.0        # wall-time breakdown accumulators
         @printf("%-5s %-9s %-10s\n","step","z","sec"); flush(stdout)
+        maxstep = parse(Int, get(ENV, "CIC_MAXSTEP", "200000"))   # cap steps for quick perf timing
         for step in 0:200000
             z = znow(); a = anow()
+            step >= maxstep && (@printf("MAXSTEP %d reached at z=%.2f — stopping\n", maxstep, z); flush(stdout); break)
             # Hard safety net: never let a leak run the machine out of RAM.  Sys.maxrss
             # is a cheap ccall (no fork); for a monotonically-growing leak max≈current.
             rss_now = Sys.maxrss() / 2^20
@@ -456,6 +563,18 @@ function main()
                     # handles the stiff high-z CMB coupling, so run the FULL chemistry
                     # at ALL z every hydro step (no CMB-lock) — species react + advect
                     # consistently per step.
+                    # PER-Z DENSITY UNITS (bug fix): solve_chem! uses ρ_cgs = ρ·density_units
+                    # with NO a³ factor, but Arepo's ρ is COMOVING. The IC chem_init! set the
+                    # a=1 units (UDENS·h²), so at high z the chem saw the density ~(1+z)³ too
+                    # LOW → recombination far too slow → x_HII FROZEN at the IC value (0.0624 at
+                    # all z, vs Enzo/RAMSES recombining to ~2e-4). Re-init each step with the
+                    # physical density units at the current a: density_units = UDENS·h²/a³
+                    # (exactly what RAMSES does via the per-z scale_d). length/time units are
+                    # a-invariant here (utherm is specific; t_s = dt·UTIME).
+                    MultiCode.chem_init!(; hubble=snap.hconst*100, Om=snap.omega_m,
+                        OL=snap.omega_l, a_value=anew, fh=0.76,
+                        density_units=UDENS*snap.hconst^2/anew^3, length_units=ULEN,
+                        time_units=UTIME, deuterium=true, engine=:kernels)
                     _ct = time()
                     MultiCode.arepo_chem_step!(h; a_value=anew, dt=dphys,
                         engine=:kernels, backend=CHEM_BK, precision=CHEM_PREC)
@@ -507,12 +626,18 @@ function main()
     end
     write_tables()
     @printf("\nwrote %d Arepo outputs → %s\n", length(pk_results), datafile)
+    ArepoLib.barrier()           # rank 0 finishes the .dat before anyone tears MPI down
+    ArepoLib.mpi_finalize()      # clean shutdown on all ranks → mpiexec EXIT 0
 end
 
-# physical elapsed time between a1,a2 in seconds:  ∫ da/(a H(a)),  H0=100h km/s/Mpc
+# physical elapsed time between a1,a2 in seconds:  ∫ da/(a H(a)),  H0=100h km/s/Mpc.
+# MUST include RADIATION to match Arepo's own hubble_function (darkenergy.c, Omega_r=4.15e-5/h²
+# taken out of Lambda) — else the chem dt is ~14% too large at high z (no-rad H is too low),
+# over-recombining/over-cooling the gas.  Keeps flat: Om + (OL-Or) + Or = 1 (Ok absorbed in OL).
 function _dt_phys(a1, a2, h, Om, OL)
     H0 = 100*h * 1e5 / 3.0857e24                      # 1/s
-    f(a) = 1.0/(a*H0*sqrt(Om/a^3 + OL))
+    Or = 4.15e-5 / h^2
+    f(a) = 1.0/(a*H0*sqrt(Om/a^3 + Or/a^4 + (OL - Or)))
     n=64; s=0.0; da=(a2-a1)/n
     for i in 1:n; a=a1+(i-0.5)*da; s+=f(a)*da; end
     return s

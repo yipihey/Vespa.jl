@@ -67,6 +67,18 @@ function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
         GrackleChem.grackle_reduced_step!(rho, eint, HII, H2I, HDI; a_value=a_value, dt=dt)
     elseif engine === :kernels
         cfg = _CHEM_CFG[]
+        # CIC_CHEMDBG=1: print the EXACT physical inputs solve_chem! sees (n_H, eint_cgs, x_e,
+        # dt_s, z) + post-step x_e, so the Arepo vs RAMSES chem hand-off can be diffed side by
+        # side on a small (16³) setup.  ρ_cgs = field·density_units (NO a³, solve.jl convention).
+        _cdbg = get(ENV, "CIC_CHEMDBG", "0") == "1"
+        if _cdbg
+            mh = 1.6726e-24; du = cfg.density_units; vu2 = (cfg.length_units/cfg.time_units)^2
+            rmean = sum(rho)/length(rho); nH = rmean*du*cfg.fh/mh
+            ecgs = (sum(eint)/length(eint))*vu2; xe0 = sum(HII)/(sum(max.(rho,eps()))*cfg.fh)
+            println("[chemdbg] z=", round(1/a_value-1,digits=2), " n=", length(rho),
+                    " nH=", nH, " eint_cgs=", ecgs, " xe_in=", xe0,
+                    " dt_s=", dt*cfg.time_units, " du=", du, " vu2=", vu2); flush(stdout)
+        end
         ChemistryKernels.solve_chem!(rho, eint, HII, H2I, HDI;
             a_value=a_value, dt=dt, density_units=cfg.density_units,
             length_units=cfg.length_units, time_units=cfg.time_units,
@@ -74,6 +86,11 @@ function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
             deuterium=cfg.deuterium && HDI !== nothing,
             hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
             backend=backend, precision=precision)
+        if _cdbg
+            xe1 = sum(HII)/(sum(max.(rho,eps()))*cfg.fh)
+            ecgs1 = (sum(eint)/length(eint))*(cfg.length_units/cfg.time_units)^2
+            println("[chemdbg]   -> xe_out=", xe1, " eint_cgs_out=", ecgs1); flush(stdout)
+        end
     else
         error("unknown chem engine :$engine (use :grackle or :kernels)")
     end
@@ -256,9 +273,11 @@ function enzo_chem_step!(h, level, dt; Om::Real, OL::Real, hub::Real, box::Real,
         nact = map(length, rng)
         RD=reshape(Df,gd); RGE=reshape(GEf,gd); RTE=reshape(TEf,gd)
         RH=reshape(HIIf,gd); RH2=reshape(H2If,gd); RHD = haveD ? reshape(HDIf,gd) : nothing
+        any(<(1), nact) && continue          # degenerate subgrid (active dim ≤ 0): nothing to solve
         Da  = vec(RD[rng...]);  GEa = vec(RGE[rng...])
         HIIa= vec(RH[rng...]);  H2Ia= vec(RH2[rng...]); HDIa = haveD ? vec(RHD[rng...]) : nothing
         na = length(Da)
+        na == 0 && continue                   # empty active block ⇒ a 0-ndrange GPU launch hangs
 
         # → physical CGS (active cells are well-behaved; light clamps for safety).
         # NB: floor RELATIVE to the field (eps()≈2.2e-16 is a HUGE *density* in CGS

@@ -22,6 +22,7 @@
 #     <julia> --project=lib/MultiCode/test lib/MultiCode/examples/cicass_highz_pk.jl
 
 using EnzoLib, MultiCode, CICASSLib, PoissonKernels, Printf, Statistics
+import Vespa   # bflux_plane: rasterize the GPU reflux registers into Enzo's flux planes (FC)
 include(joinpath(@__DIR__, "..", "..", "EnzoLib", "examples", "sb_metal_amr.jl"))  # hydro!/helpers (defines BE)
 # CUDA pool reclaim: the GPU FFT/gravity allocate fresh N³ scratch each cycle and the
 # CUDA.jl pool never shrinks → footprint ratchets up (11→20 GB at 256³).  Periodic
@@ -247,6 +248,13 @@ function gravity_gpu!(h, level, dt; respart=nothing)
     end
     M = _gstate[:M]; Nact = _gstate[:N]; ng = _gstate[:ng]
     n = EnzoLib.session_num_grids_on_level(h, 0)
+    # AMR: the subgrid gravity prep (poisson_gravity_hook → session_prepare_density(h,L>0))
+    # copies the PARENT level-0 GravitatingMassField via CopyParentToGravitatingFieldBoundary.
+    # The optimized on-device source build bypasses Enzo's PrepareDensityField, so the parent
+    # GMF is absent → 'NO GMF in PARENT'. (Re)build the level-0 GMF here whenever finer grids
+    # exist so the parent copy succeeds. Cost (the GMF CIC) is paid only once AMR has created
+    # subgrids; non-AMR runs keep the full on-device optimization untouched.
+    EnzoLib.session_num_grids_on_level(h, 1) > 0 && EnzoLib.session_prepare_density(h, 0)
     for i in 0:n-1
         g = EnzoLib.problem_grid_index_on_level(h, 0, i)
         local src3
@@ -300,12 +308,61 @@ const _lstep = Ref(0)
     S1 .+= dS1; S2 .+= dS2; S3 .+= dS3
     return nothing
 end
+
+# ── Conservative coarse–fine flux correction (FC) for the GPU AMR hydro ──────────────────
+# muscl_hancock_step_3d! records grid-frame face fluxes (`fluxrec`); PPMKernels.boundary_flux_
+# register extracts the coarse–fine reflux registers (validated in-situ to round-off), and
+# `_write_gpu_reflux!` writes them into Enzo's SubgridFluxesEstimate so Enzo's
+# UpdateFromFinerGrids/CorrectForRefinedFluxes restore conservation at coarse–fine boundaries.
+# NB: muscl is dimensionally SPLIT, so this conserves to ~few×1e-4 (comparable to Enzo's own
+# split PPM AMR), NOT round-off — bit-round-off would need an unsplit KA hydro.
+const _FLUXCORR  = get(ENV, "CIC_FLUXCORR", "1") == "1"   # FC on by default for AMR; 0 = projection-only
+const _DO_REFLUX = Ref(false)                             # set in main_cic: _FLUXCORR && maxlevel>0
+# Enzo BaryonField slot → Vespa conserved component (1=D,2=S1,3=S2,4=S3,5=E). iGE/species are
+# not flux-corrected (comp −1 ⇒ zero plane) but their registers are still allocated as Enzo
+# requires (AddToBoundaryFluxes derefs every field of the own-boundary entry).
+_reflux_fieldmap() = Dict(iD=>1, iV1=>2, iV2=>3, iV3=>4, iTE=>5)
+
+function _write_gpu_reflux!(h, level, i, g, fr, gd, dxc, dt, fmap)
+    nf    = EnzoLib.problem_num_fields(h, g)
+    nsub  = EnzoLib.problem_num_subgrids(h, level, i)
+    g0    = EnzoLib.problem_grid_global_start(h, g)          # length-3 global first-active index
+    Vcell = dxc^3
+    breg  = PPMKernels.boundary_flux_register(fr, gd, NG, dt, dxc; nv=5)   # validated frec→registers
+    act   = breg.act
+    comp_of(fld) = get(fmap, fld, -1)
+    write_plane!(setter, dim, st, en, flux_off, lk) = begin
+        for fld in 0:nf-1
+            pl = Vespa.bflux_plane(Val(3), dim, (st[1],st[2],st[3]), (en[1],en[2],en[3]),
+                                   (g0[1],g0[2],g0[3]), flux_off, comp_of(fld), Vcell, lk)
+            setter(fld, pl)
+        end
+    end
+    for sub in 0:nsub-2, dim in 0:2, side in 0:1               # proper subgrids: coarse InitialFlux
+        st, en = EnzoLib.problem_subgrid_flux_extent(h, level, i, sub, dim, side)
+        off = st[dim+1] - g0[dim+1] + (side == 0 ? 0 : 1)
+        lk = I -> get(breg.interior, (dim+1, I), nothing)
+        write_plane!((fld,pl)->EnzoLib.problem_set_subgrid_flux(h,level,i,sub,fld,dim,side,pl),
+                     dim, st, en, off, lk)
+    end
+    own = nsub - 1                                            # own outer boundary: RefinedFlux
+    for dim in 0:2, side in 0:1
+        st, en = EnzoLib.problem_subgrid_flux_extent(h, level, i, own, dim, side)
+        sym = side == 0 ? :lo : :hi; bc = side == 0 ? 1 : act[dim+1]
+        lk = I -> get(breg.flux, (dim+1, sym, I), nothing)
+        write_plane!((fld,pl)->EnzoLib.problem_set_subgrid_flux(h,level,i,own,fld,dim,side,pl),
+                     dim, st, en, bc, lk)
+    end
+    return nothing
+end
+
 function hydro_localppm!(h, level, dt)
     bep = PPMKernels.backend(BE)
     n = EnzoLib.session_num_grids_on_level(h, level)
     order = isodd(_lstep[]) ? (3,2,1) : (1,2,3); _lstep[] += 1
     acosmo = EnzoLib.session_cosmology(h)[1]
     chalf = T(0.5 * dt)
+    fmap = _DO_REFLUX[] ? _reflux_fieldmap() : nothing       # conservative coarse–fine FC
     for i in 0:n-1
         g = EnzoLib.problem_grid_index_on_level(h, level, i)
         gd = Tuple(Int.(EnzoLib.problem_grid_dims(h, g)))
@@ -326,9 +383,14 @@ function hydro_localppm!(h, level, dt)
         sp   = _species_indices(h, g)
         cols = Tuple(dev(bep, EnzoLib.problem_get_field(h, fi, g)) for fi in sp)   # ρ_s densities
         _grav_kick!(S1, S2, S3, Tau, Dd, ax, ay, az, chalf)            # ½ kick (pre)
+        # record per-face hydro fluxes for the coarse–fine correction (gravity is a separate
+        # per-cell source, applied consistently across levels — not refluxed)
+        fr = fmap === nothing ? nothing :
+             ntuple(_ -> ntuple(_ -> PPMKernels.device_zeros(bep, T, (prod(gd),)), 6), 3)
         PPMKernels.muscl_hancock_step_3d!(Dd, S1, S2, S3, Tau, gd, NG;
-            dt=dt, gamma=GAMMA, dx=dxc, ge=Ge, colours=cols, order=order,
+            dt=dt, gamma=GAMMA, dx=dxc, ge=Ge, colours=cols, order=order, fluxrec=fr,
             recon=:ppm_local, predictor=:trace, riemann=:hll, face_periodic=(level==0))
+        fr === nothing || _write_gpu_reflux!(h, level, i, g, fr, gd, dxc, dt, fmap)
         _grav_kick!(S1, S2, S3, Tau, Dd, ax, ay, az, chalf)            # ½ kick (post)
         wr(fi, a) = EnzoLib.problem_set_field(h, fi, Float64.(PPMKernels.to_host(a)); grid=g)
         wr(iD, Dd); wr(iV1, S1 ./ Dd); wr(iV2, S2 ./ Dd); wr(iV3, S3 ./ Dd)
@@ -487,6 +549,60 @@ function main_cic()
     CosmologyFinalRedshift       = $(ZEND)
     CosmologySimulationInitialFractionHII = $(s0.x_e)
     """
+    # ── AMR (opt-in via CIC_MAXLEVEL>0; appended last so it overrides the base block's
+    #    StaticHierarchy=1 / MaximumRefinementLevel=0).
+    #    CIC_FLAG_METHODS (default "4") selects Enzo CellFlaggingMethods (space-separated):
+    #      • 4 — refine by DM particle mass: "≥N particles/cell" ⇒ MinimumOverDensityFor-
+    #        Refinement = N·(Ω_dm/Ω_m) = N·(1−f_b). Refines COLLAPSING STRUCTURE and flags
+    #        NOTHING in the smooth high-z IGM — the right default for a z=1000→20 run.
+    #      • 6 — refine by Jeans length (RefineByJeansLengthSafetyFactor = cells/λ_J). Now SAFE
+    #        with CIC_JEANS_TCOLD=0 (real T): at z=1000 λ_J≈60 pc proper ≈ 10 cells (RESOLVED),
+    #        so method 6 flags nothing in the smooth IGM and refines only collapsed/heated gas.
+    #        (The earlier runaway — 64³→128³→256³→… up to 1024³ at a 128³ root — was NOT the
+    #        intrinsic λ_J but JeansRefinementColdTemperature=1 forcing T=1 K into λ_J, ~52×
+    #        too small; see the tcold note below.) Overdensity (4) is still the cleaner default.
+    #    The driver already calls session_rebuild(h,0) each cycle and evolve_level! recurses
+    #    into the finer grids via the level-aware GPU hooks — no driver change needed. ──
+    maxlevel = parse(Int, get(ENV, "CIC_MAXLEVEL", "0"))
+    if maxlevel > 0
+        npart  = parse(Int,     get(ENV, "CIC_REFINE_NPART", "4"))    # DM particles/cell (method 4)
+        cpj    = parse(Int,     get(ENV, "CIC_JEANS_CELLS",   "4"))   # cells per Jeans length (method 6)
+        # Enzo's JeansRefinementColdTemperature is NOT a floor: when >0 it OVERRIDES the
+        # Jeans-length temperature to that CONSTANT for every cell (an isothermal-collapse
+        # mode), so a small value like 1 K makes λ_J ~52× too small at z~1000 (T_gas≈2727 K)
+        # → the whole domain flags to max level (runaway). ≤0 ⇒ use the REAL temperature
+        # (ComputeTemperatureField); at z=1000 that gives λ_J≈60 pc ≈ 10 cells (resolved),
+        # so method 6 correctly refines only collapsed/heated gas. Default 0 = real T.
+        tcold  = parse(Float64, get(ENV, "CIC_JEANS_TCOLD",   "0.0")) # ≤0: real T; >0: constant T [K]
+        odref  = npart * (1.0 - _Ob_cic)                              # N·(Ω_dm/Ω_m); ×V_topcell → mass
+        methods = split(strip(get(ENV, "CIC_FLAG_METHODS", "4")))     # default: overdensity (4) ONLY
+        flagstr = join(methods, " ")
+        odstr   = join((m == "6" ? "0" : string(odref) for m in methods), " ")  # Jeans takes no ODref
+        massexp = join(("0" for _ in methods), " ")
+        usejeans = "6" in methods
+        # Enzo's parameter parser matches the name at COLUMN 0 (sscanf literal) — any leading
+        # whitespace makes the line silently ignored. Keep `jeans` lines and the interpolation
+        # flush-left so every parameter is honored (a stray indent on FluxCorrection left it at
+        # its default TRUE → GetProjectedBoundaryFluxes derefs the unfilled flux registers →
+        # segfault once a subgrid appears).
+        jeans = usejeans ? "RefineByJeansLengthSafetyFactor       = $(cpj)\n" *
+                           "JeansRefinementColdTemperature        = $(tcold)\n" : ""
+        _DO_REFLUX[] = _FLUXCORR                                  # conservative coarse–fine FC (default on)
+        fc = _FLUXCORR ? 1 : 0
+        chem *= """
+        StaticHierarchy                       = 0
+        MaximumRefinementLevel                = $(maxlevel)
+        RefineBy                              = 2
+        CellFlaggingMethod                    = $(flagstr)
+        MinimumOverDensityForRefinement       = $(odstr)
+        MinimumMassForRefinementLevelExponent = $(massexp)
+        $(jeans)FluxCorrection                        = $(fc)
+        """
+        @printf("  AMR ON: MaxLevel=%d RefineBy=2  flag=[%s]  DM ODref=%.3f%s  FluxCorrection=%d%s\n",
+                maxlevel, flagstr, odref,
+                usejeans ? @sprintf("  +Jeans %d cells/λ Tcold=%.1fK", cpj, tcold) : "  (overdensity-only)",
+                fc, fc == 1 ? " (conservative reflux: split-MUSCL ~few×1e-4)" : " (projection-only)")
+    end
     # NB: the gas temperature is OWNED by run_cicass_enzo (init_temperature below); it sets
     # the internal energy explicitly with μ=1.22 (neutral).  Do NOT also set
     # CosmologySimulationInitialTemperature here — Enzo's μ≈0.6 conversion would be 2× hot.
@@ -594,6 +710,13 @@ function main_cic()
         hooks = Dict{Symbol,Function}()
         # CIC_HYDRO_SOLVER: :ppm (Enzo-PPM port, default) or :localppm (fast one-ghost Local PPM)
         hsolver = Symbol(get(ENV, "CIC_HYDRO_SOLVER", "ppm"))
+        # Conservative FC needs the per-face flux record that only the :localppm MUSCL path
+        # produces (`fluxrec`); the :ppm port (ppm_step_3d!) records no fluxes, so its
+        # SubgridFluxes stay unfilled and FinalizeFluxes would segfault. Force :localppm when FC.
+        if _DO_REFLUX[] && hsolver !== :localppm
+            @warn "CIC_FLUXCORR=1 requires the flux-recording hydro; forcing CIC_HYDRO_SOLVER=:localppm (was :$hsolver)."
+            hsolver = :localppm
+        end
         hydrofn = hsolver === :localppm ? hydro_localppm! :
                   hsolver === :fvgk     ? hydro_fvgk!     : hydro!
         hmode === :julia && @printf("  hydro slot = :julia / %s\n", hsolver)
@@ -670,8 +793,14 @@ function main_cic()
                 end
             end
         end
+        # reflux=_DO_REFLUX[]: when FC is on (default under AMR), session_update_from_finer runs
+        # Enzo's full flux machinery (create/finalize/UpdateFromFinerGrids/CorrectForRefinedFluxes)
+        # and the :localppm hydro hook FILLS the registers (_write_gpu_reflux!) each step, so the
+        # coarse–fine flux mismatch is corrected. With CIC_FLUXCORR=0 it falls back to projection-
+        # only AMR (FluxCorrection=0 in the param, reflux off — fine→coarse projection without
+        # GetProjectedBoundaryFluxes, so no deref of unfilled registers).
         eng = EnzoLib.EngineConfig(; hydro=hmode, gravity=gmode, cooling=coolmode,
-                                   comoving_expansion=coexp, reflux=false,
+                                   comoving_expansion=coexp, reflux=_DO_REFLUX[],
                                    particle_push=pmode, hooks=hooks, probe=probe)
         # CIC_COPYOLD=0 skips the per-cycle OldBaryonField copy (~8s/run) but is UNSAFE:
         # measured to change baryon large-scale P(k) ~2× (the comoving-expansion/gravity
@@ -842,6 +971,12 @@ function main_cic()
             sec = time() - t0; evolvet[] += sec; ncyc[] += 1
             BE === :cuda && RECLAIM_EVERY > 0 && (cyc % RECLAIM_EVERY == 0) && CUDA.reclaim()
             tr = time(); EnzoLib.session_rebuild(h, 0); rebuildt[] += time() - tr
+            if maxlevel > 0                              # AMR: report the hierarchy each cycle
+                ng = [EnzoLib.session_num_grids_on_level(h, L) for L in 0:maxlevel]
+                occ = maximum(vcat(0, [L for L in 0:maxlevel if ng[L+1] > 0]))
+                _, znow = EnzoLib.session_cosmology(h)
+                @printf("    [AMR cyc%-3d z=%.1f] grids/level=%s maxOccLevel=%d\n", cyc, znow, ng, occ)
+            end
             _, z = EnzoLib.session_cosmology(h)        # Enzo's a is normalized to 1 at z_start;
             a = 1.0 / (1.0 + z)                          # use the PHYSICAL scale factor
             if DO_DRAG                                    # Compton momentum drag over this Δln a
