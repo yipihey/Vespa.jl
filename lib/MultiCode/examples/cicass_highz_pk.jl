@@ -382,10 +382,11 @@ function hydro_fvgk!(h, level, dt)
             sys = FV.EulerColors{nsp}(γ = γ);  z = (1f0, 0f0, 0f0, 0f0, 1f0, ntuple(_ -> 0f0, nsp)...)
         end
         U0 = [z for _ in 1:Nact, _ in 1:Nact, _ in 1:Nact]
-        # Riemann solver for the FVGK CTU path: :llf (default, most diffusive) or :hllc
-        # (contact-restoring, sharper small scales) via CIC_FVGK_RIEMANN.
+        # Riemann solver (CIC_FVGK_RIEMANN: :llf default | :hllc contact-restoring) and reconstruction
+        # (CIC_FVGK_RECON: :plm default | :ppm local CW84 parabolic) for the FVGK CTU path.
         fvr = Symbol(get(ENV, "CIC_FVGK_RIEMANN", "llf"))
-        _FVGRID[] = FV.Grid3DCuMarch(sys, U0; dx = dxc, riemann = fvr); _FVNSP[] = nsp
+        fvrec = Symbol(get(ENV, "CIC_FVGK_RECON", "plm"))
+        _FVGRID[] = FV.Grid3DCuMarch(sys, U0; dx = dxc, riemann = fvr, recon = fvrec); _FVNSP[] = nsp
     end
     gv = _FVGRID[]; gv.dx = dxc
     VOL = Nact^3; nv = 5 + nsp
