@@ -99,6 +99,47 @@ end
 # FiniteVolumeGodunovKA Godunov scheme (it owns the periodic boundary internally).
 function _fvgk_patch_hydro! end
 
+# ── interior-only chemistry: strided, in-place, f32 storage / f64 network ──────────────────────
+# Processes ONLY the pdim³ interior cells: maps the linear interior thread → the strided nd³ index
+# and reads/writes the f32 patch arrays directly — no gather/scatter, no f64 materialization.  Each
+# cell promotes to Float64, runs the stiff network (ChemistryKernels.evolve_cell — the same per-cell
+# map solve_chem_device! drives), narrows back, and applies the dual-energy Tau/Ge update.  Cosmology
+# args match solve_chem_device!'s defaults (hubble=71, Ωm=.27, ΩΛ=.73, fh=.76; no metals/expansion).
+@kernel function _chem_interior_k!(D, Ge, Tau, sp1, sp2, sp3,
+                                   du, vu2, tu, dt, z, deut, rtab, ctab,
+                                   nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
+    t = @index(Global)
+    @inbounds begin
+        TT = eltype(D)
+        t0 = t - 1
+        ix = t0 % pd1; q = t0 ÷ pd1
+        iy = q % pd2;  iz = q ÷ pd2
+        idx = (ng + ix) + nd1 * (ng + iy) + nd1 * nd2 * (ng + iz) + 1
+        d  = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
+        h1 = Float64(sp1[idx]); h2 = Float64(sp2[idx]); hd = deut ? Float64(sp3[idx]) : 0.0
+        en, hn, h2n, hdn, _ = ChemistryKernels.evolve_cell(d*du, e0*vu2, h1*du, h2*du,
+                                  deut ? hd*du : 0.0, dt*tu, z;
+                                  hubble=71.0, Om=0.27, OL=0.73, fh=0.76, deuterium=deut,
+                                  rate_tables=rtab, cool_tables=ctab)
+        enew = en / vu2
+        Ge[idx]  = TT(d * enew)
+        Tau[idx] = Tau[idx] + TT(d * (enew - e0))
+        sp1[idx] = TT(hn / du); sp2[idx] = TT(h2n / du)
+        deut && (sp3[idx] = TT(hdn / du))
+    end
+end
+
+"Run the stiff chemistry on patch `p`'s interior only (no ghost work, no gather/scatter copies)."
+function _chem_interior!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, rate_tables, cool_tables)
+    deut = pg.deut && length(p.species) >= 3
+    sp3  = deut ? p.species[3] : p.species[1]            # placeholder ref when no deuterium (unread)
+    nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
+    _chem_interior_k!(pg.backend)(p.D, p.Ge, p.Tau, p.species[1], p.species[2], sp3,
+        Float64(du), Float64((lu/tu)^2), Float64(tu), Float64(dt), Float64(1.0/a_value - 1.0),
+        deut, rate_tables, cool_tables, nd1, nd2, pg.ng, pd1, pd2; ndrange = pd1*pd2*pd3)
+    return nothing
+end
+
 # ── periodic ghost exchange along one axis (the patch-patch coupling) ──────────
 # For np=2 (or 1) the lo and hi neighbor along an axis are the same partner, and
 # the rule is symmetric: a patch's lo ghost ← partner's last ng INTERIOR planes,
@@ -313,9 +354,9 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             si!(f, v) = (@views _r3(f, pg.nd)[li, lj, lk] .= _r3(v, pg.pdim); nothing)  # scatter back into interior
             sa!(f, v) = (@views _r3(f, pg.nd)[li, lj, lk] .+= _r3(v, pg.pdim); nothing) # scatter-ADD (no read-gather)
             for p in pg.patches
-                Dint = gi(p.D); Geint = gi(p.Ge); r64 = Float64.(Dint)
-                e64  = Float64.(Geint) ./ r64; e0 = copy(e64)
                 if pg.packed
+                    Dint = gi(p.D); Geint = gi(p.Ge); r64 = Float64.(Dint)
+                    e64  = Float64.(Geint) ./ r64; e0 = copy(e64)
                     s1 = gi(p.species[1]); s2 = gi(p.species[2]); hdc = haveHD ? gi(p.species[3]) : nothing
                     if oncpu
                         sp1 = Array(s1); sp2 = Array(s2); sp3 = haveHD ? Array(hdc) : nothing
@@ -342,6 +383,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                 elseif oncpu
                     # GPU/CPU role flip: download the interior, solve the stiff network on the HOST
                     # (no warp divergence), then upload the cooled energy + species back.
+                    Dint = gi(p.D); Geint = gi(p.Ge)
                     rh = Float64.(Array(Dint)); eh = Float64.(Array(Geint)) ./ rh; e0h = copy(eh)
                     h1 = Float64.(Array(gi(p.species[1]))); h2 = Float64.(Array(gi(p.species[2])))
                     hd = haveHD ? Float64.(Array(gi(p.species[3]))) : nothing
@@ -355,16 +397,8 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                     si!(p.species[2], PPMKernels.to_device(be, T.(h2), T))
                     haveHD && si!(p.species[3], PPMKernels.to_device(be, T.(hd), T))
                 else
-                    HII = Float64.(gi(p.species[1])); H2I = Float64.(gi(p.species[2]))
-                    HDI = haveHD ? Float64.(gi(p.species[3])) : nothing
-                    ChemistryKernels.solve_chem_device!(r64, e64, HII, H2I, HDI;
-                        a_value=a_value, dt=dt, density_units=du, length_units=lu,
-                        time_units=tu, deuterium=pg.deut, backend=pg.besym, precision=Float64,
-                        rate_tables=rate_tables, cool_tables=cool_tables)
-                    sa!(p.Tau, Dint .* T.(e64 .- e0))
-                    si!(p.Ge,  Dint .* T.(e64))
-                    si!(p.species[1], T.(HII)); si!(p.species[2], T.(H2I))
-                    haveHD && si!(p.species[3], T.(HDI))
+                    # f32 species, device chem: strided in-place — no gather/scatter, no f64 materialization
+                    _chem_interior!(pg, p, a_value, dt, du, lu, tu, rate_tables, cool_tables)
                 end
             end
         end

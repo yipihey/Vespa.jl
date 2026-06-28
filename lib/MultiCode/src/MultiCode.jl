@@ -31,6 +31,7 @@ using EnzoLib
 using RamsesLib
 using ArepoLib
 using PPMKernels
+using KernelAbstractions: @kernel, @index
 import PoissonKernels
 import ChemistryKernels
 import R3D
