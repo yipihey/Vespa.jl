@@ -299,71 +299,72 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
         # while the async kernels still reference it (chem's own sync covers the joint case)
         do_chem || PPMKernels.KA.synchronize(be)
       end # do_hydro
-        # chemistry: per patch, per cell.  Runs on the full nd³ array (ghosts carry
-        # post-exchange physical neighbour values; the interior result is what matters,
-        # ghosts get overwritten by the next exchange).  ALWAYS solved in Float64 — the
-        # stiff network overflows in f32 (NaN) — by promoting on read and narrowing on
-        # write, so f32-storage patches keep the chemistry accurate (mirrors the cicass
-        # zero-copy chem).  On a Float64 grid these are identity copies.
+        # chemistry: per patch, per cell — INTERIOR ONLY.  The old path ran the stiff network over
+        # the full nd³ array, but the ghost results are immediately overwritten by the next halo
+        # exchange (pure waste; (nd/pdim)³ ≈ +42% at np=2/ng=4, worse for smaller patches).  We
+        # GATHER each patch interior into contiguous pdim³ buffers, solve, and SCATTER back — the
+        # interior result is bit-identical, the ghost work is gone.  ALWAYS solved in Float64 (the
+        # stiff network NaNs in f32), promoting on read / narrowing on write.
         if do_chem && chem && !isempty(pg.patches[1].species)
             haveHD = pg.deut && length(pg.patches[1].species) >= 3
             oncpu = chem_backend === :cpu && pg.besym !== :cpu     # run chem on the HOST
+            li, lj, lk = _interior(pg)
+            gi(f)   = vec(_r3(f, pg.nd)[li, lj, lk])                          # gather interior → contiguous pdim³
+            si!(f, v) = (@views _r3(f, pg.nd)[li, lj, lk] .= _r3(v, pg.pdim); nothing)  # scatter back into interior
+            sa!(f, v) = (@views _r3(f, pg.nd)[li, lj, lk] .+= _r3(v, pg.pdim); nothing) # scatter-ADD (no read-gather)
             for p in pg.patches
+                Dint = gi(p.D); Geint = gi(p.Ge); r64 = Float64.(Dint)
+                e64  = Float64.(Geint) ./ r64; e0 = copy(e64)
                 if pg.packed
-                    # species are packed UInt16 fractions Xᵢ; ChemistryKernels.solve_chem_device_u16!
-                    # unpacks Xᵢ·ρ → ρxᵢ, evolves the f64 network, and repacks IN PLACE — no f32 round-trip.
-                    r64 = Float64.(p.D); e64 = Float64.(p.Ge ./ p.D); e0 = copy(e64)
-                    hdc = haveHD ? p.species[3] : nothing
+                    s1 = gi(p.species[1]); s2 = gi(p.species[2]); hdc = haveHD ? gi(p.species[3]) : nothing
                     if oncpu
-                        sp1 = Array(p.species[1]); sp2 = Array(p.species[2])
-                        sp3 = haveHD ? Array(p.species[3]) : nothing
-                        rh  = Float64.(Array(p.D)); eh = Float64.(Array(p.Ge)) ./ rh; eh0 = copy(eh)
+                        sp1 = Array(s1); sp2 = Array(s2); sp3 = haveHD ? Array(hdc) : nothing
+                        rh = Float64.(Array(Dint)); eh = Float64.(Array(Geint)) ./ rh; eh0 = copy(eh)
                         ChemistryKernels.solve_chem_device_u16!(rh, eh, sp1, sp2, sp3;
                             a_value=a_value, dt=dt, density_units=du, length_units=lu,
                             time_units=tu, deuterium=pg.deut, backend=:cpu, precision=Float64,
                             rate_tables=rate_tables, cool_tables=cool_tables)
-                        p.Tau .+= p.D .* PPMKernels.to_device(be, T.(eh .- eh0), T)
-                        p.Ge  .= p.D .* PPMKernels.to_device(be, T.(eh), T)
-                        copyto!(p.species[1], sp1); copyto!(p.species[2], sp2)
-                        haveHD && copyto!(p.species[3], sp3)
+                        sa!(p.Tau, Dint .* PPMKernels.to_device(be, T.(eh .- eh0), T))
+                        si!(p.Ge,  Dint .* PPMKernels.to_device(be, T.(eh), T))
+                        si!(p.species[1], PPMKernels.to_device(be, sp1, UInt16))
+                        si!(p.species[2], PPMKernels.to_device(be, sp2, UInt16))
+                        haveHD && si!(p.species[3], PPMKernels.to_device(be, sp3, UInt16))
                     else
-                        ChemistryKernels.solve_chem_device_u16!(r64, e64, p.species[1], p.species[2], hdc;
+                        ChemistryKernels.solve_chem_device_u16!(r64, e64, s1, s2, hdc;
                             a_value=a_value, dt=dt, density_units=du, length_units=lu,
                             time_units=tu, deuterium=pg.deut, backend=pg.besym, precision=Float64,
                             rate_tables=rate_tables, cool_tables=cool_tables)
-                        p.Tau .+= p.D .* T.(e64 .- e0)
-                        p.Ge  .= p.D .* T.(e64)
+                        sa!(p.Tau, Dint .* T.(e64 .- e0))
+                        si!(p.Ge,  Dint .* T.(e64))
+                        si!(p.species[1], s1); si!(p.species[2], s2)
+                        haveHD && si!(p.species[3], hdc)
                     end
                 elseif oncpu
-                    # GPU/CPU role flip: download the patch state, solve the stiff network on
-                    # the HOST (faster — no warp divergence; see patch_cicass CIC_CHEM_BACKEND),
-                    # then upload the cooled energy + species back to the device.
-                    rh  = Float64.(Array(p.D)); eh = Float64.(Array(p.Ge)) ./ rh; e0 = copy(eh)
-                    h1  = Float64.(Array(p.species[1])); h2 = Float64.(Array(p.species[2]))
-                    hd  = haveHD ? Float64.(Array(p.species[3])) : nothing
+                    # GPU/CPU role flip: download the interior, solve the stiff network on the HOST
+                    # (no warp divergence), then upload the cooled energy + species back.
+                    rh = Float64.(Array(Dint)); eh = Float64.(Array(Geint)) ./ rh; e0h = copy(eh)
+                    h1 = Float64.(Array(gi(p.species[1]))); h2 = Float64.(Array(gi(p.species[2])))
+                    hd = haveHD ? Float64.(Array(gi(p.species[3]))) : nothing
                     ChemistryKernels.solve_chem_device!(rh, eh, h1, h2, hd;
                         a_value=a_value, dt=dt, density_units=du, length_units=lu,
                         time_units=tu, deuterium=pg.deut, backend=:cpu, precision=Float64,
                         rate_tables=rate_tables, cool_tables=cool_tables)
-                    p.Tau .+= p.D .* PPMKernels.to_device(be, T.(eh .- e0), T)
-                    p.Ge  .= p.D .* PPMKernels.to_device(be, T.(eh), T)
-                    p.species[1] .= PPMKernels.to_device(be, T.(h1), T)
-                    p.species[2] .= PPMKernels.to_device(be, T.(h2), T)
-                    haveHD && (p.species[3] .= PPMKernels.to_device(be, T.(hd), T))
+                    sa!(p.Tau, Dint .* PPMKernels.to_device(be, T.(eh .- e0h), T))
+                    si!(p.Ge,  Dint .* PPMKernels.to_device(be, T.(eh), T))
+                    si!(p.species[1], PPMKernels.to_device(be, T.(h1), T))
+                    si!(p.species[2], PPMKernels.to_device(be, T.(h2), T))
+                    haveHD && si!(p.species[3], PPMKernels.to_device(be, T.(hd), T))
                 else
-                    r64  = Float64.(p.D)
-                    e64  = Float64.(p.Ge ./ p.D)        # specific internal energy
-                    e0   = copy(e64)
-                    HII  = Float64.(p.species[1]); H2I = Float64.(p.species[2])
-                    HDI  = haveHD ? Float64.(p.species[3]) : nothing
+                    HII = Float64.(gi(p.species[1])); H2I = Float64.(gi(p.species[2]))
+                    HDI = haveHD ? Float64.(gi(p.species[3])) : nothing
                     ChemistryKernels.solve_chem_device!(r64, e64, HII, H2I, HDI;
                         a_value=a_value, dt=dt, density_units=du, length_units=lu,
                         time_units=tu, deuterium=pg.deut, backend=pg.besym, precision=Float64,
                         rate_tables=rate_tables, cool_tables=cool_tables)
-                    p.Tau .+= p.D .* T.(e64 .- e0)      # cooled internal energy → total
-                    p.Ge  .= p.D .* T.(e64)
-                    p.species[1] .= T.(HII); p.species[2] .= T.(H2I)
-                    haveHD && (p.species[3] .= T.(HDI))
+                    sa!(p.Tau, Dint .* T.(e64 .- e0))
+                    si!(p.Ge,  Dint .* T.(e64))
+                    si!(p.species[1], T.(HII)); si!(p.species[2], T.(H2I))
+                    haveHD && si!(p.species[3], T.(HDI))
                 end
             end
         end

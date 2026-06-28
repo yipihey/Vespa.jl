@@ -43,6 +43,10 @@ const PCOUR  = parse(Float64, get(ENV, "CIC_PCOURANT","0.8"))
 const NOUT   = parse(Int, get(ENV, "CIC_NOUT", "6"))
 const MAXCYC = parse(Int, get(ENV, "CIC_MAXCYC", "200000"))
 const DODRAG = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
+# CIC_SOLVER = ppm (PPMKernels split sweeps, default) | fvgk (FiniteVolumeGodunovKA unsplit CTU;
+# advects the 3 species as EulerColors passive scalars). :fvgk loads FVGK to activate MultiCodeFVGKExt.
+const SOLVER = Symbol(get(ENV, "CIC_SOLVER", "ppm"))
+SOLVER === :fvgk && @eval using FiniteVolumeGodunovKA
 # CIC_OVERLAP=1: overlap the host top-grid gravity with the GPU hydro+chem.  The
 # patch_step!/push_particles! GPU kernels are launched ASYNC, then the CPU computes
 # the NEXT step's accel (FFT + scatter) while the GPU runs this step; the result is
@@ -275,7 +279,7 @@ function main()
         order = isodd(cyc) ? (3,2,1) : (1,2,3)
         tg = time()
         if OVERLAP
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
             BE === :cuda && CUDA.synchronize()            # hydro+push done ⇒ ρ_next density final
@@ -300,7 +304,7 @@ function main()
             end
         else
             acc = gravity!(a, dτ)
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
                         du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
         end
