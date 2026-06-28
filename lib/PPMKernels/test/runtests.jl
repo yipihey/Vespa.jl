@@ -56,5 +56,6 @@ include("harness.jl")
     include("test_muscl_grid.jl")       # 3-D unsplit RK2 MUSCL driver (HydroMethod=3)
     include("test_ppml.jl")             # PPML stateful char-traced solver (Ustyugov+ 2009)
     include("test_colour.jl")           # passive species (colour) advection on the PPM mass flux
+    include("test_reflux_capture.jl")   # frec → coarse–fine reflux registers (AMR flux correction)
     # include("test_sweep.jl")          # Phase 3
 end

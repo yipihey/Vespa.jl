@@ -221,6 +221,39 @@ boundary, not the bridge.
   end-to-end parent-ghost shows — Vespa reads the innermost interpolated layer,
   Enzo's multi-layer reconstruction differs at higher order. The flux bridge stays
   EXACTLY conservative; this is the boundary-ACCURACY half in ND.
+- **GPU/CPU PPMKernels stepper (KA) — capture EXACT; end-to-end REDUCES drift but is
+  NOT round-off (operator-split limitation, understood).** The same reflux contract is
+  now driven by the KernelAbstractions `muscl_hancock_step_3d!` instead of the native
+  Vespa driver: it records grid-frame face fluxes (`fluxrec`), and
+  `PPMKernels.boundary_flux_register` (`lib/PPMKernels/src/reflux_capture.jl`) extracts
+  the per-(axis,side,cell) boundary + per-(axis,LO-cell) interior registers in the SAME
+  keys/signs/units as the native `BoundaryFluxRegister`, so the SAME `_write_fluxes!` and
+  Enzo machinery consume it unchanged. The hook is now `reflux_hydro_hook(stepper)` with a
+  pluggable stepper (native_stepper / ppmkernels_stepper); the native path is bit-identical
+  (1D `7.894919286223351e-16`).
+  - **Capture is EXACT, verified two ways.** (a) Synthetic, `test_reflux_capture.jl`
+    (PPMKernels): the KA gather equals an independent host-loop reference key-for-key, and
+    the boundary register obeys the conservation identity `ΔQ_active == Σ_lo − Σ_hi` to
+    round-off (CPU; GPU when present). (b) IN SITU, `test_gpu_reflux.jl` gate 1: the SAME
+    identity holds to round-off (`~1e-16`) on EVERY live 3-D AMR grid, including the
+    NON-cubic refined strips (`8×32×32`, `8×64×64`) with Enzo's real parent-interpolated
+    ghosts. So each grid's recorded boundary flux is exactly the flux it applied.
+  - **End-to-end is NOT round-off — and that is a real property of the SPLIT scheme, not a
+    capture bug.** On a static 3-D Sod-AMR nest (32³, waves interior), the native UNSPLIT
+    driver conserves composite mass to `~4e-14`, but `muscl_hancock_step_3d!` gives mass
+    drift `~1.8e-4` WITH the correction vs `~6e-4` WITHOUT (a ~3.4× reduction), and this
+    residual is INDEPENDENT of reconstruction (plm/ppm_local), Riemann solver (hll/hllc),
+    parent-ghost on/off, and refinement depth (it persists at MaximumRefinementLevel=1).
+    Root cause: `muscl_hancock_step_3d!` is DIMENSIONALLY SPLIT — the coarse grid's
+    InitialFlux and the fine grid's RefinedFlux at an interface are evaluated on different
+    per-sweep intermediate states, so Enzo's "replace the face flux"
+    `CorrectForRefinedFluxes` (exact only for an UNSPLIT scheme, which the native Vespa
+    HLLC+PLM+SSP-RK2 driver IS — hence its round-off in 1D/2D/3D) leaves the transverse
+    fluxes inconsistent. Reaching round-off needs an UNSPLIT KA hydro (the native driver is
+    CPU-only; PPMKernels' grid drivers are all Strang/dimensionally-split) — that is the
+    follow-up, not part of this pass. The `test_gpu_reflux.jl` end-to-end gate therefore
+    asserts the HONEST facts (reflux reduces the drift ≥2.5× and the residual is bounded),
+    with the native round-off control available behind `REFLUX_NATIVE_3D=1`.
 
 ## Why this is a dedicated effort, not a tail-end task
 
@@ -230,3 +263,40 @@ non-conservation, not a crash. It needs the Vespa recording side, ~4 bridge
 functions + a dylib rebuild, and the reflux-conservation test as the gate. Doing it
 right is worth a focused pass; a non-conservative shortcut is worse than not doing
 it.
+
+## Resolution (2026-06-19): re-platform onto Vespa's own FluxRegister
+
+The end-to-end residual above (`~1.8e-4`) is the **Enzo C++ `CorrectForRefinedFluxes`
+× split-scheme interaction**, invisible from Julia and not closable on the Enzo path
+(see `docs/adr/0003`'s follow-up notes and the prior-outcome record in the re-platform
+plan). The closing move is to stop using Enzo's reflux: drive the hydro through
+**Vespa's native `evolve_level!` + `FluxRegister`** (`src/reflux.jl`), which already
+conserve to round-off in 1D/2D/3D, and inject the KA compute as a **swappable
+batched-per-face flux backend** (`src/ka_flux.jl`, P1 of the re-platform plan).
+
+The decisive realization: **coarse↔fine conservation telescopes from the
+single-flux-per-face structure** (the same `F·area` added to the lo cell, subtracted
+from the hi cell, and recorded into `_reflux_capture!`), so it is INDEPENDENT of the
+flux function. Moving the Riemann solve to a batched backend (`HostBatchedFlux`, and a
+GPU/KA backend next) cannot break conservation — only the solution values change.
+
+`Simulation` gained a `flux::Any` field (default `nothing` = native per-face path);
+`accumulate_flux!` routes to `_accumulate_flux_batched!` when it is set. The batched
+path is a 3-pass walk over the deterministic `for_each_face` (gather L/R states →
+batched `compute_face_fluxes!` → scatter), reusing `_face_value`, `_boundary_ghost`,
+`_reflux_capture!`, and `_bflux_capture*` verbatim. Gate `test/test_amr_ka_flux.jl`:
+refined Sod (single-rate + subcycled) and 2D Sedov conserve to **round-off**
+(mass drift `~1e-11`, rtol=1e-9), and the batched path is **bit-identical to the
+native per-face path** (`worst_state_diff = 0.0`). This closes the exact-conservation
+problem the Enzo path could not — by construction, on the native stack.
+
+The real GPU/CPU device backend is `KAFlux(backend)` — a KernelAbstractions kernel
+that calls the same `hllc_flux` (pure `NTuple{5}` arithmetic ⇒ GPU-compilable),
+shipped as the `VespaKAFluxExt` package extension (weak-dep on KernelAbstractions, so
+the core stays headless). Gate `test/gpu/test_ka_flux_gpu.jl` (opt-in env
+`test/gpu/`): on an **NVIDIA RTX A6000**, `KAFlux(CUDABackend())` conserves to
+round-off under AMR + subcycling (Sod + 2D Sedov, mass drift `1.03e-11`, identical to
+CPU) and its solution is **bit-identical to the host path** (`worst_state_diff = 0.0`
+— the device flux is copied back and scattered host-side, so conservation telescopes
+exactly regardless of any FP divergence). `KAFlux(CPU())` ≡ `HostBatchedFlux` (worst
+diff 0). Tested on GPU (CUDA) and CPU; 13/13 green. **Phase 1 closed.**

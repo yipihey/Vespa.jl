@@ -163,6 +163,21 @@ end
 @inline _replace(I::CartesianIndex{N}, axis::Int, val::Int) where {N} =
     CartesianIndex(ntuple(d -> d == axis ? val : I[d], N))
 
+# Bulk, allocation-free per-face neighbor handles (see MeshInterface). Reuses the
+# exact `MI.neighbor` arithmetic (already alloc-free) once per face; the explicit
+# boundary mask avoids overloading the handle value (a 1-cell periodic axis wraps a
+# cell to itself, a genuine Interior).
+@inline function MI.face_neighbor_handles(m::UniformMesh{N}, I::CartesianIndex{N};
+                                  bcs::BoundaryConditions) where {N}
+    nbs = ntuple(Val(2N)) do f
+        ax = (f + 1) >> 1; sd = isodd(f) ? :lo : :hi
+        MI.neighbor(m, I, ax, sd; bcs = bcs)
+    end
+    h = ntuple(f -> nbs[f] isa Interior ? nbs[f].cell : I, Val(2N))
+    b = ntuple(f -> !(nbs[f] isa Interior), Val(2N))
+    return (h, b)
+end
+
 # Face enumeration: emit each unique face once. The hi-side query yields every
 # interior face (incl. the periodic wrap, which the hi-edge cell resolves to the
 # lo-edge cell) and the hi-domain boundary; the lo-side query contributes only

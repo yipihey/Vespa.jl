@@ -15,8 +15,10 @@ using EnzoBackend
     include("test_set_acceleration.jl")    # set_acceleration bridge: :julia gravity → :enzo hydro coupling primitive
     include("test_julia_reflux.jl")        # ADR-0003 part B: conservative :julia hydro under AMR (SubgridFluxes bridge)
     include("test_julia_reflux_2d.jl")     # ADR-0003 follow-up #2: ND face-plane raster — 2D conservation (if grid lib built)
+    include("test_gpu_reflux.jl")          # PPMKernels (GPU+CPU) reflux: in-situ capture identity + end-to-end (if grid lib built)
     include("test_local_ppm_method.jl")    # HydroMethod=10 selects conservative one-ghost local PPM
     include("test_local_ppm_amr.jl")       # standard 1-D/2-D Sod + 3-D Noh AMR analytic tests
+    include("test_flag_jeans.jl")           # AMR oracle: enzomodules_flag_jeans bridge (CellFlaggingMethod=6)
     # Phase C subgrid gravity runs in its OWN process: a prior session's leaked
     # Enzo globals empty the GravityTest deposit (GMF = NaN) in a shared host.
     @testset "Phase C: subgrid gravity (isolated process)" begin

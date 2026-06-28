@@ -209,6 +209,52 @@ function comp_accel_ref(src::Array{Float64,3}, ddims::NTuple{3,<:Integer};
     return a1, a2, a3
 end
 
+"""
+    flag_jeans_ref(density, energy; dx, safety, density_units, length_units, time_units)
+        -> (flag::Array{Int}, count::Int)
+
+Enzo's standalone Jeans-length flagging (`CellFlaggingMethod = 6`) on a regular block:
+returns the per-cell 0/1 flag field and the flagged-cell count. `safety` =
+`RefineByJeansLengthSafetyFactor` (cells per Jeans length). `density`/`energy` are the gas
+density and (specific) energy on the block; the `*_units` are the CGS unit scales. This is
+the differential ORACLE for the native `Vespa.jeans_length_indicator`.
+"""
+function flag_jeans_ref(density::Array{Float64}, energy::Array{Float64};
+                        dx::Real, safety::Real,
+                        density_units::Real, length_units::Real, time_units::Real)
+    size(density) == size(energy) || error("flag_jeans_ref: density/energy shape mismatch")
+    dims = Cint[size(density)...]
+    flag = zeros(Cint, length(density)); cnt = Ref{Cint}(0)
+    rc = ccall(_gsym(:enzomodules_flag_jeans), Cint,
+               (Cint, Ptr{Cint}, Cdouble, Ptr{Cdouble}, Ptr{Cdouble},
+                Cdouble, Cdouble, Cdouble, Cdouble, Ptr{Cint}, Ptr{Cint}),
+               ndims(density), dims, dx, density, energy, safety,
+               density_units, length_units, time_units, flag, cnt)
+    rc < 0 && error("enzomodules_flag_jeans returned $rc")
+    return reshape(Int.(flag), size(density)), Int(cnt[])
+end
+
+"""
+    flag_cells_ref(method, threshold, d, e, u, v, w; dx) -> (flag::Array{Int}, count::Int)
+
+Enzo's standalone single-method flagging on a regular block (`enzomodules_flag_cells`):
+`method` is a `CellFlaggingMethod` code (1=slope, 2=baryon-mass, 3=shocks, 6=Jeans, …),
+`threshold` its parameter. `d,e,u,v,w` are density, energy, and the three velocities.
+"""
+function flag_cells_ref(method::Integer, threshold::Real,
+                        d::Array{Float64}, e::Array{Float64},
+                        u::Array{Float64}, v::Array{Float64}, w::Array{Float64}; dx::Real)
+    dims = Cint[size(d)...]
+    flag = zeros(Cint, length(d)); cnt = Ref{Cint}(0)
+    rc = ccall(_gsym(:enzomodules_flag_cells), Cint,
+               (Cint, Ptr{Cint}, Cdouble, Cint, Cdouble,
+                Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble},
+                Ptr{Cint}, Ptr{Cint}),
+               ndims(d), dims, dx, method, threshold, d, e, u, v, w, flag, cnt)
+    rc < 0 && error("enzomodules_flag_cells returned $rc")
+    return reshape(Int.(flag), size(d)), Int(cnt[])
+end
+
 # ── low-level Session / problem entry points (signatures per problems.py) ─────
 const Handle = Ptr{Cvoid}
 

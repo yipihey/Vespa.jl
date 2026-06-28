@@ -219,7 +219,8 @@ end
 function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
                    D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int,
                    dt::Real, gamma::Real, theta::Real, dx::Real, small_rho::Real;
-                   ge = nothing, dGe = nothing, eta1::Real = 1e-3)
+                   ge = nothing, dGe = nothing, eta1::Real = 1e-3,
+                   frec = nothing, frec_w::Real = 1)
     be = KA.get_backend(D); T = eltype(D); N = length(D)
     rho, eint, vx, vy, vz = prim; dual = ge !== nothing
     if dual
@@ -235,6 +236,7 @@ function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
         na = dims[axis]; ntr = N ÷ na
         active = na - 2 * ng; nfi = active + 1
         dtdx = T(dt) / T(dx)
+        perm = _axis_perm(axis)               # identity for axis 1; needed for flux recording too
         # cyclic velocity roles (normal, transverse1, transverse2) — Enzo EulerSweeps
         vu, vv, vw = axis == 1 ? (vx, vy, vz) : axis == 2 ? (vy, vz, vx) : (vz, vx, vy)
         fd  = _scratch(D, nfi * ntr); fs1 = _scratch(D, nfi * ntr); fs2 = _scratch(D, nfi * ntr)
@@ -249,7 +251,6 @@ function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
                                   na, nfi, ng, dtdx; ndrange = (active, ntr))
             dual && _scalar_div_add!(be)(dGe, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
         else
-            perm = _axis_perm(axis)
             rhoT = transpose3(rho, dims, perm); eintT = transpose3(eint, dims, perm)
             vuT  = transpose3(vu, dims, perm);  vvT = transpose3(vv, dims, perm); vwT = transpose3(vw, dims, perm)
             muscl_flux_line!(fd, fs1, fs2, fs3, fe, rhoT, eintT, vuT, vvT, vwT;
@@ -272,6 +273,21 @@ function _muscl_L!(dD, dS1, dS2, dS3, dE, prim,
                 _scalar_div_local!(be)(dGel, fge, na, nfi, ng, dtdx; ndrange = (active, ntr))
                 _untranspose_add_into!(dGe, dGel, dims, perm)
             end
+        end
+        # AMR reflux recording: accumulate w·(this axis's flux line) into frec[axis] in the
+        # grid frame (momenta rotate back like the velocities). With w=½ on each of the two
+        # RK stages, frec ends as ½(F₁+F₂) — the single per-face flux that produced the update
+        # (so `boundary_flux_register` consumes it exactly like the split path's frec).
+        if frec !== nothing
+            fa = frec[axis]; nrm = axis; t1 = axis % 3 + 1; t2 = t1 % 3 + 1
+            slab = _scratch(D, N)
+            recf(comp, tgt) = begin
+                fill!(slab, zero(T))
+                _flux_to_slab_scaled!(be)(slab, comp, T(frec_w), na, nfi, ng; ndrange = (nfi, ntr))
+                _untranspose_add_into!(tgt, slab, dims, perm)
+            end
+            recf(fd, fa[1]); recf(fs1, fa[1+nrm]); recf(fs2, fa[1+t1]); recf(fs3, fa[1+t2]); recf(fe, fa[5])
+            dual && recf(fge, fa[6])
         end
         KA.synchronize(be)
     end
@@ -297,7 +313,8 @@ synced at step end.
 """
 function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
                         dt::Real, gamma::Real, theta::Real = 1.5, dx::Real = 1.0,
-                        small_rho::Real = 1e-10, bc! = nothing, ge = nothing, eta1::Real = 1e-3)
+                        small_rho::Real = 1e-10, bc! = nothing, ge = nothing, eta1::Real = 1e-3,
+                        fluxrec = nothing)
     be = KA.get_backend(D); T = eltype(D); N = length(D); dual = ge !== nothing
     half = T(0.5)
     bcfill!() = bc! === nothing ? nothing :
@@ -313,10 +330,16 @@ function muscl_step_3d!(D, S1, S2, S3, Tau, dims::NTuple{3,Int}, ng::Int;
     Ge0 = dual ? sc() : nothing; dGe = dual ? sc() : nothing
     copyto!(D0, D); copyto!(S10, S1); copyto!(S20, S2); copyto!(S30, S3); copyto!(Tau0, Tau)
     dual && copyto!(Ge0, ge)
+    # zero the (caller-owned) reflux registers; each RK stage accumulates ½·flux into them
+    if fluxrec !== nothing
+        for a in 1:3, c in eachindex(fluxrec[a]); fill!(fluxrec[a][c], zero(T)); end
+    end
 
+    # both RK stages record with weight ½ ⇒ frec = ½(F₁+F₂), the single per-face flux.
     L!(D_, S1_, S2_, S3_, Tau_) =
         _muscl_L!(dD, dS1, dS2, dS3, dE, prim, D_, S1_, S2_, S3_, Tau_,
-                  dims, ng, dt, gamma, theta, dx, small_rho; ge = ge, dGe = dGe, eta1 = eta1)
+                  dims, ng, dt, gamma, theta, dx, small_rho; ge = ge, dGe = dGe, eta1 = eta1,
+                  frec = fluxrec, frec_w = half)
 
     # stage 1: U1 = U0 + dU(U0)   (in place; D…Tau currently hold U0)
     bcfill!()                                  # ghost zones for U0
@@ -378,6 +401,14 @@ end
 @kernel function _flux_to_slab!(Gt, @Const(f), na::Int, nfi::Int, nghost::Int)
     gi, gj = @index(Global, NTuple)
     @inbounds Gt[(gj - 1) * na + nghost + gi] = f[(gj - 1) * nfi + gi]
+end
+
+# scaled variant for the UNSPLIT driver, which records the RK2-averaged single-per-face
+# flux ½(F₁+F₂): the slab gets `w·f` and is then `_untranspose_add_into!`-ed (accumulated)
+# into frec across the two stages (w=½ each), rather than overwritten as in the split path.
+@kernel function _flux_to_slab_scaled!(Gt, @Const(f), w, na::Int, nfi::Int, nghost::Int)
+    gi, gj = @index(Global, NTuple)
+    @inbounds Gt[(gj - 1) * na + nghost + gi] = w * f[(gj - 1) * nfi + gi]
 end
 
 # one Hancock sweep along `axis`, mutating the conserved state in place. Mirrors

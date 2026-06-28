@@ -654,3 +654,47 @@ end
         @test all(s0[f] == s1[f] for f in 1:5)
     end
 end
+
+# The UNSPLIT driver (muscl_step_3d!) records the RK2-averaged single-per-face flux ½(F₁+F₂).
+# Because it is operator-unsplit (all axis fluxes from one frozen state per stage), this single
+# flux per face is what telescopes EXACTLY across coarse–fine boundaries — the round-off AMR
+# reflux the split MUSCL-Hancock cannot reach. Here we lock that the recorded ½(F₁+F₂) IS the
+# update: ΔU[c] = −Σ_a (frec[a][c+ê_a] − frec[a][c])·(dt/dx) to round-off.
+@testset "unsplit flux recording reproduces the conservative update (round-off reflux)" begin
+    ng = 3; n = 16; nb = n + 2ng; dims = (nb, nb, nb); N = nb^3
+    gamma = 1.4; dx = 1.0 / n; dt = 0.008
+    nx, ny, nz = dims; idx(i, j, k) = i + nx * (j - 1) + nx * ny * (k - 1)
+    rho = zeros(N); vx = zeros(N); vy = zeros(N); vz = zeros(N); etot = zeros(N)
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        x = (i - ng - 0.5) / n; y = (j - ng - 0.5) / n; z = (k - ng - 0.5) / n; q = idx(i, j, k)
+        rho[q] = 1.0 + 0.3 * sinpi(2x) * cospi(2y); pr = 0.6 + 0.2 * cospi(2z)
+        vx[q] = 0.2 * sinpi(2y); vy[q] = 0.15 * cospi(2z); vz[q] = -0.1 * sinpi(2x)
+        etot[q] = pr / ((gamma - 1) * rho[q]) + 0.5 * (vx[q]^2 + vy[q]^2 + vz[q]^2)
+    end
+    ea = (1, nx, nx * ny)
+    D = copy(rho); S1 = rho .* vx; S2 = rho .* vy; S3 = rho .* vz; Tau = rho .* etot
+    U0 = (copy(D), copy(S1), copy(S2), copy(S3), copy(Tau))
+    frec = ntuple(_ -> ntuple(_ -> zeros(N), 6), 3)
+    PPMKernels.muscl_step_3d!(D, S1, S2, S3, Tau, dims, ng; dt = dt, gamma = gamma, dx = dx, fluxrec = frec)
+    U1 = (D, S1, S2, S3, Tau); dtdx = dt / dx
+    for fld in 1:5
+        maxres = 0.0
+        for k in ng+1:nz-ng, j in ng+1:ny-ng, i in ng+1:nx-ng
+            c = idx(i, j, k)
+            div = 0.0
+            for a in 1:3
+                div += (frec[a][fld][c+ea[a]] - frec[a][fld][c]) * dtdx
+            end
+            maxres = max(maxres, abs((U1[fld][c] - U0[fld][c]) + div))
+        end
+        @test maxres < 1e-13                # round-off ⇒ the single ½(F₁+F₂) per face IS the update
+    end
+
+    # inert when fluxrec=nothing (pure read-out, no feedback)
+    s0 = (copy(rho), rho .* vx, rho .* vy, rho .* vz, rho .* etot)
+    s1 = (copy(rho), rho .* vx, rho .* vy, rho .* vz, rho .* etot)
+    PPMKernels.muscl_step_3d!(s0..., dims, ng; dt = dt, gamma = gamma, dx = dx)
+    fr2 = ntuple(_ -> ntuple(_ -> zeros(N), 6), 3)
+    PPMKernels.muscl_step_3d!(s1..., dims, ng; dt = dt, gamma = gamma, dx = dx, fluxrec = fr2)
+    @test all(s0[f] == s1[f] for f in 1:5)
+end

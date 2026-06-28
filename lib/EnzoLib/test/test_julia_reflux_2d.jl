@@ -18,7 +18,7 @@
 # :julia hydro conserves to round-off, but the strip's coarse–fine boundary is a
 # genuine 2D face plane (60-cell x-faces, 4-cell y-faces) — so it exercises the
 # ND orthogonal-dim raster, not the 1D single-cell collapse.
-const REFLUX_PF_2D = abspath(joinpath(@__DIR__, "..", "..", "..", "..",
+const REFLUX_PF_2D = abspath(joinpath(_ENZO_DEV,
                                       "run", "Hydro", "Hydro-2D", "SodShockTube2DAMR", "SodShockTube2DAMR.enzo"))
 
 if get(ENV, "REFLUX_NOTEST", "") != ""

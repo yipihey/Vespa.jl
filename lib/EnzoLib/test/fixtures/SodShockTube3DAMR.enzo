@@ -1,0 +1,51 @@
+#
+# PROBLEM DEFINITION FILE: Sod Shock Tube, 3D AMR variant (PPMKernels reflux gate)
+#
+# A planar (x-direction) Sod shock tube on a 3D grid. The initial discontinuity is
+# refined at start (RefineAtStart) into a NEST of levels around x=0.5, so there are
+# coarse–fine boundaries INTERIOR to the outermost refined region — co-located with
+# the Sod waves as they spread outward. The y/z state is uniform, so per (y,z) column
+# this is the mild 1D Sod the hydro conserves to round-off; the nest's interior
+# coarse–fine faces are genuine 3D face planes. This is the 3D analog of
+# Hydro-2D/SodShockTube2DAMR (and Hydro-1D/.../SodShockTubeAMR) used by the GPU/CPU
+# PPMKernels conservative-reflux gate (test_gpu_reflux.jl). muscl_hancock_step_3d! is
+# a 3-D driver, so the reflux gate for it must be a 3-D problem.
+#
+ProblemType            = 1
+TopGridRank            = 3
+TopGridDimensions      = 32 32 32
+
+HydroMethod            = 0
+
+StopTime               = 0.25
+StopCycle              = 100000
+dtDataDump             = 1.0e30
+DataDumpName           = data3d
+
+# transmissive (outflow) on all faces — waves stay interior over the test window
+LeftFaceBoundaryCondition    = 1 1 1
+RightFaceBoundaryCondition   = 1 1 1
+
+Gamma                  = 1.4
+CourantSafetyNumber    = 0.8
+
+#  AMR: refine the initial discontinuity into a static interior nest (2 levels)
+StaticHierarchy           = 0
+MaximumRefinementLevel    = 2
+RefineBy                  = 2
+CellFlaggingMethod        = 1
+MinimumSlopeForRefinement = 0.2
+
+#  the (x-direction) Sod shock tube
+HydroShockTubesRefineAtStart         = 1
+HydroShockTubesInitialDiscontinuity  = 0.5
+HydroShockTubesLeftDensity           = 1.0
+HydroShockTubesLeftVelocityX         = 0.0
+HydroShockTubesLeftVelocityY         = 0.0
+HydroShockTubesLeftVelocityZ         = 0.0
+HydroShockTubesLeftPressure          = 1.0
+HydroShockTubesRightDensity          = 0.125
+HydroShockTubesRightVelocityX        = 0.0
+HydroShockTubesRightVelocityY        = 0.0
+HydroShockTubesRightVelocityZ        = 0.0
+HydroShockTubesRightPressure         = 0.1

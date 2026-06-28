@@ -59,6 +59,12 @@ _hg_bckind(::Periodic)   = PERIODIC
 _hg_frame_bcs(bcs::BoundaryConditions, D::Int) =
     FrameBoundaries(ntuple(d -> (_hg_bckind(bc_on(bcs, d, :lo)),
                                  _hg_bckind(bc_on(bcs, d, :hi))), D))
+# Static-rank form: `ntuple(_, Val(D))` is type-stable ⇒ the FrameBoundaries is
+# isbits/stack-allocated. Use this wherever `D` is a type parameter to avoid the
+# per-call allocation of the runtime-`Int` method above.
+_hg_frame_bcs(bcs::BoundaryConditions, ::Val{D}) where {D} =
+    FrameBoundaries(ntuple(d -> (_hg_bckind(bc_on(bcs, d, :lo)),
+                                 _hg_bckind(bc_on(bcs, d, :hi))), Val(D)))
 
 # ─────────────────────────────── the mesh ───────────────────────────────────
 
@@ -70,8 +76,10 @@ power of two; the root is isotropically refined `log2(dims[1])` times). It refin
 dynamically thereafter via [`refine!`](@ref). `domain` is a tuple of `(lo, hi)`
 physical bounds per axis.
 """
-mutable struct HGMesh{D,T} <: AbstractMeshBackend
-    mesh::HierarchicalMesh{D}
+mutable struct HGMesh{D,T,M} <: AbstractMeshBackend
+    mesh::HierarchicalMesh{D,M}      # M (sibling-index type) concretely captured ⇒ `m.mesh`
+                                     # access is type-stable (no per-call box in neighbor/
+                                     # face_neighbor_handles/for_each_face).
     frame::EulerianFrame{D,T}
     leaves::Vector{Int}
     lo::NTuple{D,T}
@@ -97,7 +105,7 @@ function HGMesh(dims::NTuple{D,Integer}, domain::NTuple{D,<:Tuple};
     hi = ntuple(d -> T(domain[d][2]), D)
     frame = EulerianFrame(mesh, lo, hi)
 
-    m = HGMesh{D,T}(mesh, frame, Int[], lo, hi, k)
+    m = HGMesh(mesh, frame, Int[], lo, hi, k)   # infer {D,T,M} from the field types
     _resync!(m)
     return m
 end
@@ -171,12 +179,24 @@ end
 # coarse↔fine face this returns HG's representative leaf, which is an adequate
 # stencil neighbor for the limited slope. Periodic wrap and domain BCs are
 # resolved by HG's `face_neighbors_with_bcs`.
-function MI.neighbor(m::HGMesh, i::Integer, axis::Int, side::Symbol;
-                     bcs::BoundaryConditions)
+function MI.neighbor(m::HGMesh{D}, i::Integer, axis::Int, side::Symbol;
+                     bcs::BoundaryConditions) where {D}
     f = _face_index(axis, side)
-    nb = face_neighbors_with_bcs(m.mesh, i, _hg_frame_bcs(bcs, MI.rank(m)))[f]
+    nb = face_neighbors_with_bcs(m.mesh, i, _hg_frame_bcs(bcs, Val(D)))[f]
     (nb === nothing || nb == 0) && return DomainBoundary(bc_on(bcs, axis, side))
     return Interior(Int(nb))
+end
+
+# Bulk, allocation-free per-face neighbor handles (see MeshInterface). Reads the
+# CACHED, BC-resolved representative tuple `face_neighbors_with_bcs` (a 0 entry is
+# a domain boundary or non-leaf) and returns plain `Int` handles + a boundary mask
+# — no per-face `NeighborRef` box, no runtime-`Int` FrameBoundaries rebuild.
+@inline function MI.face_neighbor_handles(m::HGMesh{D}, i::Integer;
+                                  bcs::BoundaryConditions) where {D}
+    t = face_neighbors_with_bcs(m.mesh, i, _hg_frame_bcs(bcs, Val(D)))
+    h = ntuple(f -> (t[f] === nothing || t[f] == 0) ? Int(i) : Int(t[f]), Val(2D))
+    b = ntuple(f -> (t[f] === nothing || t[f] == 0), Val(2D))
+    return (h, b)
 end
 
 # ───────────────────── face enumeration with hanging nodes ──────────────────
@@ -193,48 +213,61 @@ end
 # Periodic axes (no fine neighbor recorded ⇒ empty list) are resolved via the
 # BC-aware representative and emitted once from the hi side. Periodic across a
 # refinement boundary is a documented follow-up (the AMR tests use Outflow).
+# Reads the neighbor graph's per-leaf NTuple `representatives` + the multi-fine `fine`
+# Dict DIRECTLY (instead of `face_fine_neighbors`, which allocates a fresh Vector —
+# `copy(list)` / `UInt32[rep]` / `UInt32[]` — on EVERY call: 2·D·n_leaf per traversal,
+# exploding (~27 allocs/leaf) on fragmented AMR meshes). Emission/dedup is unchanged:
+# conforming/i-fine from the hi side, coarse↔fine from the fine side, periodic via the
+# BC table, all once. NeighborRef args are concretely typed at each call site (no box).
 function MI.for_each_face(f, m::HGMesh{D}; bcs::BoundaryConditions) where {D}
-    ensure_neighbor_graph!(m.mesh)
+    g = ensure_neighbor_graph!(m.mesh)
+    reps = g.representatives
+    fined = g.fine
     fbcs = _hg_frame_bcs(bcs, D)
     mesh = m.mesh
     @inbounds for i in m.leaves
-        li = Int(level_of(mesh, i))
-        area_i = ()  # lazily per axis below
+        ii = Int(i); li = Int(level_of(mesh, i))
         for d in 1:D
             a = MI.face_area(m, i, d)
 
-            # ---- hi face ----
+            # ---- hi face (left = i, right = hi-neighbour) ----
             fhi = 2d
-            nbr = face_fine_neighbors(mesh, i, fhi)
-            if isempty(nbr)
-                per = face_neighbors_with_bcs(mesh, i, fbcs)[fhi]
-                if per === nothing || per == 0
-                    f(Interior(i), DomainBoundary(bc_on(bcs, d, :hi)), d, a)
-                else
-                    f(Interior(i), Interior(Int(per)), d, a)        # periodic, once
+            fl = get(fined, (UInt32(ii), UInt8(fhi)), nothing)
+            if fl === nothing
+                rep = reps[ii][fhi]
+                if rep == 0
+                    per = face_neighbors_with_bcs(mesh, i, fbcs)[fhi]
+                    if per === nothing || per == 0
+                        f(Interior(i), DomainBoundary(bc_on(bcs, d, :hi)), d, a)
+                    else
+                        f(Interior(i), Interior(Int(per)), d, a)        # periodic, once
+                    end
+                elseif Int(level_of(mesh, rep)) <= li                   # conforming / i-fine sub-face
+                    f(Interior(i), Interior(Int(rep)), d, a)
                 end
             else
-                for j in nbr
-                    lj = Int(level_of(mesh, j))
-                    lj > li && continue                              # i coarse: from fine side
-                    f(Interior(i), Interior(Int(j)), d, a)          # conforming or i-fine sub-face
+                for j in fl                                             # i coarse: neighbours finer → skip
+                    Int(level_of(mesh, j)) > li && continue
+                    f(Interior(i), Interior(Int(j)), d, a)
                 end
             end
 
-            # ---- lo face ----
+            # ---- lo face (emitted only as i-fine sub-faces: coarse → fine) ----
             flo = 2d - 1
-            nbr = face_fine_neighbors(mesh, i, flo)
-            if isempty(nbr)
-                per = face_neighbors_with_bcs(mesh, i, fbcs)[flo]
-                if per === nothing || per == 0
-                    f(DomainBoundary(bc_on(bcs, d, :lo)), Interior(i), d, a)
+            fl = get(fined, (UInt32(ii), UInt8(flo)), nothing)
+            if fl === nothing
+                rep = reps[ii][flo]
+                if rep == 0
+                    per = face_neighbors_with_bcs(mesh, i, fbcs)[flo]
+                    (per === nothing || per == 0) &&
+                        f(DomainBoundary(bc_on(bcs, d, :lo)), Interior(i), d, a)
+                    # periodic lo face: emitted from the partner's hi side (skip)
+                elseif Int(level_of(mesh, rep)) < li                    # coarse on the lo side → emit
+                    f(Interior(Int(rep)), Interior(i), d, a)
                 end
-                # periodic lo face: emitted from the partner's hi side (skip)
             else
-                for j in nbr
-                    lj = Int(level_of(mesh, j))
-                    lj < li || continue                             # only i-fine sub-faces here
-                    f(Interior(Int(j)), Interior(i), d, a)          # coarse j → fine i, +d normal
+                for j in fl
+                    Int(level_of(mesh, j)) < li && f(Interior(Int(j)), Interior(i), d, a)
                 end
             end
         end
@@ -247,37 +280,45 @@ end
 # HG conservatively remaps it on refine/coarsen. The store is registered as a
 # refinement listener at allocation; mutating the mesh remaps every store.
 
-"Holds an `AdaptiveField` over a degree-0 polynomial field set (cell means)."
-struct HGFieldStore <: AbstractFieldStore
-    af::AdaptiveField
+"Holds an `AdaptiveField` over a degree-0 polynomial field set (cell means).
+Parametrized on the AdaptiveField's CONCRETE type so `parent(store.af)` (the inner
+`PolynomialFieldSet`) is concretely typed — otherwise an abstract `af::AdaptiveField`
+field erases the type and every `parent`/view access returns `Any` (allocating). The
+inner field set keeps its type across regrids (`_rebuild_with_n` preserves the params),
+so `A` is stable."
+struct HGFieldStore{A<:AdaptiveField} <: AbstractFieldStore
+    af::A
     names::Vector{Symbol}
 end
 
 """
     HGScalarView(store, name)
 
-Seam-contract view: `v[cell]` reads/writes the scalar cell mean of `name`. It
+Seam-contract view: `v[cell]` reads/writes the scalar cell mean of field `F`. It
 dereferences `parent(store.af)` on each access so it stays valid across regrids
-(AdaptiveField rebuilds the inner field set on refinement).
+(AdaptiveField rebuilds the inner field set on refinement). The field name is a TYPE
+parameter `F`, so `getproperty(parent(af), F)` resolves statically (no runtime-symbol
+`getproperty` ⇒ no per-access allocation); combined with the concretely-typed
+`HGFieldStore{A}`, the whole `v[cell]` chain inlines to a plain array index.
 """
-struct HGScalarView{T,S} <: AbstractArray{T,1}
+struct HGScalarView{T,S,F} <: AbstractArray{T,1}
     store::S
-    name::Symbol
 end
 # Infer the coefficient precision T from the named polynomial field (degree-0 ⇒
-# the single coeff IS the cell mean; its element type is the field precision).
+# the single coeff IS the cell mean; its element type is the field precision), and
+# encode the field name as the type parameter F.
 function HGScalarView(store, name::Symbol)
     pf = getproperty(Base.parent(store.af), name)
     T = length(pf) == 0 ? Float64 : typeof(pf[1][1])   # coefficient precision from a live entry
-    return HGScalarView{T,typeof(store)}(store, name)
+    return HGScalarView{T,typeof(store),name}(store)
 end
 
-@inline _pfv(v::HGScalarView) = getproperty(Base.parent(v.store.af), v.name)
+@inline _pf(v::HGScalarView{T,S,F}) where {T,S,F} = getproperty(Base.parent(v.store.af), F)
 Base.size(v::HGScalarView) = (Base.parent(v.store.af).n,)
 Base.IndexStyle(::Type{<:HGScalarView}) = IndexLinear()
-Base.@propagate_inbounds Base.getindex(v::HGScalarView, i::Integer) = _pfv(v)[Int(i)][1]
+Base.@propagate_inbounds Base.getindex(v::HGScalarView, i::Integer) = _pf(v)[Int(i)][1]
 Base.@propagate_inbounds Base.setindex!(v::HGScalarView{T}, x, i::Integer) where {T} =
-    (_pfv(v)[Int(i)] = (T(x),); x)
+    (_pf(v)[Int(i)] = (T(x),); x)
 
 MI.field_eltype(::HGMesh{D,T}) where {D,T} = T   # default field precision = geometry T
 MI.coord_eltype(::HGMesh{D,T}) where {D,T} = T

@@ -231,6 +231,23 @@ topology — no float epsilon.
 function neighbor end
 
 """
+    face_neighbor_handles(backend, cell; bcs) -> (handles::NTuple{2N,H}, isbnd::NTuple{2N,Bool})
+
+The BC-resolved representative neighbor handle of `cell` across every face, with
+`N = rank(backend)`. Face index `f = 2*axis-1` is the `:lo` side and `f = 2*axis`
+the `:hi` side. `isbnd[f]` is `true` for a domain-boundary face (then `handles[f]`
+is the cell's own handle and the caller supplies the boundary state). Otherwise
+`handles[f]` is the neighbor cell handle (interior or periodic wrap), exactly the
+handle [`neighbor`](@ref) would return for that face.
+
+This is a type-stable, allocation-free bulk form of [`neighbor`](@ref): both
+returned tuples are isbits, and backends read cached topology rather than boxing a
+[`NeighborRef`](@ref) per face. Use it on hot paths that need every face of a cell
+(e.g. assembling a per-cell gradient stencil).
+"""
+function face_neighbor_handles end
+
+"""
     for_each_face(f, backend; bcs)
 
 Apply `f(left, right, axis, area)` exactly once to every unique (sub)face of the
@@ -296,7 +313,7 @@ export AbstractMeshBackend,
     NeighborRef, Interior, DomainBoundary,
     rank, domain, n_cells, for_each_cell, for_each_face, level_of, max_level,
     refine!, coarsen!,
-    cell_center, cell_width, cell_volume, face_area, neighbor,
+    cell_center, cell_width, cell_volume, face_area, neighbor, face_neighbor_handles,
     allocate_fields, field_eltype, coord_eltype, field_view, restrict!, prolong!,
     Instrumented, span_report, reset_spans!
 

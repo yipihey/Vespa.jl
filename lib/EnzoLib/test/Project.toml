@@ -12,9 +12,11 @@ RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
+PPMKernels = "1a2b3c4d-0007-4000-8000-000000000007"
 
 [sources]
 PoissonKernels = {path = "../../PoissonKernels"}
+PPMKernels = {path = "../../PPMKernels"}
 CodeBridge = {path = "../../CodeBridge"}
 EnzoBackend = {path = "../../EnzoBackend"}
 EnzoFixtures = {path = "../../EnzoFixtures"}
