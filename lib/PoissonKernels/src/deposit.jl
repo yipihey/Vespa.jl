@@ -213,6 +213,8 @@ function cic_deposit!(ρ::AbstractVector{T},
                       N::Integer, disp::Real=0, shift::Real=-0.5) where {T}
     be = KA.get_backend(ρ)
     fill!(ρ, zero(T))
+    length(mass) == 0 && return ρ      # nothing to deposit (e.g. an empty AMR subgrid) — KA's
+                                       # launch partition divides by ndrange, so guard ndrange=0
     Tp = eltype(px)
     _cic_deposit_kernel!(be)(ρ, px, py, pz, vx, vy, vz, mass,
                              Int(N), Tp(disp), Tp(shift); ndrange = length(mass))

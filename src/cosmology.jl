@@ -225,15 +225,126 @@ function enable_cosmology!(sim::Simulation; OmegaMatter::Real, OmegaLambda::Real
                            OmegaRadiation::Real = 0.0, HubbleConstantNow::Real,
                            ComovingBoxSize::Real, InitialRedshift::Real,
                            FinalRedshift::Real, MaxExpansionRate::Real = 0.01,
-                           gravity::Bool = true)
+                           gravity::Bool = true, ka = nothing)
     c = Cosmology(; OmegaMatter, OmegaLambda, OmegaRadiation, HubbleConstantNow,
                   ComovingBoxSize, InitialRedshift, FinalRedshift, MaxExpansionRate)
     sim.cosmo = c
     set_expansion!(c, c.t_initial)                         # a = 1 at sim.t = 0
     if gravity && sim.grav === nothing
-        enable_gravity!(sim; G = 1.0 / (4π), bcs = Periodic())   # comoving Poisson: 4πG = 1
+        # comoving Poisson: 4πG = 1; `ka` selects the GPU/CPU device CG.
+        enable_gravity!(sim; G = 1.0 / (4π), bcs = Periodic(), ka = ka)
     end
     return c
+end
+
+# ── Compton drag (gas ↔ CMB thermal coupling; Grid_ComptonCoolingTerms / cool1d) ─
+# Inverse-Compton scattering off CMB photons relaxes the gas temperature toward
+# T_cmb = T_cmb0·(1+z) at the rate Γ_C = (8 σ_T a_rad T_cmb⁴)/(3 m_e c)·x_e (per
+# free electron), which scales as (1+z)⁴ and so tightly couples gas to the CMB at
+# high z. Applied as an operator-split semi-implicit relaxation on the gas thermal
+# energy: T ← (T + Γ_C·dt·T_cmb)/(1 + Γ_C·dt) (unconditionally stable, exact for
+# constant T_cmb). The free-electron fraction `electron_fraction = n_e/n_H` and mean
+# molecular weight `mu` are inputs here (they come from ChemistryKernels in a full
+# run); density is unchanged, kinetic energy untouched — only thermal energy decays.
+const SIGMA_T_CGS = 6.6524587e-25      # Thomson cross section, cm²
+const A_RAD_CGS   = 7.5657e-15         # radiation constant, erg cm⁻³ K⁻⁴
+const M_E_CGS     = 9.10938e-28        # electron mass, g
+const C_CGS       = 2.99792458e10      # cm/s
+const K_B_CGS     = 1.380649e-16       # erg/K
+const M_H_CGS     = 1.6726e-24         # hydrogen mass, g
+const T_CMB0_K    = 2.725              # CMB temperature today, K
+
+"Physical gas temperature (K) from a cell's conserved state, given μ and the units."
+@inline function _cell_temperature(sim::Simulation, U, γ, mu::Float64, vel_unit::Float64)
+    di = density_index(sim.model); ei = energy_index(sim.model); mom = momentum_indices(sim.model)
+    ρ = U[di]
+    ke = 0.0
+    @inbounds for d in 1:rank(sim.backend)
+        ke += U[mom[d]]^2
+    end
+    ke *= 0.5 / ρ
+    e_spec = (U[ei] - ke) / ρ                              # code specific thermal energy
+    return (γ - 1) * mu * M_H_CGS / K_B_CGS * e_spec * vel_unit^2, ke   # (T[K], kinetic density)
+end
+
+"""
+    apply_compton_drag!(sim, dt; electron_fraction=1.0, mu=0.6)
+
+Relax the gas temperature toward `T_cmb = 2.725(1+z)` by inverse-Compton scattering
+over a code-time step `dt` (semi-implicit; density and kinetic energy unchanged).
+`electron_fraction` (= n_e/n_H) and `mu` parametrize the ionization state. No-op
+without cosmology.
+"""
+function apply_compton_drag!(sim::Simulation, dt::Real; electron_fraction::Real = 1.0,
+                             mu::Real = 0.6)
+    cosmo = sim.cosmo
+    cosmo === nothing && return nothing
+    a = cosmo.a
+    z = redshift_at_scale_factor(cosmo, a)
+    u = cosmology_units(cosmo, a)
+    Tcmb = T_CMB0_K * (1 + z)
+    ΓC = 8 * SIGMA_T_CGS * A_RAD_CGS * Tcmb^4 / (3 * M_E_CGS * C_CGS) * Float64(electron_fraction)
+    dt_s = Float64(dt) * u.time                            # code dt → seconds
+    fac = ΓC * dt_s
+    γ = sim.γ; muf = Float64(mu)
+    ei = energy_index(sim.model)
+    e_to_T = (γ - 1) * muf * M_H_CGS / K_B_CGS * u.velocity^2   # specific-energy → T[K]
+    Tf = _Tf(sim)
+    for_each_cell(sim.backend) do c
+        U = get_U(sim.sv, c)
+        Tgas, ke = _cell_temperature(sim, U, γ, muf, u.velocity)
+        Tnew = (Tgas + fac * Tcmb) / (1 + fac)             # semi-implicit relaxation
+        ρ = U[density_index(sim.model)]
+        eth_new = Tnew / e_to_T * ρ                        # back to thermal energy density
+        set_U!(sim.sv, c, ntuple(k -> k == ei ? Tf(ke + eth_new) : U[k], nvars_val(sim.model)))
+        return nothing
+    end
+    return nothing
+end
+
+# ── native cosmology driver (Phase 4: the full stack, no Enzo) ────────────────
+"""
+    evolve_cosmology!(sim; a_final, policy=nothing, regrid_every=0, compton=false,
+                      electron_fraction=1.0, mu=0.6, maxstep=100_000, verbose=false) -> nsteps
+
+Drive a self-gravitating dark-matter run on the native KA/Julia stack from the
+current expansion factor to `a_final`, with adaptive refinement. Each step takes an
+expansion-limited substep, pushes the particles (comoving KDK; gravity solved via
+`sim.grav`, GPU when `grav.ka` is set), optionally applies Compton drag to the gas,
+and advances the background. With a `policy` (and `regrid_every > 0`) it regrids on
+the refinement indicator every `regrid_every` steps — e.g. DM overdensity for the
+cosmological zoom. No Enzo: hierarchy, reflux, gravity, particles, and expansion are
+all Vespa's own. (Gas hydro + chemistry coupling under one clock is the remaining
+integration; this driver is the gravitational/expansion backbone.)
+"""
+function evolve_cosmology!(sim::Simulation; a_final::Real, policy = nothing,
+                           regrid_every::Integer = 0, compton::Bool = false,
+                           electron_fraction::Real = 1.0, mu::Real = 0.6,
+                           maxstep::Integer = 100_000, verbose::Bool = false, ka = nothing)
+    cosmo = sim.cosmo
+    cosmo === nothing && error("evolve_cosmology! requires enable_cosmology!")
+    sim.grav === nothing && error("evolve_cosmology! requires self-gravity")
+    ka === nothing || (sim.grav.ka = ka)                # device Poisson + push when ka given
+    step = 0
+    solve_poisson!(sim, sim.grav)                       # φ for the initial state
+    while cosmo.a < a_final && step < maxstep
+        if policy !== nothing && regrid_every > 0 && step % regrid_every == 0
+            n = regrid!(sim, policy)
+            verbose && n > 0 && @printf("  step %d: regrid +%d (max_level %d)\n",
+                                        step, n, max_level(sim.backend))
+        end
+        dt = expansion_dt(cosmo)
+        a_next, _ = expansion_at(cosmo, cosmo.t_initial + sim.t + dt)
+        a_next > a_final && (dt *= (a_final - cosmo.a) / (a_next - cosmo.a))  # land on a_final
+        sim.particles === nothing || push_particles!(sim, dt; ka = ka)
+        compton && apply_compton_drag!(sim, dt; electron_fraction = electron_fraction, mu = mu)
+        sim.t += dt
+        set_expansion!(cosmo, cosmo.t_initial + sim.t)
+        step += 1
+    end
+    verbose && @printf("evolve_cosmology!: %d steps to a=%.4f (z=%.3f)\n",
+                       step, cosmo.a, redshift(cosmo))
+    return step
 end
 
 # ── Zel'dovich pancake (the C3 gate; ZeldovichPancakeInitialize.C) ────────────

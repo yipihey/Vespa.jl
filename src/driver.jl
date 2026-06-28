@@ -41,6 +41,8 @@ mutable struct Simulation{B,P,S,V,M<:EquationSet,Tg<:AbstractFloat}
     step::Int
     grav::Any           # nothing, or a GravityField (self-gravity; default off)
     cosmo::Any          # nothing, or a Cosmology (comoving expansion; default off)
+    flux::Any           # nothing (native per-face path), or an AbstractFluxBackend (batched KA flux)
+    particles::Any      # nothing, or a ParticleSet (dark-matter self-gravity; default off)
 end
 
 # Precision the kernels read off the data: Tf = field state, Tg = geometry/time,
@@ -70,7 +72,8 @@ function Simulation(backend, prob::Problem; layout::AbstractLayout = SoA(),
     views(store) = map(nm -> field_view(backend, store, nm), names)
     bcs = _as_bcs(prob.bcs, N)
     sim = Simulation(backend, prob, bcs, model, Tg(prob.γ), state, u0, acc,
-                     views(state), views(u0), views(acc), layout, zero(Tg), 0, nothing, nothing)
+                     views(state), views(u0), views(acc), layout, zero(Tg), 0,
+                     nothing, nothing, nothing, nothing)
     set_initial_conditions!(sim)
     return sim
 end
@@ -81,12 +84,19 @@ _as_bcs(pairs::Tuple, ::Int) = BoundaryConditions(pairs)
 
 # -- per-cell conserved state access through cached views (size from the views) --
 @inline get_U(v, cell) = map(vw -> @inbounds(vw[cell]), v)
+# `map` over the (possibly HETEROGENEOUS) view tuple is unrolled at compile time, so
+# every `vw[cell]` is concretely typed. An explicit `for i; v[i][cell]=…` would index
+# the tuple with a runtime `i` — type-unstable (each HGScalarView carries its field
+# name as a type param ⇒ distinct types) and allocates per component.
 @inline function set_U!(v, cell, U)
-    @inbounds for i in eachindex(v)
-        v[i][cell] = U[i]
-    end
+    map((vw, u) -> (@inbounds vw[cell] = u), v, U)
     return nothing
 end
+
+# Accumulate `s·F` into a cell's view-tuple components, alloc-free (same reason as
+# set_U!: avoids the dynamic `av[k]` index into the heterogeneous accumulator tuple).
+@inline _acc_add!(v, cell, F, s) =
+    (map((vw, f) -> (@inbounds vw[cell] += s * f), v, F); nothing)
 
 function set_initial_conditions!(sim::Simulation)
     b, init = sim.backend, sim.problem.init
@@ -126,21 +136,25 @@ end
 # Primitive state at a cell.
 @inline _W(sim::Simulation, cell) = cons2prim(sim.model, get_U(sim.sv, cell))
 
-# Neighbor primitive state across (axis, side): interior cell, or BC ghost of the
-# current cell's primitive state.
-@inline function _neighbor_W(sim::Simulation, cell, Wc, axis::Int, side::Symbol)
-    nb = neighbor(sim.backend, cell, axis, side; bcs = sim.bcs)
-    if nb isa Interior
-        return _W(sim, nb.cell)
-    else
-        return _boundary_ghost(sim, Wc, nb.bc, axis, side, cell)
-    end
-end
-
 # minmod-limited PLM slope of every primitive component along `axis` at `cell`.
+# Resolves both face neighbours with ONE allocation-free `face_neighbor_handles`
+# read (handles + boundary mask) instead of two boxed `neighbor()` calls — the
+# `NeighborRef` return is abstract, so `neighbor()` heap-allocates per call (~4×/face
+# in reconstruction). A boundary face uses the fixed per-(axis,side) BC ghost; the
+# resolution is identical to `neighbor()` (same cached `face_neighbors_with_bcs`).
 @inline function _plm_slope(sim::Simulation, cell, Wc, axis::Int)
-    WL = _neighbor_W(sim, cell, Wc, axis, :lo)
-    WR = _neighbor_W(sim, cell, Wc, axis, :hi)
+    nbh, isbnd = face_neighbor_handles(sim.backend, cell; bcs = sim.bcs)
+    lo = 2axis - 1; hi = 2axis
+    # `::typeof(Wc)` pins the GHOST BRANCH specifically (not the whole ternary): `bc_on`
+    # returns an ABSTRACT `AbstractBC`, so `_boundary_ghost` infers as `Any`. Asserting on
+    # the branch keeps BOTH ternary arms concrete ⇒ the merge stays typed and the `_W`
+    # NTuple is never boxed through an `Any` φ-node (asserting the whole ternary is too
+    # late — the merge is already `Any`). The boundary ghost genuinely is a primitive
+    # tuple of the same type as `Wc`.
+    WL = isbnd[lo] ? _boundary_ghost(sim, Wc, bc_on(sim.bcs, axis, :lo), axis, :lo, cell)::typeof(Wc) :
+                     _W(sim, nbh[lo])
+    WR = isbnd[hi] ? _boundary_ghost(sim, Wc, bc_on(sim.bcs, axis, :hi), axis, :hi, cell)::typeof(Wc) :
+                     _W(sim, nbh[hi])
     return map(limited_slope, WL, Wc, WR)
 end
 
@@ -193,6 +207,9 @@ end
 # cell's net-flux-out and −F·area to the right's — and stays conservative across
 # coarse↔fine sub-faces once the backend emits them (Phase B).
 function accumulate_flux!(sim::Simulation; reflux = nothing, bflux = nothing)
+    if sim.flux !== nothing
+        return _accumulate_flux_batched!(sim, sim.flux; reflux = reflux, bflux = bflux)
+    end
     b = sim.backend
     av = sim.accv
     z = ntuple(_ -> zero(_Tf(sim)), nvars_val(sim.model))
@@ -224,11 +241,8 @@ end
     F = riemann_flux(sim.model, WL, WR, axis)
     av = sim.accv
     aT = Base.eltype(F)(area)             # face area at field precision
-    @inbounds for k in eachindex(F)
-        fk = F[k] * aT
-        av[k][i] += fk        # flux leaves i
-        av[k][j] -= fk        # flux enters j
-    end
+    _acc_add!(av, i, F, aT)               # flux leaves i (+F·area)
+    _acc_add!(av, j, F, -aT)              # flux enters j (−F·area)
     if reflux !== nothing
         for reg in reflux
             _reflux_capture!(sim, reg, i, j, F, area)
@@ -247,9 +261,7 @@ end
     F = riemann_flux(sim.model, WL, Wg, axis)
     av = sim.accv
     aT = Base.eltype(F)(area)
-    @inbounds for k in eachindex(F)
-        av[k][i] += F[k] * aT      # outward normal +axis
-    end
+    _acc_add!(av, i, F, aT)            # outward normal +axis
     bflux === nothing || _bflux_capture!(bflux, axis, :hi, i, F, area)   # outer face on i's hi side
     return nothing
 end
@@ -264,9 +276,7 @@ end
     av = sim.accv
     aT = Base.eltype(F)(area)
     bflux === nothing || _bflux_capture!(bflux, axis, :lo, j, F, area)   # outer face on j's lo side
-    @inbounds for k in eachindex(F)
-        av[k][j] -= F[k] * aT      # outward normal −axis
-    end
+    _acc_add!(av, j, F, -aT)           # outward normal −axis
     return nothing
 end
 
@@ -438,6 +448,16 @@ function regrid!(sim::Simulation, policy::RefinementPolicy)
         end
     end
     isempty(to_refine) || refine!(b, to_refine)
+    if !isempty(to_refine)
+        # The particle locator and the KA-Poisson cache hold per-leaf geometry; the
+        # mesh just changed, so drop them (rebuilt lazily on next use).
+        sim.particles === nothing || invalidate_particle_locator!(sim.particles)
+        if sim.grav !== nothing
+            sim.grav.ka_cache = nothing                 # GPU CSR cache (mesh changed)
+            sim.grav.cg_cache = nothing                 # CPU CSR cache (mesh changed)
+            sim.grav.mg_cache = nothing                 # multigrid hierarchy (mesh changed)
+        end
+    end
     return length(to_refine)
 end
 

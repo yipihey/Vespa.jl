@@ -7,6 +7,17 @@ version = "0.1.0"
 MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
+# The KA flux backend (`KAFlux`) lives in a package extension so the core stays
+# headless (depends only on MeshInterface); loading KernelAbstractions enables the
+# GPU/CPU device flux path (`ext/VespaKAFluxExt.jl`).
+[weakdeps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+
+[extensions]
+VespaKAFluxExt = "KernelAbstractions"
+VespaKAGravityExt = "KernelAbstractions"
+VespaKAParticlesExt = "KernelAbstractions"
+
 # The active (root) project is the only place Julia honors [sources], and every
 # [sources] key must also appear in [deps] or [extras]. HGBackend pulls in
 # HierarchicalGrids (path-dev'd) which transitively needs R3D (an unregistered

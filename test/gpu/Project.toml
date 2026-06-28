@@ -1,0 +1,24 @@
+# Opt-in GPU test environment for the KA flux backend (`KAFlux`). Kept separate
+# from `test/Project.toml` so the heavy CUDA/KernelAbstractions precompile does NOT
+# burden the core suite. Run: `<julia> --project=test/gpu test/gpu/test_ka_flux_gpu.jl`
+# (needs a functional CUDA device; the test skips cleanly with only the CPU-KA path
+# when CUDA.functional() is false).
+[deps]
+Vespa = "1a2b3c4d-0000-4000-8000-000000000000"
+MeshInterface = "1a2b3c4d-0001-4000-8000-000000000001"
+RefMesh = "1a2b3c4d-0002-4000-8000-000000000002"
+HGBackend = "1a2b3c4d-0003-4000-8000-000000000003"
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+Vespa = {path = "../.."}
+MeshInterface = {path = "../../lib/MeshInterface"}
+RefMesh = {path = "../../lib/RefMesh"}
+HGBackend = {path = "../../lib/HGBackend"}
+HierarchicalGrids = {path = "../../../HierarchicalGrids.jl"}
+R3D = {url = "https://github.com/yipihey/r3djl", subdir = "R3D.jl", rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"}

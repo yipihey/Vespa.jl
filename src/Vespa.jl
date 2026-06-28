@@ -30,8 +30,11 @@ include("equationset.jl")   # the swappable physics/variable model (default Idea
 include("problem.jl")
 include("driver.jl")
 include("reflux.jl")        # coarse–fine flux registers (used by evolve_level!)
+include("ka_flux.jl")       # batched-per-face flux backend (KA hydro under the native reflux)
 include("gravity.jl")       # self-gravity: composite Poisson (CG) + g source
+include("particles.jl")     # dark-matter particles: CIC deposit into the Poisson source
 include("cosmology.jl")     # comoving coordinates: Enzo-compatible units + a(t)
+include("refinement.jl")    # AMR refinement indicators (Jeans, particle-count) — Enzo-ported
 include("diagnostics.jl")
 include("exact_riemann.jl")
 
@@ -39,7 +42,11 @@ export Problem, Simulation, evolve!, evolve_level!, step!, compute_dt,
     EquationSet, IdealHydro, nvars, conserved_names,
     density_index, momentum_indices, energy_index,
     enable_gravity!, GravityField, solve_poisson!, apply_laplacian!,
-    Cosmology, enable_cosmology!, cosmology_units, cosmology_tfinal,
+    ParticleSet, enable_particles!, deposit_particle_density!, particle_deposited_mass,
+    particle_density,
+    interp_gravity_to_particles!, push_particles!, particle_momentum,
+    Cosmology, enable_cosmology!, cosmology_units, cosmology_tfinal, apply_compton_drag!,
+    evolve_cosmology!,
     gravitational_constant_code,
     redshift, scale_factor_at_redshift, redshift_at_scale_factor,
     time_from_scale_factor, expansion_at,
@@ -47,6 +54,12 @@ export Problem, Simulation, evolve!, evolve_level!, step!, compute_dt,
     conserved_totals, dump_fields, cell_samples, primitive_at,
     exact_riemann_sample, sod_problem_defaults,
     RefinementPolicy, regrid!, density_gradient_indicator,
+    jeans_length_indicator, jeans_refinement_policy,
+    particle_count_indicator, particle_refinement_policy, deposit_particle_counts!,
+    # reflux internals reused by the live-Enzo AMR flux bridge (MultiCode GPU hydro)
+    BoundaryFluxRegister, bflux_plane,
+    # batched-per-face flux backend (KA hydro under the native FluxRegister AMR)
+    AbstractFluxBackend, HostBatchedFlux, KAFlux, compute_face_fluxes!,
     # re-exported from MeshInterface for spec/driver ergonomics
     SoA, AoS, Blocked, Outflow, Periodic, Reflecting, BoundaryConditions,
     refine!, coarsen!, level_of, max_level,
