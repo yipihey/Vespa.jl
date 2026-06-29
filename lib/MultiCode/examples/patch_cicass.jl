@@ -111,7 +111,7 @@ function dm_ic(snap, c::Cosmo, u_i, backend)
     py = dev([T(mod(pos[p,2], 1.0)) for p in 1:Npart])
     pz = dev([T(mod(pos[p,3], 1.0)) for p in 1:Npart])
     vx = mk(@view(vel[:,1]), vconv); vy = mk(@view(vel[:,2]), vconv); vz = mk(@view(vel[:,3]), vconv)
-    mass = dev(fill(T(1 - c.fb), Npart))
+    mass = T(1 - c.fb)                                   # SCALAR: equal-mass DM ⇒ no N³ mass array
     @printf("DM IC: %d particles, mass_per=%.4f (1−f_b), v→code=%.4e\n", Npart, 1-c.fb, vconv); flush(stdout)
     return (px=px, py=py, pz=pz, vx=vx, vy=vy, vz=vz, mass=mass)
 end
@@ -158,7 +158,7 @@ end
 # interiors; ghosts are re-derived by scatter_global!'s exchange_ghosts!).
 const _CKF = ("D","S1","S2","S3","Tau","Ge")
 const _CKS = ("HII","H2I","HDI")
-const _CKP = ("px","py","pz","vx","vy","vz","mass")
+const _CKP = ("px","py","pz","vx","vy","vz")          # mass is a scalar attribute (equal-mass DM)
 
 function save_checkpoint(path, pg, parts, c, a, cyc)
     g = gather_global(pg)
@@ -167,6 +167,7 @@ function save_checkpoint(path, pg, parts, c, a, cyc)
         for (nm, arr) in zip(_CKS, g.species); f["species/"*nm] = arr; end
         for nm in _CKP; f["particles/"*nm] = Array(getfield(parts, Symbol(nm))); end
         A = attrs(f)
+        A["pmass"] = Float64(parts.mass)                  # scalar equal-mass DM
         A["dims"] = collect(pg.ncell); A["a"] = a; A["z"] = a_to_z(a); A["cyc"] = cyc
         A["dx"] = pg.dx; A["gamma"] = pg.gamma; A["du"] = pg.du; A["lu"] = pg.lu; A["tu"] = pg.tu
         A["Om"] = c.Om; A["OL"] = c.OL; A["Or"] = c.Or; A["h0"] = c.h0; A["box"] = c.box
@@ -182,7 +183,7 @@ function load_checkpoint(path)
                   species=[read(f,"species/"*nm) for nm in _CKS])
         parts = NamedTuple{Symbol.(_CKP)}(Tuple(read(f,"particles/"*nm) for nm in _CKP))
         A = attrs(f)
-        return (; fields, parts, ncell=Tuple(Int.(A["dims"])), a=Float64(A["a"]), cyc=Int(A["cyc"]),
+        return (; fields, parts, pmass=Float64(A["pmass"]), ncell=Tuple(Int.(A["dims"])), a=Float64(A["a"]), cyc=Int(A["cyc"]),
                 dx=Float64(A["dx"]), du=Float64(A["du"]), lu=Float64(A["lu"]), tu=Float64(A["tu"]),
                 Om=Float64(A["Om"]), OL=Float64(A["OL"]), Or=Float64(A["Or"]),
                 h0=Float64(A["h0"]), box=Float64(A["box"]), Ob=Float64(A["Ob"]), XH=Float64(A["XH"]))
@@ -199,7 +200,8 @@ function main()
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
                              besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true)
         scatter_global!(pg, ck.fields)
-        parts = NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP))
+        parts = merge(NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP)),
+                      (mass = T(ck.pmass),))
         @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
                 ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
         return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)

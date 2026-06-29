@@ -257,6 +257,76 @@ function cic_deposit_det!(ρi::AbstractVector{<:Integer},
     return ρi
 end
 
+# UNIFORM-MASS variants of the two deposits: when every particle carries the same mass
+# (e.g. equal-mass DM), pass `mass` as a scalar `Real` instead of an N-vector — no per-
+# particle mass array is allocated (saves 4 B/particle = a full N³ Float32 grid).  The
+# scalar folds into the per-corner factor (`m` for float, `m·qscale` for the integer det).
+@kernel function _cic_deposit_unif_kernel!(ρ, @Const(px), @Const(py), @Const(pz),
+                                           @Const(vx), @Const(vy), @Const(vz),
+                                           N::Int, disp, shift, m)
+    p = @index(Global)
+    @inbounds begin
+        one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*vx[p], one_)*N + shift
+        gy = mod(py[p] + disp*vy[p], one_)*N + shift
+        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
+        fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
+        fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
+        ia = mod(i0, N); ib = mod(i0+1, N); wxa = one_-fx; wxb = fx
+        ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
+        ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
+        Nj = N; Nk = N*N
+        KA.@atomic ρ[ia + Nj*ja + Nk*ka + 1] += m*wxa*wya*wza
+        KA.@atomic ρ[ib + Nj*ja + Nk*ka + 1] += m*wxb*wya*wza
+        KA.@atomic ρ[ia + Nj*jb + Nk*ka + 1] += m*wxa*wyb*wza
+        KA.@atomic ρ[ib + Nj*jb + Nk*ka + 1] += m*wxb*wyb*wza
+        KA.@atomic ρ[ia + Nj*ja + Nk*kb + 1] += m*wxa*wya*wzb
+        KA.@atomic ρ[ib + Nj*ja + Nk*kb + 1] += m*wxb*wya*wzb
+        KA.@atomic ρ[ia + Nj*jb + Nk*kb + 1] += m*wxa*wyb*wzb
+        KA.@atomic ρ[ib + Nj*jb + Nk*kb + 1] += m*wxb*wyb*wzb
+    end
+end
+
+@kernel function _cic_deposit_det_unif_kernel!(ρi, @Const(px), @Const(py), @Const(pz),
+                                               @Const(vx), @Const(vy), @Const(vz),
+                                               N::Int, disp, shift, mq)
+    p = @index(Global)
+    @inbounds begin
+        one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*vx[p], one_)*N + shift
+        gy = mod(py[p] + disp*vy[p], one_)*N + shift
+        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
+        fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
+        fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
+        ia = mod(i0, N); ib = mod(i0+1, N); wxa = one_-fx; wxb = fx
+        ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
+        ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
+        Nj = N; Nk = N*N
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxa*wya*wza)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxb*wya*wza)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxa*wyb*wza)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxb*wyb*wza)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxa*wya*wzb)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxb*wya*wzb)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxa*wyb*wzb)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxb*wyb*wzb)
+    end
+end
+
+"Uniform-mass deterministic deposit: `mass` is a scalar (no N-vector). See [`cic_deposit_det!`](@ref)."
+function cic_deposit_det!(ρi::AbstractVector{<:Integer},
+                          px, py, pz, vx, vy, vz, mass::Real;
+                          N::Integer, disp::Real=0, shift::Real=-0.5, qbits::Integer=23)
+    be = KA.get_backend(ρi); fill!(ρi, zero(eltype(ρi)))
+    length(px) == 0 && return ρi
+    Tp = eltype(px)
+    _cic_deposit_det_unif_kernel!(be)(ρi, px, py, pz, vx, vy, vz,
+                                      Int(N), Tp(disp), Tp(shift), Tp(mass*2.0^qbits); ndrange = length(px))
+    return ρi
+end
+
 """
     cic_deposit!(ρ, px,py,pz, vx,vy,vz, mass; N, disp=0, shift=-0.5) -> ρ
 
@@ -276,5 +346,17 @@ function cic_deposit!(ρ::AbstractVector{T},
     Tp = eltype(px)
     _cic_deposit_kernel!(be)(ρ, px, py, pz, vx, vy, vz, mass,
                              Int(N), Tp(disp), Tp(shift); ndrange = length(mass))
+    return ρ
+end
+
+"Uniform-mass float deposit: `mass` is a scalar (no N-vector). See [`cic_deposit!`](@ref)."
+function cic_deposit!(ρ::AbstractVector{T},
+                      px, py, pz, vx, vy, vz, mass::Real;
+                      N::Integer, disp::Real=0, shift::Real=-0.5) where {T}
+    be = KA.get_backend(ρ); fill!(ρ, zero(T))
+    length(px) == 0 && return ρ
+    Tp = eltype(px)
+    _cic_deposit_unif_kernel!(be)(ρ, px, py, pz, vx, vy, vz,
+                                  Int(N), Tp(disp), Tp(shift), T(mass); ndrange = length(px))
     return ρ
 end
