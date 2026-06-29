@@ -2,9 +2,10 @@
 #
 # The patch stores the log2-packed mass FRACTION Xᵢ=ρxᵢ/ρ (ChemistryKernels log2_species.jl convention); I/O
 # stays in ρ·xᵢ. CPU-only checks (no GPU): (1) scatter→gather ρxᵢ round-trips through the UInt16 quantum;
-# (2) solver=:ppm is rejected (packed is the :fvgk flow); (3) the packed chem path (solve_chem_device_u16!)
-# matches the f32 chem path (solve_chem_device!) to the packing quantization. The FVGK packed ADVECTION is
-# CUDA-only and lives in test_fvgk_solver.jl.
+# (2) the :ppm sweep advects packed species (decode Xᵢ·ρ→ρXᵢ, advect, re-encode per axis) — hydro fields
+# match f32 exactly, species within the quantum; (3) the packed chem path (solve_chem_device_u16!) matches
+# the f32 chem path (solve_chem_device!) to the packing quantization. The FVGK packed ADVECTION (CUDA-only)
+# lives in test_fvgk_solver.jl.
 # Run: <julia> --project=lib/MultiCode/test lib/MultiCode/test/test_patchgrid_packed.jl
 
 using Test
@@ -46,9 +47,22 @@ mkpg(packed) = build_patchgrid(; ng=NG, ncell=NC, np=(1,1,1), dx=1.0, gamma=GAM,
         end
     end
 
-    @testset "solver=:ppm rejects packed storage" begin
-        pg = mkpg(true); scatter_global!(pg, ic)
-        @test_throws ErrorException patch_step!(pg, 1e-3; a_value=AV, solver=:ppm, chem=false)
+    @testset "packed PPM hydro advection ≡ f32 (within UInt16 quantization)" begin
+        pgp = mkpg(true);  scatter_global!(pgp, ic)
+        pgf = mkpg(false); scatter_global!(pgf, ic)
+        dt = 1e-3
+        patch_step!(pgp, dt; a_value=AV, solver=:ppm, do_hydro=true, do_chem=false, chem=true)
+        patch_step!(pgf, dt; a_value=AV, solver=:ppm, do_hydro=true, do_chem=false, chem=true)
+        gp = gather_global(pgp); gf = gather_global(pgf)
+        # colours are PASSIVE ⇒ the hydro fields must be identical regardless of packing
+        @test maximum(abs.(gp.D   .- gf.D))   / maximum(abs.(gf.D))   < 1e-10
+        @test maximum(abs.(gp.Tau .- gf.Tau)) / maximum(abs.(gf.Tau)) < 1e-10
+        # the advected species agree within the UInt16 quantum (decode·ρ → advect → encode/ρ per axis)
+        for q in 1:NSP
+            @test all(isfinite, gp.species[q])
+            xp = gp.species[q] ./ gp.D; xf = gf.species[q] ./ gf.D
+            @test maximum(abs.(xp .- xf) ./ (xf .+ eps())) < 2e-2
+        end
     end
 
     @testset "packed chem ≡ f32 chem (within UInt16 quantization)" begin

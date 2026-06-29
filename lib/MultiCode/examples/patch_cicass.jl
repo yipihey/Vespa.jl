@@ -48,6 +48,10 @@ const DODRAG = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
 # advects the 3 species as EulerColors passive scalars). :fvgk loads FVGK to activate MultiCodeFVGKExt.
 const SOLVER = Symbol(get(ENV, "CIC_SOLVER", "ppm"))
 SOLVER === :fvgk && @eval using FiniteVolumeGodunovKA
+# CIC_PACKED=1: store the 3 species as UInt16 log₂-packed mass fractions (2 B/cell vs 4 B
+# f32) — works with both :fvgk and (now) :ppm.  The PPM sweep decodes Xᵢ·ρ→ρXᵢ into f32
+# scratch per axis, advects, re-encodes ρXᵢ/ρ→Xᵢ; the chem path already solves in UInt16.
+const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
 # CIC_OVERLAP=1: overlap the host top-grid gravity with the GPU hydro+chem.  The
 # patch_step!/push_particles! GPU kernels are launched ASYNC, then the CPU computes
 # the NEXT step's accel (FFT + scatter) while the GPU runs this step; the result is
@@ -198,7 +202,7 @@ function main()
         a_start = ck.a; a_end = z_to_a(ZEND); u_i = cosmo_units(c, z_to_a(ZSTART)); dx = ck.dx
         cyc_start = ck.cyc
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
-                             besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true)
+                             besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true, packed_species=PACKED)
         scatter_global!(pg, ck.fields)
         parts = merge(NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP)),
                       (mass = T(ck.pmass),))
@@ -220,7 +224,7 @@ function main()
     # build the decomposition (dx=1/ncell: super-comoving box=1, a absorbed into units)
     dx = 1.0 / N
     pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
-                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=true)
+                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=true, packed_species=PACKED)
     scatter_global!(pg, gas_ic(snap, c, a_start, u_i))
     parts = dm_ic(snap, c, u_i, pg.backend)
     return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)

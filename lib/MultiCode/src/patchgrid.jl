@@ -319,19 +319,35 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             # cross-patch exchange (FVGK is unsplit). See MultiCodeFVGKExt.
             _fvgk_patch_hydro!(pg, dt)
         else
-            pg.packed && error("patch_step!: packed_species (UInt16) storage requires solver=:fvgk — " *
-                               "the PPM sweep advects f32 colours; rebuild without packed_species for :ppm")
             ngs = pg.ng - 1
             ngs >= 1 || error("patch_step!: need ng ≥ 2 for the compute-with-overlap halo (got ng=$(pg.ng))")
+            nsp = length(pg.patches[1].species)
+            # UInt16-packed species: the PPM colour advection rides the mass flux on f32 mass-
+            # densities ρXᵢ, but packed patches store the FRACTION Xᵢ (UInt16).  Since ρXᵢ = Xᵢ·ρ
+            # holds at every point, per axis we decode Xᵢ·ρ → ρXᵢ into reused f32 scratch, advect
+            # (the halo Xᵢ was just exchanged, type-generically), then re-encode ρXᵢ/ρ_new → Xᵢ
+            # against the post-sweep density.  One f32 scratch set (nsp·nd³), reused over all
+            # patches/axes — keeps the persistent storage at 2 B/cell while the sweep sees f32.
+            scr = (pg.packed && nsp > 0) ? ntuple(_ -> similar(pg.patches[1].D), nsp) : nothing
             for axis in order
                 PPMKernels._pool_reset!()
                 exchange_ghosts_axis!(pg, axis)
                 for p in pg.patches
+                    if scr !== nothing
+                        for q in 1:nsp
+                            scr[q] .= ChemistryKernels.decode_log2sp.(T, p.species[q]) .* p.D
+                        end
+                    end
+                    cols = scr !== nothing ? scr : (isempty(p.species) ? nothing : Tuple(p.species))
                     PPMKernels._hancock_sweep_axis!(p.D, p.S1, p.S2, p.S3, p.Tau, pg.nd, ngs, axis;
                         dt=dt, gamma=pg.gamma, theta=1.5, dx=pg.dx, small_rho=1e-10,
                         recon=:ppm_local, predictor=:trace, ge=p.Ge,
-                        colours=isempty(p.species) ? nothing : Tuple(p.species),
-                        riemann=:hll, face_periodic=false)
+                        colours=cols, riemann=:hll, face_periodic=false)
+                    if scr !== nothing
+                        for q in 1:nsp
+                            p.species[q] .= ChemistryKernels.encode_log2sp.(scr[q] ./ p.D)
+                        end
+                    end
                 end
             end
             # DEF reset (gas energy ↔ total energy) once per step, per patch
