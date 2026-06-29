@@ -209,25 +209,36 @@ and the deterministic CIC deposit for the DM.  Cubic power-of-two `ncell` requir
 """
 function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nbins::Integer=0,
                              axis::Integer=1, scale_v::Real=1.0, velocity::Bool=true)
-    be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc)
+    be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc); sv = T(scale_v)
     pk(f) = PoissonKernels.power_spectrum_aniso_gpu(f; boxsize=box, nmu=nmu, nbins=nbins, axis=axis)
-    g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)   # gas density
+    # deposit per-particle weight `w` (mass, or mass·v for momentum) → float grid (det. CIC)
+    dep!(buf, w) = (PoissonKernels.cic_deposit_det!(buf, parts.px, parts.py, parts.pz,
+                        parts.vx, parts.vy, parts.vz, w; N=nc[1], disp=0, shift=-0.5, qbits=23);
+                    reshape(T.(buf) .* T(2.0^-23), nc))
+    # ── gas: overdensity + mass-weighted velocity from the resident patch fields ──
+    g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)
     μg = T(Float64(sum(g))/Ntot); Pgas = pk(g ./ μg .- one(T))
     Pvgas = nothing
     if velocity
         S1=PPMKernels.device_zeros(be,T,nc); S2=PPMKernels.device_zeros(be,T,nc); S3=PPMKernels.device_zeros(be,T,nc)
         _assemble_field_gpu!(S1,pg,p->p.S1); _assemble_field_gpu!(S2,pg,p->p.S2); _assemble_field_gpu!(S3,pg,p->p.S3)
-        sv = T(scale_v)
-        Pvgas = pk((S1 ./ g .* sv, S2 ./ g .* sv, S3 ./ g .* sv))
+        Pvgas = pk((S1 ./ g .* sv, S2 ./ g .* sv, S3 ./ g .* sv)); S1=S2=S3=nothing
     end
-    # DM overdensity via the deterministic on-device CIC deposit
+    g = nothing
+    # ── DM: overdensity + mass-weighted velocity via the deterministic CIC deposit ──
     ρpi = PPMKernels.device_zeros(be, Int64, (Ntot,))
-    PoissonKernels.cic_deposit_det!(ρpi, parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz,
-                                    parts.mass; N=nc[1], disp=0, shift=-0.5, qbits=23)
-    ρd = reshape(T.(ρpi) .* T(2.0^-23), nc); μd = T(Float64(sum(ρd))/Ntot)
+    ρd  = dep!(ρpi, parts.mass); μd = T(Float64(sum(ρd))/Ntot)
     Pdm = pk(ρd ./ μd .- one(T))
+    Pvdm = nothing
+    if velocity
+        flr = T(1f-12) * μd                                      # ignore (near-)empty cells
+        vcomp(vp) = (pc = dep!(ρpi, parts.mass .* vp);           # Σ m·v_c·W  (momentum)
+                     ifelse.(ρd .> flr, pc ./ ρd .* sv, zero(T)))# mass-weighted v_c (× scale_v)
+        Pvdm = pk((vcomp(parts.vx), vcomp(parts.vy), vcomp(parts.vz)))
+    end
     return (; k=Pgas.k, gas_delta=Pgas.P, dm_delta=Pdm.P,
-            gas_vel=(Pvgas===nothing ? nothing : Pvgas.P), Nmodes=Pgas.Nmodes)
+            gas_vel=(Pvgas===nothing ? nothing : Pvgas.P),
+            dm_vel =(Pvdm ===nothing ? nothing : Pvdm.P), Nmodes=Pgas.Nmodes)
 end
 
 """

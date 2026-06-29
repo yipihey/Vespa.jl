@@ -341,6 +341,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                     g = create_group(f, @sprintf("z%05.1f", zo))
                     g["k"] = collect(P.k); g["gas_delta"] = P.gas_delta; g["dm_delta"] = P.dm_delta
                     P.gas_vel === nothing || (g["gas_vel"] = P.gas_vel)
+                    P.dm_vel  === nothing || (g["dm_vel"]  = P.dm_vel)
                     g["Nmodes"] = P.Nmodes
                     A = attrs(g); A["z"]=zo; A["a"]=a; A["box"]=c.box; A["axis"]=PKAXIS; A["nmu"]=PKMU
                 end
