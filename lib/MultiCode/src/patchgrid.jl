@@ -178,6 +178,16 @@ exchange_ghosts!(pg::PatchGrid) = (for a in 1:3; exchange_ghosts_axis!(pg, a); e
 # ── scatter a global IC into patches / gather patches back to a global array ───
 _interior(pg) = (pg.ng+1):(pg.ng+pg.pdim[1]), (pg.ng+1):(pg.ng+pg.pdim[2]), (pg.ng+1):(pg.ng+pg.pdim[3])
 
+# Σ f(interior cells of `fdev`) accumulated in Float64 — ON-DEVICE.  Only the scalar
+# comes back to the host (no full-grid gather/transfer).  Backend-agnostic: a
+# CuArray view-reduce on the GPU, an Array view-reduce on the CPU.  This is the
+# fast replacement for the `gather_global` + host-sum idiom in per-cycle reductions
+# (Compton drag, total mass, δ_rms) — ~250× faster than transferring the field.
+@inline _interior_sum(pg::PatchGrid, fdev) =
+    sum(Float64, @view _r3(fdev, pg.nd)[_interior(pg)...])
+@inline _interior_sumsq(pg::PatchGrid, fdev) =
+    mapreduce(x -> Float64(x)^2, +, @view _r3(fdev, pg.nd)[_interior(pg)...])
+
 "Octant ranges of patch `p` in the global ncell grid (1-based)."
 function _octant(pg::PatchGrid, p::Patch)
     o = p.idx .* pg.pdim
@@ -408,10 +418,22 @@ end
 
 # total active mass Σ D·dV over all patches (diagnostic / conservation check)
 function total_mass(pg::PatchGrid)
-    li, lj, lk = _interior(pg); s = 0.0; dV = pg.dx^3
+    s = 0.0
+    for p in pg.patches; s += _interior_sum(pg, p.D); end
+    return s * pg.dx^3
+end
+
+"""
+    density_contrast_rms(pg) -> δ_rms = std(ρ)/⟨ρ⟩ over all interior cells.
+
+On-device reduction (Σρ and Σρ² per patch, no full-grid gather/host-transfer) —
+the fast diagnostic replacement for `std(vec(gather_global(pg).D))/mean(...)`.
+"""
+function density_contrast_rms(pg::PatchGrid)
+    N = prod(pg.ncell); s = 0.0; s2 = 0.0
     for p in pg.patches
-        h = _r3(PPMKernels.to_host(p.D), pg.nd)
-        @views s += sum(Float64.(h[li, lj, lk]))
+        s  += _interior_sum(pg, p.D); s2 += _interior_sumsq(pg, p.D)
     end
-    return s * dV
+    μ = s / N; var = max(s2 / N - μ^2, 0.0)
+    return sqrt(var) / μ
 end

@@ -76,10 +76,14 @@ internal energy fixed (frame-agnostic — never damps the coherent streaming bul
 Mirrors `ramses_compton_drag!`.
 """
 function compton_drag_patches!(pg::PatchGrid, f::Real)
-    g = gather_global(pg)                                   # interiors → global mass-weighted bulk
-    M = sum(Float64.(g.D))
-    vbx = sum(Float64.(g.S1))/M; vby = sum(Float64.(g.S2))/M; vbz = sum(Float64.(g.S3))/M
-    T = pg.T; ff = T(f); vx = T(vbx); vy = T(vby); vz = T(vbz)
+    # mass-weighted bulk velocity from ON-DEVICE interior reductions (no full-grid
+    # gather/host-transfer — that copy was the dominant high-z per-cycle cost).
+    M = 0.0; px = 0.0; py = 0.0; pz = 0.0
+    for p in pg.patches
+        M  += _interior_sum(pg, p.D)
+        px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
+    end
+    T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M)
     for p in pg.patches
         ke0 = (p.S1.^2 .+ p.S2.^2 .+ p.S3.^2) ./ (2 .* p.D)
         p.S1 .= p.D .* vx .+ (p.S1 .- p.D .* vx) .* ff

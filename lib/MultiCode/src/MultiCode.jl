@@ -82,7 +82,7 @@ include("global_gravity.jl")       # global CPU-FFT top-grid gravity coupling th
 include("patch_cosmo.jl")          # super-comoving cosmology (units, Friedmann, drag, particle push)
 
 export PatchGrid, Patch, build_patchgrid, scatter_global!, gather_global
-export exchange_ghosts!, exchange_ghosts_axis!, patch_step!, total_mass
+export exchange_ghosts!, exchange_ghosts_axis!, patch_step!, total_mass, density_contrast_rms
 export assemble_global_density!, solve_global_poisson!, patch_accel, patch_accel_gpu, global_gravity_accel
 export particle_accel_field, assemble_global_density_gpu!, particle_accel_field_gpu, global_gravity_gpu
 export Cosmo, cosmo_units, dadtau, dtau_for_dlna, Hofa, growth_D, compton_drag_over_H

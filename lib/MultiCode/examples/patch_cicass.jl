@@ -322,7 +322,7 @@ function main()
         sec = time() - t0
         if cyc % 10 == 0
             ρmax = maximum(Float64(maximum(p.D)) for p in pg.patches)
-            δrms = let g = gather_global(pg); v = Float64.(vec(g.D)); std(v)/mean(v) end
+            δrms = density_contrast_rms(pg)            # on-device (no full-grid gather)
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
         end
