@@ -19,6 +19,7 @@
 #   (CPU-f64 reference: BACKEND=cpu; supply an existing IC with CIC_SNAP=/tmp/.../cic_ramses.cicass)
 
 using MultiCode, CICASSLib, Printf, Statistics
+using HDF5
 import PoissonKernels
 import PPMKernels
 import ChemistryKernels
@@ -118,9 +119,12 @@ end
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 function max_signal(pg)
     smax = 0.0
-    for p in pg.patches
-        D = p.D; cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (p.Ge ./ D), 0))
-        sig = abs.(p.S1 ./ D) .+ abs.(p.S2 ./ D) .+ abs.(p.S3 ./ D) .+ 3 .* cs
+    li = (pg.ng+1):(pg.ng+pg.pdim[1]); lj = (pg.ng+1):(pg.ng+pg.pdim[2]); lk = (pg.ng+1):(pg.ng+pg.pdim[3])
+    iv(f) = @view reshape(f, pg.nd)[li, lj, lk]      # INTERIOR view (exclude ghosts) so the
+    for p in pg.patches                              # CFL timestep depends only on the physical
+        D = iv(p.D)                                  # state — makes checkpoint/restart bit-exact
+        cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (iv(p.Ge) ./ D), 0))   # (and avoids D=0 ghost NaNs)
+        sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ 3 .* cs
         smax = max(smax, Float64(maximum(sig)))
     end
     return smax
@@ -146,7 +150,60 @@ function write_cellcmp(pg, c::Cosmo, u, a, z)
     return (ρmean=mean(ρb), δrms=std(ρb)/mean(ρb), xHII=mean(xHIIv), T=mean(Tcell))
 end
 
+# ── flat-HDF5 PatchGrid checkpoint/restart ────────────────────────────────────
+# Full restart state: the 6 conserved fields + 3 species (interior, via gather_global),
+# the DM particle SoA, and the scalars (a, cycle) + grid/units/cosmology metadata.
+# No HG, no cell-path bookkeeping — a uniform Cartesian dump that scatter_global!
+# consumes directly.  Round-trip is Float32-exact (gather/scatter strip/restore
+# interiors; ghosts are re-derived by scatter_global!'s exchange_ghosts!).
+const _CKF = ("D","S1","S2","S3","Tau","Ge")
+const _CKS = ("HII","H2I","HDI")
+const _CKP = ("px","py","pz","vx","vy","vz","mass")
+
+function save_checkpoint(path, pg, parts, c, a, cyc)
+    g = gather_global(pg)
+    h5open(path, "w") do f
+        for (nm, arr) in zip(_CKF, (g.D, g.S1, g.S2, g.S3, g.Tau, g.Ge)); f["fields/"*nm] = arr; end
+        for (nm, arr) in zip(_CKS, g.species); f["species/"*nm] = arr; end
+        for nm in _CKP; f["particles/"*nm] = Array(getfield(parts, Symbol(nm))); end
+        A = attrs(f)
+        A["dims"] = collect(pg.ncell); A["a"] = a; A["z"] = a_to_z(a); A["cyc"] = cyc
+        A["dx"] = pg.dx; A["gamma"] = pg.gamma; A["du"] = pg.du; A["lu"] = pg.lu; A["tu"] = pg.tu
+        A["Om"] = c.Om; A["OL"] = c.OL; A["Or"] = c.Or; A["h0"] = c.h0; A["box"] = c.box
+        A["Ob"] = c.fb*c.Om; A["XH"] = c.XH
+    end
+    @printf("  ✔ checkpoint z=%.2f a=%.5f cyc=%d → %s\n", a_to_z(a), a, cyc, path); flush(stdout)
+end
+
+function load_checkpoint(path)
+    h5open(path, "r") do f
+        fields = (D=read(f,"fields/D"), S1=read(f,"fields/S1"), S2=read(f,"fields/S2"),
+                  S3=read(f,"fields/S3"), Tau=read(f,"fields/Tau"), Ge=read(f,"fields/Ge"),
+                  species=[read(f,"species/"*nm) for nm in _CKS])
+        parts = NamedTuple{Symbol.(_CKP)}(Tuple(read(f,"particles/"*nm) for nm in _CKP))
+        A = attrs(f)
+        return (; fields, parts, ncell=Tuple(Int.(A["dims"])), a=Float64(A["a"]), cyc=Int(A["cyc"]),
+                dx=Float64(A["dx"]), du=Float64(A["du"]), lu=Float64(A["lu"]), tu=Float64(A["tu"]),
+                Om=Float64(A["Om"]), OL=Float64(A["OL"]), Or=Float64(A["Or"]),
+                h0=Float64(A["h0"]), box=Float64(A["box"]), Ob=Float64(A["Ob"]), XH=Float64(A["XH"]))
+    end
+end
+
 function main()
+    if haskey(ENV, "CIC_RESTART")
+        ck = load_checkpoint(ENV["CIC_RESTART"])
+        N = ck.ncell[1]; ncell = ck.ncell; np = (NPX, NPX, NPX)
+        c = Cosmo(; Om=ck.Om, OL=ck.OL, h0=ck.h0, box=ck.box, Ob=ck.Ob, XH=ck.XH, Or=ck.Or)
+        a_start = ck.a; a_end = z_to_a(ZEND); u_i = cosmo_units(c, z_to_a(ZSTART)); dx = ck.dx
+        cyc_start = ck.cyc
+        pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
+                             besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true)
+        scatter_global!(pg, ck.fields)
+        parts = NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP))
+        @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
+                ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
+        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
+    end
     snap = load_snapshot()
     N = snap.n
     ncell = (N, N, N); np = (NPX, NPX, NPX)
@@ -164,7 +221,12 @@ function main()
                          besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=true)
     scatter_global!(pg, gas_ic(snap, c, a_start, u_i))
     parts = dm_ic(snap, c, u_i, pg.backend)
+    return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
+end
 
+# Shared gravity setup + cosmological evolution loop (IC start with cyc_start=0, or
+# resumed from a checkpoint at cyc_start).
+function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
     # parallel CPU FFT for the top-grid gravity: :fftw (FFTW threads) or :ka
     # (KernelAbstractions radix-2 on the CPU backend, parallel over Julia threads).
     fftsolver = Symbol(get(ENV, "CIC_FFT", "ka"))
@@ -195,13 +257,24 @@ function main()
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
 
-    # output checkpoints in a: explicit CIC_ZOUT="z1,z2,…" (the cross-code list) or log-spaced
+    # output checkpoints in a: explicit CIC_ZOUT="z1,z2,…" (the cross-code list) or log-spaced.
+    # Anchor the log-spaced schedule to ZSTART (NOT a_start) so it is IDENTICAL on a restart —
+    # otherwise the dτ_out clamps land on different redshifts and the timestep sequence (hence
+    # the whole evolution) diverges from the uninterrupted run.
     a_outs = haskey(ENV, "CIC_ZOUT") ?
         sort([z_to_a(parse(Float64, s)) for s in split(ENV["CIC_ZOUT"], ",")]) :
-        exp.(range(log(a_start), log(a_end), length=NOUT))
+        exp.(range(log(z_to_a(ZSTART)), log(a_end), length=NOUT))
     NOUTS = length(a_outs)
-    ai = 1; D_start = growth_D(c, a_start)
+    # on a restart, skip outputs already crossed; growth is always normalised to ZSTART
+    ai = searchsortedfirst(a_outs, a_start - 1e-12); D_start = growth_D(c, z_to_a(ZSTART))
     pk_log = NamedTuple[]
+    # CIC_ZCHECKPOINT="z1,z2,…": write a full flat-HDF5 PatchGrid checkpoint when a first
+    # crosses each z (named <CIC_CKPT_PREFIX>_z<z>.h5, default prefix "cicass_ckpt").
+    a_chks = haskey(ENV, "CIC_ZCHECKPOINT") ?
+        [z_to_a(parse(Float64, s)) for s in split(ENV["CIC_ZCHECKPOINT"], ",")] : Float64[]
+    z_chks = [parse(Float64, s) for s in (haskey(ENV,"CIC_ZCHECKPOINT") ? split(ENV["CIC_ZCHECKPOINT"], ",") : String[])]
+    chk_done = falses(length(a_chks))
+    ckpref = get(ENV, "CIC_CKPT_PREFIX", "cicass_ckpt")
 
     # the top-grid gravity, split so the GPU step can be launched between the host
     # density snapshot and the (overlappable) CPU FFT + accel scatter.
@@ -237,7 +310,7 @@ function main()
         acc = gravity!(a, dτ0)
     end
     @printf("%-5s %-9s %-9s %-9s %-9s %-7s\n", "cyc", "a", "z", "δb_rms", "ρmax", "sec")
-    for cyc in 0:MAXCYC-1
+    for cyc in cyc_start:MAXCYC-1
         t0 = time()
         z = a_to_z(a); u = cosmo_units(c, a)
 
@@ -251,6 +324,14 @@ function main()
                     zo, a, st.δrms, g2, st.xHII, st.T); flush(stdout)
             ai += 1
             BE === :cuda && CUDA.reclaim()
+        end
+
+        # ── full-state checkpoint when a first crosses a requested z (top of cycle) ──
+        for k in eachindex(a_chks)
+            if !chk_done[k] && a >= a_chks[k] - 1e-12
+                save_checkpoint(@sprintf("%s_z%d.h5", ckpref, round(Int, z_chks[k])), pg, parts, c, a, cyc)
+                chk_done[k] = true
+            end
         end
         a >= a_end && break
 

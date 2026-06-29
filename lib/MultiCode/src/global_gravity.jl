@@ -171,11 +171,15 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
         @views ρd[gi, gj, gk] .= D3[li, lj, lk]
     end
     if particles !== nothing                              # DM periodic CIC on device
-        ρp = PPMKernels.device_zeros(be, T, (Ntot,))
-        PoissonKernels.cic_deposit!(ρp, particles.px, particles.py, particles.pz,
-                                    particles.vx, particles.vy, particles.vz, particles.mass;
-                                    N=nc[1], disp=0.5*dt/a, shift=-0.5)
-        ρd .+= reshape(ρp, nc)
+        # DETERMINISTIC integer deposit (quantized weights + integer atomics, order-
+        # independent) so the gravity — and hence checkpoint/restart and run-to-run — is
+        # bit-reproducible.  The float `cic_deposit!`'s atomicAdd is order-dependent: the
+        # ~2e-5 run-to-run noise AND the restart divergence both traced to it. repic-style.
+        ρpi = PPMKernels.device_zeros(be, Int64, (Ntot,))
+        PoissonKernels.cic_deposit_det!(ρpi, particles.px, particles.py, particles.pz,
+                                        particles.vx, particles.vy, particles.vz, particles.mass;
+                                        N=nc[1], disp=0.5*dt/a, shift=-0.5, qbits=23)
+        ρd .+= reshape(T.(ρpi), nc) .* T(2.0^-23)
     end
     ρd .-= T(meandens)                                    # known constant — no reduction, no f64
     return ρd

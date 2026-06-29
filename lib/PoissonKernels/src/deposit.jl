@@ -199,6 +199,64 @@ function cic_deposit_fixed!(ρ::AbstractVector{<:AbstractFloat}, Px, Py, Pz; N::
     return ρ
 end
 
+# DETERMINISTIC drop-in for `_cic_deposit_kernel!`: identical float positions / drift /
+# shift / CIC weights, but each corner's contribution `m·w` is quantized to `round(Int64,
+# m·w·qscale)` and accumulated by INTEGER atomic add.  Integer addition is associative ⇒
+# the grid sum is independent of thread/atomic order ⇒ BIT-EXACTLY reproducible (run-to-run
+# and across checkpoint/restart), unlike the float atomic.  This is the repic
+# `deposit_det_kernel!` pattern (yipihey/repic).  `qscale = 2^qbits`; qbits=23 keeps the
+# quantum at the Float32 ULP of `m·w` (no accuracy change vs the float deposit) while the
+# per-cell Int64 sum (≤ Nppc·m·2^23) stays far below 2^63.  Host recovers ρ = ρi / qscale.
+@kernel function _cic_deposit_det_kernel!(ρi, @Const(px), @Const(py), @Const(pz),
+                                          @Const(vx), @Const(vy), @Const(vz), @Const(mass),
+                                          N::Int, disp, shift, qscale)
+    p = @index(Global)
+    @inbounds begin
+        one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*vx[p], one_)*N + shift
+        gy = mod(py[p] + disp*vy[p], one_)*N + shift
+        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
+        fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
+        fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
+        mq = mass[p]*qscale
+        ia = mod(i0, N); ib = mod(i0+1, N); wxa = one_-fx; wxb = fx
+        ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
+        ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
+        Nj = N; Nk = N*N
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxa*wya*wza)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxb*wya*wza)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxa*wyb*wza)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxb*wyb*wza)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxa*wya*wzb)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxb*wya*wzb)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxa*wyb*wzb)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxb*wyb*wzb)
+    end
+end
+
+"""
+    cic_deposit_det!(ρi::AbstractVector{Int64}, px,py,pz, vx,vy,vz, mass; N, disp=0,
+                     shift=-0.5, qbits=23) -> ρi
+
+Deterministic CIC deposit — same registration as [`cic_deposit!`](@ref) (drift `disp·v`,
+cell `shift`, periodic, Enzo-GMF `shift=-0.5`) but accumulated as quantized integers
+(`round(Int64, m·w·2^qbits)`) with integer atomics, so the result is independent of atomic
+order ⇒ bit-reproducible across runs and checkpoint/restart.  Recover the float density as
+`ρi ./ 2.0^qbits`.  qbits=23 matches the Float32 ULP of the weights (no accuracy change).
+"""
+function cic_deposit_det!(ρi::AbstractVector{<:Integer},
+                          px, py, pz, vx, vy, vz, mass;
+                          N::Integer, disp::Real=0, shift::Real=-0.5, qbits::Integer=23)
+    be = KA.get_backend(ρi)
+    fill!(ρi, zero(eltype(ρi)))
+    length(mass) == 0 && return ρi
+    Tp = eltype(px)
+    _cic_deposit_det_kernel!(be)(ρi, px, py, pz, vx, vy, vz, mass,
+                                 Int(N), Tp(disp), Tp(shift), Tp(2.0^qbits); ndrange = length(mass))
+    return ρi
+end
+
 """
     cic_deposit!(ρ, px,py,pz, vx,vy,vz, mass; N, disp=0, shift=-0.5) -> ρ
 
