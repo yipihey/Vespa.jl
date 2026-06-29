@@ -79,13 +79,34 @@ function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
                     " nH=", nH, " eint_cgs=", ecgs, " xe_in=", xe0,
                     " dt_s=", dt*cfg.time_units, " du=", du, " vu2=", vu2); flush(stdout)
         end
-        ChemistryKernels.solve_chem!(rho, eint, HII, H2I, HDI;
-            a_value=a_value, dt=dt, density_units=cfg.density_units,
-            length_units=cfg.length_units, time_units=cfg.time_units,
-            hubble=cfg.hubble, Om=cfg.Om, OL=cfg.OL, fh=cfg.fh,
-            deuterium=cfg.deuterium && HDI !== nothing,
-            hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
-            backend=backend, precision=precision)
+        # CIC_CHEM_BINNED=1: phase-space-binned solve — one stiff solve per occupied
+        # state-space bin (ρ,e,x_i), response mapped back to every cell. Big win at
+        # high z where the gas is near-uniform (recombination is the costliest step).
+        # CIC_CHEM_BIN_TOL = bin width in dex (default 0.02; smaller = more accurate).
+        _binned = get(ENV, "CIC_CHEM_BINNED", "0") == "1"
+        if _binned
+            _btol = parse(Float64, get(ENV, "CIC_CHEM_BIN_TOL", "0.02"))
+            _bmap = Symbol(get(ENV, "CIC_CHEM_BIN_MAP", "linear"))   # :linear | :ratio | :broadcast
+            _bdev = backend !== :cpu                                  # GPU → fully on-device binning
+            nb = ChemistryKernels.solve_chem_binned!(rho, eint, HII, H2I, HDI;
+                a_value=a_value, dt=dt, density_units=cfg.density_units,
+                length_units=cfg.length_units, time_units=cfg.time_units,
+                hubble=cfg.hubble, Om=cfg.Om, OL=cfg.OL, fh=cfg.fh,
+                deuterium=cfg.deuterium && HDI !== nothing,
+                hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
+                backend=backend, precision=precision, tol=_btol, mapback=_bmap, ondevice=_bdev)
+            _cdbg && println("[chembin] nbins=", nb, "/", length(rho),
+                             " (", round(length(rho)/max(nb,1), digits=1), "× fewer solves, ",
+                             _bmap, _bdev ? "/ondevice" : "", ")")
+        else
+            ChemistryKernels.solve_chem!(rho, eint, HII, H2I, HDI;
+                a_value=a_value, dt=dt, density_units=cfg.density_units,
+                length_units=cfg.length_units, time_units=cfg.time_units,
+                hubble=cfg.hubble, Om=cfg.Om, OL=cfg.OL, fh=cfg.fh,
+                deuterium=cfg.deuterium && HDI !== nothing,
+                hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
+                backend=backend, precision=precision)
+        end
         if _cdbg
             xe1 = sum(HII)/(sum(max.(rho,eps()))*cfg.fh)
             ecgs1 = (sum(eint)/length(eint))*(cfg.length_units/cfg.time_units)^2
