@@ -57,6 +57,12 @@ const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
 # the NEXT step's accel (FFT + scatter) while the GPU runs this step; the result is
 # applied as the gravity kick at the next step (one-step-lagged, operator-split).
 const OVERLAP = get(ENV, "CIC_OVERLAP", "0") == "1"
+# CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
+# gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
+# instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
+const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
+const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
+const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const REPORTS= joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
 const TAG    = get(ENV, "CIC_TAG", "")
 const XH     = 0.76
@@ -328,6 +334,18 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             push!(pk_log, (z=zo, a=a, δrms=st.δrms, g2=g2, xHII=st.xHII, T=st.T))
             @printf("  ● output z=%.2f a=%.5f  δb_rms=%.3e  D²/D₀²=%.3e  <x_HII>=%.3e  <T>=%.1f K\n",
                     zo, a, st.δrms, g2, st.xHII, st.T); flush(stdout)
+            if PKMEAS                                     # on-device anisotropic P(k,μ); tiny table, no full dump
+                P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, axis=PKAXIS, scale_v=uo.v/1e5)
+                pf = @sprintf("%s_pkmu.h5", ckpref)
+                h5open(pf, isfile(pf) ? "r+" : "w") do f
+                    g = create_group(f, @sprintf("z%05.1f", zo))
+                    g["k"] = collect(P.k); g["gas_delta"] = P.gas_delta; g["dm_delta"] = P.dm_delta
+                    P.gas_vel === nothing || (g["gas_vel"] = P.gas_vel)
+                    g["Nmodes"] = P.Nmodes
+                    A = attrs(g); A["z"]=zo; A["a"]=a; A["box"]=c.box; A["axis"]=PKAXIS; A["nmu"]=PKMU
+                end
+                @printf("    ↳ P(k,μ) on device → %s [z%05.1f]\n", pf, zo); flush(stdout)
+            end
             ai += 1
             BE === :cuda && CUDA.reclaim()
         end

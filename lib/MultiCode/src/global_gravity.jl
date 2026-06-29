@@ -185,6 +185,51 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
     return ρd
 end
 
+# assemble one patch field's interior into a global device grid (column-major, ncell³)
+function _assemble_field_gpu!(dst, pg::PatchGrid, getf)
+    li, lj, lk = _interior(pg)
+    for p in pg.patches
+        gi, gj, gk = _octant(pg, p)
+        f3 = reshape(getf(p), pg.nd)
+        @views dst[gi, gj, gk] .= f3[li, lj, lk]
+    end
+    return dst
+end
+
+"""
+    patch_power_spectra(pg, parts; box, nmu=4, nbins=0, axis=1, scale_v=1.0, velocity=true)
+        -> (; k, gas_delta, dm_delta, gas_vel, Nmodes)
+
+On-device anisotropic P(k,μ) of the gas overdensity, DM overdensity, and (optionally) the
+gas velocity — measured straight from the resident GPU patch fields + particle SoA, NO host
+transfer and NO full-grid dump.  μ=|k_axis|/|k| (the v_bc stream is along `axis`).  `box` is
+the sim length unit (P is in box³); `scale_v` multiplies the code velocity (e.g. u.v/1e5 for
+km/s).  Each `P` is `(nbins, nmu)`.  Uses the device FFT [`PoissonKernels.power_spectrum_aniso_gpu`]
+and the deterministic CIC deposit for the DM.  Cubic power-of-two `ncell` required.
+"""
+function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nbins::Integer=0,
+                             axis::Integer=1, scale_v::Real=1.0, velocity::Bool=true)
+    be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc)
+    pk(f) = PoissonKernels.power_spectrum_aniso_gpu(f; boxsize=box, nmu=nmu, nbins=nbins, axis=axis)
+    g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)   # gas density
+    μg = T(Float64(sum(g))/Ntot); Pgas = pk(g ./ μg .- one(T))
+    Pvgas = nothing
+    if velocity
+        S1=PPMKernels.device_zeros(be,T,nc); S2=PPMKernels.device_zeros(be,T,nc); S3=PPMKernels.device_zeros(be,T,nc)
+        _assemble_field_gpu!(S1,pg,p->p.S1); _assemble_field_gpu!(S2,pg,p->p.S2); _assemble_field_gpu!(S3,pg,p->p.S3)
+        sv = T(scale_v)
+        Pvgas = pk((S1 ./ g .* sv, S2 ./ g .* sv, S3 ./ g .* sv))
+    end
+    # DM overdensity via the deterministic on-device CIC deposit
+    ρpi = PPMKernels.device_zeros(be, Int64, (Ntot,))
+    PoissonKernels.cic_deposit_det!(ρpi, parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz,
+                                    parts.mass; N=nc[1], disp=0, shift=-0.5, qbits=23)
+    ρd = reshape(T.(ρpi) .* T(2.0^-23), nc); μd = T(Float64(sum(ρd))/Ntot)
+    Pdm = pk(ρd ./ μd .- one(T))
+    return (; k=Pgas.k, gas_delta=Pgas.P, dm_delta=Pdm.P,
+            gas_vel=(Pvgas===nothing ? nothing : Pvgas.P), Nmodes=Pgas.Nmodes)
+end
+
 """
     particle_accel_field_gpu(pg, φd; ng2=pg.ng) -> (φpad, leftedge, cellsize)
 
