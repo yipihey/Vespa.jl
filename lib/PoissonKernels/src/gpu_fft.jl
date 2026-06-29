@@ -237,3 +237,56 @@ function power_spectrum_gpu(delta::AbstractArray{T,3}; boxsize = 1.0, nbins::Int
     Pc = (Psum[keep] ./ cnt[keep])
     return (k = kc, P = Pc, Nmodes = cnt[keep])
 end
+
+"""
+    power_spectrum_aniso_gpu(field; boxsize=1.0, nmu=4, nbins=0, axis=1) -> (k, P, Nmodes)
+
+Anisotropic P(k,μ) on the device.  `field` is a real cubic power-of-two device array
+(scalar overdensity) OR a 3-tuple of such arrays (a vector field → power Σ_c|f̂_c|², e.g.
+velocity).  μ = |k_axis|/|k| (the v_bc stream is along `axis`; default 1).  Returns the
+radial-bin centre wavenumbers `k` (physical), the binned power `P` of shape `(nbins, nmu)`,
+and the per-(k,μ) mode count `Nmodes`.  Same normalization as [`power_spectrum_gpu`].  The
+FFT(s) run on `field`'s backend; only the (k,μ) binning of |f̂|² is on the host.
+"""
+function power_spectrum_aniso_gpu(field; boxsize = 1.0, nmu::Integer = 4,
+                                  nbins::Integer = 0, axis::Integer = 1)
+    fields = field isa Tuple ? field : (field,)
+    f1 = fields[1]; be = KA.get_backend(f1); N = size(f1); T = eltype(f1)
+    all(_ispow2, N) || error("power_spectrum_aniso_gpu needs power-of-two dims, got $N")
+    all(==(N[1]), N) || error("power_spectrum_aniso_gpu needs a cubic grid, got $N")
+    n = N[1]; L = Float64(boxsize isa Number ? boxsize : boxsize[1])
+    brdev = get!(_GPUFFT_CACHE, (:brev, typeof(be), T, n)) do
+        to_device(be, _bitrev_table(n), Int32)
+    end
+    Pacc = nothing                                       # Σ_components |f̂|² (unnormalized), on host
+    for f in fields
+        xr = copyto!(similar(f), f); xi = KA.zeros(be, T, N...)
+        xr, xi = _fft3d!(xr, xi, brdev, -1); KA.synchronize(be)   # forward DFT on DEVICE
+        ar = Array(xr); ai = Array(xi)
+        p = Float64.(ar).^2 .+ Float64.(ai).^2
+        Pacc = Pacc === nothing ? p : (Pacc .+ p)
+    end
+    invN3 = 1.0/Float64(n)^3; V = L^3; nb = nbins > 0 ? Int(nbins) : n ÷ 2
+    kf = 2π/L; kny = n/2
+    Psum = zeros(Float64, nb, nmu); ksum = zeros(Float64, nb); cnt = zeros(Int, nb, nmu)
+    @inbounds for k in 0:n-1
+        kz = k <= n÷2 ? k : k - n
+        for j in 0:n-1
+            ky = j <= n÷2 ? j : j - n
+            for i in 0:n-1
+                kx = i <= n÷2 ? i : i - n
+                km = sqrt(Float64(kx*kx + ky*ky + kz*kz))
+                (km <= 0 || km > kny) && continue
+                ka = axis == 1 ? kx : axis == 2 ? ky : kz
+                b  = clamp(1 + floor(Int, (km/kny)*nb), 1, nb)
+                mb = clamp(1 + floor(Int, (abs(Float64(ka))/km)*nmu), 1, nmu)
+                Psum[b,mb] += V * Pacc[i+1,j+1,k+1] * invN3 * invN3
+                ksum[b] += km*kf; cnt[b,mb] += 1
+            end
+        end
+    end
+    tot = vec(sum(cnt, dims=2))
+    kc = [tot[b] > 0 ? ksum[b]/tot[b] : NaN for b in 1:nb]
+    P  = [cnt[b,m] > 0 ? Psum[b,m]/cnt[b,m] : NaN for b in 1:nb, m in 1:nmu]
+    return (k = kc, P = P, Nmodes = cnt)
+end

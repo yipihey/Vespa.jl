@@ -40,7 +40,7 @@ export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!, gathe
 export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!, fft_poisson_rfft!, fft_set_num_threads!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
-export power_spectrum_gpu
+export power_spectrum_gpu, power_spectrum_aniso_gpu
 export cic_deposit!, cic_deposit_det!, cic_deposit_fixed!, cic_deposit_bits!, cic_bits_scale
 export interp_accel_to_particles!, interp_force_from_potential!, particle_kick!, particle_drift!
 export copy_field!, fill_periodic_ghosts!
