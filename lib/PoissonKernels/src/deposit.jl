@@ -224,14 +224,14 @@ end
         ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
         ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
         Nj = N; Nk = N*N
-        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxa*wya*wza)
-        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxb*wya*wza)
-        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxa*wyb*wza)
-        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxb*wyb*wza)
-        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxa*wya*wzb)
-        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxb*wya*wzb)
-        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxa*wyb*wzb)
-        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxb*wyb*wzb)
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wya*wza)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wya*wza)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wyb*wza)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wyb*wza)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wya*wzb)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wya*wzb)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wyb*wzb)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wyb*wzb)
     end
 end
 
@@ -304,14 +304,14 @@ end
         ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
         ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
         Nj = N; Nk = N*N
-        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxa*wya*wza)
-        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(Int64, mq*wxb*wya*wza)
-        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxa*wyb*wza)
-        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(Int64, mq*wxb*wyb*wza)
-        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxa*wya*wzb)
-        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(Int64, mq*wxb*wya*wzb)
-        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxa*wyb*wzb)
-        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(Int64, mq*wxb*wyb*wzb)
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wya*wza)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wya*wza)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wyb*wza)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wyb*wza)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wya*wzb)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wya*wzb)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wyb*wzb)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wyb*wzb)
     end
 end
 
