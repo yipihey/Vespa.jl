@@ -490,6 +490,12 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
         end
+        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == 30 && BE === :cuda
+            @eval import CUDA; CUDA.reclaim(); GC.gc(); CUDA.reclaim()
+            used = (CUDA.total_memory() - CUDA.available_memory()) / 2^30
+            @printf("  MEMPROBE: live GPU = %.2f GiB at %d³ (%d Mcell)\n", used, NGRID, NGRID^3 ÷ 10^6); flush(stdout)
+            break
+        end
     end
 
     if PHASE && nph[] > 0
