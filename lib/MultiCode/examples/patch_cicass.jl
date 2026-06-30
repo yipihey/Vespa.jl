@@ -61,6 +61,9 @@ const OVERLAP = get(ENV, "CIC_OVERLAP", "0") == "1"
 # recombination + Compton heat/cool off the CMB (the processes that touch the energy eq here), no
 # stiff subcycler.  CIC_CHEM=full (default) runs the general ChemistryKernels network.
 const CHEMMODE = Symbol(get(ENV, "CIC_CHEM", "full"))
+# CIC_CHEM_NSUB: analytic sub-steps per hydro step (default 1 = fastest).  >1 tracks the evolving
+# T so k2(T) follows the Compton heating within the step → tighter match to the stiff network.
+const CHEMNSUB = parse(Int, get(ENV, "CIC_CHEM_NSUB", "1"))
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
@@ -392,7 +395,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         if OVERLAP
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
-                        chemmode=CHEMMODE, hz=Hofa(c, a))
+                        chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
             BE === :cuda && CUDA.synchronize()            # hydro+push done ⇒ ρ_next density final
             if gravmode === :gpu
@@ -403,14 +406,14 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                 end
                 patch_step!(pg, dτ; a_value=a, order=order, chem=true, du=u.d, lu=u.l, tu=u.t,
                             do_hydro=false, do_chem=true, chem_backend=:cpu, rate_tables=ratetab, cool_tables=cooltab,
-                            chemmode=CHEMMODE, hz=Hofa(c, a))   # CPU chem on main thread
+                            chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)   # CPU chem on main thread
                 acc = fetch(gpu); ngrav[] += 1
             else
                 ta = time(); snapshot!(dτ, a_new); asm_t[] += time()-ta        # host ρ_next for the CPU FFT
                 gpu = Threads.@spawn begin                # this step's chemistry on the GPU
                     patch_step!(pg, dτ; a_value=a, order=order, chem=true, du=u.d, lu=u.l, tu=u.t,
                                 do_hydro=false, do_chem=true, rate_tables=ratetab, cool_tables=cooltab,
-                                chemmode=CHEMMODE, hz=Hofa(c, a))
+                                chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
                     BE === :cuda && CUDA.synchronize()
                 end
                 acc = solve_accel!(a_new)                 # next-step accel on the CPU, overlaps chem
@@ -420,7 +423,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             acc = gravity!(a, dτ)
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
                         du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab,
-                        chemmode=CHEMMODE, hz=Hofa(c, a))
+                        chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
         end
         grav_t[] += time() - tg

@@ -106,7 +106,7 @@ function _fvgk_patch_hydro! end
 # map solve_chem_device! drives), narrows back, and applies the dual-energy Tau/Ge update.  Cosmology
 # args match solve_chem_device!'s defaults (hubble=71, Ωm=.27, ΩΛ=.73, fh=.76; no metals/expansion).
 @kernel function _chem_interior_k!(D, Ge, Tau, sp1, sp2, sp3,
-                                   du, vu2, tu, dt, z, deut, rtab, ctab,
+                                   du, vu2, tu, dt, z, hub, omc, olc, deut, rtab, ctab,
                                    nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -119,7 +119,7 @@ function _fvgk_patch_hydro! end
         h1 = Float64(sp1[idx]); h2 = Float64(sp2[idx]); hd = deut ? Float64(sp3[idx]) : 0.0
         en, hn, h2n, hdn, _ = ChemistryKernels.evolve_cell(d*du, e0*vu2, h1*du, h2*du,
                                   deut ? hd*du : 0.0, dt*tu, z;
-                                  hubble=71.0, Om=0.27, OL=0.73, fh=0.76, deuterium=deut,
+                                  hubble=hub, Om=omc, OL=olc, fh=0.76, deuterium=deut,
                                   rate_tables=rtab, cool_tables=ctab)
         enew = en / vu2
         Ge[idx]  = TT(d * enew)
@@ -130,12 +130,14 @@ function _fvgk_patch_hydro! end
 end
 
 "Run the stiff chemistry on patch `p`'s interior only (no ghost work, no gather/scatter copies)."
-function _chem_interior!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, rate_tables, cool_tables)
+function _chem_interior!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, rate_tables, cool_tables,
+                         hub, omc, olc)
     deut = pg.deut && length(p.species) >= 3
     sp3  = deut ? p.species[3] : p.species[1]            # placeholder ref when no deuterium (unread)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
     _chem_interior_k!(pg.backend)(p.D, p.Ge, p.Tau, p.species[1], p.species[2], sp3,
         Float64(du), Float64((lu/tu)^2), Float64(tu), Float64(dt), Float64(1.0/a_value - 1.0),
+        Float64(hub), Float64(omc), Float64(olc),
         deut, rate_tables, cool_tables, nd1, nd2, pg.ng, pd1, pd2; ndrange = pd1*pd2*pd3)
     return nothing
 end
@@ -150,25 +152,38 @@ end
 # peebles_k2 (Peebles C-factor; needs Hz) and temperature_from_reduced, so T and k2 are identical to the
 # stiff path.  Λc, Tγ match EmissionKernels (COMPA=5.65e-36, Tγ=2.725·(1+z)).  n_e = n_HII (He neutral at
 # z≲2000).  H2/HD carry NO energy here and are left as advected colours (not evolved).  Pure; GPU-safe.
-@inline function _recomb_compton_cell(d, e0, hii, h2, dt, z, Hz, fh, gamma)
+@inline function _recomb_compton_cell(d, e0, hii, h2, dt, z, Hz, fh, gamma, nsub::Int)
     R = typeof(e0)
     mh = R(ChemistryKernels.MH); kB = R(ChemistryKernels.KBOLTZ)
-    Told  = ChemistryKernels.temperature_from_reduced(d, e0, hii, h2; fh=fh, gamma=gamma)
-    nHI   = max((R(fh)*d - hii - h2)/mh, R(1e-30))
-    nHII0 = hii/mh
-    k2    = ChemistryKernels.peebles_k2(Told, nHI, Hz)                  # cm³/s, incl. Peebles C
-    nHII  = nHII0 / (one(R) + k2*nHII0*dt)                              # exact for fixed k2
-    hii_n = nHII*mh
-    Tcmb  = R(2.725)*(one(R)+R(z)); Lc = R(5.65e-36)*(one(R)+R(z))^4    # ≡ comp2_cmb / comp1_cmb
-    nHeI  = (one(R)-R(fh))*d/(R(4)*mh)
-    ntot  = nHI + R(2)*nHII + nHeI                                      # HI + HII + e + HeI (post-recomb)
-    Tmid  = ChemistryKernels.temperature_from_reduced(d, e0, hii_n, h2; fh=fh, gamma=gamma)
-    invtC = R(2)*Lc*nHII / (R(3)*kB*ntot)                              # 1/t_C  (n_e = n_HII)
-    Tnew  = Tcmb + (Tmid - Tcmb)*exp(-dt*invtC)
-    return e0 * (Tnew/Tmid), hii_n                                      # eint ∝ T at fixed n_tot
+    Tcmb = R(2.725)*(one(R)+R(z)); Lc = R(5.65e-36)*(one(R)+R(z))^4    # ≡ comp2_cmb / comp1_cmb
+    nHeI = (one(R)-R(fh))*d/(R(4)*mh)
+    hii_c = hii; e_c = e0; sdt = dt/R(nsub)
+    # JOINT closed form per step (no operator-split bias):
+    #   Compton:  T(t)=Tγ+(T₀-Tγ)e^{-t/t_C}  (exact for x≈const over a step; recomb is slow per step here)
+    #   Recomb :  evaluate k₂ at the TIME-AVERAGED T of that relaxation, T̄=Tγ+(T₀-Tγ)·(1-e^{-Δt/t_C})/(Δt/t_C),
+    #             so α(T(t)) follows the Compton heating WITHIN the step — the dominant coupling that a plain
+    #             split (k₂ at the cold start-T) gets wrong.  Then x←x/(1+k₂(T̄) n_HII Δt) and the Compton
+    #             relaxation apply (n_e=n_HII; He neutral at z≲1000 — negligible).  nsub>1 refines T₀'s drift.
+    for _ in 1:nsub
+        nHI   = max((R(fh)*d - hii_c - h2)/mh, R(1e-30))
+        nHII0 = hii_c/mh
+        Told  = ChemistryKernels.temperature_from_reduced(d, e_c, hii_c, h2; fh=fh, gamma=gamma)
+        ntot  = nHI + R(2)*nHII0 + nHeI                                # HI + HII + e(=HII) + HeI
+        invtC = R(2)*Lc*nHII0 / (R(3)*kB*ntot)                         # Compton rate 1/t_C
+        xr    = sdt*invtC                                              # Δt/t_C
+        decay = xr > R(1e-8) ? (one(R) - exp(-xr))/xr : one(R)         # ⟨e^{-t/t_C}⟩ over the step
+        Tavg  = Tcmb + (Told - Tcmb)*decay                            # time-averaged T for α(T(t))
+        k2    = ChemistryKernels.peebles_k2(Tavg, nHI, Hz)            # cm³/s, incl. Peebles C (radiation Hz)
+        nHII  = nHII0 / (one(R) + k2*nHII0*sdt)                        # n²-self-limiting recombination
+        hii_c = nHII*mh
+        Tmid  = ChemistryKernels.temperature_from_reduced(d, e_c, hii_c, h2; fh=fh, gamma=gamma)
+        Tnew  = Tcmb + (Tmid - Tcmb)*exp(-xr)                          # Compton exponential relaxation
+        e_c   = e_c * (Tnew/Tmid)                                      # eint ∝ T at fixed n_tot
+    end
+    return e_c, hii_c
 end
 
-@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma,
+@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
                                    nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -177,13 +192,13 @@ end
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
         d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, Float64(sp1[idx])*du, Float64(sp2[idx])*du,
-                                          dt*tu, z, Hz, fh, gamma)
+                                          dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0)); sp1[idx] = TT(hii_n/du)
     end
 end
 
-@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma,
+@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
                                           nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -193,7 +208,7 @@ end
         d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
         hii = Float64(ChemistryKernels.decode_log2sp(Float64, sp1[idx]))*d   # fraction → code mass dens
         h2  = Float64(ChemistryKernels.decode_log2sp(Float64, sp2[idx]))*d
-        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, h2*du, dt*tu, z, Hz, fh, gamma)
+        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, h2*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0))
         sp1[idx] = ChemistryKernels.encode_log2sp(TT(hii_n/du/d))            # back to mass fraction
@@ -201,11 +216,11 @@ end
 end
 
 "Fast analytic recombination + Compton on patch `p`'s interior (no stiff solver; needs Hz [s⁻¹])."
-function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz)
+function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, nsub::Int)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
     sp2 = length(p.species) >= 2 ? p.species[2] : p.species[1]
     args = (p.D, p.Ge, p.Tau, p.species[1], sp2, Float64(du), Float64((lu/tu)^2), Float64(tu),
-            Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma),
+            Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma), Int(nsub),
             nd1, nd2, pg.ng, pd1, pd2)
     (pg.packed ? _chem_analytic_packed_k! : _chem_analytic_k!)(pg.backend)(args...; ndrange = pd1*pd2*pd3)
     return nothing
@@ -357,7 +372,8 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                      accel=nothing, chem::Bool=true, solver::Symbol=:ppm,
                      du::Real=pg.du, lu::Real=pg.lu, tu::Real=pg.tu,
                      do_hydro::Bool=true, do_chem::Bool=true, chem_backend::Symbol=pg.besym,
-                     rate_tables=nothing, cool_tables=nothing, chemmode::Symbol=:full, hz::Real=0.0)
+                     rate_tables=nothing, cool_tables=nothing, chemmode::Symbol=:full, chemnsub::Int=1,
+                     cosmo_h0::Real=71.0, cosmo_Om::Real=0.27, cosmo_OL::Real=0.73)
     # `do_hydro`/`do_chem` split the step into its two GPU phases.  Chemistry does NOT
     # change the density, so the next step's top-grid gravity can be solved on the host
     # from the post-hydro density WHILE this step's chemistry runs on the GPU — a
@@ -443,10 +459,13 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
         # GATHER each patch interior into contiguous pdim³ buffers, solve, and SCATTER back — the
         # interior result is bit-identical, the ghost work is gone.  ALWAYS solved in Float64 (the
         # stiff network NaNs in f32), promoting on read / narrowing on write.
+        # ONE cosmology routine for every chem path: H(z) from ChemistryKernels.hubble_z_of with the
+        # ACTUAL (cosmo_h0,Om,OL) — the analytic channel and the stiff network read the identical Hz,
+        # so the recombination freeze-out (Peebles C ∝ 1/Hz, radiation-inclusive) can never diverge.
         if do_chem && chem && !isempty(pg.patches[1].species) && chemmode === :analytic
-            # FAST PATH: analytic Case-B recombination + Compton (post-recombination IGM); no subcycler
+            hz = ChemistryKernels.hubble_z_of(1.0/a_value - 1.0; hubble=cosmo_h0, Om=cosmo_Om, OL=cosmo_OL)
             for p in pg.patches
-                _chem_analytic!(pg, p, a_value, dt, du, lu, tu, hz)
+                _chem_analytic!(pg, p, a_value, dt, du, lu, tu, hz, chemnsub)
             end
         elseif do_chem && chem && !isempty(pg.patches[1].species)
             haveHD = pg.deut && length(pg.patches[1].species) >= 3
@@ -466,6 +485,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                         ChemistryKernels.solve_chem_device_u16!(rh, eh, sp1, sp2, sp3;
                             a_value=a_value, dt=dt, density_units=du, length_units=lu,
                             time_units=tu, deuterium=pg.deut, backend=:cpu, precision=Float64,
+                            hubble=cosmo_h0, Om=cosmo_Om, OL=cosmo_OL,
                             rate_tables=rate_tables, cool_tables=cool_tables)
                         sa!(p.Tau, Dint .* PPMKernels.to_device(be, T.(eh .- eh0), T))
                         si!(p.Ge,  Dint .* PPMKernels.to_device(be, T.(eh), T))
@@ -476,6 +496,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                         ChemistryKernels.solve_chem_device_u16!(r64, e64, s1, s2, hdc;
                             a_value=a_value, dt=dt, density_units=du, length_units=lu,
                             time_units=tu, deuterium=pg.deut, backend=pg.besym, precision=Float64,
+                            hubble=cosmo_h0, Om=cosmo_Om, OL=cosmo_OL,
                             rate_tables=rate_tables, cool_tables=cool_tables)
                         sa!(p.Tau, Dint .* T.(e64 .- e0))
                         si!(p.Ge,  Dint .* T.(e64))
@@ -492,6 +513,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                     ChemistryKernels.solve_chem_device!(rh, eh, h1, h2, hd;
                         a_value=a_value, dt=dt, density_units=du, length_units=lu,
                         time_units=tu, deuterium=pg.deut, backend=:cpu, precision=Float64,
+                        hubble=cosmo_h0, Om=cosmo_Om, OL=cosmo_OL,
                         rate_tables=rate_tables, cool_tables=cool_tables)
                     sa!(p.Tau, Dint .* PPMKernels.to_device(be, T.(eh .- e0h), T))
                     si!(p.Ge,  Dint .* PPMKernels.to_device(be, T.(eh), T))
@@ -500,7 +522,8 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                     haveHD && si!(p.species[3], PPMKernels.to_device(be, T.(hd), T))
                 else
                     # f32 species, device chem: strided in-place — no gather/scatter, no f64 materialization
-                    _chem_interior!(pg, p, a_value, dt, du, lu, tu, rate_tables, cool_tables)
+                    _chem_interior!(pg, p, a_value, dt, du, lu, tu, rate_tables, cool_tables,
+                                    cosmo_h0, cosmo_Om, cosmo_OL)
                 end
             end
         end
