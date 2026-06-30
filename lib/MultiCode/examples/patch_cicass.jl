@@ -28,7 +28,11 @@ import EmissionKernels
 const BE = Symbol(get(ENV, "BACKEND", "cuda"))
 BE === :cuda && @eval import CUDA              # register the :cuda kernels backends
 const T  = BE === :cpu ? Float64 : Float32
-const NG = 4
+# Patch ghost depth.  The :fvgk solver owns periodicity internally and reads patch interiors
+# only (gather/scatter/chem/density all interior); the sole ghost users are the gravity gas
+# kick (∂φ central diff ⇒ ng≥1) and the particle force interp (CIC+diff ⇒ ng2≥2), so ng=2 is
+# the safe floor.  :ppm needs ng≥3 (parabolic+flattening stencil); keep 4.  CIC_NG overrides.
+const NG = parse(Int, get(ENV, "CIC_NG", get(ENV, "CIC_SOLVER", "ppm") == "fvgk" ? "2" : "4"))
 
 # ── parameters (defaults match the cicass cross-code comparison) ──
 const NGRID  = parse(Int, get(ENV, "CIC_NGRID", "128"))
@@ -348,6 +352,15 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     end
 
     a = a_start; m0 = total_mass(pg)
+    # Pre-build the FVGK global grid NOW, in a clean pool — its big contiguous f16 R/O buffers must
+    # place before cycle-0's gravity (cuFFT plan) and Morton sort (radix scratch) fragment the pool.
+    # The lazy first-step build otherwise fails near the memory ceiling even when the steady-state
+    # working set fits (dt=0 ⇒ a pure f16 round-trip of the IC, no physical change).
+    if SOLVER === :fvgk
+        patch_step!(pg, 0.0; a_value=a, order=(1,2,3), accel=nothing, chem=false, solver=:fvgk,
+                    du=u_i.d, lu=u_i.l, tu=u_i.t, do_hydro=true, do_chem=false, chemmode=CHEMMODE)
+        BE === :cuda && CUDA.synchronize()
+    end
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing
     if OVERLAP

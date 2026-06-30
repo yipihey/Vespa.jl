@@ -58,8 +58,10 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
         # alloc); the gather/scatter GE_SCALE-lift the energy slots so the cold eint survives f16 storage.
         store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))
+        # scratch=:minimal drops the rk2-only third state buffer (NV·VOL) — the DE path always
+        # steps with run_ctus_de16! (R+O only), so this saves a full grid buffer (~14 B/cell @f16).
         return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec,
-                             de_prec = :f16, ge_scale = gesc, store = store)
+                             de_prec = :f16, ge_scale = gesc, store = store, scratch = :minimal)
     end
     if nsp == 0
         sys = Euler(γ = γ);                 z = (1f0, 0f0, 0f0, 0f0, 1f0)
@@ -67,7 +69,9 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         sys = EulerColors{nsp}(γ = γ);      z = (1f0, 0f0, 0f0, 0f0, 1f0, ntuple(_ -> 0f0, nsp)...)
     end
     U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]        # concrete Array{NTuple{5+nsp,Float32},3}
-    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec)
+    # rk2 needs the third buffer; CTU/single-pass paths don't — drop it unless rk2 is selected.
+    scr = get(ENV, "CIC_FVGK_INTEGRATOR", "ctu") == "rk2" ? :full : :minimal
+    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec, scratch = scr)
 end
 
 # var c of the global FVGK buffer, as a (ncell...) view (column-major, var-major flat).

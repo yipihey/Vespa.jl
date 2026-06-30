@@ -141,13 +141,13 @@ end
 end
 @inline _morton3(x::UInt32, y::UInt32, z::UInt32) = _part1by2(x) | (_part1by2(y) << 1) | (_part1by2(z) << 2)
 
-@kernel function _morton_packed_k!(packed, @Const(px), @Const(py), @Const(pz), N::Int32, Nm1::UInt32)
+@kernel function _morton_key_k!(keys, @Const(px), @Const(py), @Const(pz), N::Int32, Nm1::UInt32)
     p = @index(Global)
     @inbounds begin
         ix = min(unsafe_trunc(UInt32, floor(px[p]*N)), Nm1)
         iy = min(unsafe_trunc(UInt32, floor(py[p]*N)), Nm1)
         iz = min(unsafe_trunc(UInt32, floor(pz[p]*N)), Nm1)
-        packed[p] = (UInt64(_morton3(ix, iy, iz)) << 32) | UInt64(p - 1)   # (Morton key | 0-based idx)
+        keys[p] = _morton3(ix, iy, iz)                            # 30-bit Morton key (UInt32)
     end
 end
 
@@ -157,18 +157,31 @@ end
 Reorder the particle SoA in place by the Morton (Z-order) code of each particle's Eulerian cell on the
 `N³` grid, restoring deposit/gather locality.  Permutes every AbstractVector field (px..vz and a tracked
 `id`); the scalar `mass` is untouched.  Bit-identical physics (deposit + push are order-independent).
-Uses a packed-UInt64 key-value `sort!` (GPU radix).  Requires `N ≤ 1024` (Morton fits 30 bits).
+
+Uses a **UInt32 Morton key + stable `sortperm!`** (CUDA.jl's sortperm! is properly stable), so ties — many
+particles in one cell at low z — resolve by ascending original index, making the permutation IDENTICAL to
+the old packed-(Morton<<32|idx) `sort!` but at HALF the peak: key(4 B/cell) + Int32 perm(4) instead of
+packed-UInt64(8) + perm(4) + the live key — the difference between Morton fitting and OOM near the grid
+ceiling.  Requires `N ≤ 1024` (Morton fits 30 bits).
 """
 function morton_sort_particles!(parts; N::Integer)
     px = parts.px; Np = length(px); be = PoissonKernels.KA.get_backend(px)
-    packed = similar(px, UInt64)
-    _morton_packed_k!(be)(packed, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
+    mkey = similar(px, UInt32)
+    _morton_key_k!(be)(mkey, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
     PoissonKernels.KA.synchronize(be)
-    sort!(packed)                                                  # radix by (Morton<<32 | idx)
-    perm = Int32.((packed .& 0x00000000ffffffff) .+ UInt64(1))     # 1-based gather permutation
+    perm = similar(px, Int32, Np)                                 # 1-based gather permutation (Int32)
+    sortperm!(perm, mkey; initialized = false)                    # stable ⇒ identical perm to the packed sort
+    _free_buf!(mkey)                                              # release the key buffer before the gathers
     for f in keys(parts)
         a = getfield(parts, f)
         a isa AbstractVector && (a .= a[perm])
     end
     return parts
+end
+# Eagerly release a device buffer (CUDA: return it to the pool now, before the field gathers
+# allocate, so the sort's peak stays at key+perm not key+perm+gather).  No-op on backends w/o it.
+function _free_buf!(a)
+    m = parentmodule(typeof(a))
+    isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a)
+    return nothing
 end
