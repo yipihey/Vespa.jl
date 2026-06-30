@@ -120,10 +120,15 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
     nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
-    if _nspecies(pg) > 0
-        run_ctu!(g, dtf / nsub, nsub)        # f32: the f16-tiled run_ctus! can't carry colours yet
+    # Pure hydro → fast f16-tiled run_ctus!.  WITH species the default is all-f32 run_ctu!: (1) the
+    # f16-tiled path still faults on the Vespa-assembled grid (separate from the colour underflow the
+    # FVGK f32 side-channel now fixes), and (2) f16's dual-energy Ge=Tau-½S²/D cancellation corrupts a
+    # COLD gas's internal energy.  CIC_FVGK_F16=1 opts into run_ctus! (f16 hydro + f32 colours) for
+    # warm-gas / non-dual-energy use once the grid fault is resolved.
+    if _nspecies(pg) == 0 || get(ENV, "CIC_FVGK_F16", "0") == "1"
+        run_ctus!(g, dtf / nsub, nsub)
     else
-        run_ctus!(g, dtf / nsub, nsub)       # pure hydro: fast f16-tiled path
+        run_ctu!(g, dtf / nsub, nsub)
     end
     _fvgk_scatter!(g, pg)
     _fvgk_sync_ge!(pg)
