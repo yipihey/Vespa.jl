@@ -123,3 +123,52 @@ function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Rea
     PoissonKernels.particle_kick!(parts.vx, parts.vy, parts.vz, axp, ayp, azp; ts=half, coef=0.0)
     return (axp, ayp, azp)
 end
+
+# ── Morton (Z-order) particle sort: restore deposit/gather locality, bit-identical physics ─────────
+# The DM CIC deposit is ~17× slower for scrambled vs grid-ordered particles (uncoalesced atomics), and
+# the Lagrangian order decays as the DM clusters.  Re-sorting the SoA by each particle's Eulerian-cell
+# Morton code restores 3D locality (deposit AND the force gather in push_particles!).  The INTEGER
+# deposit and the per-particle push are order-INDEPENDENT ⇒ the sort changes ONLY storage order, not
+# the physics (bit-identical).  A tracked Lagrangian `id`, permuted with the sort, preserves the
+# particle→Lagrangian-grid map needed to rebuild the phase-space sheet from snapshots.
+@inline function _part1by2(n::UInt32)
+    n &= 0x000003ff
+    n = (n | (n << 16)) & 0xff0000ff
+    n = (n | (n <<  8)) & 0x0300f00f
+    n = (n | (n <<  4)) & 0x030c30c3
+    n = (n | (n <<  2)) & 0x09249249
+    return n
+end
+@inline _morton3(x::UInt32, y::UInt32, z::UInt32) = _part1by2(x) | (_part1by2(y) << 1) | (_part1by2(z) << 2)
+
+@kernel function _morton_packed_k!(packed, @Const(px), @Const(py), @Const(pz), N::Int32, Nm1::UInt32)
+    p = @index(Global)
+    @inbounds begin
+        ix = min(unsafe_trunc(UInt32, floor(px[p]*N)), Nm1)
+        iy = min(unsafe_trunc(UInt32, floor(py[p]*N)), Nm1)
+        iz = min(unsafe_trunc(UInt32, floor(pz[p]*N)), Nm1)
+        packed[p] = (UInt64(_morton3(ix, iy, iz)) << 32) | UInt64(p - 1)   # (Morton key | 0-based idx)
+    end
+end
+
+"""
+    morton_sort_particles!(parts; N) -> parts
+
+Reorder the particle SoA in place by the Morton (Z-order) code of each particle's Eulerian cell on the
+`N³` grid, restoring deposit/gather locality.  Permutes every AbstractVector field (px..vz and a tracked
+`id`); the scalar `mass` is untouched.  Bit-identical physics (deposit + push are order-independent).
+Uses a packed-UInt64 key-value `sort!` (GPU radix).  Requires `N ≤ 1024` (Morton fits 30 bits).
+"""
+function morton_sort_particles!(parts; N::Integer)
+    px = parts.px; Np = length(px); be = PoissonKernels.KA.get_backend(px)
+    packed = similar(px, UInt64)
+    _morton_packed_k!(be)(packed, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
+    PoissonKernels.KA.synchronize(be)
+    sort!(packed)                                                  # radix by (Morton<<32 | idx)
+    perm = Int32.((packed .& 0x00000000ffffffff) .+ UInt64(1))     # 1-based gather permutation
+    for f in keys(parts)
+        a = getfield(parts, f)
+        a isa AbstractVector && (a .= a[perm])
+    end
+    return parts
+end

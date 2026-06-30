@@ -72,6 +72,12 @@ const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full
 # barriers that serialize the GPU, so it INFLATES the wall a bit — use it only for the breakdown,
 # never to quote production throughput (the uninstrumented sec/cyc is the real number).
 const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
+# CIC_PSORT=K: Morton-sort the DM particle SoA every K steps to keep the CIC deposit/force-gather
+# coalesced as the DM clusters (bit-identical — deposit+push are order-independent).  0 = off.
+const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
+# CIC_PIDS=1 (auto-on under PSORT): carry a Lagrangian particle index `id` (permuted with the sort)
+# so the particle→Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.
+const PIDS  = PSORT > 0 || get(ENV, "CIC_PIDS", "0") == "1"
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
@@ -139,8 +145,12 @@ function dm_ic(snap, c::Cosmo, u_i, backend)
     pz = dev([T(mod(pos[p,3], 1.0)) for p in 1:Npart])
     vx = mk(@view(vel[:,1]), vconv); vy = mk(@view(vel[:,2]), vconv); vz = mk(@view(vel[:,3]), vconv)
     mass = T(1 - c.fb)                                   # SCALAR: equal-mass DM ⇒ no N³ mass array
-    @printf("DM IC: %d particles, mass_per=%.4f (1−f_b), v→code=%.4e\n", Npart, 1-c.fb, vconv); flush(stdout)
-    return (px=px, py=py, pz=pz, vx=vx, vy=vy, vz=vz, mass=mass)
+    @printf("DM IC: %d particles, mass_per=%.4f (1−f_b), v→code=%.4e%s\n",
+            Npart, 1-c.fb, vconv, PIDS ? "  (+Lagrangian id)" : ""); flush(stdout)
+    parts = (px=px, py=py, pz=pz, vx=vx, vy=vy, vz=vz, mass=mass)
+    # Lagrangian index id = i+jN+kN² (the IC grid order) → unravel to (i,j,k) for the sheet
+    PIDS && (parts = (; parts..., id=PPMKernels.to_device(backend, collect(Int32, 0:Npart-1))))
+    return parts
 end
 
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
@@ -195,6 +205,7 @@ function save_checkpoint(path, pg, parts, c, a, cyc)
         for (nm, arr) in zip(_CKF, (g.D, g.S1, g.S2, g.S3, g.Tau, g.Ge)); f["fields/"*nm] = arr; end
         for (nm, arr) in zip(_CKS, g.species); f["species/"*nm] = arr; end
         for nm in _CKP; f["particles/"*nm] = Array(getfield(parts, Symbol(nm))); end
+        haskey(parts, :id) && (f["particles/id"] = Array(parts.id))   # Lagrangian index for the sheet
         A = attrs(f)
         A["pmass"] = Float64(parts.mass)                  # scalar equal-mass DM
         A["dims"] = collect(pg.ncell); A["a"] = a; A["z"] = a_to_z(a); A["cyc"] = cyc
@@ -211,6 +222,7 @@ function load_checkpoint(path)
                   S3=read(f,"fields/S3"), Tau=read(f,"fields/Tau"), Ge=read(f,"fields/Ge"),
                   species=[read(f,"species/"*nm) for nm in _CKS])
         parts = NamedTuple{Symbol.(_CKP)}(Tuple(read(f,"particles/"*nm) for nm in _CKP))
+        haskey(f, "particles/id") && (parts = (; parts..., id=read(f,"particles/id")))
         A = attrs(f)
         return (; fields, parts, pmass=Float64(A["pmass"]), ncell=Tuple(Int.(A["dims"])), a=Float64(A["a"]), cyc=Int(A["cyc"]),
                 dx=Float64(A["dx"]), du=Float64(A["du"]), lu=Float64(A["lu"]), tu=Float64(A["tu"]),
@@ -231,6 +243,7 @@ function main()
         scatter_global!(pg, ck.fields)
         parts = merge(NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP)),
                       (mass = T(ck.pmass),))
+        haskey(ck.parts, :id) && (parts = (; parts..., id=PPMKernels.to_device(pg.backend, ck.parts.id)))
         @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
                 ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
         return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
@@ -345,6 +358,11 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     for cyc in cyc_start:MAXCYC-1
         t0 = time()
         z = a_to_z(a); u = cosmo_units(c, a)
+
+        # ── Morton-resort the DM SoA every PSORT steps (keeps deposit/gather coalesced; bit-identical) ──
+        if PSORT > 0 && cyc % PSORT == 0
+            morton_sort_particles!(parts; N=N)
+        end
 
         # ── outputs at crossed checkpoints (checked BEFORE stepping so a lands exactly) ──
         while ai <= NOUTS && a >= a_outs[ai] - 1e-12
