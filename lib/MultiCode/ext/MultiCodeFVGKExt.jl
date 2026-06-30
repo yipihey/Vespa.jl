@@ -176,14 +176,20 @@ function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
     return pg
 end
 
-function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
+function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspeed=nothing)
     pg.fvgk === nothing && (pg.fvgk = _build_fvgk_global(pg))
     g = pg.fvgk; dtf = Float32(dt)
     pg.dedup || _fvgk_gather!(g, pg)                             # dedup: patches ARE g.R, no copy
     # one 2nd-order CTU step; sub-cycle if the driver dt exceeds FVGK's CTU CFL. With species the
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
-    nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
+    # CTU sub-cycles needed to honor the 0.45 unsplit CFL.  Vespa's max_signal IS FVGK's per-cell
+    # summed directional speed (|vx|+|vy|+|vz|+3c), so when the driver passes `sigspeed` we compute
+    # nsub directly — no per-step GPU speed reduction and no spd buffer (scratch=:minimal drops it).
+    # dt=0 (the pre-build grid-allocation step) is a no-op ⇒ nsub=1, never touching dt_cfl/spd.
+    nsub = dtf <= 0 ? 1 :
+           sigspeed !== nothing ? max(1, ceil(Int, dtf * Float32(sigspeed) / (0.45f0 * Float32(pg.dx)))) :
+           max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
     de = _de(g, pg)
     # CIC_FVGK_F16=1 → all-f16 DUAL-ENERGY run_ctus_de16! (Ge evolved in-grid; cold gas, no NaN).  Else
     # single-energy f32: run_ctu! (CTU, accurate) or run_rk2! (CIC_FVGK_INTEGRATOR=rk2; ≈CTU cost), and

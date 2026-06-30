@@ -79,9 +79,11 @@ const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
 # CIC_PSORT=K: Morton-sort the DM particle SoA every K steps to keep the CIC deposit/force-gather
 # coalesced as the DM clusters (bit-identical — deposit+push are order-independent).  0 = off.
 const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
-# CIC_PIDS=1 (auto-on under PSORT): carry a Lagrangian particle index `id` (permuted with the sort)
-# so the particle→Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.
-const PIDS  = PSORT > 0 || get(ENV, "CIC_PIDS", "0") == "1"
+# CIC_PIDS=1: carry a Lagrangian particle index `id` (permuted with the sort) so the particle→
+# Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.  Defaults ON
+# under PSORT (Morton) but CIC_PIDS=0 overrides to drop it (−4 B/cell of particle storage) when the
+# sheet isn't needed — Morton still works, it just doesn't permute a (nonexistent) id.
+const PIDS  = get(ENV, "CIC_PIDS", PSORT > 0 ? "1" : "0") == "1"
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
@@ -445,7 +447,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         order = isodd(cyc) ? (3,2,1) : (1,2,3)
         tg = time()
         if OVERLAP
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
@@ -476,7 +478,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             sync() = (BE === :cuda && CUDA.synchronize())
             sync(); tt = time(); acc = gravity!(a, dτ); sync(); gph_t[] += time()-tt
             tt = time()
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             sync(); hyd_t[] += time()-tt; tt = time()
@@ -489,7 +491,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             sync(); prt_t[] += time()-tt; nph[] += 1
         else
             acc = gravity!(a, dτ)
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)

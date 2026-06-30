@@ -398,7 +398,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
                      du::Real=pg.du, lu::Real=pg.lu, tu::Real=pg.tu,
                      do_hydro::Bool=true, do_chem::Bool=true, chem_backend::Symbol=pg.besym,
                      rate_tables=nothing, cool_tables=nothing, chemmode::Symbol=:full, chemnsub::Int=1,
-                     cosmo_h0::Real=71.0, cosmo_Om::Real=0.27, cosmo_OL::Real=0.73)
+                     cosmo_h0::Real=71.0, cosmo_Om::Real=0.27, cosmo_OL::Real=0.73, sigspeed=nothing)
     # `do_hydro`/`do_chem` split the step into its two GPU phases.  Chemistry does NOT
     # change the density, so the next step's top-grid gravity can be solved on the host
     # from the post-hydro density WHILE this step's chemistry runs on the GPU — a
@@ -424,7 +424,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             # into one global periodic grid, steps once, disperses back — decomposition-invariant
             # for any np (bit-identical to the undecomposed run), then re-derives Ge. No per-axis
             # cross-patch exchange (FVGK is unsplit). See MultiCodeFVGKExt.
-            _fvgk_patch_hydro!(pg, dt)
+            _fvgk_patch_hydro!(pg, dt, sigspeed)
         else
             ngs = pg.ng - 1
             ngs >= 1 || error("patch_step!: need ng ≥ 2 for the compute-with-overlap halo (got ng=$(pg.ng))")
