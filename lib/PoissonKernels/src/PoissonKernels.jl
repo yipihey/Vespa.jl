@@ -36,7 +36,7 @@ using KernelAbstractions
 const KA = KernelAbstractions
 
 export backend, has_backend, device_zeros, to_device, to_host
-export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!, gather_periodic_block!, grav_kick_from_potential!
+export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!, gather_periodic_block!, grav_kick_from_potential!, grav_kick_from_global_potential!
 export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!, fft_poisson_rfft!, fft_set_num_threads!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
