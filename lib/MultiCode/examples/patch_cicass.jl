@@ -27,6 +27,7 @@ import EmissionKernels
 
 const BE = Symbol(get(ENV, "BACKEND", "cuda"))
 BE === :cuda && @eval import CUDA              # register the :cuda kernels backends
+BE === :metal && @eval import Metal            # register the :metal kernel backends
 const T  = BE === :cpu ? Float64 : Float32
 const NG = 4
 
@@ -158,10 +159,11 @@ function max_signal(pg)
     smax = 0.0
     li = (pg.ng+1):(pg.ng+pg.pdim[1]); lj = (pg.ng+1):(pg.ng+pg.pdim[2]); lk = (pg.ng+1):(pg.ng+pg.pdim[3])
     iv(f) = @view reshape(f, pg.nd)[li, lj, lk]      # INTERIOR view (exclude ghosts) so the
+    Tloc = pg.T; gm1 = Tloc(GAMMA * (GAMMA - 1)); z = zero(Tloc)
     for p in pg.patches                              # CFL timestep depends only on the physical
         D = iv(p.D)                                  # state — makes checkpoint/restart bit-exact
-        cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (iv(p.Ge) ./ D), 0))   # (and avoids D=0 ghost NaNs)
-        sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ 3 .* cs
+        cs = sqrt.(max.(gm1 .* (iv(p.Ge) ./ D), z))   # (and avoids D=0 ghost NaNs)
+        sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ Tloc(3) .* cs
         smax = max(smax, Float64(maximum(sig)))
     end
     return smax
@@ -263,8 +265,11 @@ function main()
     dx = 1.0 / N
     pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
                          besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
-    scatter_global!(pg, gas_ic(snap, c, a_start, u_i))
+    gas = gas_ic(snap, c, a_start, u_i)
+    scatter_global!(pg, gas)
+    gas = nothing; GC.gc()
     parts = dm_ic(snap, c, u_i, pg.backend)
+    snap = nothing; GC.gc()
     return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
 end
 
@@ -490,11 +495,20 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
         end
-        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == 30 && BE === :cuda
-            @eval import CUDA; CUDA.reclaim(); GC.gc(); CUDA.reclaim()
-            used = (CUDA.total_memory() - CUDA.available_memory()) / 2^30
-            @printf("  MEMPROBE: live GPU = %.2f GiB at %d³ (%d Mcell)\n", used, NGRID, NGRID^3 ÷ 10^6); flush(stdout)
-            break
+        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == 30
+            if BE === :cuda
+                @eval import CUDA; CUDA.reclaim(); GC.gc(); CUDA.reclaim()
+                used = (CUDA.total_memory() - CUDA.available_memory()) / 2^30
+                @printf("  MEMPROBE: live CUDA = %.2f GiB at %d³ (%d Mcell)\n", used, NGRID, NGRID^3 ÷ 10^6); flush(stdout)
+                break
+            elseif BE === :metal
+                @eval import Metal; Metal.synchronize(); GC.gc(); Metal.synchronize()
+                s = Metal.alloc_stats
+                used = max(0, s.alloc_bytes - s.free_bytes) / 2^30
+                @printf("  MEMPROBE: live Metal = %.2f GiB at %d³ (%d Mcell)  [alloc %.2f GiB | freed %.2f GiB]\n",
+                        used, NGRID, NGRID^3 ÷ 10^6, s.alloc_bytes/2^30, s.free_bytes/2^30); flush(stdout)
+                break
+            end
         end
     end
 

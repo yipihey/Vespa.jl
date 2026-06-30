@@ -175,7 +175,7 @@ end
         decay = xr > R(1e-8) ? (one(R) - exp(-xr))/xr : one(R)         # ⟨e^{-t/t_C}⟩ over the step
         Tavg  = Tcmb + (Told - Tcmb)*decay                            # time-averaged T for α(T(t))
         # Peebles C-factor only matters during recombination (z≳500); below, C≈1 ⇒ k2 = α_B (cheap)
-        k2    = z > 500 ? ChemistryKernels.peebles_k2(Tavg, nHI, Hz) : ChemistryKernels.recfast_alpha(Tavg)*R(1e6)
+        k2    = z > R(500) ? ChemistryKernels.peebles_k2(Tavg, nHI, Hz) : ChemistryKernels.recfast_alpha(Tavg)*R(1e6)
         nHII  = nHII0 / (one(R) + k2*nHII0*sdt)                        # n²-self-limiting recombination
         hii_c = nHII*mh
         Tnew  = Tcmb + (Told - Tcmb)*exp(-xr)                          # Compton relaxation (n_tot shift ~x≪1)
@@ -191,8 +191,8 @@ end
         TT = eltype(D); t0 = t - 1
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
-        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, Float64(sp1[idx])*du, dt*tu, z, Hz, fh, gamma, nsub)
+        d = TT(D[idx]); e0 = TT(Ge[idx]) / d
+        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, TT(sp1[idx])*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0)); sp1[idx] = TT(hii_n/du)
     end
@@ -205,8 +205,8 @@ end
         TT = eltype(D); t0 = t - 1
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
-        hii = Float64(ChemistryKernels.decode_log2sp(Float64, sp1[idx]))*d   # fraction → code mass dens
+        d = TT(D[idx]); e0 = TT(Ge[idx]) / d
+        hii = ChemistryKernels.decode_log2sp(TT, sp1[idx])*d   # fraction → code mass dens
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0))
@@ -217,8 +217,9 @@ end
 "Fast analytic recombination + Compton on patch `p`'s interior (HII-only color; no stiff solver; needs Hz)."
 function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, nsub::Int)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
-    args = (p.D, p.Ge, p.Tau, p.species[1], Float64(du), Float64((lu/tu)^2), Float64(tu),
-            Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma), Int(nsub),
+    R = pg.T
+    args = (p.D, p.Ge, p.Tau, p.species[1], R(du), R((lu/tu)^2), R(tu),
+            R(dt), R(1.0/a_value - 1.0), R(hz), R(0.76), R(pg.gamma), Int(nsub),
             nd1, nd2, pg.ng, pd1, pd2)
     (pg.packed ? _chem_analytic_packed_k! : _chem_analytic_k!)(pg.backend)(args...; ndrange = pd1*pd2*pd3)
     return nothing
@@ -262,15 +263,13 @@ exchange_ghosts!(pg::PatchGrid) = (for a in 1:3; exchange_ghosts_axis!(pg, a); e
 # ── scatter a global IC into patches / gather patches back to a global array ───
 _interior(pg) = (pg.ng+1):(pg.ng+pg.pdim[1]), (pg.ng+1):(pg.ng+pg.pdim[2]), (pg.ng+1):(pg.ng+pg.pdim[3])
 
-# Σ f(interior cells of `fdev`) accumulated in Float64 — ON-DEVICE.  Only the scalar
-# comes back to the host (no full-grid gather/transfer).  Backend-agnostic: a
-# CuArray view-reduce on the GPU, an Array view-reduce on the CPU.  This is the
-# fast replacement for the `gather_global` + host-sum idiom in per-cycle reductions
-# (Compton drag, total mass, δ_rms) — ~250× faster than transferring the field.
+# Σ f(interior cells of `fdev`) reduced on-device, then widened only after the
+# scalar comes back to the host.  Metal cannot allocate Float64 device arrays, so
+# the reduction must stay in the array element type there.
 @inline _interior_sum(pg::PatchGrid, fdev) =
-    sum(Float64, @view _r3(fdev, pg.nd)[_interior(pg)...])
+    Float64(sum(@view _r3(fdev, pg.nd)[_interior(pg)...]))
 @inline _interior_sumsq(pg::PatchGrid, fdev) =
-    mapreduce(x -> Float64(x)^2, +, @view _r3(fdev, pg.nd)[_interior(pg)...])
+    Float64(sum(abs2, @view _r3(fdev, pg.nd)[_interior(pg)...]))
 
 "Octant ranges of patch `p` in the global ncell grid (1-based)."
 function _octant(pg::PatchGrid, p::Patch)
