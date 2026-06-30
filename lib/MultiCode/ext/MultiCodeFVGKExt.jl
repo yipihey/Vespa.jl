@@ -46,16 +46,20 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
     # f32 Euler/EulerColors path (Ge re-derived post-step).
     if get(ENV, "CIC_FVGK_F16", "0") == "1"
         if nsp == 0
-            sys = FV.EulerDE(γ = γ);             z = (1f0, 0f0, 0f0, 0f0, 1f0, 0.5f0)
+            sys = FV.EulerDE(γ = γ);             z = (1f0, 0f0, 0f0, 0f0, 1f-6, 5f-7)
         else
-            sys = FV.EulerDEColors{nsp}(γ = γ);  z = (1f0, 0f0, 0f0, 0f0, 1f0, 0.5f0, ntuple(_ -> 0f0, nsp)...)
+            sys = FV.EulerDEColors{nsp}(γ = γ);  z = (1f0, 0f0, 0f0, 0f0, 1f-6, 5f-7, ntuple(_ -> 0f0, nsp)...)
         end
         U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # GE_SCALE lifts the COLD eint into f16's normal range: CICASS Ge=ρ·eint spans ~1e-8 (z=1000)
         # down to ~4e-11 (z=20), BELOW the f16 subnormal floor (~6e-8) → raw f16 flushes to 0 → NaN.
         # 1e7 maps that range to f16-normal [~4e-4, 0.12] (and E≲1e-4 → ≲1e3, no overflow).
         gesc = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
-        return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec, de_prec = :f16, ge_scale = gesc)
+        # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
+        # alloc); the gather/scatter GE_SCALE-lift the energy slots so the cold eint survives f16 storage.
+        store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))
+        return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec,
+                             de_prec = :f16, ge_scale = gesc, store = store)
     end
     if nsp == 0
         sys = Euler(γ = γ);                 z = (1f0, 0f0, 0f0, 0f0, 1f0)
@@ -71,6 +75,9 @@ end
 
 # dual-energy grid? EulerDE[Colors] carries Ge (nconserved = 6+nsp); single-energy Euler[Colors] is 5+nsp.
 @inline _de(g, pg) = FV.nconserved(g.sys) - _nspecies(pg) == 6
+# f16-storage grid (g.R is __half)? then the energy slots (5=E,6=Ge) are stored GE_SCALE-lifted.
+@inline _f16store(g) = eltype(g.R) === Float16
+@inline _gesc() = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
 
 # Conserved fields map 1:1 onto the global var-major slots: (D,S1,S2,S3,Tau) then the species in slots
 # 6..5+nsp as LINEAR ρ·xᵢ (the EulerColors conserved colours). Ge is NOT carried (re-derived post-step).
@@ -81,11 +88,16 @@ end
 function _fvgk_gather!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5   # DE adds Ge as slot 6; species follow at hoff+q
+    f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gblock(g, nc, GVOL, c); src = MultiCode._r3(f, pg.nd)
-            @views Gblk[gi, gj, gk] .= src[li, lj, lk]
+            if f16s && c >= 5                                    # E (5), Ge (6): lift into f16's normal range
+                @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* gesc
+            else
+                @views Gblk[gi, gj, gk] .= src[li, lj, lk]
+            end
         end
         Dsrc = MultiCode._r3(p.D, pg.nd)
         for (q, sf) in enumerate(p.species)
@@ -104,12 +116,17 @@ end
 function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5
+    f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0
     GD = _gblock(g, nc, GVOL, 1)                                    # post-step global density ρ_post
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gblock(g, nc, GVOL, c); dst = MultiCode._r3(f, pg.nd)
-            @views dst[li, lj, lk] .= Gblk[gi, gj, gk]
+            if f16s && c >= 5                                       # un-lift E, Ge back to physical f32
+                @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* igesc
+            else
+                @views dst[li, lj, lk] .= Gblk[gi, gj, gk]
+            end
         end
         for (q, sf) in enumerate(p.species)
             Gblk = _gblock(g, nc, GVOL, hoff + q); dst = MultiCode._r3(sf, pg.nd)
