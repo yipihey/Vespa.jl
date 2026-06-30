@@ -45,7 +45,12 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         sys = EulerColors{nsp}(γ = γ);      z = (1f0, 0f0, 0f0, 0f0, 1f0, ntuple(_ -> 0f0, nsp)...)
     end
     U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]        # concrete Array{NTuple{5+nsp,Float32},3}
-    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx))           # placeholder; overwritten by the first gather
+    # Riemann/recon are baked into the transpiled CUDA-C at construction (cached per (sys,riemann,recon)).
+    # Default LLF+PLM (cheapest); CIC_FVGK_RIEMANN=hllc gives the contact-restoring solver (less diffusive,
+    # better for the v_bc small-scale structure) at a higher per-flux cost; CIC_FVGK_RECON=ppm for parabolic.
+    riem = Symbol(get(ENV, "CIC_FVGK_RIEMANN", "llf"))
+    rec  = Symbol(get(ENV, "CIC_FVGK_RECON",   "plm"))
+    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec)
 end
 
 # var c of the global FVGK buffer, as a (ncell...) view (column-major, var-major flat).
