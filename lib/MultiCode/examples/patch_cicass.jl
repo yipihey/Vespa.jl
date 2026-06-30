@@ -57,12 +57,17 @@ const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
 # the NEXT step's accel (FFT + scatter) while the GPU runs this step; the result is
 # applied as the gravity kick at the next step (one-step-lagged, operator-split).
 const OVERLAP = get(ENV, "CIC_OVERLAP", "0") == "1"
+# CIC_CHEM=analytic: fast closed-form chemistry for the post-recombination IGM — ONLY HII Case-B
+# recombination + Compton heat/cool off the CMB (the processes that touch the energy eq here), no
+# stiff subcycler.  CIC_CHEM=full (default) runs the general ChemistryKernels network.
+const CHEMMODE = Symbol(get(ENV, "CIC_CHEM", "full"))
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
 const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
+const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
 const REPORTS= joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
 const TAG    = get(ENV, "CIC_TAG", "")
 const XH     = 0.76
@@ -254,7 +259,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     PoissonKernels.fft_set_num_threads!(nthr)
     # CIC_CHEM_TABLES=1 (default): log–log rate table for the chemistry hot path (~2.4× the
     # stiff network on GPU, <1e-5 vs the analytic fits); =0 falls back to the analytic fits.
-    usetab  = get(ENV, "CIC_CHEM_TABLES", "1") == "1"
+    usetab  = get(ENV, "CIC_CHEM_TABLES", "1") == "1" && CHEMMODE !== :analytic   # analytic uses no tables
     tabbe   = chembk === :cpu ? :cpu : chembk
     ratetab = usetab ? ChemistryKernels.build_rate_tables(; precision=Float64, backend=tabbe) : nothing
     cooltab = usetab ? EmissionKernels.build_cooling_tables(; precision=Float64, backend=tabbe) : nothing
@@ -335,7 +340,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             @printf("  ● output z=%.2f a=%.5f  δb_rms=%.3e  D²/D₀²=%.3e  <x_HII>=%.3e  <T>=%.1f K\n",
                     zo, a, st.δrms, g2, st.xHII, st.T); flush(stdout)
             if PKMEAS                                     # on-device anisotropic P(k,μ); tiny table, no full dump
-                P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, axis=PKAXIS, scale_v=uo.v/1e5)
+                P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, nbins=PKNB, axis=PKAXIS, scale_v=uo.v/1e5)
                 pf = @sprintf("%s_pkmu.h5", ckpref)
                 h5open(pf, isfile(pf) ? "r+" : "w") do f
                     g = create_group(f, @sprintf("z%05.1f", zo))
@@ -386,7 +391,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         tg = time()
         if OVERLAP
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
-                        du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false)
+                        du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
+                        chemmode=CHEMMODE, hz=Hofa(c, a))
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
             BE === :cuda && CUDA.synchronize()            # hydro+push done ⇒ ρ_next density final
             if gravmode === :gpu
@@ -396,13 +402,15 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                     BE === :cuda && CUDA.synchronize(); g
                 end
                 patch_step!(pg, dτ; a_value=a, order=order, chem=true, du=u.d, lu=u.l, tu=u.t,
-                            do_hydro=false, do_chem=true, chem_backend=:cpu, rate_tables=ratetab, cool_tables=cooltab)   # CPU chem on main thread
+                            do_hydro=false, do_chem=true, chem_backend=:cpu, rate_tables=ratetab, cool_tables=cooltab,
+                            chemmode=CHEMMODE, hz=Hofa(c, a))   # CPU chem on main thread
                 acc = fetch(gpu); ngrav[] += 1
             else
                 ta = time(); snapshot!(dτ, a_new); asm_t[] += time()-ta        # host ρ_next for the CPU FFT
                 gpu = Threads.@spawn begin                # this step's chemistry on the GPU
                     patch_step!(pg, dτ; a_value=a, order=order, chem=true, du=u.d, lu=u.l, tu=u.t,
-                                do_hydro=false, do_chem=true, rate_tables=ratetab, cool_tables=cooltab)
+                                do_hydro=false, do_chem=true, rate_tables=ratetab, cool_tables=cooltab,
+                                chemmode=CHEMMODE, hz=Hofa(c, a))
                     BE === :cuda && CUDA.synchronize()
                 end
                 acc = solve_accel!(a_new)                 # next-step accel on the CPU, overlaps chem
@@ -411,7 +419,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         else
             acc = gravity!(a, dτ)
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
-                        du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab)
+                        du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab,
+                        chemmode=CHEMMODE, hz=Hofa(c, a))
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
         end
         grav_t[] += time() - tg
