@@ -164,21 +164,22 @@ end
     #             so α(T(t)) follows the Compton heating WITHIN the step — the dominant coupling that a plain
     #             split (k₂ at the cold start-T) gets wrong.  Then x←x/(1+k₂(T̄) n_HII Δt) and the Compton
     #             relaxation apply (n_e=n_HII; He neutral at z≲1000 — negligible).  nsub>1 refines T₀'s drift.
+    gm1 = R(gamma) - one(R)
     for _ in 1:nsub
         nHI   = max((R(fh)*d - hii_c - h2)/mh, R(1e-30))
         nHII0 = hii_c/mh
-        Told  = ChemistryKernels.temperature_from_reduced(d, e_c, hii_c, h2; fh=fh, gamma=gamma)
         ntot  = nHI + R(2)*nHII0 + nHeI                                # HI + HII + e(=HII) + HeI
+        Told  = max(gm1*d*e_c/(kB*ntot), one(R))                       # inline T (trace-H2 γ-corr negligible)
         invtC = R(2)*Lc*nHII0 / (R(3)*kB*ntot)                         # Compton rate 1/t_C
         xr    = sdt*invtC                                              # Δt/t_C
         decay = xr > R(1e-8) ? (one(R) - exp(-xr))/xr : one(R)         # ⟨e^{-t/t_C}⟩ over the step
         Tavg  = Tcmb + (Told - Tcmb)*decay                            # time-averaged T for α(T(t))
-        k2    = ChemistryKernels.peebles_k2(Tavg, nHI, Hz)            # cm³/s, incl. Peebles C (radiation Hz)
+        # Peebles C-factor only matters during recombination (z≳500); below, C≈1 ⇒ k2 = α_B (cheap)
+        k2    = z > 500 ? ChemistryKernels.peebles_k2(Tavg, nHI, Hz) : ChemistryKernels.recfast_alpha(Tavg)*R(1e6)
         nHII  = nHII0 / (one(R) + k2*nHII0*sdt)                        # n²-self-limiting recombination
         hii_c = nHII*mh
-        Tmid  = ChemistryKernels.temperature_from_reduced(d, e_c, hii_c, h2; fh=fh, gamma=gamma)
-        Tnew  = Tcmb + (Tmid - Tcmb)*exp(-xr)                          # Compton exponential relaxation
-        e_c   = e_c * (Tnew/Tmid)                                      # eint ∝ T at fixed n_tot
+        Tnew  = Tcmb + (Told - Tcmb)*exp(-xr)                          # Compton relaxation (n_tot shift ~x≪1)
+        e_c   = e_c * (Tnew/Told)                                      # eint ∝ T at fixed n_tot
     end
     return e_c, hii_c
 end
