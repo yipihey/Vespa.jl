@@ -156,10 +156,30 @@ function _fvgk_sync_ge!(pg::MultiCode.PatchGrid)
     return nothing
 end
 
+# Re-point the (np=1) patch gas fields onto g.R's ghost-free f16 blocks and free the f32 patch
+# arrays — eliminating the patch↔g.R duplication.  Energies (slots 5=Tau, 6=Ge) are GE_SCALE-lifted
+# in g.R, so pg.gesc carries the scale for the consumers (chem/drag/kick/outputs).  np=1 only (the
+# patch IS the whole grid ⇒ each block view is contiguous; np>1 octants would be strided).
+_free!(a) = (m = parentmodule(typeof(a)); isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a); nothing)
+function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
+    prod(pg.np) == 1 || error("FVGK dedup needs np=1 (got np=$(pg.np))")
+    g = pg.fvgk; g === nothing && error("_fvgk_dedup!: build the FVGK grid first (pre-build)")
+    (_f16store(g) && _de(g, pg)) || error("FVGK dedup needs CIC_FVGK_F16=1 (f16 dual-energy store)")
+    nc = pg.ncell; GVOL = prod(nc); nsp = _nspecies(pg)
+    for p in pg.patches, f in MultiCode._allfields(p); _free!(f); end
+    blk(c) = view(g.R, (c-1)*GVOL + 1 : c*GVOL)                  # contiguous f16 block view (np=1)
+    newp = MultiCode.Patch((0,0,0), blk(1), blk(2), blk(3), blk(4), blk(5), blk(6),
+                           [blk(6+q) for q in 1:nsp], ((1,1),(1,1),(1,1)))
+    pg.patches = [newp]
+    pg.ng = 0; pg.nd = pg.pdim                                   # gas fields are ghost-free now
+    pg.gesc = Float64(_gesc()); pg.packed = false; pg.dedup = true
+    return pg
+end
+
 function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     pg.fvgk === nothing && (pg.fvgk = _build_fvgk_global(pg))
     g = pg.fvgk; dtf = Float32(dt)
-    _fvgk_gather!(g, pg)
+    pg.dedup || _fvgk_gather!(g, pg)                             # dedup: patches ARE g.R, no copy
     # one 2nd-order CTU step; sub-cycle if the driver dt exceeds FVGK's CTU CFL. With species the
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
@@ -177,8 +197,8 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     else
         run_ctu!(g, dtf / nsub, nsub)
     end
-    _fvgk_scatter!(g, pg)
-    de || _fvgk_sync_ge!(pg)        # DE evolves Ge in-grid; single-energy re-derives Ge = Tau − KE
+    pg.dedup || _fvgk_scatter!(g, pg)                           # dedup: g.R IS the state, no copy back
+    de || pg.dedup || _fvgk_sync_ge!(pg)   # DE evolves Ge in-grid; single-energy re-derives Ge = Tau − KE
     return nothing
 end
 

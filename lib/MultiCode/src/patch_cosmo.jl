@@ -83,14 +83,16 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         M  += _interior_sum(pg, p.D)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
-    T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M)
+    T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M); gs = T(pg.gesc)
+    f32 = Float32   # promote the KE so cold-gas Sᵢ² doesn't underflow f16 g.R storage (dedup)
     for p in pg.patches
-        ke0 = (p.S1.^2 .+ p.S2.^2 .+ p.S3.^2) ./ (2 .* p.D)
+        d = f32.(p.D)
+        ke0 = (f32.(p.S1).^2 .+ f32.(p.S2).^2 .+ f32.(p.S3).^2) ./ (2 .* d)
         p.S1 .= p.D .* vx .+ (p.S1 .- p.D .* vx) .* ff
         p.S2 .= p.D .* vy .+ (p.S2 .- p.D .* vy) .* ff
         p.S3 .= p.D .* vz .+ (p.S3 .- p.D .* vz) .* ff
-        ke1 = (p.S1.^2 .+ p.S2.^2 .+ p.S3.^2) ./ (2 .* p.D)
-        p.Tau .+= ke1 .- ke0                                # internal energy unchanged
+        ke1 = (f32.(p.S1).^2 .+ f32.(p.S2).^2 .+ f32.(p.S3).^2) ./ (2 .* d)
+        p.Tau .+= eltype(p.Tau).((ke1 .- ke0) .* gs)        # internal energy fixed; gs lifts f16 g.R Tau
     end
     return nothing
 end

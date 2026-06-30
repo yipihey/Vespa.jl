@@ -164,7 +164,7 @@ function max_signal(pg)
     iv(f) = @view reshape(f, pg.nd)[li, lj, lk]      # INTERIOR view (exclude ghosts) so the
     for p in pg.patches                              # CFL timestep depends only on the physical
         D = iv(p.D)                                  # state — makes checkpoint/restart bit-exact
-        cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (iv(p.Ge) ./ D), 0))   # (and avoids D=0 ghost NaNs)
+        cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (iv(p.Ge) ./ D ./ pg.gesc), 0))   # un-lift f16 g.R Ge (gesc)
         sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ 3 .* cs
         smax = max(smax, Float64(maximum(sig)))
     end
@@ -181,7 +181,7 @@ function write_cellcmp(pg, c::Cosmo, u, a, z)
     HII = Float64.(vec(g.species[1]))
     H2I = length(g.species) >= 2 ? Float64.(vec(g.species[2])) : zero(HII)
     HDI = length(g.species) >= 3 ? Float64.(vec(g.species[3])) : zero(HII)
-    eint = Float64.(vec(g.Ge)) ./ ρb
+    eint = Float64.(vec(g.Ge)) ./ ρb ./ pg.gesc        # un-lift f16 g.R Ge (gesc=1 unless dedup)
     xHIIv = HII ./ ρb ./ XH; fH2v = H2I ./ ρb ./ XH; fHDv = HDI ./ ρb
     μv = 1.0 ./ ((XH + (1-XH)/4) .+ XH .* (xHIIv .- 0.5 .* fH2v))
     Tcell = eint .* ((GAMMA-1) .* μv .* u.T2)                  # K
@@ -360,6 +360,15 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         patch_step!(pg, 0.0; a_value=a, order=(1,2,3), accel=nothing, chem=false, solver=:fvgk,
                     du=u_i.d, lu=u_i.l, tu=u_i.t, do_hydro=true, do_chem=false, chemmode=CHEMMODE)
         BE === :cuda && CUDA.synchronize()
+        # CIC_FVGK_DEDUP=1 (np=1): drop the f32 patch gas copy — repoint the gas fields onto g.R's
+        # ghost-free f16 blocks (energies GE_SCALE-lifted, carried via pg.gesc).  Eliminates ~11 GB
+        # at 760³ (patch storage = the FVGK grid's duplicate).  The pre-build above first loads g.R.
+        if get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
+            MultiCode._fvgk_dedup!(pg)
+            BE === :cuda && CUDA.synchronize()
+            @printf("  FVGK dedup ON: patch gas → g.R views, ng=0, gesc=%.0e, f32 patch copy freed\n", pg.gesc)
+            flush(stdout)
+        end
     end
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing

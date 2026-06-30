@@ -37,7 +37,7 @@ struct Patch{A,S}
 end
 
 "The decomposition: a uniform periodic ncell³ grid tiled into np patches, GPU-resident."
-mutable struct PatchGrid{A,S}
+mutable struct PatchGrid
     backend                              # PPMKernels backend handle
     besym   ::Symbol                     # backend name (:cpu/:cuda/:metal) for ChemistryKernels
     T       ::DataType                   # element type (Float64 on cpu, Float32 on gpu)
@@ -51,8 +51,12 @@ mutable struct PatchGrid{A,S}
     du      ::Float64; lu::Float64; tu::Float64   # chem cgs unit factors
     deut    ::Bool                       # H+D chemistry (3 species) vs H-only (2)
     packed  ::Bool                       # species stored as packed UInt16 fractions (vs f32 ρ·xᵢ)
-    patches ::Vector{Patch{A,S}}
+    patches ::Vector                     # Vector{Patch{...}} — loosely typed so the FVGK dedup can
+                                         # repoint the gas fields to (different-typed) g.R block views
     fvgk    ::Any                        # nothing, or per-patch FiniteVolumeGodunovKA grids (solver=:fvgk)
+    gesc    ::Float64                    # GE_SCALE on the stored energy slots (1.0 normally; >1 when the
+                                         # gas fields are f16 g.R views in the FVGK dedup — see ext)
+    dedup   ::Bool                       # gas fields ARE the FVGK grid g.R (no patch copy, ng=0); ext-set
 end
 
 _lin(ix, iy, iz, np) = ix + np[1]*iy + np[1]*np[2]*iz + 1
@@ -91,13 +95,18 @@ function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                              zeros_dev(), zeros_dev(), SA[spec_zeros() for _ in 1:nspecies], nbr)
     end
     PatchGrid(backend, besym, T, ng, np, ncell, pdim, nd, Float64(dx), Float64(gamma),
-              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing)
+              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing, 1.0, false)
 end
 
 # Hydro-solver hook for `solver=:fvgk`: overridden by `MultiCodeFVGKExt` when
 # `FiniteVolumeGodunovKA` is loaded. Advances every patch one full step of `dt` with the
 # FiniteVolumeGodunovKA Godunov scheme (it owns the periodic boundary internally).
 function _fvgk_patch_hydro! end
+
+# Re-point the (np=1) patch gas fields onto the persistent FVGK grid g.R blocks (ghost-free f16
+# views), free the f32 patch arrays, and set ng=0 / gesc=GE_SCALE / dedup=true.  Eliminates the
+# patch↔g.R duplication.  Defined by MultiCodeFVGKExt (only meaningful for solver=:fvgk).
+function _fvgk_dedup! end
 
 # ── interior-only chemistry: strided, in-place, f32 storage / f64 network ──────────────────────
 # Processes ONLY the pdim³ interior cells: maps the linear interior thread → the strided nd³ index
@@ -184,33 +193,33 @@ end
     return e_c, hii_c
 end
 
-@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
+@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int, gesc,
                                    nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
-        TT = eltype(D); t0 = t - 1
+        TT = eltype(Ge); t0 = t - 1                  # energy eltype (f16 g.R view in dedup, else f32)
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
+        d = Float64(D[idx]); e0 = (Float64(Ge[idx])/gesc) / d           # un-lift the stored energy slot
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, Float64(sp1[idx])*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
-        Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0)); sp1[idx] = TT(hii_n/du)
+        Ge[idx]  = TT(d*enew*gesc); Tau[idx] = Tau[idx] + TT(d*(enew - e0)*gesc); sp1[idx] = eltype(sp1)(hii_n/du)
     end
 end
 
-@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
+@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int, gesc,
                                           nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
-        TT = eltype(D); t0 = t - 1
+        TT = eltype(Ge); t0 = t - 1
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
+        d = Float64(D[idx]); e0 = (Float64(Ge[idx])/gesc) / d
         hii = Float64(ChemistryKernels.decode_log2sp(Float64, sp1[idx]))*d   # fraction → code mass dens
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
-        Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0))
-        sp1[idx] = ChemistryKernels.encode_log2sp(TT(hii_n/du/d))            # back to mass fraction
+        Ge[idx]  = TT(d*enew*gesc); Tau[idx] = Tau[idx] + TT(d*(enew - e0)*gesc)
+        sp1[idx] = ChemistryKernels.encode_log2sp(eltype(D)(hii_n/du/d))     # back to mass fraction
     end
 end
 
@@ -218,7 +227,7 @@ end
 function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, nsub::Int)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
     args = (p.D, p.Ge, p.Tau, p.species[1], Float64(du), Float64((lu/tu)^2), Float64(tu),
-            Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma), Int(nsub),
+            Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma), Int(nsub), pg.gesc,
             nd1, nd2, pg.ng, pd1, pd2)
     (pg.packed ? _chem_analytic_packed_k! : _chem_analytic_k!)(pg.backend)(args...; ndrange = pd1*pd2*pd3)
     return nothing
@@ -356,6 +365,24 @@ end
     return nothing
 end
 
+# One KDK ½ gravity kick over all patches.  Non-dedup: `accel` is a per-patch Vector of ghosted
+# potential blocks (grav_kick_from_potential!).  Dedup: gas fields are ghost-free g.R views and
+# `accel` is the single GLOBAL potential read with periodic wrap (grav_kick_from_global_potential!,
+# GE_SCALE-aware so the f16-lifted Tau slot stays consistent).
+function _apply_grav_kick!(pg::PatchGrid, accel, dt)
+    if pg.dedup
+        p = pg.patches[1]
+        PoissonKernels.grav_kick_from_global_potential!(accel, p.D, p.S1, p.S2, p.S3, p.Tau;
+            nc=pg.ncell, dx=pg.dx, halfdt=0.5*dt, gesc=pg.gesc)
+    else
+        for (p, φb) in zip(pg.patches, accel)
+            PoissonKernels.grav_kick_from_potential!(φb, p.D, p.S1, p.S2, p.S3, p.Tau;
+                dims=pg.nd, ng=pg.ng, dx=pg.dx, halfdt=0.5*dt)
+        end
+    end
+    return nothing
+end
+
 # ── per-cycle hydro + chemistry over all patches ──────────────────────────────
 """
     patch_step!(pg, dt; a_value, order=(1,2,3), accel=nothing, chem=true)
@@ -382,12 +409,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
       if do_hydro
         # ½ gravity kick (pre) — `accel` is per-patch POTENTIAL blocks; g = −∇φ is
         # central-differenced inline (no stored accel field), KE-consistent KDK.
-        if accel !== nothing
-            for (p, φb) in zip(pg.patches, accel)
-                PoissonKernels.grav_kick_from_potential!(φb, p.D, p.S1, p.S2, p.S3, p.Tau;
-                    dims=pg.nd, ng=pg.ng, dx=pg.dx, halfdt=0.5*dt)
-            end
-        end
+        accel === nothing || _apply_grav_kick!(pg, accel, dt)
         # dimensionally-split hydro, halo refreshed before each axis sweep.
         # COMPUTE-WITH-OVERLAP: the PPM solver's flux at a pencil's active-EDGE interface
         # is computed with a boundary stencil that differs from an interior interface, so a
@@ -441,12 +463,7 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             end
         end
         # ½ gravity kick (post)
-        if accel !== nothing
-            for (p, φb) in zip(pg.patches, accel)
-                PoissonKernels.grav_kick_from_potential!(φb, p.D, p.S1, p.S2, p.S3, p.Tau;
-                    dims=pg.nd, ng=pg.ng, dx=pg.dx, halfdt=0.5*dt)
-            end
-        end
+        accel === nothing || _apply_grav_kick!(pg, accel, dt)
         # hydro phase without chem: synchronize so the scratch pool isn't released
         # while the async kernels still reference it (chem's own sync covers the joint case)
         do_chem || PPMKernels.KA.synchronize(be)
