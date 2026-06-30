@@ -121,9 +121,9 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
     nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
     if _nspecies(pg) > 0
-        run_ctu!(g, dtf / nsub, nsub)
+        run_ctu!(g, dtf / nsub, nsub)        # f32: the f16-tiled run_ctus! can't carry colours yet
     else
-        run_ctus!(g, dtf / nsub, nsub)
+        run_ctus!(g, dtf / nsub, nsub)       # pure hydro: fast f16-tiled path
     end
     _fvgk_scatter!(g, pg)
     _fvgk_sync_ge!(pg)
