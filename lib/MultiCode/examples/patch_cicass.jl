@@ -64,6 +64,14 @@ const CHEMMODE = Symbol(get(ENV, "CIC_CHEM", "full"))
 # CIC_CHEM_NSUB: analytic sub-steps per hydro step (default 1 = fastest).  >1 tracks the evolving
 # T so k2(T) follows the Compton heating within the step → tighter match to the stiff network.
 const CHEMNSUB = parse(Int, get(ENV, "CIC_CHEM_NSUB", "1"))
+# analytic chem only evolves HII, so carry a SINGLE color (HII) — H2I/HDI are unused tracers.
+# Fewer colors = less advection AND a normal-valued color the FVGK f16-tiled path can carry.
+const NSPEC = CHEMMODE === :analytic ? 1 : 3
+const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full network
+# CIC_PHASE_TIMING=1: CUDA-synced per-phase split (gravity | hydro | chem | particles).  Adds
+# barriers that serialize the GPU, so it INFLATES the wall a bit — use it only for the breakdown,
+# never to quote production throughput (the uninstrumented sec/cyc is the real number).
+const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
@@ -115,7 +123,8 @@ function gas_ic(snap, c::Cosmo, a_i, u_i)
     end
     @printf("gas IC: f_b=%.4f  T_gas=%.1f K (eint=%.3e code)  x_HII0=%.3e  v→code=%.4e\n",
             c.fb, Tg, eint, xHII0, vconv); flush(stdout)
-    return (D=Float64.(D), S1=S1, S2=S2, S3=S3, Tau=Tau, Ge=Ge, species=[HII,H2I,HDI])
+    species = NSPEC == 1 ? [HII] : [HII, H2I, HDI]    # analytic: HII-only color
+    return (D=Float64.(D), S1=S1, S2=S2, S3=S3, Tau=Tau, Ge=Ge, species=species)
 end
 
 # ── dark-matter particle SoA (global box-normalized [0,1) positions, code velocities) ──
@@ -155,7 +164,9 @@ max_pvel(parts) = max(Float64(maximum(abs.(parts.vx))),
 function write_cellcmp(pg, c::Cosmo, u, a, z)
     g = gather_global(pg)
     ρb  = Float64.(vec(g.D))
-    HII = Float64.(vec(g.species[1])); H2I = Float64.(vec(g.species[2])); HDI = Float64.(vec(g.species[3]))
+    HII = Float64.(vec(g.species[1]))
+    H2I = length(g.species) >= 2 ? Float64.(vec(g.species[2])) : zero(HII)
+    HDI = length(g.species) >= 3 ? Float64.(vec(g.species[3])) : zero(HII)
     eint = Float64.(vec(g.Ge)) ./ ρb
     xHIIv = HII ./ ρb ./ XH; fH2v = H2I ./ ρb ./ XH; fHDv = HDI ./ ρb
     μv = 1.0 ./ ((XH + (1-XH)/4) .+ XH .* (xHIIv .- 0.5 .* fH2v))
@@ -237,8 +248,8 @@ function main()
 
     # build the decomposition (dx=1/ncell: super-comoving box=1, a absorbed into units)
     dx = 1.0 / N
-    pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
-                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=true, packed_species=PACKED)
+    pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
+                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
     scatter_global!(pg, gas_ic(snap, c, a_start, u_i))
     parts = dm_ic(snap, c, u_i, pg.backend)
     return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
@@ -276,6 +287,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
+    gph_t = Ref(0.0); hyd_t = Ref(0.0); chm_t = Ref(0.0); prt_t = Ref(0.0); nph = Ref(0)  # CIC_PHASE_TIMING
 
     # output checkpoints in a: explicit CIC_ZOUT="z1,z2,…" (the cross-code list) or log-spaced.
     # Anchor the log-spaced schedule to ZSTART (NOT a_start) so it is IDENTICAL on a restart —
@@ -419,6 +431,22 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                 acc = solve_accel!(a_new)                 # next-step accel on the CPU, overlaps chem
                 wait(gpu)
             end
+        elseif PHASE
+            # per-phase split (CUDA-synced): gravity | hydro | chem | particles
+            sync() = (BE === :cuda && CUDA.synchronize())
+            sync(); tt = time(); acc = gravity!(a, dτ); sync(); gph_t[] += time()-tt
+            tt = time()
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+                        du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
+                        chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
+            sync(); hyd_t[] += time()-tt; tt = time()
+            patch_step!(pg, dτ; a_value=a, order=order, chem=true, solver=SOLVER,
+                        du=u.d, lu=u.l, tu=u.t, do_hydro=false, do_chem=true, chem_backend=chembk,
+                        rate_tables=ratetab, cool_tables=cooltab,
+                        chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
+            sync(); chm_t[] += time()-tt; tt = time()
+            pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
+            sync(); prt_t[] += time()-tt; nph[] += 1
         else
             acc = gravity!(a, dτ)
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
@@ -446,6 +474,14 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         end
     end
 
+    if PHASE && nph[] > 0
+        let n = nph[], tot = (gph_t[]+hyd_t[]+chm_t[]+prt_t[])/nph[]
+            @printf("\nPER-PHASE (CUDA-synced, %d cyc, %s/%s): gravity %.4f | hydro %.4f | chem %.4f | particles %.4f  → %.4f s/cyc\n",
+                    n, SOLVER, CHEMMODE, gph_t[]/n, hyd_t[]/n, chm_t[]/n, prt_t[]/n, tot)
+            @printf("  shares: gravity %.0f%% | hydro %.0f%% | chem %.0f%% | particles %.0f%%\n",
+                    100gph_t[]/n/tot, 100hyd_t[]/n/tot, 100chm_t[]/n/tot, 100prt_t[]/n/tot)
+        end
+    end
     @printf("\nmass drift over run: %.3e\n", abs(total_mass(pg)-m0)/m0)
     let n=max(ngrav[],1)
         @printf("top-grid gravity (%s): %.4f s/solve  [assemble %.4f | FFT %.4f | patch_accel %.4f | part_field %.4f] over %d solves\n",

@@ -152,7 +152,7 @@ end
 # peebles_k2 (Peebles C-factor; needs Hz) and temperature_from_reduced, so T and k2 are identical to the
 # stiff path.  Λc, Tγ match EmissionKernels (COMPA=5.65e-36, Tγ=2.725·(1+z)).  n_e = n_HII (He neutral at
 # z≲2000).  H2/HD carry NO energy here and are left as advected colours (not evolved).  Pure; GPU-safe.
-@inline function _recomb_compton_cell(d, e0, hii, h2, dt, z, Hz, fh, gamma, nsub::Int)
+@inline function _recomb_compton_cell(d, e0, hii, dt, z, Hz, fh, gamma, nsub::Int)
     R = typeof(e0)
     mh = R(ChemistryKernels.MH); kB = R(ChemistryKernels.KBOLTZ)
     Tcmb = R(2.725)*(one(R)+R(z)); Lc = R(5.65e-36)*(one(R)+R(z))^4    # ≡ comp2_cmb / comp1_cmb
@@ -166,7 +166,7 @@ end
     #             relaxation apply (n_e=n_HII; He neutral at z≲1000 — negligible).  nsub>1 refines T₀'s drift.
     gm1 = R(gamma) - one(R)
     for _ in 1:nsub
-        nHI   = max((R(fh)*d - hii_c - h2)/mh, R(1e-30))
+        nHI   = max((R(fh)*d - hii_c)/mh, R(1e-30))                    # HII-only color; H2/HD not carried
         nHII0 = hii_c/mh
         ntot  = nHI + R(2)*nHII0 + nHeI                                # HI + HII + e(=HII) + HeI
         Told  = max(gm1*d*e_c/(kB*ntot), one(R))                       # inline T (trace-H2 γ-corr negligible)
@@ -184,7 +184,7 @@ end
     return e_c, hii_c
 end
 
-@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
+@kernel function _chem_analytic_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
                                    nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -192,14 +192,13 @@ end
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
         d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
-        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, Float64(sp1[idx])*du, Float64(sp2[idx])*du,
-                                          dt*tu, z, Hz, fh, gamma, nsub)
+        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, Float64(sp1[idx])*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0)); sp1[idx] = TT(hii_n/du)
     end
 end
 
-@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, sp2, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
+@kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int,
                                           nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -208,19 +207,17 @@ end
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
         d = Float64(D[idx]); e0 = Float64(Ge[idx]) / d
         hii = Float64(ChemistryKernels.decode_log2sp(Float64, sp1[idx]))*d   # fraction → code mass dens
-        h2  = Float64(ChemistryKernels.decode_log2sp(Float64, sp2[idx]))*d
-        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, h2*du, dt*tu, z, Hz, fh, gamma, nsub)
+        e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew); Tau[idx] = Tau[idx] + TT(d*(enew - e0))
         sp1[idx] = ChemistryKernels.encode_log2sp(TT(hii_n/du/d))            # back to mass fraction
     end
 end
 
-"Fast analytic recombination + Compton on patch `p`'s interior (no stiff solver; needs Hz [s⁻¹])."
+"Fast analytic recombination + Compton on patch `p`'s interior (HII-only color; no stiff solver; needs Hz)."
 function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, nsub::Int)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
-    sp2 = length(p.species) >= 2 ? p.species[2] : p.species[1]
-    args = (p.D, p.Ge, p.Tau, p.species[1], sp2, Float64(du), Float64((lu/tu)^2), Float64(tu),
+    args = (p.D, p.Ge, p.Tau, p.species[1], Float64(du), Float64((lu/tu)^2), Float64(tu),
             Float64(dt), Float64(1.0/a_value - 1.0), Float64(hz), 0.76, Float64(pg.gamma), Int(nsub),
             nd1, nd2, pg.ng, pd1, pd2)
     (pg.packed ? _chem_analytic_packed_k! : _chem_analytic_k!)(pg.backend)(args...; ndrange = pd1*pd2*pd3)
