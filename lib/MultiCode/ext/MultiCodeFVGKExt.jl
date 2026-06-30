@@ -125,11 +125,13 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
     nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
-    # Pure hydro → fast f16-tiled run_ctus!.  WITH species the default is all-f32 run_ctu!: (1) the
-    # f16-tiled path still faults on the Vespa-assembled grid (separate from the colour underflow the
-    # FVGK f32 side-channel now fixes), and (2) f16's dual-energy Ge=Tau-½S²/D cancellation corrupts a
-    # COLD gas's internal energy.  CIC_FVGK_F16=1 opts into run_ctus! (f16 hydro + f32 colours) for
-    # warm-gas / non-dual-energy use once the grid fault is resolved.
+    # Pure hydro → fast f16-tiled run_ctus!.  WITH species the default is all-f32 run_ctu!: the f16 tile
+    # carries E in __half, so for the COLD CICASS gas (eint ≈ 1e-6 ≪ KE) the E−½S²/D pressure cancellation
+    # underflows → NaN (verified: f16 NaNs ~10M cells/step on the real z≈1000 state, f32 zero).  Those NaNs
+    # propagate to NaN particle positions → the CIC deposit's atomic index goes out of bounds → the CUDA-700
+    # "grid fault" (it was never a grid/kernel bug — run_ctus! is memcheck-clean on the same data).  The fix
+    # is a mixed-precision DUAL-ENERGY tile (f16 ρ,ρv; f32 E + an evolved Ge); CIC_FVGK_F16=1 is unsafe here
+    # until that lands — for warm single-energy gas it is fine.
     if _nspecies(pg) == 0 || get(ENV, "CIC_FVGK_F16", "0") == "1"
         run_ctus!(g, dtf / nsub, nsub)
     else
