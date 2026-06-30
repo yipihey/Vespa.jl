@@ -132,8 +132,12 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
     # "grid fault" (it was never a grid/kernel bug — run_ctus! is memcheck-clean on the same data).  The fix
     # is a mixed-precision DUAL-ENERGY tile (f16 ρ,ρv; f32 E + an evolved Ge); CIC_FVGK_F16=1 is unsafe here
     # until that lands — for warm single-energy gas it is fine.
+    # CIC_FVGK_INTEGRATOR=rk2 → run_rk2! (MUSCL + SSP-RK2; no transverse corrections, cheaper than CTU but
+    # more diffusive, tighter CFL).  Default ctu = run_ctu! (transverse-corrected, accurate).
     if _nspecies(pg) == 0 || get(ENV, "CIC_FVGK_F16", "0") == "1"
         run_ctus!(g, dtf / nsub, nsub)
+    elseif get(ENV, "CIC_FVGK_INTEGRATOR", "ctu") == "rk2"
+        run_rk2!(g, dtf / nsub, nsub)
     else
         run_ctu!(g, dtf / nsub, nsub)
     end
