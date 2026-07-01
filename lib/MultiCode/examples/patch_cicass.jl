@@ -106,13 +106,16 @@ const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
 # CIC_NODUMP=1: skip the multi-GB per-output cellcmp .bin (still compute+print the δrms/xHII/T
 # diagnostic).  For P(k)-only analysis runs (CIC_PK=1) that don't need the full-state field dumps.
 const NODUMP = get(ENV, "CIC_NODUMP", "0") == "1"
-# CIC_VEL16=1: store DM particle velocities as Float16 while keeping positions Float32.
-# The particle kick promotes to at least f32 and stores back to the velocity element type.
-const VEL16 = get(ENV, "CIC_VEL16", "0") == "1"
-# CIC_GRAV1BUF=1 (GPU gravity only): share one nc³ device field for ρ/φ and let particles
-# read the global potential directly, avoiding the padded φ copy.
+# CIC_VEL16=1: store DM particle VELOCITIES as Float16 (positions stay f32) — 24→18 B/cell of
+# particle storage.  The kick/drift math is promoted to f32 (particle_kick!/drift! compute in
+# ≥f32), so only the between-step velocity storage is f16.  Small P(k)/growth cost — validate.
+const VEL16  = get(ENV, "CIC_VEL16",  "0") == "1"
+# CIC_GRAV1BUF=1 (gpu gravity): consolidate the gravity buffers — (a) share ONE device field for
+# both ρ and φ (the rfft solve is in-place), and (b) particles read that GLOBAL φ with periodic
+# wrap instead of a padded (ncell+2ng2)³ copy.  Drops ρd+φpad → ~4 B/cell persistent + a lower
+# per-solve peak.  Bit-identical (in-place FFT + wrap == padded ghost fill).
 const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1"
-GRAV1BUF && OVERLAP && error("CIC_GRAV1BUF shares the ρ/φ buffer; disable CIC_OVERLAP so particles read φ before it is overwritten.")
+GRAV1BUF && OVERLAP && error("CIC_GRAV1BUF shares the ρ/φ buffer; the async CIC_OVERLAP gravity would overwrite the live φ before the push reads it. Set CIC_OVERLAP=0.")
 # CIC_GRAV_HOST32=1: CPU-gravity host density/potential arrays are Float32. This is the
 # Metal hero default; CPU-f64 reference runs can leave it off.
 const GRAV_HOST32 = get(ENV, "CIC_GRAV_HOST32", "0") == "1"
@@ -203,7 +206,7 @@ function dm_ic(snap, c::Cosmo, u_i, backend)
     pos = snap.dm_pos; vel = snap.dm_vel; Npart = size(pos, 1)
     vconv = 1.0e5 / u_i.v
     dev(v) = PPMKernels.to_device(backend, v, T)
-    VT = VEL16 ? Float16 : T
+    VT = VEL16 ? Float16 : T                             # positions stay f32; velocities opt-in f16
     mkv(col, conv) = PPMKernels.to_device(backend, [VT(conv*col[p]) for p in 1:Npart], VT)
     px = dev([T(mod(pos[p,1], 1.0)) for p in 1:Npart])
     py = dev([T(mod(pos[p,2], 1.0)) for p in 1:Npart])
@@ -739,6 +742,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     # full-GPU gravity scratch in pg.T (Float32) — the mean is the known Ω-fixed constant
     # (subtracted in assemble_global_density_gpu!), so no f64 reduction / no f64 arrays needed.
     ρd = gravmode === :gpu ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
+    # GRAV1BUF: φ shares ρ's buffer (in-place rfft solve) — one nc³ field instead of two.
     φd = gravmode === :gpu ? (GRAV1BUF ? ρd : PPMKernels.device_zeros(pg.backend, T, ncell)) : nothing
     # CPU-gravity DM deposit scratch. Reused each solve; otherwise the Metal path allocates
     # a full device density and full host conversion every gravity call.

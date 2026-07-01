@@ -384,13 +384,14 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     # ghost depth pg.ng (the FVGK dedup sets pg.ng=0, but particles still need the padded potential).
     be = pg.backend; nc = pg.ncell
     ρd === nothing && (ρd = PPMKernels.device_zeros(be, pg.T, nc))
-    φd === nothing && (φd = PPMKernels.device_zeros(be, pg.T, nc))     # may alias ρd
+    φd === nothing && (φd = PPMKernels.device_zeros(be, pg.T, nc))     # may alias ρd (in-place solve)
     assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens)
     PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # rfft, φd may === ρd
     # dedup: the gas kick reads the GLOBAL φ directly (grav_kick_from_global_potential!), so the
     # per-patch ghosted φ-block copy is unnecessary — pass φd itself as the "accel".
     gas = pg.dedup ? φd : patch_accel_gpu(pg, φd; dx=pg.dx)
     if global_push
+        # particles read the GLOBAL φ (periodic wrap) — no padded (ncell+2ng2)³ copy, no fill work.
         return (gas=gas, phi=φd, le=0.0, cs=1.0/nc[1], nc=nc)
     end
     φpad, le, cs = particle_accel_field_gpu(pg, φd; ng2=ng2)

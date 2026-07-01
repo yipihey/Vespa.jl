@@ -25,8 +25,8 @@ const NP   = parse(Int, get(ENV, "CIC_NP", "2"))
 const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
 const PIDS   = get(ENV, "CIC_PIDS", "1") == "1"
 const DEDUP  = get(ENV, "CIC_FVGK_DEDUP", "0") == "1"
-const VEL16  = get(ENV, "CIC_VEL16", "0") == "1"
-const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1"
+const VEL16  = get(ENV, "CIC_VEL16",  "0") == "1"   # f16 particle velocities (positions stay f32)
+const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1" # ρ/φ share one buffer (in-place solve)
 const NSPEC  = 1                              # analytic chem carries one colour (HII)
 const GAMMA  = 5/3
 ENV["CIC_FVGK_F16"]  = get(ENV, "CIC_FVGK_F16",  "1")
@@ -103,13 +103,13 @@ function probe(N)
     PIDS && (parts = (; parts..., id=dzero(Int32)))
 
     ρd = PoissonKernels.device_zeros(pg.backend, T, ncell)
-    φd = GRAV1BUF ? ρd : PoissonKernels.device_zeros(pg.backend, T, ncell)
+    φd = GRAV1BUF ? ρd : PoissonKernels.device_zeros(pg.backend, T, ncell)  # share ⇒ one nc³ field
 
     # per-component byte breakdown (device only)
     patch_b = pg.dedup ? 0 : sum(p -> sum(devbytes, MultiCode._allfields(p)), pg.patches)
     fvgk_b  = pg.fvgk === nothing ? 0 : sum(fvgk_bytes, pg.fvgk isa AbstractVector ? pg.fvgk : (pg.fvgk,))
     part_b  = sum(devbytes, values(parts))
-    grav_b  = GRAV1BUF ? devbytes(ρd) : devbytes(ρd) + devbytes(φd)
+    grav_b  = GRAV1BUF ? devbytes(ρd) : devbytes(ρd) + devbytes(φd)   # shared ⇒ count once
 
     reclaim_backend()
     live = live_backend()

@@ -132,9 +132,9 @@ function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Rea
     else
         axp, ayp, azp = scratch
     end
-    # force = −∇φ central-differenced at the CIC cells (no stored accel). With
-    # `nc !== nothing`, read the global nc³ potential directly with periodic wrap
-    # instead of a padded potential copy.
+    # force = −∇φ central-differenced at the CIC cells (no stored accel).  `nc !== nothing`
+    # ⇒ read the GLOBAL nc³ φ with periodic wrap (no padded copy — the consolidated-gravity path);
+    # else read the ghosted padded block `φpad`.  axp is similar(px) ⇒ f32 even when velocities are f16.
     if nc === nothing
         le = (leftedge, leftedge, leftedge)
         PoissonKernels.interp_force_from_potential!(axp, ayp, azp,
