@@ -85,8 +85,11 @@ const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full
 # never to quote production throughput (the uninstrumented sec/cyc is the real number).
 const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
 # CIC_PSORT=K: Morton-sort the DM particle SoA every K steps to keep the CIC deposit/force-gather
-# coalesced as the DM clusters (bit-identical — deposit+push are order-independent).  0 = off.
+# coalesced as the DM clusters.  0 = off.  On Metal, CIC_PSORT_MODE=auto uses a low-memory
+# coarse-bucket Morton reorder (CIC_PSORT_BUCKET, power-of-two, default ≤256) because Metal has no
+# native GPU sortperm; CUDA/CPU keep the stable full sort unless CIC_PSORT_MODE=bucket is forced.
 const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
+const SORT_TIMING = get(ENV, "CIC_SORT_TIMING", "0") == "1"
 
 const MAX_SIGNAL_GROUP = 256
 const _MAX_SIGNAL_CACHE = Dict{Any,Any}()
@@ -835,7 +838,14 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
 
         # ── Morton-resort the DM SoA every PSORT steps (keeps deposit/gather coalesced; bit-identical) ──
         if PSORT > 0 && cyc % PSORT == 0
+            tsort = time()
             morton_sort_particles!(parts; N=N)
+            if SORT_TIMING
+                @printf("  PSORT: cycle %d  %.3f s  mode=%s bucket=%s\n",
+                        cyc, time() - tsort, get(ENV, "CIC_PSORT_MODE", "auto"),
+                        get(ENV, "CIC_PSORT_BUCKET", "auto"))
+                flush(stdout)
+            end
         end
 
         # ── outputs at crossed checkpoints (checked BEFORE stepping so a lands exactly) ──

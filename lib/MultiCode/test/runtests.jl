@@ -158,6 +158,7 @@ include("test_sedov_compare.jl")   # the science-grade run: one Sedov IC, four e
 include("test_amr_guest.jl")       # the guest slot under AMR (composite raster)
 include("test_amr_fastpath.jl")    # Next-3: the per-level fast path (ghosts + flux registers)
 include("test_gravity_slot.jl")    # Next-4: the gravity guest slot (KA Poisson vs RAMSES MG)
+include("test_particle_sort.jl")   # CICASS Metal: low-memory bucket particle reorder
 include("test_dfmm_engine.jl")     # Next-5: dfmm via the MultiCodeDfmmExt package extension
 include("test_athena_engine.jl")   # Next-8: Athena++ via MultiCodeAthenaExt (registry on-ramp)
 # Next-11: the GADGET-4 halo service — in its OWN PROCESS: HDF5.jl (via

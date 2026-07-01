@@ -31,7 +31,7 @@ using EnzoLib
 using RamsesLib
 using ArepoLib
 using PPMKernels
-using KernelAbstractions: @kernel, @index
+using KernelAbstractions: @kernel, @index, @atomic
 import PoissonKernels
 import ChemistryKernels
 import R3D
@@ -87,7 +87,7 @@ export assemble_global_density!, solve_global_poisson!, patch_accel, patch_accel
 export particle_accel_field, assemble_global_density_gpu!, particle_accel_field_gpu, global_gravity_gpu
 export patch_power_spectra
 export Cosmo, cosmo_units, dadtau, dtau_for_dlna, Hofa, growth_D, compton_drag_over_H
-export compton_drag_patches!, push_particles!, z_to_a, a_to_z, morton_sort_particles!
+export compton_drag_patches!, push_particles!, z_to_a, a_to_z, morton_sort_particles!, bucket_morton_sort_particles!
 
 """
     run_dfmm_sod(spec = SodSpec(gamma = 5/3, t = 0.2); N = 200, tau = 1e-3,

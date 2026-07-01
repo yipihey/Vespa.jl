@@ -179,6 +179,48 @@ end
     end
 end
 
+@inline function _bucket_key_pos(x, y, z, Bf::Float32, Bm1::UInt32)
+    fx = max(0f0, Float32(x) * Bf)
+    fy = max(0f0, Float32(y) * Bf)
+    fz = max(0f0, Float32(z) * Bf)
+    ix = min(unsafe_trunc(UInt32, floor(fx)), Bm1)
+    iy = min(unsafe_trunc(UInt32, floor(fy)), Bm1)
+    iz = min(unsafe_trunc(UInt32, floor(fz)), Bm1)
+    return _morton3(ix, iy, iz)
+end
+
+@kernel function _bucket_hist_k!(counts, @Const(px), @Const(py), @Const(pz), Bf::Float32, Bm1::UInt32)
+    p = @index(Global)
+    @inbounds begin
+        b = Int(_bucket_key_pos(px[p], py[p], pz[p], Bf, Bm1)) + 1
+        @atomic counts[b] + UInt32(1)
+    end
+end
+
+@kernel function _exclusive_from_inclusive_k!(starts, @Const(counts))
+    i = @index(Global)
+    @inbounds starts[i] = starts[i] - counts[i]
+end
+
+@kernel function _bucket_dest_k!(dest, starts, @Const(px), @Const(py), @Const(pz), Bf::Float32, Bm1::UInt32)
+    p = @index(Global)
+    @inbounds begin
+        b = Int(_bucket_key_pos(px[p], py[p], pz[p], Bf, Bm1)) + 1
+        oldnew = @atomic starts[b] + UInt32(1)
+        dest[p] = first(oldnew) + UInt32(1)       # convert exclusive 0-based offset to Julia's 1-based index
+    end
+end
+
+@kernel function _scatter_by_dest_k!(tmp, @Const(src), @Const(dest))
+    p = @index(Global)
+    @inbounds tmp[Int(dest[p])] = src[p]
+end
+
+@kernel function _copy_vector_k!(dst, @Const(src))
+    p = @index(Global)
+    @inbounds dst[p] = src[p]
+end
+
 """
     morton_sort_particles!(parts; N) -> parts
 
@@ -186,13 +228,21 @@ Reorder the particle SoA in place by the Morton (Z-order) code of each particle'
 `N³` grid, restoring deposit/gather locality.  Permutes every AbstractVector field (px..vz and a tracked
 `id`); the scalar `mass` is untouched.  Bit-identical physics (deposit + push are order-independent).
 
-Uses a **UInt32 Morton key + stable `sortperm!`** (CUDA.jl's sortperm! is properly stable), so ties — many
-particles in one cell at low z — resolve by ascending original index, making the permutation IDENTICAL to
-the old packed-(Morton<<32|idx) `sort!` but at HALF the peak: key(4 B/cell) + Int32 perm(4) instead of
-packed-UInt64(8) + perm(4) + the live key — the difference between Morton fitting and OOM near the grid
-ceiling.  Requires `N ≤ 1024` (Morton fits 30 bits).
+On CUDA/CPU this uses a **UInt32 Morton key + stable `sortperm!`** (CUDA.jl's
+sortperm! is properly stable), so ties resolve by ascending original index.
+On Metal, where there is no native GPU `sortperm!`, `CIC_PSORT_MODE=auto`
+uses [`bucket_morton_sort_particles!`](@ref): a coarse Morton bucket reorder
+with no full key or permutation buffer.  Set `CIC_PSORT_MODE=sortperm` to force
+the legacy path or `CIC_PSORT_MODE=bucket` to force the bucket path.
 """
 function morton_sort_particles!(parts; N::Integer)
+    px = parts.px; be = PoissonKernels.KA.get_backend(px)
+    mode = Symbol(lowercase(get(ENV, "CIC_PSORT_MODE", "auto")))
+    if mode === :bucket || (mode === :auto && _is_metal_backend(be))
+        return bucket_morton_sort_particles!(parts; N)
+    elseif !(mode in (:auto, :sortperm, :morton, :full))
+        error("CIC_PSORT_MODE must be auto, bucket, sortperm, morton, or full; got $mode")
+    end
     px = parts.px; Np = length(px); be = PoissonKernels.KA.get_backend(px)
     mkey = similar(px, UInt32)
     _morton_key_k!(be)(mkey, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
@@ -206,6 +256,78 @@ function morton_sort_particles!(parts; N::Integer)
     end
     return parts
 end
+
+"""
+    bucket_morton_sort_particles!(parts; N, bucket_side) -> parts
+
+Low-memory GPU particle locality reorder.  Particles are grouped by a coarse
+power-of-two Morton bucket grid (`bucket_side³`, default `CIC_PSORT_BUCKET` or
+`min(prevpow2(N), 256)`).  The order inside each bucket is intentionally
+unstable, but all particle vector fields are permuted by the same `dest` map, so
+the SoA stays aligned and the scalar `mass` remains untouched.
+
+Peak device scratch is one `UInt32` destination index per particle, one temporary
+field at a time, and two short bucket arrays during prefix construction.  This is
+the Metal path used by `morton_sort_particles!` in `CIC_PSORT_MODE=auto`.
+"""
+function bucket_morton_sort_particles!(parts; N::Integer, bucket_side::Union{Nothing,Integer}=nothing)
+    px = parts.px
+    Np = length(px)
+    Np <= typemax(UInt32) || error("bucket_morton_sort_particles!: Np=$Np exceeds UInt32 destination capacity")
+    B = _particle_bucket_side(N, bucket_side)
+    nb = B^3
+    be = PoissonKernels.KA.get_backend(px)
+    counts = similar(px, UInt32, nb)
+    fill!(counts, UInt32(0))
+    _bucket_hist_k!(be)(counts, px, parts.py, parts.pz, Float32(B), UInt32(B - 1); ndrange = Np)
+    PoissonKernels.KA.synchronize(be)
+    starts = similar(counts)
+    cumsum!(starts, counts)                                      # inclusive prefix
+    _exclusive_from_inclusive_k!(be)(starts, counts; ndrange = nb)
+    PoissonKernels.KA.synchronize(be)
+    _free_buf!(counts)
+
+    dest = similar(px, UInt32, Np)
+    _bucket_dest_k!(be)(dest, starts, px, parts.py, parts.pz, Float32(B), UInt32(B - 1); ndrange = Np)
+    PoissonKernels.KA.synchronize(be)
+    _free_buf!(starts)
+
+    for f in keys(parts)
+        a = getfield(parts, f)
+        if a isa AbstractVector
+            length(a) == Np || error("particle field $f has length $(length(a)), expected $Np")
+            tmp = similar(a)
+            _scatter_by_dest_k!(be)(tmp, a, dest; ndrange = Np)
+            _copy_vector_k!(be)(a, tmp; ndrange = Np)
+            PoissonKernels.KA.synchronize(be)
+            _free_buf!(tmp)
+        end
+    end
+    _free_buf!(dest)
+    return parts
+end
+
+function _particle_bucket_side(N::Integer, bucket_side::Union{Nothing,Integer})
+    B = bucket_side === nothing ? parse(Int, get(ENV, "CIC_PSORT_BUCKET", string(min(_prevpow2(Int(N)), 256)))) : Int(bucket_side)
+    B > 0 || error("CIC_PSORT_BUCKET must be positive")
+    B <= 1024 || error("CIC_PSORT_BUCKET=$B is too large; Morton bucket keys support at most 1024")
+    _ispow2(B) || error("CIC_PSORT_BUCKET=$B must be a power of two so Morton bucket keys are dense")
+    return B
+end
+
+_ispow2(n::Integer) = n > 0 && (n & (n - 1)) == 0
+
+function _prevpow2(n::Integer)
+    n > 0 || return 1
+    p = 1
+    while p <= typemax(Int) >>> 1 && (p << 1) <= n
+        p <<= 1
+    end
+    return p
+end
+
+_is_metal_backend(be) = occursin("Metal", string(typeof(be)))
+
 # Eagerly release a device buffer (CUDA: return it to the pool now, before the field gathers
 # allocate, so the sort's peak stays at key+perm not key+perm+gather).  No-op on backends w/o it.
 function _free_buf!(a)
