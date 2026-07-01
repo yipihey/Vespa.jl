@@ -211,6 +211,66 @@ function _assemble_field_gpu!(dst, pg::PatchGrid, getf)
     return dst
 end
 
+@kernel function _normalize_delta_k!(a, meanv::Float32)
+    i = @index(Global)
+    @inbounds a[i] = a[i] / meanv - 1f0
+end
+
+@kernel function _momentum_to_velocity_k!(mom, @Const(rho), scalev::Float32, floorv::Float32)
+    i = @index(Global)
+    @inbounds begin
+        r = Float32(rho[i])
+        mom[i] = r > floorv ? Float32(mom[i]) / r * scalev : 0f0
+    end
+end
+
+@kernel function _cic_deposit_weighted_unif_k!(ρ, @Const(px), @Const(py), @Const(pz), @Const(w),
+                                               N::Int, shift, mass)
+    p = @index(Global)
+    @inbounds begin
+        z = zero(px[p]); one_ = oneunit(px[p])
+        gx = mod(px[p] + z, one_) * N + shift
+        gy = mod(py[p] + z, one_) * N + shift
+        gz = mod(pz[p] + z, one_) * N + shift
+        fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
+        fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
+        fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
+        ia = mod(i0, N); ib = mod(i0 + 1, N); wxa = one_ - fx; wxb = fx
+        ja = mod(j0, N); jb = mod(j0 + 1, N); wya = one_ - fy; wyb = fy
+        ka = mod(k0, N); kb = mod(k0 + 1, N); wza = one_ - fz; wzb = fz
+        m = mass * (w[p] + zero(w[p]))
+        Nj = N; Nk = N * N
+        @atomic ρ[ia + Nj*ja + Nk*ka + 1] += m*wxa*wya*wza
+        @atomic ρ[ib + Nj*ja + Nk*ka + 1] += m*wxb*wya*wza
+        @atomic ρ[ia + Nj*jb + Nk*ka + 1] += m*wxa*wyb*wza
+        @atomic ρ[ib + Nj*jb + Nk*ka + 1] += m*wxb*wyb*wza
+        @atomic ρ[ia + Nj*ja + Nk*kb + 1] += m*wxa*wya*wzb
+        @atomic ρ[ib + Nj*ja + Nk*kb + 1] += m*wxb*wya*wzb
+        @atomic ρ[ia + Nj*jb + Nk*kb + 1] += m*wxa*wyb*wzb
+        @atomic ρ[ib + Nj*jb + Nk*kb + 1] += m*wxb*wyb*wzb
+    end
+end
+
+function _normalize_delta!(be, a, meanv)
+    _normalize_delta_k!(be)(a, Float32(meanv); ndrange=length(a))
+    PoissonKernels.KA.synchronize(be)
+    return a
+end
+
+function _momentum_to_velocity!(be, mom, rho, scalev, floorv)
+    _momentum_to_velocity_k!(be)(mom, rho, Float32(scalev), Float32(floorv); ndrange=length(mom))
+    PoissonKernels.KA.synchronize(be)
+    return mom
+end
+
+function _deposit_weighted_unif!(be, ρ, parts, w; N::Integer)
+    fill!(ρ, zero(eltype(ρ)))
+    _cic_deposit_weighted_unif_k!(be)(ρ, parts.px, parts.py, parts.pz, w,
+        Int(N), -0.5f0, eltype(ρ)(parts.mass); ndrange=length(parts.px))
+    PoissonKernels.KA.synchronize(be)
+    return reshape(ρ, (N, N, N))
+end
+
 """
     patch_power_spectra(pg, parts; box, nmu=4, nbins=0, axis=1, scale_v=1.0, velocity=true)
         -> (; k, gas_delta, dm_delta, gas_vel, Nmodes)
@@ -243,26 +303,50 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
     end
     # ── gas: overdensity + mass-weighted velocity from the resident patch fields ──
     g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)
-    μg = T(Float64(sum(g))/Ntot); Pgas = pk(g ./ μg .- one(T))
+    μg = T(Float64(sum(g))/Ntot)
     Pvgas = nothing
     if velocity
-        S1=PPMKernels.device_zeros(be,T,nc); S2=PPMKernels.device_zeros(be,T,nc); S3=PPMKernels.device_zeros(be,T,nc)
-        _assemble_field_gpu!(S1,pg,p->p.S1); _assemble_field_gpu!(S2,pg,p->p.S2); _assemble_field_gpu!(S3,pg,p->p.S3)
-        Pvgas = pk((S1 ./ g .* sv, S2 ./ g .* sv, S3 ./ g .* sv)); S1=S2=S3=nothing
+        Psum = nothing; Nm = nothing; kk = nothing
+        mom = PPMKernels.device_zeros(be, T, nc)
+        for pick in (p->p.S1, p->p.S2, p->p.S3)
+            fill!(mom, zero(T))
+            _assemble_field_gpu!(mom, pg, pick)
+            _momentum_to_velocity!(be, mom, g, sv, zero(T))
+            Pv = pk(mom)
+            Psum = Psum === nothing ? copy(Pv.P) : (Psum .+ Pv.P)
+            Nm === nothing && (Nm = Pv.Nmodes; kk = Pv.k)
+        end
+        Pvgas = (k=kk, P=Psum, Nmodes=Nm)
+        mom = nothing
     end
+    _normalize_delta!(be, g, μg)
+    Pgas = pk(g)
     g = nothing
     # ── DM: overdensity + mass-weighted velocity via the deterministic CIC deposit ──
     ρpi = PPMKernels.device_zeros(be, metal ? T : Int64, (Ntot,))
-    ρd  = metal ? copy(dep!(ρpi, parts.mass)) : dep!(ρpi, parts.mass)
+    ρd  = dep!(ρpi, parts.mass)
     μd = T(Float64(sum(ρd))/Ntot)
-    Pdm = pk(ρd ./ μd .- one(T))
     Pvdm = nothing
     if velocity
         flr = T(1f-12) * μd                                      # ignore (near-)empty cells
-        vcomp(vp) = (pc = dep!(ρpi, parts.mass .* vp);           # Σ m·v_c·W  (momentum)
-                     ifelse.(ρd .> flr, pc ./ ρd .* sv, zero(T)))# mass-weighted v_c (× scale_v)
-        Pvdm = pk((vcomp(parts.vx), vcomp(parts.vy), vcomp(parts.vz)))
+        Psum = nothing; Nm = nothing; kk = nothing
+        pc = PPMKernels.device_zeros(be, metal ? T : Int64, (Ntot,))
+        for vp in (parts.vx, parts.vy, parts.vz)
+            if metal
+                vgrid = _deposit_weighted_unif!(be, pc, parts, vp; N=nc[1])  # Σ m·v_c·W
+            else
+                vgrid = dep!(pc, parts.mass .* vp)
+            end
+            _momentum_to_velocity!(be, vgrid, ρd, sv, flr)       # mass-weighted v_c (× scale_v)
+            Pv = pk(vgrid)
+            Psum = Psum === nothing ? copy(Pv.P) : (Psum .+ Pv.P)
+            Nm === nothing && (Nm = Pv.Nmodes; kk = Pv.k)
+        end
+        Pvdm = (k=kk, P=Psum, Nmodes=Nm)
+        pc = nothing
     end
+    _normalize_delta!(be, ρd, μd)
+    Pdm = pk(ρd)
     return (; k=Pgas.k, gas_delta=Pgas.P, dm_delta=Pdm.P,
             gas_vel=(Pvgas===nothing ? nothing : Pvgas.P),
             dm_vel =(Pvdm ===nothing ? nothing : Pvdm.P), Nmodes=Pgas.Nmodes)

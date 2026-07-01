@@ -119,6 +119,7 @@ const GRAV_HOST32 = get(ENV, "CIC_GRAV_HOST32", "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
+const PKVEL  = get(ENV, "CIC_PK_VEL", "1") == "1"
 const CELLDUMP = get(ENV, "CIC_CELL_DUMP", PKMEAS ? "0" : "1") == "1"
 const REPORTS= joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
 const TAG    = get(ENV, "CIC_TAG", "")
@@ -857,7 +858,10 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             @printf("  ● output z=%.2f a=%.5f  δb_rms=%.3e  D²/D₀²=%.3e  <x_HII>=%.3e  <T>=%.1f K\n",
                     zo, a, st.δrms, g2, st.xHII, st.T); flush(stdout)
             if PKMEAS                                     # on-device anisotropic P(k,μ); tiny table, no full dump
-                P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, nbins=PKNB, axis=PKAXIS, scale_v=uo.v/1e5)
+                tpk = time()
+                P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, nbins=PKNB, axis=PKAXIS,
+                                         scale_v=uo.v/1e5, velocity=PKVEL)
+                tpk = time() - tpk
                 pf = @sprintf("%s_pkmu.h5", ckpref)
                 h5open(pf, isfile(pf) ? "r+" : "w") do f
                     group_name = @sprintf("z%05.1f", zo)
@@ -869,7 +873,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                     g["Nmodes"] = P.Nmodes
                     A = attrs(g); A["z"]=zo; A["a"]=a; A["box"]=c.box; A["axis"]=PKAXIS; A["nmu"]=PKMU
                 end
-                @printf("    ↳ P(k,μ) on device → %s [z%05.1f]\n", pf, zo); flush(stdout)
+                @printf("    ↳ P(k,μ) on device → %s [z%05.1f] %.2f s\n", pf, zo, tpk); flush(stdout)
             end
             ai += 1
             BE === :cuda && CUDA.reclaim()

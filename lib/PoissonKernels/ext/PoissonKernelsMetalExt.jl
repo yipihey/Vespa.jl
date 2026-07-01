@@ -10,6 +10,7 @@ module PoissonKernelsMetalExt
 
 using PoissonKernels
 using Metal
+using KernelAbstractions: @kernel, @index, @Const, @atomic
 
 const MG = Metal.MPSGraphs
 using Metal.MPSGraphs: MPSGraph, MPSGraphFFTDescriptor, MPSGraphTensor,
@@ -135,6 +136,44 @@ function _mps_forward_rfft!(x::Metal.MtlArray{Float32,3})
     return P.chat
 end
 
+@kernel function _pkmu_bin_rfft_k!(psum, ksum, cnt, @Const(chat),
+                                   n::Int32, nb::Int32, nμ::Int32, axis::Int32,
+                                   kf::Float32, kny::Float32, scale::Float32,
+                                   count_modes::Int32)
+    p = @index(Global)
+    h = (n >>> 1) + Int32(1)
+    q = Int32(p - 1)
+    i = q % h
+    q = q ÷ h
+    j = q % n
+    k = q ÷ n
+    @inbounds begin
+        kz = k <= (n >>> 1) ? k : k - n
+        ky = j <= (n >>> 1) ? j : j - n
+        kx = i
+        km2 = kx*kx + ky*ky + kz*kz
+        if km2 > 0
+            km = sqrt(Float32(km2))
+            if km <= kny
+                ka = axis == Int32(1) ? kx : axis == Int32(2) ? ky : kz
+                b = Int32(1) + unsafe_trunc(Int32, floor((km / kny) * Float32(nb)))
+                b = min(max(b, Int32(1)), nb)
+                mb = Int32(1) + unsafe_trunc(Int32, floor((abs(Float32(ka)) / km) * Float32(nμ)))
+                mb = min(max(mb, Int32(1)), nμ)
+                mult = (i == 0 || i == (n >>> 1)) ? Float32(1) : Float32(2)
+                mult_i = (i == 0 || i == (n >>> 1)) ? UInt32(1) : UInt32(2)
+                z = chat[p]
+                pow = mult * scale * (real(z)*real(z) + imag(z)*imag(z))
+                @atomic psum[Int(b), Int(mb)] + pow
+                if count_modes == Int32(1)
+                    @atomic ksum[Int(b)] + (mult * km * kf)
+                    @atomic cnt[Int(b), Int(mb)] + mult_i
+                end
+            end
+        end
+    end
+end
+
 function PoissonKernels.fft_poisson_rfft!(φ::Metal.MtlArray{T,3},
                                           ρ::Metal.MtlArray{T,3};
                                           G::Real=1.0, a::Real=1.0,
@@ -184,36 +223,24 @@ function _power_spectrum_aniso_mps(fields::Tuple; boxsize=1.0, nmu::Integer=4,
     V = L^3
 
     Psum = zeros(Float64, nb, nμ)
-    ksum = zeros(Float64, nb)
-    cnt = zeros(Int, nb, nμ)
-    first_field = true
+    psumd = Metal.zeros(Float32, nb, nμ)
+    ksumd = Metal.zeros(Float32, nb)
+    cntd = Metal.zeros(UInt32, nb, nμ)
+    scale = Float32(V * invN3 * invN3)
+    ndr = prod(PoissonKernels._rfft_dims(N))
 
-    for f in fields
-        hk = Array(_mps_forward_rfft!(f))
-        @inbounds for k in 0:n-1
-            kz = k <= n ÷ 2 ? k : k - n
-            for j in 0:n-1
-                ky = j <= n ÷ 2 ? j : j - n
-                for i in 0:n÷2
-                    kx = i
-                    km = sqrt(Float64(kx*kx + ky*ky + kz*kz))
-                    (km <= 0 || km > kny) && continue
-                    ka = axis == 1 ? kx : axis == 2 ? ky : kz
-                    b = clamp(1 + floor(Int, (km/kny)*nb), 1, nb)
-                    mb = clamp(1 + floor(Int, (abs(Float64(ka))/km)*nμ), 1, nμ)
-                    mult = (i == 0 || i == n ÷ 2) ? 1 : 2
-                    z = hk[i+1, j+1, k+1]
-                    Psum[b, mb] += mult * V * (Float64(real(z))^2 + Float64(imag(z))^2) * invN3 * invN3
-                    if first_field
-                        ksum[b] += mult * km * kf
-                        cnt[b, mb] += mult
-                    end
-                end
-            end
-        end
-        first_field = false
+    for (ifield, f) in pairs(fields)
+        chat = _mps_forward_rfft!(f)
+        _pkmu_bin_rfft_k!(Metal.MetalBackend())(psumd, ksumd, cntd, chat,
+            Int32(n), Int32(nb), Int32(nμ), Int32(axis),
+            Float32(kf), Float32(kny), scale, ifield == 1 ? Int32(1) : Int32(0);
+            ndrange = ndr)
+        Metal.synchronize()
     end
 
+    Psum .= Float64.(Array(psumd))
+    ksum = Float64.(Array(ksumd))
+    cnt = Int.(Array(cntd))
     tot = vec(sum(cnt, dims=2))
     kc = [tot[b] > 0 ? ksum[b]/tot[b] : NaN for b in 1:nb]
     P = [cnt[b,m] > 0 ? Psum[b,m]/cnt[b,m] : NaN for b in 1:nb, m in 1:nμ]
