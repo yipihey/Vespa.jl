@@ -21,10 +21,10 @@
                                       N::Int, disp, shift)
     p = @index(Global)
     @inbounds begin
-        one_ = oneunit(px[p])
-        gx = mod(px[p] + disp*vx[p], one_)*N + shift
-        gy = mod(py[p] + disp*vy[p], one_)*N + shift
-        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        z = zero(px[p]); one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*(vx[p] + z), one_)*N + shift
+        gy = mod(py[p] + disp*(vy[p] + z), one_)*N + shift
+        gz = mod(pz[p] + disp*(vz[p] + z), one_)*N + shift
         fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
         fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
         fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
@@ -212,10 +212,10 @@ end
                                           N::Int, disp, shift, qscale)
     p = @index(Global)
     @inbounds begin
-        one_ = oneunit(px[p])
-        gx = mod(px[p] + disp*vx[p], one_)*N + shift
-        gy = mod(py[p] + disp*vy[p], one_)*N + shift
-        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        z = zero(px[p]); one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*(vx[p] + z), one_)*N + shift
+        gy = mod(py[p] + disp*(vy[p] + z), one_)*N + shift
+        gz = mod(pz[p] + disp*(vz[p] + z), one_)*N + shift
         fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
         fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
         fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
@@ -224,14 +224,15 @@ end
         ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
         ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
         Nj = N; Nk = N*N
-        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wya*wza)
-        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wya*wza)
-        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wyb*wza)
-        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wyb*wza)
-        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wya*wzb)
-        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wya*wzb)
-        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wyb*wzb)
-        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wyb*wzb)
+        hq = oftype(mq, 0.5)
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wya*wza + hq)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wya*wza + hq)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wyb*wza + hq)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wyb*wza + hq)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wya*wzb + hq)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wya*wzb + hq)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wyb*wzb + hq)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wyb*wzb + hq)
     end
 end
 
@@ -266,10 +267,10 @@ end
                                            N::Int, disp, shift, m)
     p = @index(Global)
     @inbounds begin
-        one_ = oneunit(px[p])
-        gx = mod(px[p] + disp*vx[p], one_)*N + shift
-        gy = mod(py[p] + disp*vy[p], one_)*N + shift
-        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        z = zero(px[p]); one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*(vx[p] + z), one_)*N + shift
+        gy = mod(py[p] + disp*(vy[p] + z), one_)*N + shift
+        gz = mod(pz[p] + disp*(vz[p] + z), one_)*N + shift
         fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
         fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
         fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
@@ -293,10 +294,10 @@ end
                                                N::Int, disp, shift, mq)
     p = @index(Global)
     @inbounds begin
-        one_ = oneunit(px[p])
-        gx = mod(px[p] + disp*vx[p], one_)*N + shift
-        gy = mod(py[p] + disp*vy[p], one_)*N + shift
-        gz = mod(pz[p] + disp*vz[p], one_)*N + shift
+        z = zero(px[p]); one_ = oneunit(px[p])
+        gx = mod(px[p] + disp*(vx[p] + z), one_)*N + shift
+        gy = mod(py[p] + disp*(vy[p] + z), one_)*N + shift
+        gz = mod(pz[p] + disp*(vz[p] + z), one_)*N + shift
         fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
         fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
         fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
@@ -304,14 +305,15 @@ end
         ja = mod(j0, N); jb = mod(j0+1, N); wya = one_-fy; wyb = fy
         ka = mod(k0, N); kb = mod(k0+1, N); wza = one_-fz; wzb = fz
         Nj = N; Nk = N*N
-        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wya*wza)
-        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wya*wza)
-        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxa*wyb*wza)
-        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += round(eltype(ρi), mq*wxb*wyb*wza)
-        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wya*wzb)
-        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wya*wzb)
-        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxa*wyb*wzb)
-        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += round(eltype(ρi), mq*wxb*wyb*wzb)
+        hq = oftype(mq, 0.5)
+        KA.@atomic ρi[ia + Nj*ja + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wya*wza + hq)
+        KA.@atomic ρi[ib + Nj*ja + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wya*wza + hq)
+        KA.@atomic ρi[ia + Nj*jb + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wyb*wza + hq)
+        KA.@atomic ρi[ib + Nj*jb + Nk*ka + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wyb*wza + hq)
+        KA.@atomic ρi[ia + Nj*ja + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wya*wzb + hq)
+        KA.@atomic ρi[ib + Nj*ja + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wya*wzb + hq)
+        KA.@atomic ρi[ia + Nj*jb + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxa*wyb*wzb + hq)
+        KA.@atomic ρi[ib + Nj*jb + Nk*kb + 1] += unsafe_trunc(eltype(ρi), mq*wxb*wyb*wzb + hq)
     end
 end
 

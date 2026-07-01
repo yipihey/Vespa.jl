@@ -68,6 +68,18 @@
     vref = ((1 - coef) .* vx .+ axp .* ts) ./ (1 + coef)
     @test maximum(abs.(PoissonKernels.to_host(vxk) .- vref)) < 1e-14
 
+    # (2b) f16-stored velocities still kick in f32 and only round on store.
+    vxh = PoissonKernels.to_device(bek, Float16.(vx), Float16)
+    vyh = PoissonKernels.to_device(bek, Float16.(vy), Float16)
+    vzh = PoissonKernels.to_device(bek, Float16.(vz), Float16)
+    adx32 = PoissonKernels.to_device(bek, axp, Float32)
+    ady32 = PoissonKernels.to_device(bek, ayp, Float32)
+    adz32 = PoissonKernels.to_device(bek, azp, Float32)
+    PoissonKernels.particle_kick!(vxh, vyh, vzh, adx32, ady32, adz32; ts = ts, coef = coef)
+    vhref = Float16.(((1f0 - Float32(coef)) .* Float32.(Float16.(vx)) .+ Float32.(axp) .* Float32(ts)) ./
+                     (1f0 + Float32(coef)))
+    @test PoissonKernels.to_host(vxh) == vhref
+
     # (3) drift x += coef·v (no wrap exact; wrap maps into [0,1))
     cd = 0.031
     pxd = PoissonKernels.to_device(bek, px, Float64); pyd = PoissonKernels.to_device(bek, py, Float64)
@@ -81,6 +93,28 @@
     h = PoissonKernels.to_host(pxw)
     @test all(0 .<= h .< 1)
     @test maximum(abs.(h .- mod.(px .+ 5.0 .* vx, 1.0))) < 1e-14
+
+    # (3b) global nc³ potential + periodic wrap matches the padded-potential path.
+    φg = [sin(0.17i + 0.11j - 0.09k) + 0.2cos(0.07i * j) for i in 1:N, j in 1:N, k in 1:N]
+    φpad = zeros(Float64, M, M, M)
+    @views φpad[NG+1:NG+N, NG+1:NG+N, NG+1:NG+N] .= φg
+    PoissonKernels.fill_periodic_ghosts!(φpad; ng = NG)
+    force_pair(name, ::Type{T}) where {T} = begin
+        be = PoissonKernels.backend(name); d(x) = PoissonKernels.to_device(be, x, T)
+        apx = PoissonKernels.device_zeros(be, T, (np,)); apy = similar(apx); apz = similar(apx)
+        agx = similar(apx); agy = similar(apx); agz = similar(apx)
+        PoissonKernels.interp_force_from_potential!(apx, apy, apz,
+            d(px), d(py), d(pz), d(vx), d(vy), d(vz), d(φpad);
+            dcoef = dcoef, cellsize = cellsize, leftedge = le)
+        PoissonKernels.interp_force_from_global_potential!(agx, agy, agz,
+            d(px), d(py), d(pz), d(vx), d(vy), d(vz), d(φg);
+            dcoef = dcoef, nc = (N, N, N))
+        map(PoissonKernels.to_host, (apx, apy, apz, agx, agy, agz))
+    end
+    fp = force_pair(:cpu, Float64)
+    @test maximum(abs.(fp[1] .- fp[4])) < 1e-12
+    @test maximum(abs.(fp[2] .- fp[5])) < 1e-12
+    @test maximum(abs.(fp[3] .- fp[6])) < 1e-12
 
     # (4) Metal f32 ≡ CPU f32 for the full interp→kick→drift→kick push
     if metal_ready()
@@ -101,6 +135,12 @@
         @test rel(am[1], ac[1]) < 1f-4
         @test rel(am[2], ac[2]) < 1f-4
         @test rel(am[3], ac[3]) < 1f-4
+
+        fm = force_pair(:metal, Float32); fc = force_pair(:cpu, Float32)
+        @info "global potential force Metal≡CPU f32" ax = rel(fm[4], fc[4]) ay = rel(fm[5], fc[5]) az = rel(fm[6], fc[6])
+        @test rel(fm[4], fc[4]) < 1f-4
+        @test rel(fm[5], fc[5]) < 1f-4
+        @test rel(fm[6], fc[6]) < 1f-4
     else
         @test_skip "Metal not available — GPU particle-push parity skipped"
     end

@@ -33,14 +33,23 @@ The launch script pins:
 BACKEND=metal
 CIC_SOLVER=fvgk
 CIC_FVGK_F16=1
+CIC_FVGK_STORE=f16
+CIC_FVGK_DEDUP=1
 CIC_CHEM=analytic
 CIC_PACKED=1
 CIC_PSORT=0
+CIC_PIDS=0
+CIC_VEL16=1
+CIC_GRAVITY=cpu
+CIC_FFT=ka
 CIC_PK=1
+CIC_CELL_DUMP=0
+CIC_NODUMP=1
 CIC_NGRID=1024
 CIC_NP=1
 CIC_BOX=0.8
 CIC_STREAM_LOAD=1
+CICASS_REAL_BYTES=4
 ```
 
 Staged IC:
@@ -211,6 +220,98 @@ both with CPU FFTW gravity and no dumps:
   mass drift      = 0.000e+00
   top-grid gravity = 0.9166 s/solve
   cycle wall       = 7.40 s
+```
+
+## FVGK/particle allocation order fix
+
+The 1024^3 transition peak was still too high because the stream-load path uploaded
+the DM particle SoA before the FVGK pre-build/dedup. That made the peak:
+
+```text
+f32 patch gas + DM particles + FVGK g.R/g.O
+```
+
+The driver now pre-builds and dedups FVGK immediately after gas scatter and before
+DM upload in the stream-load, restart, and in-memory snapshot paths. The real 1024^3
+log order is now:
+
+```text
+streaming CICASS snapshot: .../cic_stream_1024_box0p8.cicass
+gas IC ...
+FVGK dedup ON: patch gas -> g.R views, ng=0, gesc=1e+07, f32 patch copy freed
+DM IC: 1073741824 particles, mass_per=0.8430 (1-f_b), v->code=8.2245e-03
+```
+
+The synthetic 1024^3 memory probe for the current lean Metal configuration:
+
+```text
+BACKEND=metal CIC_NPROBE=1024 CIC_NP=1 CIC_PACKED=1 CIC_FVGK_F16=1
+CIC_FVGK_STORE=f16 CIC_FVGK_DEDUP=1 CIC_VEL16=1 CIC_GRAV1BUF=1 CIC_PIDS=0
+
+1024^3 (1073.7 Mcell) fields=54.00 GiB (live≈32.00)
+  patch=0.00 GiB (0 B/c)
+  fvgk =32.00 GiB (32 B/c)
+  part =18.00 GiB (18 B/c)
+  grav = 4.00 GiB (4 B/c)
+  sum  =54 B/c
+
+real time             = 27.28 s
+max resident set size = 47,208,071,168 bytes
+peak footprint        = 138,352,233,104 bytes
+```
+
+The component sum is the reliable persistent-array budget. Metal's cumulative
+allocator stats can under-report or over-report the live set after large frees; use
+the per-array sum for the byte/cell model.
+
+Production-shaped 1024^3 one-cycle validation after the reorder, with `CIC_PK=0`
+and full dumps disabled so the timing isolates startup plus one step:
+
+```text
+CIC_TAG=metal1024_orderfix_vel16_1cyc_20260701
+cycle 0 wall          = 143.37 s
+phase total           = 137.3188 s/cycle
+mass drift            = 8.746e-08
+live Metal            = 50.00 GiB at 1024^3
+real time             = 201.76 s
+max resident set size = 70,698,778,624 bytes
+peak footprint        = 154,312,055,024 bytes
+```
+
+GPU-synchronized phase breakdown for that validation run:
+
+```text
+gravity   = 68.7383 s
+hydro     = 17.3283 s
+chem      =  0.7546 s
+particles = 50.4976 s
+
+top-grid gravity = 68.3601 s/solve
+  assemble    =  3.6562 s
+  FFT         = 62.3593 s
+  patch_accel =  0.6832 s
+  part_field  =  1.6614 s
+```
+
+That run confirms the lifecycle fix on hardware: the FVGK dedup happens before the
+13+ GiB particle upload, so the transition peak is patch gas plus FVGK buffers,
+then particles arrive after the patch gas copy is gone. A fused output-summary
+reduction was also added so `CIC_CELL_DUMP=0` summaries no longer materialize
+decoded species, ionization, molecular-weight, and temperature arrays at each
+output.
+
+Post-fusion 128^3 Metal compile smokes:
+
+```text
+FVGK f16 dedup, np=1, CIC_CELL_DUMP=0:
+  cycle wall      = 3.50 s
+  mass drift      = 1.132e-06
+  top-grid gravity = 0.9519 s/solve
+
+PPM packed UInt16 species, np=2, CIC_CELL_DUMP=0:
+  cycle wall      = 7.51 s
+  mass drift      = 0.000e+00
+  top-grid gravity = 1.3498 s/solve
 ```
 
 ## Validation context

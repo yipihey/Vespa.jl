@@ -119,18 +119,26 @@ expansion is in the super-comoving units), wrapping positions to `[0,1)`.
 positions; `gx,gy,gz` is the field from `particle_accel_field`.
 """
 function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Real;
-                         scratch=nothing)
+                         scratch=nothing, nc=nothing)
     if scratch === nothing
         axp = similar(parts.px); ayp = similar(parts.px); azp = similar(parts.px)
     else
         axp, ayp, azp = scratch
     end
     half = 0.5*dtau
-    le = (leftedge, leftedge, leftedge)
-    # force = −∇φ central-differenced at the CIC cells from the padded potential (no stored accel)
-    PoissonKernels.interp_force_from_potential!(axp, ayp, azp,
-        parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
-        dcoef=half, cellsize=cellsize, leftedge=le)
+    # force = −∇φ central-differenced at the CIC cells (no stored accel). With
+    # `nc !== nothing`, read the global nc³ potential directly with periodic wrap
+    # instead of a padded potential copy.
+    if nc === nothing
+        le = (leftedge, leftedge, leftedge)
+        PoissonKernels.interp_force_from_potential!(axp, ayp, azp,
+            parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
+            dcoef=half, cellsize=cellsize, leftedge=le)
+    else
+        PoissonKernels.interp_force_from_global_potential!(axp, ayp, azp,
+            parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
+            dcoef=half, nc=nc)
+    end
     PoissonKernels.particle_kick!(parts.vx, parts.vy, parts.vz, axp, ayp, azp; ts=half, coef=0.0)
     PoissonKernels.particle_drift!(parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz;
         coef=dtau, wrap=1.0)

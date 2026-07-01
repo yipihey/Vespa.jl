@@ -62,6 +62,18 @@
         rel = maximum(abs.(ρm .- ρc)) / (maximum(abs.(ρc)) + 1f-30)
         @info "cic_deposit Metal≡CPU f32" maxrel=rel
         @test rel < 1f-4
+
+        run_det_f16(name) = begin
+            be = PoissonKernels.backend(name)
+            d32(x) = PoissonKernels.to_device(be, x, Float32)
+            d16(x) = PoissonKernels.to_device(be, Float16.(x), Float16)
+            ρi = PoissonKernels.device_zeros(be, Int32, (N*N*N,))
+            PoissonKernels.cic_deposit_det!(ρi, d32(pos[:,1]), d32(pos[:,2]), d32(pos[:,3]),
+                                            d16(vel[:,1]), d16(vel[:,2]), d16(vel[:,3]), Float32(0.83);
+                                            N=N, disp=disp, shift=shift, qbits=12)
+            reshape(PoissonKernels.to_host(ρi), N, N, N)
+        end
+        @test run_det_f16(:metal) == run_det_f16(:cpu)
     else
         @test_skip "Metal not available — GPU deposit parity skipped"
     end
