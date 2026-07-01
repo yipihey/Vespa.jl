@@ -48,6 +48,26 @@ _fmaxrel(a, b) = maximum(abs.(vec(a) .- vec(b))) / max(maximum(abs, b), eps())
     # Metal staging path (host FFT, device in/out): runs + matches the CPU f32 solve
     if metal_ready()
         @test _fmaxrel(solve(:metal, Float32), solve(:cpu, Float32)) < 1e-5
+
+        # Native Metal rfft/irfft path: MPSGraph real-to-Hermitian FFT, half-grid
+        # Green multiply, inverse real FFT, and the one-buffer ρ==φ mode used by
+        # the memory-lean CICASS gravity path.
+        bec = PoissonKernels.backend(:cpu)
+        ref = PoissonKernels.device_zeros(bec, Float32, (N, N, N))
+        PoissonKernels.fft_poisson_root!(ref, PoissonKernels.to_device(bec, ρ64, Float32);
+                                         G = 1.7, a = 0.8, boxsize = 1.0)
+        bem = PoissonKernels.backend(:metal)
+        rho_m = PoissonKernels.to_device(bem, ρ64, Float32)
+        phi_m = PoissonKernels.device_zeros(bem, Float32, (N, N, N))
+        PoissonKernels.fft_poisson_rfft!(phi_m, rho_m; G = 1.7, a = 0.8, boxsize = 1.0)
+        err_mps = _fmaxrel(PoissonKernels.to_host(phi_m), ref)
+        @test err_mps < 1e-5
+
+        rho_alias = PoissonKernels.to_device(bem, ρ64, Float32)
+        PoissonKernels.fft_poisson_rfft!(rho_alias, rho_alias; G = 1.7, a = 0.8, boxsize = 1.0)
+        err_alias = _fmaxrel(PoissonKernels.to_host(rho_alias), ref)
+        @test err_alias < 1e-5
+        @info "Metal MPSGraph rfft Poisson vs CPU f32" maxrel = err_mps alias_maxrel = err_alias
     end
 
     # the G/a coefficient scales the solution linearly

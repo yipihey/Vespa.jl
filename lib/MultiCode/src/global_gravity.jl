@@ -167,7 +167,7 @@ end
 
 Device version of [`assemble_global_density!`](@ref): gather the patches' interior gas
 density (device→device) + periodic DM CIC (device), then subtract the KNOWN cosmological
-mean `meandens` (=1 in code units) — all on the GPU in `pg.T` (Float32).  Because the mean
+mean `meandens` (=1 in code units) — all on the GPU in `pg.T` (Float32). Because the mean
 is fixed by Ωb,Ω0 (mass conservation in a periodic box), there is NO reduction over the
 field, so f32 carries the overdensity fine (no √N·ε mean error) — no f64 needed.
 """
@@ -287,7 +287,7 @@ end
     global_gravity_gpu(pg; G, a, boxsize, particles, dt, ρd, φd, ng2) -> (; gas, phi, le, cs)
 
 FULL on-GPU top-grid gravity: device density assemble → device Poisson solve
-(CUDA: rFFT/cuFFT; Metal: KA radix-2 FFT for power-of-two grids) → per-patch
+(CUDA: rFFT/cuFFT; Metal: MPSGraph rFFT/irFFT) → per-patch
 potential blocks (`patch_accel_gpu`) + padded or global potential for particles.
 No accel fields stored: `g = −∇φ` is differenced on demand in the gas kick and
 particle interp.  No host round-trip, no FFTW.
@@ -302,11 +302,7 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     ρd === nothing && (ρd = PPMKernels.device_zeros(be, pg.T, nc))
     φd === nothing && (φd = PPMKernels.device_zeros(be, pg.T, nc))     # may alias ρd
     assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens)
-    if pg.besym === :metal
-        PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=G, a=a, boxsize=boxsize)
-    else
-        PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # rfft, φd may === ρd
-    end
+    PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # rfft, φd may === ρd
     # dedup: the gas kick reads the GLOBAL φ directly (grav_kick_from_global_potential!), so the
     # per-patch ghosted φ-block copy is unnecessary — pass φd itself as the "accel".
     gas = pg.dedup ? φd : patch_accel_gpu(pg, φd; dx=pg.dx)

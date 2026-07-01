@@ -1,5 +1,5 @@
 # patch_cicass.jl — FULL CICASS smooth-baryon cosmology run on the in-process topgrid
-# decomposition (z=1000→20), GPU hydro+chem per patch + global CPU-FFT gravity.
+# decomposition (z=1000→20), GPU hydro+chem per patch + global gravity.
 #
 # This is the patch-decomposition analogue of cicass_highz_pk.jl (Enzo path) and
 # cicass_ramses_pk.jl (RAMSES path): the SAME CICASS streaming-velocity realization is
@@ -7,7 +7,7 @@
 # in RAMSES super-comoving variables (patch_cosmo.jl) — plain leapfrog hydro/particles,
 # Poisson source 1.5·Ωm·a·δ, per-a chemistry units — with NO MPI and NO host code: each
 # patch's hydro (PPMKernels) + chemistry (ChemistryKernels) runs on the GPU, the top-grid
-# gravity is one global threaded FFTW solve (PoissonKernels) gathered over all patches.
+# gravity is one global solve (threaded FFTW on the host or rFFT/irFFT on the GPU).
 #
 # Outputs (REPORTS/patch_cellcmp_z*.bin) use the SAME layout as the Enzo/RAMSES drivers
 # (N, ρb, x_HII, f_H2, f_HD, T[K]) so the existing compare_cellcmp / plot scripts read
@@ -54,6 +54,7 @@ const NOUT   = parse(Int, get(ENV, "CIC_NOUT", "6"))
 const MAXCYC = parse(Int, get(ENV, "CIC_MAXCYC", "200000"))
 const PRINT_EVERY = parse(Int, get(ENV, "CIC_PRINT_EVERY", "10"))
 const MEMPROBE_CYC = parse(Int, get(ENV, "CIC_MEMPROBE_CYC", "30"))
+const MEMPROBE_CONT = get(ENV, "CIC_MEMPROBE_CONT", "0") == "1"
 const DODRAG = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
 # CIC_SOLVER = ppm (PPMKernels split sweeps, default) | fvgk (FiniteVolumeGodunovKA unsplit CTU;
 # advects the 3 species as EulerColors passive scalars). :fvgk loads FVGK to activate MultiCodeFVGKExt.
@@ -63,7 +64,7 @@ SOLVER === :fvgk && @eval using FiniteVolumeGodunovKA
 # f32) — works with both :fvgk and (now) :ppm.  The PPM sweep decodes Xᵢ·ρ→ρXᵢ into f32
 # scratch per axis, advects, re-encodes ρXᵢ/ρ→Xᵢ; the chem path already solves in UInt16.
 const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
-# CIC_OVERLAP=1: overlap the host top-grid gravity with the GPU hydro+chem.  The
+# CIC_OVERLAP=1: overlap the host top-grid gravity with the GPU hydro+chem. The
 # patch_step!/push_particles! GPU kernels are launched ASYNC, then the CPU computes
 # the NEXT step's accel (FFT + scatter) while the GPU runs this step; the result is
 # applied as the gravity kick at the next step (one-step-lagged, operator-split).
@@ -705,7 +706,7 @@ end
 # Shared gravity setup + cosmological evolution loop (IC start with cyc_start=0, or
 # resumed from a checkpoint at cyc_start).
 function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
-    # parallel CPU FFT for the top-grid gravity: :fftw (FFTW threads) or :ka
+    # parallel CPU FFT for host top-grid gravity: :fftw (FFTW threads) or :ka
     # (KernelAbstractions radix-2 on the CPU backend, parallel over Julia threads).
     fftsolver = Symbol(get(ENV, "CIC_FFT", "ka"))
     # CIC_ACCEL = cpu (host segment-copy scatter, default) | gpu (device comp_accel + gather)
@@ -725,8 +726,10 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     ratetab = usetab ? ChemistryKernels.build_rate_tables(; precision=Float64, backend=tabbe) : nothing
     cooltab = usetab ? EmissionKernels.build_cooling_tables(; precision=Float64, backend=tabbe) : nothing
     GT = GRAV_HOST32 ? Float32 : Float64
+    fftlabel = gravmode === :gpu ? (BE === :metal ? "mps-rfft" : "rfft") : string(fftsolver)
+    gravloc = gravmode === :gpu ? "device" : string(GT)
     @printf("  gravity = %s (FFT=%s, scatter=%s, host=%s)  chem = %s  (FFTW threads=%d, Julia threads=%d)\n",
-            gravmode, fftsolver, accelmode, GT, chembk, nthr, Threads.nthreads()); flush(stdout)
+            gravmode, fftlabel, accelmode, gravloc, chembk, nthr, Threads.nthreads()); flush(stdout)
     ρg = gravmode === :cpu ? zeros(GT, ncell) : nothing
     φg = gravmode === :cpu ? zeros(GT, ncell) : nothing
     # full-GPU gravity scratch in pg.T (Float32) — the mean is the known Ω-fixed constant
@@ -802,10 +805,13 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     # needs the host density snapshot first; GPU path assembles + solves entirely on device.
     function gravity!(a_, dt_)
         if gravmode === :gpu
+            tgpu = time()
             g = global_gravity_gpu(pg; G=1.5*c.Om*a_, a=1.0, boxsize=1.0,
                                    particles=parts, dt=dt_, ρd=ρd, φd=φd,
                                    global_push=GRAV1BUF)
-            BE === :cuda && CUDA.synchronize(); ngrav[] += 1
+            BE === :cuda && CUDA.synchronize()
+            fft_t[] += time() - tgpu
+            ngrav[] += 1
             return g
         else
             tg = time(); snapshot!(dt_, a_); asm_t[] += time()-tg
@@ -901,10 +907,13 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             BE === :cuda && CUDA.synchronize()            # hydro+push done ⇒ ρ_next density final
             if gravmode === :gpu
                 gpu = Threads.@spawn begin                # NEXT-step gravity, fully on GPU
+                    tgpu = time()
                     g = global_gravity_gpu(pg; G=1.5*c.Om*a_new, a=1.0, boxsize=1.0,
                                            particles=parts, dt=dτ, ρd=ρd, φd=φd,
                                            global_push=GRAV1BUF)
-                    BE === :cuda && CUDA.synchronize(); g
+                    BE === :cuda && CUDA.synchronize()
+                    fft_t[] += time() - tgpu
+                    g
                 end
                 patch_step!(pg, dτ; a_value=a, order=order, chem=true, du=u.d, lu=u.l, tu=u.t,
                             do_hydro=false, do_chem=true, chem_backend=:cpu, rate_tables=ratetab, cool_tables=cooltab,
@@ -964,19 +973,21 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
         end
-        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == MEMPROBE_CYC
+        memprobe_now = get(ENV, "CIC_MEMPROBE", "") == "1" &&
+            (MEMPROBE_CONT ? (MEMPROBE_CYC > 0 && cyc > 0 && cyc % MEMPROBE_CYC == 0) : cyc == MEMPROBE_CYC)
+        if memprobe_now
             if BE === :cuda
                 @eval import CUDA; CUDA.reclaim(); GC.gc(); CUDA.reclaim()
                 used = (CUDA.total_memory() - CUDA.available_memory()) / 2^30
                 @printf("  MEMPROBE: live CUDA = %.2f GiB at %d³ (%d Mcell)\n", used, N, N^3 ÷ 10^6); flush(stdout)
-                break
+                MEMPROBE_CONT || break
             elseif BE === :metal
                 @eval import Metal; Metal.synchronize(); GC.gc(); Metal.synchronize()
                 s = Metal.alloc_stats
                 used = max(0, s.alloc_bytes - s.free_bytes) / 2^30
                 @printf("  MEMPROBE: live Metal = %.2f GiB at %d³ (%d Mcell)  [alloc %.2f GiB | freed %.2f GiB]\n",
                         used, N, N^3 ÷ 10^6, s.alloc_bytes/2^30, s.free_bytes/2^30); flush(stdout)
-                break
+                MEMPROBE_CONT || break
             end
         end
     end
@@ -991,9 +1002,14 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     end
     @printf("\nmass drift over run: %.3e\n", abs(total_mass(pg)-m0)/m0)
     let n=max(ngrav[],1)
-        gavg = gravmode === :cpu ? (asm_t[] + fft_t[] + pacc_t[] + pfld_t[]) / n : grav_t[] / n
-        @printf("top-grid gravity (%s): %.4f s/solve  [assemble %.4f | FFT %.4f | patch_accel %.4f | part_field %.4f] over %d solves\n",
-                fftsolver, gavg, asm_t[]/n, fft_t[]/n, pacc_t[]/n, pfld_t[]/n, ngrav[])
+        if gravmode === :gpu
+            @printf("top-grid gravity (%s): %.4f s/solve  [device assemble+rFFT+field] over %d solves\n",
+                    fftlabel, fft_t[]/n, ngrav[])
+        else
+            gavg = (asm_t[] + fft_t[] + pacc_t[] + pfld_t[]) / n
+            @printf("top-grid gravity (%s): %.4f s/solve  [assemble %.4f | FFT %.4f | patch_accel %.4f | part_field %.4f] over %d solves\n",
+                    fftlabel, gavg, asm_t[]/n, fft_t[]/n, pacc_t[]/n, pfld_t[]/n, ngrav[])
+        end
     end
     @printf("\n%-8s %-10s %-12s %-12s %-12s\n", "z", "δb_rms", "D²/D₀²", "<x_HII>", "<T>[K]")
     for r in pk_log
