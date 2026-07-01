@@ -195,9 +195,23 @@ file size    = 92,274,784 bytes
 
 The corresponding f64 size at 128^3 is `184,549,472` bytes, so the f32 snapshot
 is exactly half-size apart from the fixed 96-byte header. Extrapolated to 1024^3,
-the `.cicass` IC file drops from about `88.0 GiB` to about `44.0 GiB`. A 128^3
-Metal/FVGK f16 one-cycle smoke from the f32 snapshot completed with finite output,
-mass drift `4.353e-07`, and top-grid gravity `1.1877 s/solve`.
+the `.cicass` IC file drops from about `88.0 GiB` to about `44.0 GiB`.
+
+Post-merge `CICASS02` Metal smokes from
+`reports/multicode/hero_ics/f32_smoke128_cicass02/f32_smoke128_cicass02.cicass`,
+both with CPU FFTW gravity and no dumps:
+
+```text
+128^3 Metal FVGK f16 dedup, analytic chem, np=1, one cycle:
+  mass drift      = 1.132e-06
+  top-grid gravity = 0.6217 s/solve
+  cycle wall       = 4.02 s
+
+128^3 Metal PPM packed, analytic chem, np=2, one cycle:
+  mass drift      = 0.000e+00
+  top-grid gravity = 0.9166 s/solve
+  cycle wall       = 7.40 s
+```
 
 ## Validation context
 
