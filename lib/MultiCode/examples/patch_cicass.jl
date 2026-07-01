@@ -25,6 +25,8 @@ import PPMKernels
 import ChemistryKernels
 import EmissionKernels
 
+const KA = PPMKernels.KA
+
 const BE = Symbol(get(ENV, "BACKEND", "cuda"))
 BE === :cuda && @eval import CUDA              # register the :cuda kernels backends
 BE === :metal && @eval import Metal            # register the :metal kernel backends
@@ -78,6 +80,9 @@ const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
 # CIC_PSORT=K: Morton-sort the DM particle SoA every K steps to keep the CIC deposit/force-gather
 # coalesced as the DM clusters (bit-identical — deposit+push are order-independent).  0 = off.
 const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
+
+const MAX_SIGNAL_GROUP = 256
+const _MAX_SIGNAL_CACHE = Dict{Any,Any}()
 # CIC_PIDS=1 (auto-on under PSORT): carry a Lagrangian particle index `id` (permuted with the sort)
 # so the particle→Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.
 const PIDS  = PSORT > 0 || get(ENV, "CIC_PIDS", "0") == "1"
@@ -278,16 +283,66 @@ function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
 end
 
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
+KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
+                                            nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int, gm1, three)
+    lane = KA.@index(Local, Linear)
+    grp = KA.@index(Group, Linear)
+    lanes = KA.@uniform prod(KA.@groupsize())
+    total = ni * nj * nk
+    cell = (grp - 1) * lanes + lane
+    buf = KA.@localmem eltype(D) (MAX_SIGNAL_GROUP,)
+    v = zero(eltype(D))
+    @inbounds if cell <= total
+        q = cell - 1
+        ii = q % ni + ng + 1
+        jj = (q ÷ ni) % nj + ng + 1
+        kk = q ÷ (ni * nj) + ng + 1
+        idx = ii + nx * (jj - 1) + nx * ny * (kk - 1)
+        d = D[idx]
+        if d > zero(d)
+            invd = one(d) / d
+            cs = sqrt(max(gm1 * Ge[idx] * invd, zero(d)))
+            v = abs(S1[idx] * invd) + abs(S2[idx] * invd) + abs(S3[idx] * invd) + three * cs
+        end
+    end
+    @inbounds buf[lane] = v
+    KA.@synchronize
+    stride = lanes >>> 1
+    while stride >= 1
+        if lane <= stride
+            @inbounds buf[lane] = max(buf[lane], buf[lane + stride])
+        end
+        KA.@synchronize
+        stride >>>= 1
+    end
+    if lane == 1
+        @inbounds out[grp] = buf[1]
+    end
+end
+
+function _max_signal_work(pg)
+    nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
+    key = (typeof(pg.patches[1].D), pg.T, pg.nd, pg.pdim, MAX_SIGNAL_GROUP)
+    return get!(_MAX_SIGNAL_CACHE, key) do
+        scratch = PPMKernels.device_zeros(pg.backend, pg.T, (nblocks,))
+        host = Vector{pg.T}(undef, nblocks)
+        (; scratch, host)
+    end
+end
+
 function max_signal(pg)
     smax = 0.0
-    li = (pg.ng+1):(pg.ng+pg.pdim[1]); lj = (pg.ng+1):(pg.ng+pg.pdim[2]); lk = (pg.ng+1):(pg.ng+pg.pdim[3])
-    iv(f) = @view reshape(f, pg.nd)[li, lj, lk]      # INTERIOR view (exclude ghosts) so the
-    Tloc = pg.T; gm1 = Tloc(GAMMA * (GAMMA - 1)); z = zero(Tloc)
+    Tloc = pg.T; gm1 = Tloc(GAMMA * (GAMMA - 1))
+    work = _max_signal_work(pg)
+    nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
+    nx, ny, _ = pg.nd
+    ni, nj, nk = pg.pdim
     for p in pg.patches                              # CFL timestep depends only on the physical
-        D = iv(p.D)                                  # state — makes checkpoint/restart bit-exact
-        cs = sqrt.(max.(gm1 .* (iv(p.Ge) ./ D), z))   # (and avoids D=0 ghost NaNs)
-        sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ Tloc(3) .* cs
-        smax = max(smax, Float64(maximum(sig)))
+        _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
+            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3); ndrange=nblocks * MAX_SIGNAL_GROUP)
+        PPMKernels.KA.synchronize(pg.backend)
+        copyto!(work.host, work.scratch)
+        smax = max(smax, Float64(maximum(work.host)))
     end
     return smax
 end

@@ -146,11 +146,12 @@ The 1024^3 live Metal footprint is higher than the 512^3 projection, but it stil
 
 ## Lean-memory follow-up
 
-Follow-up changes on 2026-07-01 removed three per-call transients:
+Follow-up changes on 2026-07-01 removed four per-call transients:
 
 - `fft_poisson_root!` and `fft_poisson_rfft!` now cache the complex rFFT buffer and use `mul!` for both transforms. On the root FFTW path, the inverse writes directly into the caller's `phi` host array when possible.
 - CPU-gravity particle deposition now reuses a device density scratch plus host staging vector instead of allocating a full device density and `Float64.(to_host(...))` conversion every solve.
 - Compton drag is now one fused per-cell KA kernel, eliminating the full-grid `ke0` and `ke1` broadcast temporaries.
+- CFL signal-speed reduction now uses a fused block-max KA kernel, eliminating the full-grid `cs` and `sig` broadcast temporaries in `max_signal`.
 
 Allocation probe after warmup at 128^3:
 
