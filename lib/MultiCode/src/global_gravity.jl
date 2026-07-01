@@ -15,7 +15,8 @@
 # for the decomposition validation (REF np=1 ≡ DECOMP np=8).
 
 """
-    assemble_global_density!(ρg, pg; particles=nothing, dt=0.0, a=1.0) -> ρg
+    assemble_global_density!(ρg, pg; particles=nothing, dt=0.0, a=1.0,
+                             particle_density=nothing, particle_host=nothing) -> ρg
 
 Gather the patches' interior gas density into the global `ncell³` host array `ρg`,
 ADD the dark-matter particles via a global periodic CIC deposit (when `particles`
@@ -28,7 +29,9 @@ and `a` set the half-drift registration `disp = 0.5·dt/a` (Enzo GMF convention)
 matching the undecomposed deposit exactly.
 """
 function assemble_global_density!(ρg::Array{Float64,3}, pg::PatchGrid;
-                                  particles=nothing, dt::Real=0.0, a::Real=1.0, meandens::Real=1.0)
+                                  particles=nothing, dt::Real=0.0, a::Real=1.0,
+                                  meandens::Real=1.0, particle_density=nothing,
+                                  particle_host=nothing)
     size(ρg) == pg.ncell || error("assemble_global_density!: ρg size $(size(ρg)) ≠ ncell $(pg.ncell)")
     all(==(pg.ncell[1]), pg.ncell) || error("assemble_global_density!: cubic ncell required for CIC")
     fill!(ρg, 0.0)
@@ -39,11 +42,20 @@ function assemble_global_density!(ρg::Array{Float64,3}, pg::PatchGrid;
         @views ρg[gi, gj, gk] .= Float64.(h[li, lj, lk])
     end
     if particles !== nothing                              # DM: global periodic CIC
-        ρp = PPMKernels.device_zeros(pg.backend, pg.T, (prod(pg.ncell),))
+        n = prod(pg.ncell)
+        ρp = particle_density === nothing ? PPMKernels.device_zeros(pg.backend, pg.T, (n,)) : particle_density
+        length(ρp) == n || error("assemble_global_density!: particle_density length $(length(ρp)) != $n")
         PoissonKernels.cic_deposit!(ρp, particles.px, particles.py, particles.pz,
                                     particles.vx, particles.vy, particles.vz, particles.mass;
                                     N=pg.ncell[1], disp=0.5*dt/a, shift=-0.5)
-        ρg .+= reshape(Float64.(PPMKernels.to_host(ρp)), pg.ncell)
+        ρph = particle_host === nothing ? PPMKernels.to_host(ρp) : particle_host
+        if particle_host !== nothing
+            length(ρph) == n || error("assemble_global_density!: particle_host length $(length(ρph)) != $n")
+            copyto!(ρph, ρp)
+        end
+        @inbounds for i in eachindex(ρg)
+            ρg[i] += Float64(ρph[i])
+        end
     end
     # the periodic gravity source is the overdensity δ = ρ − mean.  In a periodic
     # cosmological box the mean is FIXED by Ωb,Ω0 (mass conservation), so we subtract the

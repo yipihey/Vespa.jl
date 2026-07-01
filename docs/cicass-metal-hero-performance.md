@@ -144,6 +144,43 @@ Full f16 stack memory probes before the streamed 1024^3 run:
 
 The 1024^3 live Metal footprint is higher than the 512^3 projection, but it still fits in 128 GiB unified memory for the one-cycle benchmark. Host and Metal memory are not additive in a simple way on unified memory, but the benchmark did complete at this size without swaps.
 
+## Lean-memory follow-up
+
+Follow-up changes on 2026-07-01 removed three per-call transients:
+
+- `fft_poisson_root!` and `fft_poisson_rfft!` now cache the complex rFFT buffer and use `mul!` for both transforms. On the root FFTW path, the inverse writes directly into the caller's `phi` host array when possible.
+- CPU-gravity particle deposition now reuses a device density scratch plus host staging vector instead of allocating a full device density and `Float64.(to_host(...))` conversion every solve.
+- Compton drag is now one fused per-cell KA kernel, eliminating the full-grid `ke0` and `ke1` broadcast temporaries.
+
+Allocation probe after warmup at 128^3:
+
+```text
+fft_poisson_root! warmed allocated bytes = 224
+fft_poisson_rfft! warmed allocated bytes = 80
+```
+
+The default hero script uses `CIC_FFT=ka`, so the FFTW `mul!` change does not explain the default 1024^3 cycle timing. It applies to `CIC_FFT=fftw` and to generic `fft_poisson_rfft!` users.
+
+Rerunning the production-shaped 1024^3 one-cycle Metal/FVGK case after the scratch reuse, with the default KA FFT path:
+
+```text
+log                     = reports/multicode/perf/hero_metal1024_box0p8_lean_1cyc_20260701.log
+real time               = 469.28 s
+max resident set size   = 57,716,277,248 bytes = 53.76 GiB
+peak memory footprint   = 231,871,636,056 bytes
+live Metal              = 90.61 GiB
+cycle wall              = 420.16 s
+top-grid gravity        = 89.1096 s/solve
+```
+
+Compared with the prior one-cycle log's `62,154,162,176` byte max RSS, host resident memory dropped by `4,437,884,928` bytes, matching the removed host conversion transient. Live Metal memory stayed at `90.61 GiB` because the scratch is now persistent resident storage rather than per-solve allocation churn. No monotonic growth was observed in this one-cycle probe; a longer run is still the right gate for slow drift.
+
+The IC realizer now links `libfftw3_threads` and reads `CICASS_FFT_THREADS`, then `FFTW_NUM_THREADS`, then `OMP_NUM_THREADS`. A 128^3 smoke with `CICASS_FFT_THREADS=4` printed:
+
+```text
+CICASS FFTW threads: 4
+```
+
 ## Validation context
 
 Metal kernel gates completed before this benchmark:

@@ -67,6 +67,24 @@ end
 z_to_a(z) = 1.0 / (1.0 + z)
 a_to_z(a) = 1.0/a - 1.0
 
+@kernel function _compton_drag_k!(@Const(D), S1, S2, S3, Tau, f, vx, vy, vz)
+    i = @index(Global)
+    @inbounds begin
+        ρ = D[i]
+        if ρ > zero(ρ)
+            sx = S1[i]; sy = S2[i]; sz = S3[i]
+            ox = ρ * vx; oy = ρ * vy; oz = ρ * vz
+            nsx = ox + (sx - ox) * f
+            nsy = oy + (sy - oy) * f
+            nsz = oz + (sz - oz) * f
+            ke0 = (sx*sx + sy*sy + sz*sz) / (ρ + ρ)
+            ke1 = (nsx*nsx + nsy*nsy + nsz*nsz) / (ρ + ρ)
+            S1[i] = nsx; S2[i] = nsy; S3[i] = nsz
+            Tau[i] += ke1 - ke0
+        end
+    end
+end
+
 """
     compton_drag_patches!(pg, f)
 
@@ -84,13 +102,9 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
     T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M)
+    be = PoissonKernels.KA.get_backend(pg.patches[1].D)
     for p in pg.patches
-        ke0 = (p.S1.^2 .+ p.S2.^2 .+ p.S3.^2) ./ (2 .* p.D)
-        p.S1 .= p.D .* vx .+ (p.S1 .- p.D .* vx) .* ff
-        p.S2 .= p.D .* vy .+ (p.S2 .- p.D .* vy) .* ff
-        p.S3 .= p.D .* vz .+ (p.S3 .- p.D .* vz) .* ff
-        ke1 = (p.S1.^2 .+ p.S2.^2 .+ p.S3.^2) ./ (2 .* p.D)
-        p.Tau .+= ke1 .- ke0                                # internal energy unchanged
+        _compton_drag_k!(be)(p.D, p.S1, p.S2, p.S3, p.Tau, ff, vx, vy, vz; ndrange=length(p.D))
     end
     return nothing
 end

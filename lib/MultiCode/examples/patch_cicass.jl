@@ -467,6 +467,11 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     # (subtracted in assemble_global_density_gpu!), so no f64 reduction / no f64 arrays needed.
     ρd = gravmode === :gpu ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
     φd = gravmode === :gpu ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
+    # CPU-gravity DM deposit scratch. Reused each solve; otherwise the Metal path allocates
+    # a full device density and full host conversion every gravity call.
+    ρp_scratch = (gravmode === :cpu && parts !== nothing) ?
+        PPMKernels.device_zeros(pg.backend, T, (prod(ncell),)) : nothing
+    ρp_host = ρp_scratch === nothing ? nothing : Vector{T}(undef, prod(ncell))
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
@@ -493,7 +498,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
 
     # the top-grid gravity, split so the GPU step can be launched between the host
     # density snapshot and the (overlappable) CPU FFT + accel scatter.
-    snapshot!(dt_, a_) = assemble_global_density!(ρg, pg; particles=parts, dt=dt_, a=1.0)
+    snapshot!(dt_, a_) = assemble_global_density!(ρg, pg; particles=parts, dt=dt_, a=1.0,
+        particle_density=ρp_scratch, particle_host=ρp_host)
     function solve_accel!(a_)                       # ρg already filled; returns accel tuple
         tf = time(); solve_global_poisson!(φg, ρg; G=1.5*c.Om*a_, a=1.0, boxsize=1.0, solver=fftsolver); fft_t[] += time()-tf
         tp = time()

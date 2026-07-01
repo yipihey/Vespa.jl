@@ -11,6 +11,7 @@
 # (Metal) arrays are accepted and staged to the host around the transform. The solve
 # is spectral, so it is EXACT for resolved modes — certified against analytic φ.
 
+using LinearAlgebra: mul!
 using FFTW: rfft, irfft, plan_rfft, plan_irfft, set_num_threads
 
 """
@@ -78,25 +79,34 @@ _host(a::AbstractArray) = a isa Array ? a : to_host(a)
 # dominates a single transform) are computed ONCE and reused.  This turns the
 # per-call cost into just the two transforms + one elementwise multiply — the
 # 126³ rebuild + plan creation that dominated the profile are gone.
+_rfft_dims(N::NTuple{3,Int}) = (N[1] ÷ 2 + 1, N[2], N[3])
+
 struct _FFTPlan{T,PF,PI}
     Gk::Array{T,3}
-    fwd::PF                       # plan_rfft (applied with `*`)
-    inv::PI                       # plan_irfft (applied with `*`)
-    rbuf::Array{T,3}              # real scratch (decouples caller's ρ from FFTW)
+    fwd::PF                       # plan_rfft
+    inv::PI                       # plan_irfft
+    chat::Array{Complex{T},3}     # cached rfft workspace
 end
 const _FFT_CACHE = Dict{Tuple{DataType,NTuple{3,Int},NTuple{3,Float64},Symbol},Any}()
+const _FFT_REAL_STAGING = Dict{Tuple{DataType,NTuple{3,Int}},Any}()
 
 function _fft_plan(::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}, greens::Symbol) where {T}
     get!(_FFT_CACHE, (T, N, L, greens)) do
         rbuf = zeros(T, N)
         fwd  = plan_rfft(rbuf)
-        chat = fwd * rbuf                      # probe the rfft shape for the inverse plan
+        chat = Array{Complex{T},3}(undef, _rfft_dims(N))
         inv  = plan_irfft(chat, N[1])
         Gk = greens === :spectral ? _greens_periodic(T, N, L) :
              greens === :discrete7 ? _greens_discrete7(T, N, L) :
              error("fft_poisson_root!: greens must be :spectral or :discrete7 (got $greens)")
-        _FFTPlan{T,typeof(fwd),typeof(inv)}(Gk, fwd, inv, rbuf)
+        _FFTPlan{T,typeof(fwd),typeof(inv)}(Gk, fwd, inv, chat)
     end::_FFTPlan
+end
+
+function _fft_real_staging(::Type{T}, N::NTuple{3,Int}) where {T}
+    get!(_FFT_REAL_STAGING, (T, N)) do
+        Array{T,3}(undef, N)
+    end::Array{T,3}
 end
 
 """
@@ -126,12 +136,13 @@ function fft_poisson_root!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
     L = boxsize isa Number ? ntuple(_ -> Float64(boxsize), 3) :
         ntuple(d -> Float64(boxsize[d]), 3)
     P = _fft_plan(T, N, L, greens)
-    copyto!(P.rbuf, _host(rho))                # host (or staged-from-device) ρ
-    chat = P.fwd * P.rbuf                      # ρ̂ = rfft(ρ)
+    phi_h = phi isa Array ? phi : _fft_real_staging(T, N)
+    copyto!(phi_h, _host(rho))                 # use caller's φ as the real FFT input when host-side
+    mul!(P.chat, P.fwd, phi_h)                 # ρ̂ = rfft(ρ)
     coef = T(G) / T(a)
-    @inbounds @. chat = coef * P.Gk * chat     # φ̂ = coef·G(k)·ρ̂
-    phi_h = P.inv * chat                       # back to real space (normalized)
-    copyto!(phi, phi_h)                        # host→host or host→device
+    @inbounds @. P.chat = coef * P.Gk * P.chat # φ̂ = coef·G(k)·ρ̂
+    mul!(phi_h, P.inv, P.chat)                 # back to real space (normalized)
+    phi === phi_h || copyto!(phi, phi_h)       # host→device only when needed
     return phi
 end
 
@@ -141,8 +152,8 @@ end
 # Real-to-complex (rfft) ⇒ half the spectral storage of a c2c transform, and cuFFT
 # supports ARBITRARY sizes (best for 2^a·3^b·5^c·7^d) — no power-of-two restriction.
 # Plans + the −1/k² Green's function (rfft half-grid) are cached per (array-type,T,N,L,greens).
-struct _RFFTPlan{PF,PI,A}
-    fwd::PF; inv::PI; Gk::A      # Gk lives on ρ's device (real, rfft shape)
+struct _RFFTPlan{PF,PI,A,C}
+    fwd::PF; inv::PI; Gk::A; chat::C      # Gk/chat live on ρ's device
 end
 const _RFFT_CACHE = Dict{Any,Any}()
 
@@ -160,17 +171,17 @@ function fft_poisson_rfft!(φ::AbstractArray{T,3}, ρ::AbstractArray{T,3};
     L = boxsize isa Number ? ntuple(_->Float64(boxsize),3) : ntuple(d->Float64(boxsize[d]),3)
     P = get!(_RFFT_CACHE, (typeof(ρ), T, N, L, greens)) do
         fwd = plan_rfft(ρ)                       # device plan (cuFFT) or host (FFTW)
-        chat = fwd * ρ
+        chat = similar(ρ, Complex{T}, _rfft_dims(N))
         inv = plan_irfft(chat, N[1])
         gh  = greens === :spectral ? _greens_periodic(T, N, L) :
               greens === :discrete7 ? _greens_discrete7(T, N, L) :
               error("fft_poisson_rfft!: greens must be :spectral or :discrete7")
         gk  = ρ isa Array ? gh : copyto!(similar(ρ, T, size(gh)), gh)   # Green's onto ρ's device
-        _RFFTPlan(fwd, inv, gk)
+        _RFFTPlan(fwd, inv, gk, chat)
     end::_RFFTPlan
     coef = T(G) / T(a)
-    chat = P.fwd * ρ                             # rfft(ρ) — complex, (N₁÷2+1,N₂,N₃)
-    @. chat = coef * P.Gk * chat                 # φ̂ = coef·G(k)·ρ̂
-    φ .= P.inv * chat                            # inverse rfft (normalized)
+    mul!(P.chat, P.fwd, ρ)                       # rfft(ρ) — complex, (N₁÷2+1,N₂,N₃)
+    @. P.chat = coef * P.Gk * P.chat             # φ̂ = coef·G(k)·ρ̂
+    mul!(φ, P.inv, P.chat)                       # inverse rfft (normalized)
     return φ
 end
