@@ -116,6 +116,37 @@
     @test maximum(abs.(fp[2] .- fp[5])) < 1e-12
     @test maximum(abs.(fp[3] .- fp[6])) < 1e-12
 
+    # (3c) fused global-potential KDK matches the old four-kernel path and keeps
+    # the same Float16 velocity rounding after the first kick.
+    function run_global_kdk(name, ::Type{Tp}, ::Type{Tv}; fused::Bool) where {Tp,Tv}
+        be = PoissonKernels.backend(name)
+        qx = PoissonKernels.to_device(be, px, Tp); qy = PoissonKernels.to_device(be, py, Tp)
+        qz = PoissonKernels.to_device(be, pz, Tp)
+        wx = PoissonKernels.to_device(be, vx, Tv); wy = PoissonKernels.to_device(be, vy, Tv)
+        wz = PoissonKernels.to_device(be, vz, Tv)
+        ph = PoissonKernels.to_device(be, φg, Tp)
+        if fused
+            PoissonKernels.particle_kdk_from_global_potential!(qx, qy, qz, wx, wy, wz, ph;
+                dcoef = dcoef, ts = ts, driftcoef = cd, nc = (N, N, N), wrap = 1.0)
+        else
+            ax = PoissonKernels.device_zeros(be, Tp, (np,)); ay = similar(ax); az = similar(ax)
+            PoissonKernels.interp_force_from_global_potential!(ax, ay, az, qx, qy, qz, wx, wy, wz, ph;
+                dcoef = dcoef, nc = (N, N, N))
+            PoissonKernels.particle_kick!(wx, wy, wz, ax, ay, az; ts = ts, coef = 0.0)
+            PoissonKernels.particle_drift!(qx, qy, qz, wx, wy, wz; coef = cd, wrap = 1.0)
+            PoissonKernels.particle_kick!(wx, wy, wz, ax, ay, az; ts = ts, coef = 0.0)
+        end
+        map(PoissonKernels.to_host, (qx, qy, qz, wx, wy, wz))
+    end
+    guf = run_global_kdk(:cpu, Float32, Float32; fused=false)
+    gf = run_global_kdk(:cpu, Float32, Float32; fused=true)
+    @test maximum(abs.(guf[1] .- gf[1])) == 0
+    @test maximum(abs.(guf[4] .- gf[4])) == 0
+    guf16 = run_global_kdk(:cpu, Float32, Float16; fused=false)
+    gf16 = run_global_kdk(:cpu, Float32, Float16; fused=true)
+    @test guf16[1] == gf16[1]
+    @test guf16[4] == gf16[4]
+
     # (4) Metal f32 ≡ CPU f32 for the full interp→kick→drift→kick push
     if metal_ready()
         run_push(name, ::Type{T}) where {T} = begin
@@ -141,6 +172,18 @@
         @test rel(fm[4], fc[4]) < 1f-4
         @test rel(fm[5], fc[5]) < 1f-4
         @test rel(fm[6], fc[6]) < 1f-4
+
+        mf = run_global_kdk(:metal, Float32, Float32; fused=true)
+        cu = run_global_kdk(:cpu, Float32, Float32; fused=false)
+        @info "fused global KDK Metal≡CPU f32" pos = rel(mf[1], cu[1]) vel = rel(mf[4], cu[4])
+        @test rel(mf[1], cu[1]) < 1f-4
+        @test rel(mf[4], cu[4]) < 1f-4
+
+        mf16 = run_global_kdk(:metal, Float32, Float16; fused=true)
+        cu16 = run_global_kdk(:cpu, Float32, Float16; fused=false)
+        @info "fused global KDK Metal≡CPU f16v" pos = rel(Float32.(mf16[1]), Float32.(cu16[1])) vel = rel(Float32.(mf16[4]), Float32.(cu16[4]))
+        @test rel(Float32.(mf16[1]), Float32.(cu16[1])) < 1f-4
+        @test rel(Float32.(mf16[4]), Float32.(cu16[4])) < 1f-4
     else
         @test_skip "Metal not available — GPU particle-push parity skipped"
     end

@@ -225,6 +225,83 @@ function interp_force_from_global_potential!(axp::AbstractVector{T}, ayp, azp,
     return axp, ayp, azp
 end
 
+# Fused global-potential particle push for the memory-lean CICASS path. This is
+# exactly the same KDK sequence as:
+#   interp_force_from_global_potential!; particle_kick!; particle_drift!; particle_kick!
+# but keeps the acceleration in registers instead of materializing axp/ayp/azp.
+@kernel function _particle_kdk_global_phi_kernel!(px, py, pz, vx, vy, vz, @Const(φg),
+                                                  dcoef, ts, driftcoef, wrap, dowrap::Int,
+                                                  invcell, c05, c1,
+                                                  n1::Int, n2::Int, n3::Int, hc)
+    p = @index(Global)
+    @inbounds begin
+        xq = px[p] + dcoef * vx[p]
+        yq = py[p] + dcoef * vy[p]
+        zq = pz[p] + dcoef * vz[p]
+        xpos = xq * invcell
+        ypos = yq * invcell
+        zpos = zq * invcell
+        i1 = unsafe_trunc(Int, xpos + c05)
+        j1 = unsafe_trunc(Int, ypos + c05)
+        k1 = unsafe_trunc(Int, zpos + c05)
+        dxr = oftype(xpos, i1) + c05 - xpos
+        dyr = oftype(ypos, j1) + c05 - ypos
+        dzr = oftype(zpos, k1) + c05 - zpos
+        ex = c1 - dxr; ey = c1 - dyr; ez = c1 - dzr
+        φr(i,j,k) = φg[_wrap1(i, n1), _wrap1(j, n2), _wrap1(k, n3)]
+        gxc(i,j,k) = -hc * (φr(i+1,j,k) - φr(i-1,j,k))
+        gyc(i,j,k) = -hc * (φr(i,j+1,k) - φr(i,j-1,k))
+        gzc(i,j,k) = -hc * (φr(i,j,k+1) - φr(i,j,k-1))
+        w(a,b,c) = a * b * c
+        ax = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ay = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        az = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+
+        Tv = eltype(vx)
+        nvx = Tv(vx[p] + ax * ts)
+        nvy = Tv(vy[p] + ay * ts)
+        nvz = Tv(vz[p] + az * ts)
+
+        x = px[p] + driftcoef * nvx
+        y = py[p] + driftcoef * nvy
+        z = pz[p] + driftcoef * nvz
+        if dowrap == 1
+            x = mod(x, wrap); y = mod(y, wrap); z = mod(z, wrap)
+        end
+        px[p] = x; py[p] = y; pz[p] = z
+
+        vx[p] = Tv(nvx + ax * ts)
+        vy[p] = Tv(nvy + ay * ts)
+        vz[p] = Tv(nvz + az * ts)
+    end
+end
+
+"""
+    particle_kdk_from_global_potential!(px,py,pz, vx,vy,vz, φg; dcoef, ts, driftcoef, nc, wrap=1)
+
+Fused KDK particle update reading the global periodic potential directly. It is
+equivalent to force interpolation from [`interp_force_from_global_potential!`](@ref),
+one kick, drift with optional periodic wrap, and the second kick, but avoids the
+three per-particle acceleration scratch vectors.
+"""
+function particle_kdk_from_global_potential!(px::AbstractVector{T}, py, pz, vx, vy, vz,
+                                             φg::AbstractArray{<:Any,3};
+                                             dcoef::Real, ts::Real, driftcoef::Real,
+                                             nc, wrap::Real=1) where {T}
+    be = KA.get_backend(px)
+    n1, n2, n3 = Int(nc[1]), Int(nc[2]), Int(nc[3])
+    dowrap = wrap > 0 ? 1 : 0
+    _particle_kdk_global_phi_kernel!(be)(px, py, pz, vx, vy, vz, φg,
+                                         T(dcoef), T(ts), T(driftcoef), T(wrap), dowrap,
+                                         T(n1), T(0.5), T(1),
+                                         n1, n2, n3, T(0.5) * T(n1);
+                                         ndrange = length(px))
+    return px, py, pz, vx, vy, vz
+end
+
 @kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),
                                ts, coef1, coef2)
     p = @index(Global)

@@ -120,12 +120,18 @@ positions; `gx,gy,gz` is the field from `particle_accel_field`.
 """
 function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Real;
                          scratch=nothing, nc=nothing)
+    half = 0.5*dtau
+    if nc !== nothing && get(ENV, "CIC_PARTICLE_FUSED", "1") == "1"
+        PoissonKernels.particle_kdk_from_global_potential!(
+            parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
+            dcoef=half, ts=half, driftcoef=dtau, nc=nc, wrap=1.0)
+        return scratch
+    end
     if scratch === nothing
         axp = similar(parts.px); ayp = similar(parts.px); azp = similar(parts.px)
     else
         axp, ayp, azp = scratch
     end
-    half = 0.5*dtau
     # force = −∇φ central-differenced at the CIC cells (no stored accel). With
     # `nc !== nothing`, read the global nc³ potential directly with periodic wrap
     # instead of a padded potential copy.
