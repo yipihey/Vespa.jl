@@ -88,6 +88,9 @@ const PIDS  = get(ENV, "CIC_PIDS", PSORT > 0 ? "1" : "0") == "1"
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
 const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
+# CIC_NODUMP=1: skip the multi-GB per-output cellcmp .bin (still compute+print the δrms/xHII/T
+# diagnostic).  For P(k)-only analysis runs (CIC_PK=1) that don't need the full-state field dumps.
+const NODUMP = get(ENV, "CIC_NODUMP", "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
@@ -189,10 +192,12 @@ function write_cellcmp(pg, c::Cosmo, u, a, z)
     xHIIv = HII ./ ρb ./ XH; fH2v = H2I ./ ρb ./ XH; fHDv = HDI ./ ρb
     μv = 1.0 ./ ((XH + (1-XH)/4) .+ XH .* (xHIIv .- 0.5 .* fH2v))
     Tcell = eint .* ((GAMMA-1) .* μv .* u.T2)                  # K
-    mkpath(REPORTS)
-    open(joinpath(REPORTS, "patch_cellcmp_$(TAG)_z$(round(Int,z)).bin"), "w") do io
-        write(io, Int64(pg.ncell[1]))
-        write(io, ρb); write(io, xHIIv); write(io, fH2v); write(io, fHDv); write(io, Tcell)
+    if !NODUMP
+        mkpath(REPORTS)
+        open(joinpath(REPORTS, "patch_cellcmp_$(TAG)_z$(round(Int,z)).bin"), "w") do io
+            write(io, Int64(pg.ncell[1]))
+            write(io, ρb); write(io, xHIIv); write(io, fH2v); write(io, fHDv); write(io, Tcell)
+        end
     end
     return (ρmean=mean(ρb), δrms=std(ρb)/mean(ρb), xHII=mean(xHIIv), T=mean(Tcell))
 end
