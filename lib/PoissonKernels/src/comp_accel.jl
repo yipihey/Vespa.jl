@@ -90,6 +90,46 @@ function grav_kick_from_potential!(φ, D, S1, S2, S3, Tau; dims, ng::Integer, dx
     return nothing
 end
 
+# Ghost-FREE gravity kick: reads the GLOBAL potential `φg` (nc³, no halo) with periodic wrap, and
+# writes the gas arrays which are ALSO ghost-free nc³ (the FVGK-canonical g.R blocks).  This removes
+# the per-patch ghosted φ-block copy entirely.  `Tau` may be GE_SCALE-lifted (energy slot stored
+# ×gesc so cold eint survives f16): the KE increment is scaled by `gesc` before adding.  All inner
+# math is done in Float32 so f16 D/S/Tau lose no precision in the (E−KE)-free momentum kick.
+@kernel function _grav_kick_global_phi_kernel!(@Const(φg), D, S1, S2, S3, Tau,
+                                               n1::Int, n2::Int, n3::Int, hc::Float32, c::Float32, gesc::Float32)
+    i, j, k = @index(Global, NTuple)               # over the full nc³ (1-based)
+    @inbounds begin
+        idx = i + n1*(j-1) + n1*n2*(k-1)
+        ip = i == n1 ? 1 : i+1; im = i == 1 ? n1 : i-1
+        jp = j == n2 ? 1 : j+1; jm = j == 1 ? n2 : j-1
+        kp = k == n3 ? 1 : k+1; km = k == 1 ? n3 : k-1
+        gx = -hc*(Float32(φg[ip + n1*(j-1) + n1*n2*(k-1)]) - Float32(φg[im + n1*(j-1) + n1*n2*(k-1)]))
+        gy = -hc*(Float32(φg[i + n1*(jp-1) + n1*n2*(k-1)]) - Float32(φg[i + n1*(jm-1) + n1*n2*(k-1)]))
+        gz = -hc*(Float32(φg[i + n1*(j-1) + n1*n2*(kp-1)]) - Float32(φg[i + n1*(j-1) + n1*n2*(km-1)]))
+        d = Float32(D[idx])
+        dS1 = d*gx*c; dS2 = d*gy*c; dS3 = d*gz*c
+        s1 = Float32(S1[idx]); s2 = Float32(S2[idx]); s3 = Float32(S3[idx])
+        dKE = ((s1*dS1 + s2*dS2 + s3*dS3) + 0.5f0*(dS1*dS1+dS2*dS2+dS3*dS3)) / d
+        Tau[idx] += eltype(Tau)(dKE * gesc)
+        S1[idx] = eltype(S1)(s1 + dS1); S2[idx] = eltype(S2)(s2 + dS2); S3[idx] = eltype(S3)(s3 + dS3)
+    end
+end
+
+"""
+    grav_kick_from_global_potential!(φg, D,S1,S2,S3,Tau; nc, dx, halfdt, gesc=1) -> nothing
+
+Half KDK gravity kick reading the GLOBAL `nc³` potential `φg` (no halo, periodic wrap) and writing
+the ghost-free gas arrays in place — the FVGK-canonical layout, with no per-patch φ-block copy.
+`gesc` (default 1) scales the energy increment when `Tau` is GE_SCALE-lifted f16 storage.
+"""
+function grav_kick_from_global_potential!(φg, D, S1, S2, S3, Tau; nc::NTuple{3,Int},
+                                          dx::Real, halfdt::Real, gesc::Real=1)
+    be = KA.get_backend(D)
+    _grav_kick_global_phi_kernel!(be)(φg, D, S1, S2, S3, Tau, nc[1], nc[2], nc[3],
+                                      Float32(0.5)/Float32(dx), Float32(halfdt), Float32(gesc); ndrange = nc)
+    return nothing
+end
+
 """
     gather_periodic_block!(out, G, o, ng, nd, nc) -> out
 

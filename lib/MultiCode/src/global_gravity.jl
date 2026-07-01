@@ -293,13 +293,17 @@ differenced on demand in the gas kick and particle interp.  No host round-trip, 
 """
 function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Real=1.0,
                             particles=nothing, dt::Real=0.0, meandens::Real=1.0,
-                            ρd=nothing, φd=nothing, ng2::Int=pg.ng)
+                            ρd=nothing, φd=nothing, ng2::Int=max(pg.ng, 2))
+    # ng2 = particle-potential halo; must stay >=2 for the CIC force interp INDEPENDENT of the gas
+    # ghost depth pg.ng (the FVGK dedup sets pg.ng=0, but particles still need the padded potential).
     be = pg.backend; nc = pg.ncell
     ρd === nothing && (ρd = PPMKernels.device_zeros(be, pg.T, nc))
     φd === nothing && (φd = PPMKernels.device_zeros(be, pg.T, nc))
     assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens)
     PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # cuFFT rfft, any size
-    gas = patch_accel_gpu(pg, φd; dx=pg.dx)                 # per-patch φ blocks
+    # dedup: the gas kick reads the GLOBAL φ directly (grav_kick_from_global_potential!), so the
+    # per-patch ghosted φ-block copy is unnecessary — pass φd itself as the "accel".
+    gas = pg.dedup ? φd : patch_accel_gpu(pg, φd; dx=pg.dx)
     φpad, le, cs = particle_accel_field_gpu(pg, φd; ng2=ng2)
     return (gas=gas, phi=φpad, le=le, cs=cs)
 end

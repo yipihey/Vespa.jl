@@ -76,8 +76,10 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
         # alloc); the gather/scatter GE_SCALE-lift the energy slots so the cold eint survives f16 storage.
         store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))
+        # scratch=:minimal drops the rk2-only third state buffer (NV·VOL) — the DE path always
+        # steps with run_ctus_de16! (R+O only), so this saves a full grid buffer (~14 B/cell @f16).
         return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec,
-                             de_prec = :f16, ge_scale = gesc, store = store)
+                             de_prec = :f16, ge_scale = gesc, store = store, scratch = :minimal)
     end
     pg.besym === :metal && error("solver=:fvgk on Metal currently requires CIC_FVGK_F16=1")
     if nsp == 0
@@ -86,7 +88,9 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         sys = EulerColors{nsp}(γ = γ);      z = (1f0, 0f0, 0f0, 0f0, 1f0, ntuple(_ -> 0f0, nsp)...)
     end
     U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]        # concrete Array{NTuple{5+nsp,Float32},3}
-    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec)
+    # rk2 needs the third buffer; CTU/single-pass paths don't — drop it unless rk2 is selected.
+    scr = get(ENV, "CIC_FVGK_INTEGRATOR", "ctu") == "rk2" ? :full : :minimal
+    return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec, scratch = scr)
 end
 
 # var c of the global FVGK buffer, as a (ncell...) view (column-major, var-major flat).
@@ -173,13 +177,42 @@ function _fvgk_sync_ge!(pg::MultiCode.PatchGrid)
     return nothing
 end
 
-function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
+# Re-point the (np=1) patch gas fields onto the FVGK grid's ghost-free f16 blocks and free the f32
+# patch arrays — eliminating patch↔FVGK duplication.  CUDA stores var-major `g.R`; Metal stores
+# component-last `g.U[:,:,:,c]`.  Energies (slots 5=Tau, 6=Ge) are GE_SCALE-lifted in-grid, so
+# pg.gesc carries the scale for consumers (chem/drag/kick/outputs).  np=1 only (the patch IS the
+# whole grid ⇒ each block view is contiguous; np>1 octants would be strided).
+_free!(a) = (m = parentmodule(typeof(a)); isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a); nothing)
+function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
+    prod(pg.np) == 1 || error("FVGK dedup needs np=1 (got np=$(pg.np))")
+    g = pg.fvgk; g === nothing && error("_fvgk_dedup!: build the FVGK grid first (pre-build)")
+    (_f16store(g) && _de(g, pg)) || error("FVGK dedup needs CIC_FVGK_F16=1 (f16 dual-energy store)")
+    nc = pg.ncell; GVOL = prod(nc); nsp = _nspecies(pg)
+    for p in pg.patches, f in MultiCode._allfields(p); _free!(f); end
+    blk(c) = _metal_de16(g) ? reshape(view(g.U, :, :, :, c), :) :
+                               view(g.R, (c-1)*GVOL + 1 : c*GVOL)
+    newp = MultiCode.Patch((0,0,0), blk(1), blk(2), blk(3), blk(4), blk(5), blk(6),
+                           [blk(6+q) for q in 1:nsp], ((1,1),(1,1),(1,1)))
+    pg.patches = [newp]
+    pg.ng = 0; pg.nd = pg.pdim                                   # gas fields are ghost-free now
+    pg.gesc = Float64(_gesc()); pg.packed = false; pg.dedup = true
+    return pg
+end
+
+function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspeed=nothing)
     pg.fvgk === nothing && (pg.fvgk = _build_fvgk_global(pg))
     g = pg.fvgk; dtf = Float32(dt)
-    _fvgk_gather!(g, pg)
+    pg.dedup || _fvgk_gather!(g, pg)                             # dedup: patches ARE g.R, no copy
     # one 2nd-order CTU step; sub-cycle if the driver dt exceeds FVGK's CTU CFL. With species the
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
+    # CTU sub-cycles needed to honor the 0.45 unsplit CFL.  Vespa's max_signal IS FVGK's per-cell
+    # summed directional speed (|vx|+|vy|+|vz|+3c), so when the driver passes `sigspeed` we compute
+    # nsub directly — no per-step GPU speed reduction and no spd buffer (scratch=:minimal drops it).
+    # dt=0 (the pre-build grid-allocation step) is a no-op ⇒ nsub=1, never touching dt_cfl/spd.
+    nsub = dtf <= 0 ? 1 :
+           sigspeed !== nothing ? max(1, ceil(Int, dtf * Float32(sigspeed) / (0.45f0 * Float32(pg.dx)))) :
+           max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
     de = _de(g, pg)
     # CIC_FVGK_F16=1 → all-f16 DUAL-ENERGY run_ctus_de16! (Ge evolved in-grid; cold gas, no NaN).  Else
     # single-energy f32: run_ctu! (CTU, accurate) or run_rk2! (CIC_FVGK_INTEGRATOR=rk2; ≈CTU cost), and
@@ -206,8 +239,8 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real)
         nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_ctu!(g, dtf / nsub, nsub)
     end
-    _fvgk_scatter!(g, pg)
-    de || _fvgk_sync_ge!(pg)        # DE evolves Ge in-grid; single-energy re-derives Ge = Tau − KE
+    pg.dedup || _fvgk_scatter!(g, pg)                           # dedup: g.R IS the state, no copy back
+    de || pg.dedup || _fvgk_sync_ge!(pg)   # DE evolves Ge in-grid; single-energy re-derives Ge = Tau − KE
     return nothing
 end
 

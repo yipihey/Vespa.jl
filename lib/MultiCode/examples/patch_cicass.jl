@@ -33,7 +33,11 @@ BE === :metal && @eval import Metal            # register the :metal kernel back
 const T  = BE === :cpu ? Float64 : Float32
 const IC_REAL_BYTES = parse(Int, get(ENV, "CICASS_REAL_BYTES", BE === :cpu ? "8" : "4"))
 IC_REAL_BYTES in (4, 8) || error("CICASS_REAL_BYTES must be 4 or 8 (got $IC_REAL_BYTES)")
-const NG = 4
+# Patch ghost depth.  The :fvgk solver owns periodicity internally and reads patch interiors
+# only (gather/scatter/chem/density all interior); the sole ghost users are the gravity gas
+# kick (∂φ central diff ⇒ ng≥1) and the particle force interp (CIC+diff ⇒ ng2≥2), so ng=2 is
+# the safe floor.  :ppm needs ng≥3 (parabolic+flattening stencil); keep 4.  CIC_NG overrides.
+const NG = parse(Int, get(ENV, "CIC_NG", get(ENV, "CIC_SOLVER", "ppm") == "fvgk" ? "2" : "4"))
 
 # ── parameters (defaults match the cicass cross-code comparison) ──
 const NGRID  = parse(Int, get(ENV, "CIC_NGRID", "128"))
@@ -85,13 +89,18 @@ const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
 
 const MAX_SIGNAL_GROUP = 256
 const _MAX_SIGNAL_CACHE = Dict{Any,Any}()
-# CIC_PIDS=1 (auto-on under PSORT): carry a Lagrangian particle index `id` (permuted with the sort)
-# so the particle→Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.
-const PIDS  = PSORT > 0 || get(ENV, "CIC_PIDS", "0") == "1"
+# CIC_PIDS=1: carry a Lagrangian particle index `id` (permuted with the sort) so the particle→
+# Lagrangian-grid map survives reordering — needed to rebuild the phase-space sheet.  Defaults ON
+# under PSORT (Morton) but CIC_PIDS=0 overrides to drop it (−4 B/cell of particle storage) when the
+# sheet isn't needed — Morton still works, it just doesn't permute a (nonexistent) id.
+const PIDS  = get(ENV, "CIC_PIDS", PSORT > 0 ? "1" : "0") == "1"
 # CIC_PK=1: measure anisotropic P(k,μ) ON DEVICE at every output redshift (gas δ, DM δ,
 # gas velocity) straight from the resident GPU fields — tiny "<ckpref>_pkmu.h5" tables
 # instead of multi-GB full-state dumps.  μ=|k_axis|/|k| (the v_bc stream is ∥ CIC_PKAXIS).
 const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
+# CIC_NODUMP=1: skip the multi-GB per-output cellcmp .bin (still compute+print the δrms/xHII/T
+# diagnostic).  For P(k)-only analysis runs (CIC_PK=1) that don't need the full-state field dumps.
+const NODUMP = get(ENV, "CIC_NODUMP", "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
@@ -121,7 +130,7 @@ function cicass_header(path::AbstractString)
         magic = read(io, 8)
         magic_s = String(magic)
         real_bytes = magic_s == "CICASS01" ? 8 :
-                     magic_s == "CICASSF4" ? 4 :
+                     (magic_s == "CICASS02" || magic_s == "CICASSF4") ? 4 :
                      error("not a CICASS snapshot (bad magic $(repr(magic_s))): $path")
         n = Int(read(io, Int32)); nsp = Int(read(io, Int32))
         hd = Vector{Float64}(undef, 10); read!(io, hd)
@@ -291,25 +300,30 @@ end
 
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
-                                            nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int, gm1, three)
+                                            nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int,
+                                            gm1, three, gesc)
     lane = KA.@index(Local, Linear)
     grp = KA.@index(Group, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
     total = ni * nj * nk
     cell = (grp - 1) * lanes + lane
-    buf = KA.@localmem eltype(D) (MAX_SIGNAL_GROUP,)
-    v = zero(eltype(D))
+    buf = KA.@localmem eltype(out) (MAX_SIGNAL_GROUP,)
+    v = zero(eltype(out))
     @inbounds if cell <= total
         q = cell - 1
         ii = q % ni + ng + 1
         jj = (q ÷ ni) % nj + ng + 1
         kk = q ÷ (ni * nj) + ng + 1
         idx = ii + nx * (jj - 1) + nx * ny * (kk - 1)
-        d = D[idx]
+        d = eltype(out)(D[idx])
         if d > zero(d)
             invd = one(d) / d
-            cs = sqrt(max(gm1 * Ge[idx] * invd, zero(d)))
-            v = abs(S1[idx] * invd) + abs(S2[idx] * invd) + abs(S3[idx] * invd) + three * cs
+            ge = eltype(out)(Ge[idx])
+            cs = sqrt(max(eltype(out)(gm1) * ge * invd / eltype(out)(gesc), zero(d)))
+            v = abs(eltype(out)(S1[idx]) * invd) +
+                abs(eltype(out)(S2[idx]) * invd) +
+                abs(eltype(out)(S3[idx]) * invd) +
+                eltype(out)(three) * cs
         end
     end
     @inbounds buf[lane] = v
@@ -339,23 +353,23 @@ end
 
 function max_signal(pg, work = nothing)
     smax = 0.0
-    Tloc = pg.T; gm1 = Tloc(GAMMA * (GAMMA - 1))
     work === nothing && (work = _max_signal_work(pg))
+    Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc)
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
     for p in pg.patches                              # CFL timestep depends only on the physical
         _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
-            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3); ndrange=nblocks * MAX_SIGNAL_GROUP)
+            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs; ndrange=nblocks * MAX_SIGNAL_GROUP)
         PPMKernels.KA.synchronize(pg.backend)
         copyto!(work.host, 1, work.scratch, 1, nblocks)
         smax = max(smax, Float64(maximum(@view work.host[1:nblocks])))
     end
     return smax
 end
-max_pvel(parts) = max(Float64(maximum(abs.(parts.vx))),
-                      Float64(maximum(abs.(parts.vy))),
-                      Float64(maximum(abs.(parts.vz))))
+max_pvel(parts) = max(Float64(maximum(abs, parts.vx)),   # maximum(abs, ·) fuses — no |v| N-array temp
+                      Float64(maximum(abs, parts.vy)),
+                      Float64(maximum(abs, parts.vz)))
 
 # ── write a cellcmp dump (same layout as enzo_cellcmp / ramses cellcmp) ──
 function cell_summary(pg, c::Cosmo, u)
@@ -374,7 +388,7 @@ function cell_summary(pg, c::Cosmo, u)
         xHIIv = xv ./ xh
         μv = one(T) ./ (T(XH + (1 - XH) / 4) .+ xh .* xHIIv)
         sx += Float64(sum(xHIIv))
-        sT += Float64(sum((Gev ./ Dv) .* tempfac .* μv))
+        sT += Float64(sum((Gev ./ Dv ./ T(pg.gesc)) .* tempfac .* μv))
     end
     return (ρmean=total_mass(pg), δrms=density_contrast_rms(pg), xHII=sx/N, T=sT/N)
 end
@@ -386,14 +400,16 @@ function write_cellcmp(pg, c::Cosmo, u, a, z)
     HII = Float64.(vec(g.species[1]))
     H2I = length(g.species) >= 2 ? Float64.(vec(g.species[2])) : zero(HII)
     HDI = length(g.species) >= 3 ? Float64.(vec(g.species[3])) : zero(HII)
-    eint = Float64.(vec(g.Ge)) ./ ρb
+    eint = Float64.(vec(g.Ge)) ./ ρb ./ pg.gesc        # un-lift f16 g.R Ge (gesc=1 unless dedup)
     xHIIv = HII ./ ρb ./ XH; fH2v = H2I ./ ρb ./ XH; fHDv = HDI ./ ρb
     μv = 1.0 ./ ((XH + (1-XH)/4) .+ XH .* (xHIIv .- 0.5 .* fH2v))
     Tcell = eint .* ((GAMMA-1) .* μv .* u.T2)                  # K
-    mkpath(REPORTS)
-    open(joinpath(REPORTS, "patch_cellcmp_$(TAG)_z$(round(Int,z)).bin"), "w") do io
-        write(io, Int64(pg.ncell[1]))
-        write(io, ρb); write(io, xHIIv); write(io, fH2v); write(io, fHDv); write(io, Tcell)
+    if !NODUMP
+        mkpath(REPORTS)
+        open(joinpath(REPORTS, "patch_cellcmp_$(TAG)_z$(round(Int,z)).bin"), "w") do io
+            write(io, Int64(pg.ncell[1]))
+            write(io, ρb); write(io, xHIIv); write(io, fH2v); write(io, fHDv); write(io, Tcell)
+        end
     end
     return (ρmean=mean(ρb), δrms=std(ρb)/mean(ρb), xHII=mean(xHIIv), T=mean(Tcell))
 end
@@ -535,6 +551,10 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         PPMKernels.device_zeros(pg.backend, T, (prod(ncell),)) : nothing
     ρp_host = ρp_scratch === nothing ? nothing : Vector{T}(undef, prod(ncell))
     maxsig_work = ρp_scratch === nothing ? nothing : (; scratch=ρp_scratch, host=ρp_host)
+    dedup_cpu_phi = gravmode === :cpu && SOLVER === :fvgk &&
+        get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
+    φkick_dev = dedup_cpu_phi ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
+    φkick_host = dedup_cpu_phi ? Array{T}(undef, ncell) : nothing
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
@@ -566,7 +586,14 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     function solve_accel!(a_)                       # ρg already filled; returns accel tuple
         tf = time(); solve_global_poisson!(φg, ρg; G=1.5*c.Om*a_, a=1.0, boxsize=1.0, solver=fftsolver); fft_t[] += time()-tf
         tp = time()
-        ga = accelmode === :gpu ? patch_accel_gpu(pg, φg; dx=dx) : patch_accel(pg, φg; dx=dx)
+        ga = if pg.dedup
+            φkick_dev === nothing && error("dedup CPU gravity requires persistent global potential scratch")
+            @. φkick_host = T(φg)
+            copyto!(φkick_dev, φkick_host)
+            φkick_dev
+        else
+            accelmode === :gpu ? patch_accel_gpu(pg, φg; dx=dx) : patch_accel(pg, φg; dx=dx)
+        end
         BE === :cuda && accelmode === :gpu && CUDA.synchronize()    # so the timer captures the device gather
         pacc_t[] += time()-tp
         tq = time(); φpad, gle, gcs = particle_accel_field(pg, φg); pfld_t[] += time()-tq
@@ -587,6 +614,24 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     end
 
     a = a_start; m0 = total_mass(pg)
+    # Pre-build the FVGK global grid NOW, in a clean pool — its big contiguous f16 R/O buffers must
+    # place before cycle-0's gravity (cuFFT plan) and Morton sort (radix scratch) fragment the pool.
+    # The lazy first-step build otherwise fails near the memory ceiling even when the steady-state
+    # working set fits (dt=0 ⇒ a pure f16 round-trip of the IC, no physical change).
+    if SOLVER === :fvgk
+        patch_step!(pg, 0.0; a_value=a, order=(1,2,3), accel=nothing, chem=false, solver=:fvgk,
+                    du=u_i.d, lu=u_i.l, tu=u_i.t, do_hydro=true, do_chem=false, chemmode=CHEMMODE)
+        BE === :cuda && CUDA.synchronize()
+        # CIC_FVGK_DEDUP=1 (np=1): drop the f32 patch gas copy — repoint the gas fields onto g.R's
+        # ghost-free f16 blocks (energies GE_SCALE-lifted, carried via pg.gesc).  Eliminates ~11 GB
+        # at 760³ (patch storage = the FVGK grid's duplicate).  The pre-build above first loads g.R.
+        if get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
+            MultiCode._fvgk_dedup!(pg)
+            BE === :cuda && CUDA.synchronize()
+            @printf("  FVGK dedup ON: patch gas → g.R views, ng=0, gesc=%.0e, f32 patch copy freed\n", pg.gesc)
+            flush(stdout)
+        end
+    end
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing
     if OVERLAP
@@ -664,7 +709,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         order = isodd(cyc) ? (3,2,1) : (1,2,3)
         tg = time()
         if OVERLAP
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)
@@ -695,7 +740,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             sync() = BE === :cuda ? CUDA.synchronize() : (BE === :metal ? Metal.synchronize() : nothing)
             sync(); tt = time(); acc = gravity!(a, dτ); sync(); gph_t[] += time()-tt
             tt = time()
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, do_hydro=true, do_chem=false,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             sync(); hyd_t[] += time()-tt; tt = time()
@@ -708,7 +753,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             sync(); prt_t[] += time()-tt; nph[] += 1
         else
             acc = gravity!(a, dτ)
-            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
+            patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER, sigspeed=sig,
                         du=u.d, lu=u.l, tu=u.t, chem_backend=chembk, rate_tables=ratetab, cool_tables=cooltab,
                         chemmode=CHEMMODE, chemnsub=CHEMNSUB, cosmo_h0=c.h0, cosmo_Om=c.Om, cosmo_OL=c.OL)
             pscratch = push_particles!(parts, acc.phi, acc.le, acc.cs, dτ; scratch=pscratch)

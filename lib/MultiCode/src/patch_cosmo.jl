@@ -67,20 +67,21 @@ end
 z_to_a(z) = 1.0 / (1.0 + z)
 a_to_z(a) = 1.0/a - 1.0
 
-@kernel function _compton_drag_k!(@Const(D), S1, S2, S3, Tau, f, vx, vy, vz)
+# Fused Compton-drag kernel: damp momentum toward the bulk and add the exact KE change to Tau, all
+# in per-cell Float32 (so cold-gas Sᵢ² doesn't underflow f16 g.R storage) with ZERO N³ temporaries —
+# the broadcast form materialized ~5·N³·4 B of scratch, which is the binding alloc near the grid ceiling.
+# gs = GE_SCALE lifts the KE increment into the f16-lifted Tau slot (1 in the non-dedup f32 path).
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs)
     i = @index(Global)
     @inbounds begin
-        ρ = D[i]
-        if ρ > zero(ρ)
-            sx = S1[i]; sy = S2[i]; sz = S3[i]
-            ox = ρ * vx; oy = ρ * vy; oz = ρ * vz
-            nsx = ox + (sx - ox) * f
-            nsy = oy + (sy - oy) * f
-            nsz = oz + (sz - oz) * f
-            ke0 = (sx*sx + sy*sy + sz*sz) / (ρ + ρ)
-            ke1 = (nsx*nsx + nsy*nsy + nsz*nsz) / (ρ + ρ)
-            S1[i] = nsx; S2[i] = nsy; S3[i] = nsz
-            Tau[i] += ke1 - ke0
+        d = Float32(D[i])
+        if d > 0f0
+            s1 = Float32(S1[i]); s2 = Float32(S2[i]); s3 = Float32(S3[i])
+            ke0 = (s1*s1 + s2*s2 + s3*s3) / (2f0*d)
+            n1 = d*vx + (s1 - d*vx)*ff; n2 = d*vy + (s2 - d*vy)*ff; n3 = d*vz + (s3 - d*vz)*ff
+            ke1 = (n1*n1 + n2*n2 + n3*n3) / (2f0*d)
+            S1[i] = eltype(S1)(n1); S2[i] = eltype(S2)(n2); S3[i] = eltype(S3)(n3)
+            Tau[i] = eltype(Tau)(Float32(Tau[i]) + (ke1 - ke0)*gs)
         end
     end
 end
@@ -101,10 +102,9 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         M  += _interior_sum(pg, p.D)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
-    T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M)
-    be = PoissonKernels.KA.get_backend(pg.patches[1].D)
+    ff = Float32(f); vx = Float32(px/M); vy = Float32(py/M); vz = Float32(pz/M); gs = Float32(pg.gesc)
     for p in pg.patches
-        _compton_drag_k!(be)(p.D, p.S1, p.S2, p.S3, p.Tau, ff, vx, vy, vz; ndrange=length(p.D))
+        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs; ndrange = length(p.D))
     end
     return nothing
 end
@@ -155,13 +155,13 @@ end
 end
 @inline _morton3(x::UInt32, y::UInt32, z::UInt32) = _part1by2(x) | (_part1by2(y) << 1) | (_part1by2(z) << 2)
 
-@kernel function _morton_packed_k!(packed, @Const(px), @Const(py), @Const(pz), N::Int32, Nm1::UInt32)
+@kernel function _morton_key_k!(keys, @Const(px), @Const(py), @Const(pz), N::Int32, Nm1::UInt32)
     p = @index(Global)
     @inbounds begin
         ix = min(unsafe_trunc(UInt32, floor(px[p]*N)), Nm1)
         iy = min(unsafe_trunc(UInt32, floor(py[p]*N)), Nm1)
         iz = min(unsafe_trunc(UInt32, floor(pz[p]*N)), Nm1)
-        packed[p] = (UInt64(_morton3(ix, iy, iz)) << 32) | UInt64(p - 1)   # (Morton key | 0-based idx)
+        keys[p] = _morton3(ix, iy, iz)                            # 30-bit Morton key (UInt32)
     end
 end
 
@@ -171,18 +171,31 @@ end
 Reorder the particle SoA in place by the Morton (Z-order) code of each particle's Eulerian cell on the
 `N³` grid, restoring deposit/gather locality.  Permutes every AbstractVector field (px..vz and a tracked
 `id`); the scalar `mass` is untouched.  Bit-identical physics (deposit + push are order-independent).
-Uses a packed-UInt64 key-value `sort!` (GPU radix).  Requires `N ≤ 1024` (Morton fits 30 bits).
+
+Uses a **UInt32 Morton key + stable `sortperm!`** (CUDA.jl's sortperm! is properly stable), so ties — many
+particles in one cell at low z — resolve by ascending original index, making the permutation IDENTICAL to
+the old packed-(Morton<<32|idx) `sort!` but at HALF the peak: key(4 B/cell) + Int32 perm(4) instead of
+packed-UInt64(8) + perm(4) + the live key — the difference between Morton fitting and OOM near the grid
+ceiling.  Requires `N ≤ 1024` (Morton fits 30 bits).
 """
 function morton_sort_particles!(parts; N::Integer)
     px = parts.px; Np = length(px); be = PoissonKernels.KA.get_backend(px)
-    packed = similar(px, UInt64)
-    _morton_packed_k!(be)(packed, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
+    mkey = similar(px, UInt32)
+    _morton_key_k!(be)(mkey, px, parts.py, parts.pz, Int32(N), UInt32(N - 1); ndrange = Np)
     PoissonKernels.KA.synchronize(be)
-    sort!(packed)                                                  # radix by (Morton<<32 | idx)
-    perm = Int32.((packed .& 0x00000000ffffffff) .+ UInt64(1))     # 1-based gather permutation
+    perm = similar(px, Int32, Np)                                 # 1-based gather permutation (Int32)
+    sortperm!(perm, mkey; initialized = false)                    # stable ⇒ identical perm to the packed sort
+    _free_buf!(mkey)                                              # release the key buffer before the gathers
     for f in keys(parts)
         a = getfield(parts, f)
         a isa AbstractVector && (a .= a[perm])
     end
     return parts
+end
+# Eagerly release a device buffer (CUDA: return it to the pool now, before the field gathers
+# allocate, so the sort's peak stays at key+perm not key+perm+gather).  No-op on backends w/o it.
+function _free_buf!(a)
+    m = parentmodule(typeof(a))
+    isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a)
+    return nothing
 end

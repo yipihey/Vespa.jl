@@ -183,12 +183,12 @@ CICASS FFTW threads: 4
 ```
 
 The IC realizer can also write f32 field snapshots with `CICASS_REAL_BYTES=4`.
-The new magic is `CICASSF4`; the legacy f64 format remains `CICASS01`. Header
+The f32 magic is `CICASS02`; the legacy f64 format remains `CICASS01`. Header
 metadata is still f64, while the 11 large field arrays are f32. A 128^3 f32 smoke
 wrote:
 
 ```text
-magic        = CICASSF4
+magic        = CICASS02
 field eltype = Float32
 file size    = 92,274,784 bytes
 ```

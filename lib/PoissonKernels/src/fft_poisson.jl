@@ -152,8 +152,11 @@ end
 # Real-to-complex (rfft) ⇒ half the spectral storage of a c2c transform, and cuFFT
 # supports ARBITRARY sizes (best for 2^a·3^b·5^c·7^d) — no power-of-two restriction.
 # Plans + the −1/k² Green's function (rfft half-grid) are cached per (array-type,T,N,L,greens).
+# `chat` is a PERSISTENT complex work buffer (the rfft output) so the solve reuses it via mul!
+# instead of allocating the full complex + inverse-real transient EVERY call — the difference
+# between fitting and OOM near the grid ceiling (the cuFFT transient was the binding alloc @768³).
 struct _RFFTPlan{PF,PI,A,C}
-    fwd::PF; inv::PI; Gk::A; chat::C      # Gk/chat live on ρ's device
+    fwd::PF; inv::PI; Gk::A; chat::C
 end
 const _RFFT_CACHE = Dict{Any,Any}()
 
@@ -177,11 +180,11 @@ function fft_poisson_rfft!(φ::AbstractArray{T,3}, ρ::AbstractArray{T,3};
               greens === :discrete7 ? _greens_discrete7(T, N, L) :
               error("fft_poisson_rfft!: greens must be :spectral or :discrete7")
         gk  = ρ isa Array ? gh : copyto!(similar(ρ, T, size(gh)), gh)   # Green's onto ρ's device
-        _RFFTPlan(fwd, inv, gk, chat)
+        _RFFTPlan(fwd, inv, gk, chat)            # keep chat as the persistent work buffer
     end::_RFFTPlan
     coef = T(G) / T(a)
-    mul!(P.chat, P.fwd, ρ)                       # rfft(ρ) — complex, (N₁÷2+1,N₂,N₃)
+    mul!(P.chat, P.fwd, ρ)                       # ρ̂ = rfft(ρ) → persistent buffer (no per-call alloc)
     @. P.chat = coef * P.Gk * P.chat             # φ̂ = coef·G(k)·ρ̂
-    mul!(φ, P.inv, P.chat)                       # inverse rfft (normalized)
+    mul!(φ, P.inv, P.chat)                       # φ = irfft(φ̂) in-place (c2r consumes P.chat; refilled next call)
     return φ
 end
