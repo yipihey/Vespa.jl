@@ -214,10 +214,21 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
                              axis::Integer=1, scale_v::Real=1.0, velocity::Bool=true)
     be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc); sv = T(scale_v)
     pk(f) = PoissonKernels.power_spectrum_aniso_gpu(f; boxsize=box, nmu=nmu, nbins=nbins, axis=axis)
-    # deposit per-particle weight `w` (mass, or mass·v for momentum) → float grid (det. CIC)
-    dep!(buf, w) = (PoissonKernels.cic_deposit_det!(buf, parts.px, parts.py, parts.pz,
-                        parts.vx, parts.vy, parts.vz, w; N=nc[1], disp=0, shift=-0.5, qbits=23);
-                    reshape(T.(buf) .* T(2.0^-23), nc))
+    # deposit per-particle weight `w` (mass, or mass·v for momentum) to a float grid.
+    # Metal does not support the Int64 deterministic atomic path used on CUDA here, so
+    # use the f32 atomic deposit for diagnostic P(k) tables on Metal.
+    metal = pg.besym === :metal
+    function dep!(buf, w)
+        if metal
+            PoissonKernels.cic_deposit!(buf, parts.px, parts.py, parts.pz,
+                parts.vx, parts.vy, parts.vz, w; N=nc[1], disp=0, shift=-0.5)
+            return reshape(buf, nc)
+        else
+            PoissonKernels.cic_deposit_det!(buf, parts.px, parts.py, parts.pz,
+                parts.vx, parts.vy, parts.vz, w; N=nc[1], disp=0, shift=-0.5, qbits=23)
+            return reshape(T.(buf) .* T(2.0^-23), nc)
+        end
+    end
     # ── gas: overdensity + mass-weighted velocity from the resident patch fields ──
     g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)
     μg = T(Float64(sum(g))/Ntot); Pgas = pk(g ./ μg .- one(T))
@@ -229,8 +240,9 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
     end
     g = nothing
     # ── DM: overdensity + mass-weighted velocity via the deterministic CIC deposit ──
-    ρpi = PPMKernels.device_zeros(be, Int64, (Ntot,))
-    ρd  = dep!(ρpi, parts.mass); μd = T(Float64(sum(ρd))/Ntot)
+    ρpi = PPMKernels.device_zeros(be, metal ? T : Int64, (Ntot,))
+    ρd  = metal ? copy(dep!(ρpi, parts.mass)) : dep!(ρpi, parts.mass)
+    μd = T(Float64(sum(ρd))/Ntot)
     Pdm = pk(ρd ./ μd .- one(T))
     Pvdm = nothing
     if velocity

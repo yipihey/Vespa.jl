@@ -44,6 +44,8 @@ const COURANT= parse(Float64, get(ENV, "CIC_COURANT", "0.8"))     # = RAMSES cou
 const PCOUR  = parse(Float64, get(ENV, "CIC_PCOURANT","0.8"))
 const NOUT   = parse(Int, get(ENV, "CIC_NOUT", "6"))
 const MAXCYC = parse(Int, get(ENV, "CIC_MAXCYC", "200000"))
+const PRINT_EVERY = parse(Int, get(ENV, "CIC_PRINT_EVERY", "10"))
+const MEMPROBE_CYC = parse(Int, get(ENV, "CIC_MEMPROBE_CYC", "30"))
 const DODRAG = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
 # CIC_SOLVER = ppm (PPMKernels split sweeps, default) | fvgk (FiniteVolumeGodunovKA unsplit CTU;
 # advects the 3 species as EulerColors passive scalars). :fvgk loads FVGK to activate MultiCodeFVGKExt.
@@ -69,7 +71,7 @@ const CHEMNSUB = parse(Int, get(ENV, "CIC_CHEM_NSUB", "1"))
 # Fewer colors = less advection AND a normal-valued color the FVGK f16-tiled path can carry.
 const NSPEC = CHEMMODE === :analytic ? 1 : 3
 const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full network
-# CIC_PHASE_TIMING=1: CUDA-synced per-phase split (gravity | hydro | chem | particles).  Adds
+# CIC_PHASE_TIMING=1: GPU-synced per-phase split (gravity | hydro | chem | particles).  Adds
 # barriers that serialize the GPU, so it INFLATES the wall a bit — use it only for the breakdown,
 # never to quote production throughput (the uninstrumented sec/cyc is the real number).
 const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
@@ -86,6 +88,7 @@ const PKMEAS = get(ENV, "CIC_PK",     "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
+const CELLDUMP = get(ENV, "CIC_CELL_DUMP", PKMEAS ? "0" : "1") == "1"
 const REPORTS= joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
 const TAG    = get(ENV, "CIC_TAG", "")
 const XH     = 0.76
@@ -101,6 +104,29 @@ function load_snapshot()
             NGRID, BOXMPCH, VBC, ZSTART); flush(stdout)
     r = MultiCode.run_cicass_streaming(; vbc=VBC, boxlength=BOXMPCH, zstart=ZSTART, ngrid=NGRID)
     return CICASSLib.read_snapshot(r.output)
+end
+
+const _CICASS_HEADER_BYTES = 8 + 4 + 4 + 10*sizeof(Float64)
+
+function cicass_header(path::AbstractString)
+    open(path, "r") do io
+        magic = read(io, 8)
+        String(magic) == "CICASS01" || error("not a CICASS snapshot: $path")
+        n = Int(read(io, Int32)); nsp = Int(read(io, Int32))
+        hd = Vector{Float64}(undef, 10); read!(io, hd)
+        box, zinit, omm, omb, oml, h, mdm, mgas, vbc, tavg = hd
+        return (; n, nsp, box, zinit, omega_m=omm, omega_b=omb, omega_l=oml,
+                hconst=h, m_dm=mdm, m_gas=mgas, vbc, tavg)
+    end
+end
+
+@inline _cicass_field_offset(N3::Integer, field::Integer) =
+    _CICASS_HEADER_BYTES + (field - 1) * N3 * sizeof(Float64)
+
+function read_cicass_field!(io, buf::Vector{Float64}, N3::Integer, field::Integer)
+    seek(io, _cicass_field_offset(N3, field))
+    read!(io, buf)
+    return buf
 end
 
 # ── build the gas IC (host ncell³ arrays) in RAMSES super-comoving code units ──
@@ -154,6 +180,103 @@ function dm_ic(snap, c::Cosmo, u_i, backend)
     return parts
 end
 
+function scatter_cicass_gas_stream!(pg, path::AbstractString, h, c::Cosmo, a_i, u_i)
+    N = h.n; N3 = N^3; T = pg.T; li, lj, lk = MultiCode._interior(pg)
+    s = CICASSLib.thermal_state(ZSTART)
+    xHII0 = s.x_e; Tg = s.T_gas
+    μ = 1.22
+    eint = Tg / ((GAMMA - 1) * μ * u_i.T2)
+    vconv = 1.0e5 / u_i.v
+    @printf("gas IC: f_b=%.4f  T_gas=%.1f K (eint=%.3e code)  x_HII0=%.3e  v→code=%.4e\n",
+            c.fb, Tg, eint, xHII0, vconv); flush(stdout)
+
+    raw = Vector{Float64}(undef, N3)
+    host = zeros(T, pg.nd)
+    open(path, "r") do io
+        read_cicass_field!(io, raw, N3, 7) # gas delta
+        δb = reshape(raw, N, N, N)
+        for p in pg.patches
+            gi, gj, gk = MultiCode._octant(pg, p)
+            fill!(host, zero(T))
+            @views host[li, lj, lk] .= T(c.fb) .* (one(T) .+ T.(δb[gi, gj, gk]))
+            copyto!(p.D, vec(host))
+            fill!(host, zero(T))
+            @views host[li, lj, lk] .= T(c.fb * eint) .* (one(T) .+ T.(δb[gi, gj, gk]))
+            copyto!(p.Ge, vec(host))
+            if pg.packed
+                ubuf = fill(UInt16(0), pg.nd)
+                @views ubuf[li, lj, lk] .= ChemistryKernels.encode_log2sp(T(xHII0))
+                copyto!(p.species[1], vec(ubuf))
+            else
+                fill!(host, zero(T))
+                @views host[li, lj, lk] .= T(c.fb * xHII0) .* (one(T) .+ T.(δb[gi, gj, gk]))
+                copyto!(p.species[1], vec(host))
+            end
+        end
+
+        for (field, slot) in zip(8:10, (:S1, :S2, :S3))
+            read_cicass_field!(io, raw, N3, field)
+            vel = reshape(raw, N, N, N)
+            for p in pg.patches
+                gi, gj, gk = MultiCode._octant(pg, p)
+                fill!(host, zero(T))
+                @views host[li, lj, lk] .= T(vconv) .* T.(vel[gi, gj, gk])
+                copyto!(getfield(p, slot), vec(host))
+            end
+        end
+    end
+    raw = nothing; host = nothing; GC.gc()
+
+    for p in pg.patches
+        D = MultiCode._r3(p.D, pg.nd); S1 = MultiCode._r3(p.S1, pg.nd)
+        S2 = MultiCode._r3(p.S2, pg.nd); S3 = MultiCode._r3(p.S3, pg.nd)
+        Ge = MultiCode._r3(p.Ge, pg.nd); Tau = MultiCode._r3(p.Tau, pg.nd)
+        @views begin
+            S1[li, lj, lk] .*= D[li, lj, lk]
+            S2[li, lj, lk] .*= D[li, lj, lk]
+            S3[li, lj, lk] .*= D[li, lj, lk]
+            Tau[li, lj, lk] .= Ge[li, lj, lk] .+
+                T(0.5) .* (S1[li, lj, lk].^2 .+ S2[li, lj, lk].^2 .+ S3[li, lj, lk].^2) ./ D[li, lj, lk]
+        end
+    end
+    exchange_ghosts!(pg)
+    return pg
+end
+
+function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
+    N3 = h.n^3; T = BE === :cpu ? Float64 : Float32
+    raw = Vector{Float64}(undef, N3)
+    buf = Vector{T}(undef, N3)
+    vconv = 1.0e5 / u_i.v
+    todev() = (d = PPMKernels.to_device(backend, buf, T); BE === :metal && Metal.synchronize(); d)
+    open(path, "r") do io
+        read_cicass_field!(io, raw, N3, 1)
+        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        px = todev()
+        read_cicass_field!(io, raw, N3, 2)
+        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        py = todev()
+        read_cicass_field!(io, raw, N3, 3)
+        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        pz = todev()
+        read_cicass_field!(io, raw, N3, 4)
+        @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
+        vx = todev()
+        read_cicass_field!(io, raw, N3, 5)
+        @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
+        vy = todev()
+        read_cicass_field!(io, raw, N3, 6)
+        @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
+        vz = todev()
+        mass = T(1 - c.fb)
+        @printf("DM IC: %d particles, mass_per=%.4f (1−f_b), v→code=%.4e%s\n",
+                N3, 1-c.fb, vconv, PIDS ? "  (+Lagrangian id)" : ""); flush(stdout)
+        parts = (px=px, py=py, pz=pz, vx=vx, vy=vy, vz=vz, mass=mass)
+        PIDS && (parts = (; parts..., id=PPMKernels.to_device(backend, collect(Int32, 0:N3-1))))
+        return parts
+    end
+end
+
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 function max_signal(pg)
     smax = 0.0
@@ -173,7 +296,29 @@ max_pvel(parts) = max(Float64(maximum(abs.(parts.vx))),
                       Float64(maximum(abs.(parts.vz))))
 
 # ── write a cellcmp dump (same layout as enzo_cellcmp / ramses cellcmp) ──
+function cell_summary(pg, c::Cosmo, u)
+    T = pg.T; N = prod(pg.ncell); sx = 0.0; sT = 0.0
+    li, lj, lk = MultiCode._interior(pg)
+    xh = T(XH); tempfac = T((GAMMA - 1) * u.T2)
+    for p in pg.patches
+        D = MultiCode._r3(p.D, pg.nd); Ge = MultiCode._r3(p.Ge, pg.nd)
+        if pg.packed
+            X = ChemistryKernels.decode_log2sp.(T, MultiCode._r3(p.species[1], pg.nd))
+        else
+            X = MultiCode._r3(p.species[1], pg.nd) ./ D
+        end
+        xv = @view X[li, lj, lk]
+        Dv = @view D[li, lj, lk]; Gev = @view Ge[li, lj, lk]
+        xHIIv = xv ./ xh
+        μv = one(T) ./ (T(XH + (1 - XH) / 4) .+ xh .* xHIIv)
+        sx += Float64(sum(xHIIv))
+        sT += Float64(sum((Gev ./ Dv) .* tempfac .* μv))
+    end
+    return (ρmean=total_mass(pg), δrms=density_contrast_rms(pg), xHII=sx/N, T=sT/N)
+end
+
 function write_cellcmp(pg, c::Cosmo, u, a, z)
+    CELLDUMP || return cell_summary(pg, c, u)
     g = gather_global(pg)
     ρb  = Float64.(vec(g.D))
     HII = Float64.(vec(g.species[1]))
@@ -249,6 +394,26 @@ function main()
         @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
                 ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
         return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
+    end
+    snap_path = get(ENV, "CIC_SNAP", "")
+    if !isempty(snap_path) && get(ENV, "CIC_STREAM_LOAD", "0") == "1"
+        @printf("streaming CICASS snapshot: %s\n", snap_path); flush(stdout)
+        h = cicass_header(snap_path)
+        N = h.n
+        ncell = (N, N, N); np = (NPX, NPX, NPX)
+        c = Cosmo(; Om=h.omega_m, OL=h.omega_l, h0=h.hconst*100, box=h.box, Ob=h.omega_b)
+        a_start = z_to_a(ZSTART); a_end = z_to_a(ZEND)
+        u_i = cosmo_units(c, a_start)
+        @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.3f h=%.3f\n",
+                N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.h0/100)
+        @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
+                ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
+        dx = 1.0 / N
+        pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
+                             besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
+        scatter_cicass_gas_stream!(pg, snap_path, h, c, a_start, u_i)
+        parts = dm_ic_stream(snap_path, h, c, u_i, pg.backend)
+        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
     end
     snap = load_snapshot()
     N = snap.n
@@ -381,7 +546,9 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                 P  = patch_power_spectra(pg, parts; box=c.box, nmu=PKMU, nbins=PKNB, axis=PKAXIS, scale_v=uo.v/1e5)
                 pf = @sprintf("%s_pkmu.h5", ckpref)
                 h5open(pf, isfile(pf) ? "r+" : "w") do f
-                    g = create_group(f, @sprintf("z%05.1f", zo))
+                    group_name = @sprintf("z%05.1f", zo)
+                    haskey(f, group_name) && delete_object(f, group_name)
+                    g = create_group(f, group_name)
                     g["k"] = collect(P.k); g["gas_delta"] = P.gas_delta; g["dm_delta"] = P.dm_delta
                     P.gas_vel === nothing || (g["gas_vel"] = P.gas_vel)
                     P.dm_vel  === nothing || (g["dm_vel"]  = P.dm_vel)
@@ -455,8 +622,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
                 wait(gpu)
             end
         elseif PHASE
-            # per-phase split (CUDA-synced): gravity | hydro | chem | particles
-            sync() = (BE === :cuda && CUDA.synchronize())
+            # per-phase split (GPU-synced): gravity | hydro | chem | particles
+            sync() = BE === :cuda ? CUDA.synchronize() : (BE === :metal ? Metal.synchronize() : nothing)
             sync(); tt = time(); acc = gravity!(a, dτ); sync(); gph_t[] += time()-tt
             tt = time()
             patch_step!(pg, dτ; a_value=a, order=order, accel=acc.gas, chem=true, solver=SOLVER,
@@ -489,24 +656,24 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         a = a_new
 
         sec = time() - t0
-        if cyc % 10 == 0
+        if PRINT_EVERY > 0 && cyc % PRINT_EVERY == 0
             ρmax = maximum(Float64(maximum(p.D)) for p in pg.patches)
             δrms = density_contrast_rms(pg)            # on-device (no full-grid gather)
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
         end
-        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == 30
+        if get(ENV, "CIC_MEMPROBE", "") == "1" && cyc == MEMPROBE_CYC
             if BE === :cuda
                 @eval import CUDA; CUDA.reclaim(); GC.gc(); CUDA.reclaim()
                 used = (CUDA.total_memory() - CUDA.available_memory()) / 2^30
-                @printf("  MEMPROBE: live CUDA = %.2f GiB at %d³ (%d Mcell)\n", used, NGRID, NGRID^3 ÷ 10^6); flush(stdout)
+                @printf("  MEMPROBE: live CUDA = %.2f GiB at %d³ (%d Mcell)\n", used, N, N^3 ÷ 10^6); flush(stdout)
                 break
             elseif BE === :metal
                 @eval import Metal; Metal.synchronize(); GC.gc(); Metal.synchronize()
                 s = Metal.alloc_stats
                 used = max(0, s.alloc_bytes - s.free_bytes) / 2^30
                 @printf("  MEMPROBE: live Metal = %.2f GiB at %d³ (%d Mcell)  [alloc %.2f GiB | freed %.2f GiB]\n",
-                        used, NGRID, NGRID^3 ÷ 10^6, s.alloc_bytes/2^30, s.free_bytes/2^30); flush(stdout)
+                        used, N, N^3 ÷ 10^6, s.alloc_bytes/2^30, s.free_bytes/2^30); flush(stdout)
                 break
             end
         end
@@ -514,7 +681,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
 
     if PHASE && nph[] > 0
         let n = nph[], tot = (gph_t[]+hyd_t[]+chm_t[]+prt_t[])/nph[]
-            @printf("\nPER-PHASE (CUDA-synced, %d cyc, %s/%s): gravity %.4f | hydro %.4f | chem %.4f | particles %.4f  → %.4f s/cyc\n",
+            @printf("\nPER-PHASE (GPU-synced, %d cyc, %s/%s): gravity %.4f | hydro %.4f | chem %.4f | particles %.4f  → %.4f s/cyc\n",
                     n, SOLVER, CHEMMODE, gph_t[]/n, hyd_t[]/n, chm_t[]/n, prt_t[]/n, tot)
             @printf("  shares: gravity %.0f%% | hydro %.0f%% | chem %.0f%% | particles %.0f%%\n",
                     100gph_t[]/n/tot, 100hyd_t[]/n/tot, 100chm_t[]/n/tot, 100prt_t[]/n/tot)
@@ -522,8 +689,9 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     end
     @printf("\nmass drift over run: %.3e\n", abs(total_mass(pg)-m0)/m0)
     let n=max(ngrav[],1)
+        gavg = gravmode === :cpu ? (asm_t[] + fft_t[] + pacc_t[] + pfld_t[]) / n : grav_t[] / n
         @printf("top-grid gravity (%s): %.4f s/solve  [assemble %.4f | FFT %.4f | patch_accel %.4f | part_field %.4f] over %d solves\n",
-                fftsolver, grav_t[]/n, asm_t[]/n, fft_t[]/n, pacc_t[]/n, pfld_t[]/n, ngrav[])
+                fftsolver, gavg, asm_t[]/n, fft_t[]/n, pacc_t[]/n, pfld_t[]/n, ngrav[])
     end
     @printf("\n%-8s %-10s %-12s %-12s %-12s\n", "z", "δb_rms", "D²/D₀²", "<x_HII>", "<T>[K]")
     for r in pk_log
