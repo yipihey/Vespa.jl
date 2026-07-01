@@ -164,17 +164,19 @@ function max_signal(pg)
     smax = 0.0
     li = (pg.ng+1):(pg.ng+pg.pdim[1]); lj = (pg.ng+1):(pg.ng+pg.pdim[2]); lk = (pg.ng+1):(pg.ng+pg.pdim[3])
     iv(f) = @view reshape(f, pg.nd)[li, lj, lk]      # INTERIOR view (exclude ghosts) so the
+    γ = GAMMA; gs = pg.gesc
+    # FUSED reduction (mapreduce): compute the per-cell signal speed and take the max WITHOUT
+    # materializing an N³ sig array — the broadcast form allocated ~2·N³·4 B of scratch, a binding
+    # transient near the grid ceiling.  gs un-lifts the f16 g.R Ge slot (=1 in the non-dedup path).
+    sigf(d, ge, s1, s2, s3) = abs(s1/d) + abs(s2/d) + abs(s3/d) + 3*sqrt(max(γ*(γ-1)*ge/d/gs, zero(d)))
     for p in pg.patches                              # CFL timestep depends only on the physical
-        D = iv(p.D)                                  # state — makes checkpoint/restart bit-exact
-        cs = sqrt.(max.(GAMMA*(GAMMA-1) .* (iv(p.Ge) ./ D ./ pg.gesc), 0))   # un-lift f16 g.R Ge (gesc)
-        sig = abs.(iv(p.S1) ./ D) .+ abs.(iv(p.S2) ./ D) .+ abs.(iv(p.S3) ./ D) .+ 3 .* cs
-        smax = max(smax, Float64(maximum(sig)))
+        smax = max(smax, Float64(mapreduce(sigf, max, iv(p.D), iv(p.Ge), iv(p.S1), iv(p.S2), iv(p.S3))))
     end
     return smax
 end
-max_pvel(parts) = max(Float64(maximum(abs.(parts.vx))),
-                      Float64(maximum(abs.(parts.vy))),
-                      Float64(maximum(abs.(parts.vz))))
+max_pvel(parts) = max(Float64(maximum(abs, parts.vx)),   # maximum(abs, ·) fuses — no |v| N-array temp
+                      Float64(maximum(abs, parts.vy)),
+                      Float64(maximum(abs, parts.vz)))
 
 # ── write a cellcmp dump (same layout as enzo_cellcmp / ramses cellcmp) ──
 function write_cellcmp(pg, c::Cosmo, u, a, z)

@@ -67,6 +67,25 @@ end
 z_to_a(z) = 1.0 / (1.0 + z)
 a_to_z(a) = 1.0/a - 1.0
 
+# Fused Compton-drag kernel: damp momentum toward the bulk and add the exact KE change to Tau, all
+# in per-cell Float32 (so cold-gas Sᵢ² doesn't underflow f16 g.R storage) with ZERO N³ temporaries —
+# the broadcast form materialized ~5·N³·4 B of scratch, which is the binding alloc near the grid ceiling.
+# gs = GE_SCALE lifts the KE increment into the f16-lifted Tau slot (1 in the non-dedup f32 path).
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs)
+    i = @index(Global)
+    @inbounds begin
+        d = Float32(D[i])
+        if d > 0f0
+            s1 = Float32(S1[i]); s2 = Float32(S2[i]); s3 = Float32(S3[i])
+            ke0 = (s1*s1 + s2*s2 + s3*s3) / (2f0*d)
+            n1 = d*vx + (s1 - d*vx)*ff; n2 = d*vy + (s2 - d*vy)*ff; n3 = d*vz + (s3 - d*vz)*ff
+            ke1 = (n1*n1 + n2*n2 + n3*n3) / (2f0*d)
+            S1[i] = eltype(S1)(n1); S2[i] = eltype(S2)(n2); S3[i] = eltype(S3)(n3)
+            Tau[i] = eltype(Tau)(Float32(Tau[i]) + (ke1 - ke0)*gs)
+        end
+    end
+end
+
 """
     compton_drag_patches!(pg, f)
 
@@ -83,16 +102,9 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         M  += _interior_sum(pg, p.D)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
-    T = pg.T; ff = T(f); vx = T(px/M); vy = T(py/M); vz = T(pz/M); gs = T(pg.gesc)
-    f32 = Float32   # promote the KE so cold-gas Sᵢ² doesn't underflow f16 g.R storage (dedup)
+    ff = Float32(f); vx = Float32(px/M); vy = Float32(py/M); vz = Float32(pz/M); gs = Float32(pg.gesc)
     for p in pg.patches
-        d = f32.(p.D)
-        ke0 = (f32.(p.S1).^2 .+ f32.(p.S2).^2 .+ f32.(p.S3).^2) ./ (2 .* d)
-        p.S1 .= p.D .* vx .+ (p.S1 .- p.D .* vx) .* ff
-        p.S2 .= p.D .* vy .+ (p.S2 .- p.D .* vy) .* ff
-        p.S3 .= p.D .* vz .+ (p.S3 .- p.D .* vz) .* ff
-        ke1 = (f32.(p.S1).^2 .+ f32.(p.S2).^2 .+ f32.(p.S3).^2) ./ (2 .* d)
-        p.Tau .+= eltype(p.Tau).((ke1 .- ke0) .* gs)        # internal energy fixed; gs lifts f16 g.R Tau
+        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs; ndrange = length(p.D))
     end
     return nothing
 end
