@@ -131,6 +131,24 @@ const XH     = 0.76
 # ── load (or generate) the CICASS realization ──
 function load_snapshot()
     path = get(ENV, "CIC_SNAP", "")
+    # CIC_SYNTH_IC=1: build an in-memory synthetic snapshot at CIC_NGRID (Lagrangian grid + a tiny
+    # single-mode Zel'dovich displacement) — for MEMORY/ceiling tests at grid sizes whose real IC
+    # won't fit on disk.  Same array shapes as a real snapshot ⇒ identical GPU footprint.
+    if get(ENV, "CIC_SYNTH_IC", "0") == "1"
+        N = NGRID; Np = N^3; box = BOXMPCH
+        @printf("SYNTHETIC IC: %d³ (%d particles) box=%.3f — memory/ceiling probe\n", N, Np, box); flush(stdout)
+        A = 0.1                                            # displacement amplitude (cells) — tiny, valid
+        dmp = Matrix{Float64}(undef, Np, 3); dmv = zeros(Float64, Np, 3)
+        Threads.@threads for p in 0:Np-1
+            i = p % N; j = (p ÷ N) % N; k = p ÷ (N*N)
+            x = (i+0.5)/N; y = (j+0.5)/N; z = (k+0.5)/N
+            @inbounds dmp[p+1,1] = mod(x + (A/N)*sinpi(2x), 1.0); dmp[p+1,2] = y; dmp[p+1,3] = z
+            @inbounds dmv[p+1,1] = 10.0*sinpi(2x)          # small km/s Zel'dovich velocity
+        end
+        gd = zeros(Float64, Np); gv = zeros(Float64, Np, 3); gt = fill(2727.6, Np)
+        return CICASSLib.CICASSSnapshot(N, 1, box, ZSTART, 0.27, 0.046, 0.73, 0.71,
+                                        1.0, 1.0, VBC, 2727.6, dmp, dmv, gd, gv, gt)
+    end
     if !isempty(path)
         @printf("loading CICASS snapshot: %s\n", path); flush(stdout)
         return CICASSLib.read_snapshot(path)
@@ -654,16 +672,20 @@ function main()
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
                              besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true, packed_species=PACKED)
         scatter_global!(pg, ck.fields)
-        prebuild_fvgk_before_particles!(pg, a_start, u_i)
-        VT = VEL16 ? Float16 : T
-        ptype(nm) = nm in ("vx", "vy", "vz") ? VT : T
-        parts = merge(NamedTuple{Symbol.(_CKP)}(Tuple(
+        # DEFERRED particle upload (thunk) — run_evolution creates it AFTER the dedup pre-build so
+        # the DM device arrays don't co-reside with the f32 patches + g.R/O (the transition peak).
+        make_parts = () -> begin
+            VT = VEL16 ? Float16 : T
+            ptype(nm) = nm in ("vx", "vy", "vz") ? VT : T
+            p = merge(NamedTuple{Symbol.(_CKP)}(Tuple(
                       PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), ptype(nm)) for nm in _CKP)),
                       (mass = T(ck.pmass),))
-        haskey(ck.parts, :id) && (parts = (; parts..., id=PPMKernels.to_device(pg.backend, ck.parts.id)))
+            haskey(ck.parts, :id) && (p = (; p..., id=PPMKernels.to_device(pg.backend, ck.parts.id)))
+            p
+        end
         @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
                 ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
-        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
+        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, cyc_start)
     end
     snap_path = get(ENV, "CIC_SNAP", "")
     if !isempty(snap_path) && get(ENV, "CIC_STREAM_LOAD", "0") == "1"
@@ -682,9 +704,8 @@ function main()
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
                              besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
         scatter_cicass_gas_stream!(pg, snap_path, h, c, a_start, u_i)
-        prebuild_fvgk_before_particles!(pg, a_start, u_i)
-        parts = dm_ic_stream(snap_path, h, c, u_i, pg.backend)
-        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
+        make_parts = () -> dm_ic_stream(snap_path, h, c, u_i, pg.backend)
+        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, 0)
     end
     snap = load_snapshot()
     N = snap.n
@@ -704,16 +725,20 @@ function main()
     gas = gas_ic(snap, c, a_start, u_i)
     scatter_global!(pg, gas)
     gas = nothing; GC.gc()
-    prebuild_fvgk_before_particles!(pg, a_start, u_i)
-    parts = dm_ic(snap, c, u_i, pg.backend)
-    snap = nothing; GC.gc()
-    return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
+    # DEFERRED particle upload (thunk): created AFTER the dedup pre-build inside run_evolution, so the
+    # DM device arrays (~N³·18 B) don't co-reside with the f32 patches + g.R/O at the dedup transition.
+    make_parts = () -> dm_ic(snap, c, u_i, pg.backend)
+    return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, 0)
 end
 
 # Shared gravity setup + cosmological evolution loop (IC start with cyc_start=0, or
 # resumed from a checkpoint at cyc_start).
-function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
-    # parallel CPU FFT for host top-grid gravity: :fftw (FFTW threads) or :ka
+function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, cyc_start)
+    parts = nothing   # DEFERRED: created by make_parts() AFTER the dedup pre-build below, so the DM
+                      # device upload doesn't peak alongside the f32 patches + g.R/O (the transition,
+                      # not the steady state, was the ceiling — see the 900³ probe).  Closures below
+                      # capture this binding; it's live before any of them are actually called.
+    # parallel CPU FFT for the top-grid gravity: :fftw (FFTW threads) or :ka
     # (KernelAbstractions radix-2 on the CPU backend, parallel over Julia threads).
     fftsolver = Symbol(get(ENV, "CIC_FFT", "ka"))
     # CIC_ACCEL = cpu (host segment-copy scatter, default) | gpu (device comp_accel + gather)
@@ -733,7 +758,9 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     ratetab = usetab ? ChemistryKernels.build_rate_tables(; precision=Float64, backend=tabbe) : nothing
     cooltab = usetab ? EmissionKernels.build_cooling_tables(; precision=Float64, backend=tabbe) : nothing
     GT = GRAV_HOST32 ? Float32 : Float64
-    fftlabel = gravmode === :gpu ? (BE === :metal ? "mps-rfft" : "rfft") : string(fftsolver)
+    kafft = get(ENV, "CIC_GRAV_KAFFT", "0") == "1"
+    kafft_c2c = get(ENV, "CIC_GRAV_KAFFT_C2C", "0") == "1"
+    fftlabel = gravmode === :gpu ? (kafft ? (kafft_c2c ? "ka-c2c" : "ka-rfft") : (BE === :metal ? "mps-rfft" : "rfft")) : string(fftsolver)
     gravloc = gravmode === :gpu ? "device" : string(GT)
     @printf("  gravity = %s (FFT=%s, scatter=%s, host=%s)  chem = %s  (FFTW threads=%d, Julia threads=%d)\n",
             gravmode, fftlabel, accelmode, gravloc, chembk, nthr, Threads.nthreads()); flush(stdout)
@@ -744,16 +771,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     ρd = gravmode === :gpu ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
     # GRAV1BUF: φ shares ρ's buffer (in-place rfft solve) — one nc³ field instead of two.
     φd = gravmode === :gpu ? (GRAV1BUF ? ρd : PPMKernels.device_zeros(pg.backend, T, ncell)) : nothing
-    # CPU-gravity DM deposit scratch. Reused each solve; otherwise the Metal path allocates
-    # a full device density and full host conversion every gravity call.
-    ρp_scratch = (gravmode === :cpu && parts !== nothing) ?
-        PPMKernels.device_zeros(pg.backend, T, (prod(ncell),)) : nothing
-    ρp_host = ρp_scratch === nothing ? nothing : Vector{T}(undef, prod(ncell))
-    maxsig_work = ρp_scratch === nothing ? nothing : (; scratch=ρp_scratch, host=ρp_host)
-    dedup_cpu_phi = gravmode === :cpu && SOLVER === :fvgk &&
-        get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
-    φkick_dev = dedup_cpu_phi ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
-    φkick_host = dedup_cpu_phi && GT !== T ? Array{T}(undef, ncell) : nothing
+    ρp_scratch = nothing; ρp_host = nothing; maxsig_work = nothing
+    φkick_dev = nothing; φkick_host = nothing
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
@@ -829,6 +848,34 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
 
     a = a_start
     prebuild_fvgk_before_particles!(pg, a, u_i)
+    BE === :cuda && (CUDA.synchronize(); GC.gc(true); CUDA.reclaim())
+    BE === :metal && (Metal.synchronize(); GC.gc(true); Metal.synchronize())
+    if SOLVER === :fvgk && gravmode === :gpu && ρd !== nothing
+        fill!(ρd, zero(T))
+        if kafft
+            if kafft_c2c
+                PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)
+            else
+                PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)
+            end
+        else
+            PoissonKernels.fft_poisson_rfft!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)
+        end
+        BE === :cuda && CUDA.synchronize()
+        BE === :metal && Metal.synchronize()
+    end
+    parts = make_parts()
+    BE === :cuda && CUDA.synchronize()
+    BE === :metal && Metal.synchronize()
+    if gravmode === :cpu && parts !== nothing
+        ρp_scratch = PPMKernels.device_zeros(pg.backend, T, (prod(ncell),))
+        ρp_host = Vector{T}(undef, prod(ncell))
+        maxsig_work = (; scratch=ρp_scratch, host=ρp_host)
+    end
+    dedup_cpu_phi = gravmode === :cpu && SOLVER === :fvgk &&
+        get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
+    φkick_dev = dedup_cpu_phi ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
+    φkick_host = dedup_cpu_phi && GT !== T ? Array{T}(undef, ncell) : nothing
     m0 = total_mass(pg)
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing

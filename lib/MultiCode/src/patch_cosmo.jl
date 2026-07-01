@@ -122,9 +122,9 @@ function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Rea
                          scratch=nothing, nc=nothing)
     half = 0.5*dtau
     if nc !== nothing && get(ENV, "CIC_PARTICLE_FUSED", "1") == "1"
-        PoissonKernels.particle_kdk_from_global_potential!(
+        PoissonKernels.push_particles_fused_global!(
             parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
-            dcoef=half, ts=half, driftcoef=dtau, nc=nc, wrap=1.0)
+            dtau=dtau, nc=nc, wrap=1.0)
         return scratch
     end
     if scratch === nothing
@@ -133,8 +133,8 @@ function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Rea
         axp, ayp, azp = scratch
     end
     # force = −∇φ central-differenced at the CIC cells (no stored accel).  `nc !== nothing`
-    # ⇒ read the GLOBAL nc³ φ with periodic wrap (no padded copy — the consolidated-gravity path);
-    # else read the ghosted padded block `φpad`.  axp is similar(px) ⇒ f32 even when velocities are f16.
+    # reads GLOBAL φ with periodic wrap.  With the fused path disabled this keeps a
+    # split-kernel comparison that still avoids the padded particle φ copy.
     if nc === nothing
         le = (leftedge, leftedge, leftedge)
         PoissonKernels.interp_force_from_potential!(axp, ayp, azp,

@@ -212,14 +212,16 @@ function interp_force_from_global_potential!(axp::AbstractVector{T}, ayp, azp,
     return axp, ayp, azp
 end
 
-# Fused global-potential particle push for the memory-lean CICASS path. This is
-# exactly the same KDK sequence as:
-#   interp_force_from_global_potential!; particle_kick!; particle_drift!; particle_kick!
-# but keeps the acceleration in registers instead of materializing axp/ayp/azp.
-@kernel function _particle_kdk_global_phi_kernel!(px, py, pz, vx, vy, vz, @Const(φg),
-                                                  dcoef, ts, driftcoef, wrap, dowrap::Int,
-                                                  invcell, c05, c1,
-                                                  n1::Int, n2::Int, n3::Int, hc)
+# ── FUSED force-interp + leapfrog KDK (no per-particle accel array) ───────────────────────────
+# The force is evaluated ONCE (at the half-drifted position) and held in REGISTERS across both
+# half-kicks — so `axp,ayp,azp` (3·Nₚ) never materialize.  Global φ, periodic-wrap CIC (as
+# interp_force_from_global_potential!); non-comoving kick (coef=0).  The half-kick
+# is rounded to the stored velocity type before the drift, matching the split
+# kick-drift-kick path exactly even for f16-stored velocities.
+@kernel function _push_kdk_global_k!(px, py, pz, vx, vy, vz, @Const(φg),
+                                     dcoef, ts, driftcoef, wrap, dowrap::Int,
+                                     invcell, c05, c1,
+                                     n1::Int, n2::Int, n3::Int, hc)
     p = @index(Global)
     @inbounds begin
         xq = px[p] + dcoef * vx[p]
@@ -281,12 +283,27 @@ function particle_kdk_from_global_potential!(px::AbstractVector{T}, py, pz, vx, 
     be = KA.get_backend(px)
     n1, n2, n3 = Int(nc[1]), Int(nc[2]), Int(nc[3])
     dowrap = wrap > 0 ? 1 : 0
-    _particle_kdk_global_phi_kernel!(be)(px, py, pz, vx, vy, vz, φg,
-                                         T(dcoef), T(ts), T(driftcoef), T(wrap), dowrap,
-                                         T(n1), T(0.5), T(1),
-                                         n1, n2, n3, T(0.5) * T(n1);
-                                         ndrange = length(px))
+    _push_kdk_global_k!(be)(px, py, pz, vx, vy, vz, φg,
+                            T(dcoef), T(ts), T(driftcoef), T(wrap), dowrap,
+                            T(n1), T(0.5), T(1),
+                            n1, n2, n3, T(0.5) * T(n1);
+                            ndrange = length(px))
     return px, py, pz, vx, vy, vz
+end
+
+"""
+    push_particles_fused_global!(px,py,pz, vx,vy,vz, φg; dtau, nc) -> nothing
+
+One-kernel leapfrog step reading the GLOBAL `nc³` potential `φg` (periodic wrap): eval `g=−∇φ` at the
+half-drifted position, kick–drift–kick, wrap — the per-particle accel stays in registers (no `axp`
+arrays).  Non-comoving (`coef=0`).  Bit-identical to the split interp+kick+drift+kick global path.
+"""
+function push_particles_fused_global!(px::AbstractVector{T}, py, pz, vx, vy, vz, φg;
+                                      dtau::Real, nc, wrap::Real=1) where {T}
+    half = T(0.5) * T(dtau)
+    particle_kdk_from_global_potential!(px, py, pz, vx, vy, vz, φg;
+        dcoef=half, ts=half, driftcoef=T(dtau), nc=nc, wrap=wrap)
+    return nothing
 end
 
 @kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),

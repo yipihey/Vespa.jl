@@ -172,7 +172,7 @@ is fixed by Ωb,Ω0 (mass conservation in a periodic box), there is NO reduction
 field, so f32 carries the overdensity fine (no √N·ε mean error) — no f64 needed.
 """
 function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt::Real=0.0,
-                                      a::Real=1.0, meandens::Real=1.0)
+                                      a::Real=1.0, meandens::Real=1.0, depbuf=nothing)
     be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc)
     all(==(nc[1]), nc) || error("assemble_global_density_gpu!: cubic ncell required")
     fill!(ρd, zero(T))
@@ -190,11 +190,24 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
         # Int32 (not Int64): per-cell Σ ≈ ρ_dm·2²³ ≲ 2.5e8 ≪ 2³¹ for these z≥20 runs (mild
         # clustering), and T.(Int) → f32 is identical for both widths (24-bit exact ≪ 2.5e8),
         # so it's BIT-IDENTICAL to the Int64 deposit but ~1.7× faster (Int32 atomics on Ampere).
-        ρpi = PPMKernels.device_zeros(be, Int32, (Ntot,))
+        # `depbuf` (when given, the KA-FFT path passes its Stockham scratch reinterpreted as Int32):
+        # reuse it as the deposit accumulator — no separate N³·4 B alloc at the grid ceiling.  The FFT
+        # runs AFTER this and overwrites it, so the borrow is safe.  Else allocate a fresh Int32 grid.
+        borrowed = depbuf !== nothing
+        ρpi = borrowed ? (fill!(depbuf, Int32(0)); reshape(depbuf, Ntot)) :
+                         PPMKernels.device_zeros(be, Int32, (Ntot,))
         PoissonKernels.cic_deposit_det!(ρpi, particles.px, particles.py, particles.pz,
                                         particles.vx, particles.vy, particles.vz, particles.mass;
                                         N=nc[1], disp=0.5*dt/a, shift=-0.5, qbits=23)
-        ρd .+= reshape(T.(ρpi), nc) .* T(2.0^-23)
+        # Fuse the Int32→f32 rescale into the accumulate — no full N³ `T.(ρpi)` copy (which, even
+        # once freed, keeps the CUDA.jl pool reservation high and starves cuFFT's out-of-pool work
+        # area at the grid ceiling).  reshape(ρpi) is a view; Int32*Float32 promotes per-element.
+        ρd .+= reshape(ρpi, nc) .* T(2.0^-23)
+        # Release the freshly-allocated deposit buffer NOW (before the FFT allocates its scratch): the
+        # FFT then REUSES this pool block instead of growing the pool.  (Skip when borrowed — not ours.)
+        borrowed || let m = parentmodule(typeof(ρpi))
+            isdefined(m, :unsafe_free!) && m.unsafe_free!(ρpi)
+        end
     end
     ρd .-= T(meandens)                                    # known constant — no reduction, no f64
     return ρd
@@ -371,8 +384,8 @@ end
     global_gravity_gpu(pg; G, a, boxsize, particles, dt, ρd, φd, ng2) -> (; gas, phi, le, cs)
 
 FULL on-GPU top-grid gravity: device density assemble → device Poisson solve
-(CUDA: rFFT/cuFFT; Metal: MPSGraph rFFT/irFFT) → per-patch
-potential blocks (`patch_accel_gpu`) + padded or global potential for particles.
+(native rFFT or optional in-tree KA FFT) → per-patch potential blocks
+(`patch_accel_gpu`) + padded or global potential for particles.
 No accel fields stored: `g = −∇φ` is differenced on demand in the gas kick and
 particle interp.  No host round-trip, no FFTW.
 """
@@ -385,8 +398,21 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     be = pg.backend; nc = pg.ncell
     ρd === nothing && (ρd = PPMKernels.device_zeros(be, pg.T, nc))
     φd === nothing && (φd = PPMKernels.device_zeros(be, pg.T, nc))     # may alias ρd (in-place solve)
-    assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens)
-    PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # rfft, φd may === ρd
+    # CIC_GRAV_KAFFT=1: solve with the in-tree KA FFT.  On CUDA this avoids cuFFT's
+    # out-of-pool work area; on Metal it gives a pure-KA alternative to the MPSGraph rFFT.
+    # Default = the REAL FFT (`fft_poisson_rfft_ka!`, ~2× faster + 8 B/cell); CIC_GRAV_KAFFT_C2C=1 forces
+    # the c2c Stockham path (12 B/cell) — whose N³ Stockham scratch the deposit can borrow (poisson_scratch_i32).
+    # Needs a 2·3·5-smooth cubic grid (rfft additionally needs even n with n/2 smooth; else it self-falls-back).
+    kafft = get(ENV, "CIC_GRAV_KAFFT", "0") == "1"
+    rfft  = kafft && get(ENV, "CIC_GRAV_KAFFT_C2C", "0") != "1"
+    depbuf = (kafft && !rfft) ? PoissonKernels.poisson_scratch_i32(be, pg.T, nc) : nothing  # only c2c has an N³ buffer to lend
+    assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens, depbuf=depbuf)
+    if kafft
+        rfft ? PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=G, a=a, boxsize=boxsize) :
+               PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=G, a=a, boxsize=boxsize)
+    else
+        PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # native rfft; φd may === ρd
+    end
     # dedup: the gas kick reads the GLOBAL φ directly (grav_kick_from_global_potential!), so the
     # per-patch ghosted φ-block copy is unnecessary — pass φd itself as the "accel".
     gas = pg.dedup ? φd : patch_accel_gpu(pg, φd; dx=pg.dx)
