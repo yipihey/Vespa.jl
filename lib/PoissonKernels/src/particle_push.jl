@@ -212,6 +212,55 @@ function interp_force_from_global_potential!(axp::AbstractVector{T}, ayp, azp,
     return axp, ayp, azp
 end
 
+# ── FUSED force-interp + leapfrog KDK (no per-particle accel array) ───────────────────────────
+# The force is evaluated ONCE (at the half-drifted position) and held in REGISTERS across both
+# half-kicks — so `axp,ayp,azp` (3·Nₚ) never materialize.  Global φ, periodic-wrap CIC (as
+# interp_force_from_global_potential!); non-comoving kick (coef=0); positions wrapped to [0,wrap).
+# Bit-identical to interp_force_from_global_potential! + two `coef=0` kicks around a drift.
+@kernel function _push_kdk_global_k!(px, py, pz, vx, vy, vz, @Const(φg),
+                                     half, dtau, invcell, c05, c1, n1::Int, n2::Int, n3::Int, hc, wrap)
+    p = @index(Global)
+    @inbounds begin
+        Tp = eltype(px)
+        vxp = Float32(vx[p]); vyp = Float32(vy[p]); vzp = Float32(vz[p])
+        xq = px[p] + half*vxp; yq = py[p] + half*vyp; zq = pz[p] + half*vzp     # eval at x + ½dt·v
+        xpos = xq*invcell; ypos = yq*invcell; zpos = zq*invcell
+        i1 = unsafe_trunc(Int, xpos+c05); j1 = unsafe_trunc(Int, ypos+c05); k1 = unsafe_trunc(Int, zpos+c05)
+        dxr = oftype(xpos,i1)+c05-xpos; dyr = oftype(ypos,j1)+c05-ypos; dzr = oftype(zpos,k1)+c05-zpos
+        ex = c1-dxr; ey = c1-dyr; ez = c1-dzr
+        φr(i,j,k) = φg[_wrap1(i,n1), _wrap1(j,n2), _wrap1(k,n3)]
+        gxc(i,j,k) = -hc*(φr(i+1,j,k)-φr(i-1,j,k))
+        gyc(i,j,k) = -hc*(φr(i,j+1,k)-φr(i,j-1,k))
+        gzc(i,j,k) = -hc*(φr(i,j,k+1)-φr(i,j,k-1))
+        w(a,b,c) = a*b*c
+        ax = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ay = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        az = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+             gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        vxf = vxp + ax*half; vyf = vyp + ay*half; vzf = vzp + az*half           # kick ½
+        xn = mod(px[p] + vxf*dtau, wrap); yn = mod(py[p] + vyf*dtau, wrap); zn = mod(pz[p] + vzf*dtau, wrap)  # drift
+        vx[p] = eltype(vx)(vxf + ax*half); vy[p] = eltype(vy)(vyf + ay*half); vz[p] = eltype(vz)(vzf + az*half) # kick ½
+        px[p] = Tp(xn); py[p] = Tp(yn); pz[p] = Tp(zn)
+    end
+end
+
+"""
+    push_particles_fused_global!(px,py,pz, vx,vy,vz, φg; dtau, nc) -> nothing
+
+One-kernel leapfrog step reading the GLOBAL `nc³` potential `φg` (periodic wrap): eval `g=−∇φ` at the
+half-drifted position, kick–drift–kick, wrap — the per-particle accel stays in registers (no `axp`
+arrays).  Non-comoving (`coef=0`).  Bit-identical to the split interp+kick+drift+kick global path.
+"""
+function push_particles_fused_global!(px, py, pz, vx, vy, vz, φg; dtau::Real, nc)
+    be = KA.get_backend(px); T = eltype(px); n1, n2, n3 = Int(nc[1]), Int(nc[2]), Int(nc[3])
+    half = T(0.5) * T(dtau)
+    _push_kdk_global_k!(be)(px, py, pz, vx, vy, vz, φg, half, T(dtau), T(n1), T(0.5), T(1),
+                            n1, n2, n3, T(0.5)*T(n1), T(1); ndrange = length(px))
+    return nothing
+end
+
 @kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),
                                ts, coef1, coef2)
     p = @index(Global)

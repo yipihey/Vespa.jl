@@ -79,6 +79,20 @@ _fft_scratch(be, ::Type{T}, N) where {T} =
     get!(_FFT_SCRATCH, (typeof(be), T, N)) do
         (KA.zeros(be, T, N...), KA.zeros(be, T, N...))
     end
+# Cached imaginary buffer, reused (zeroed) every solve — so the hot gravity FFT allocates NOTHING
+# per call (the fresh `KA.zeros` xi otherwise collides with the pooled ρpi transient at the ceiling).
+_fft_imag(be, ::Type{T}, N) where {T} =
+    get!(() -> KA.zeros(be, T, N...), _FFT_SCRATCH, (:imag, typeof(be), T, N))
+
+"""
+    poisson_scratch_i32(be, T, N) -> Int32 view of an N³ FFT scratch buffer (reinterpreted)
+
+The Stockham FFT's real scratch `sr` (Float32, N³) reinterpreted as an Int32 array of the same shape,
+for callers that need a large Int32 accumulator BEFORE the FFT runs (e.g. the deterministic CIC
+deposit).  Reusing this buffer avoids a separate N³·4 B allocation at the grid ceiling.  The FFT
+overwrites `sr` on its first stage, so the borrow must be finished before `fft_poisson_root_gpu!`.
+"""
+poisson_scratch_i32(be, ::Type{T}, N) where {T} = reinterpret(Int32, _fft_scratch(be, T, N)[1])
 
 # ── axis transposes ───────────────────────────────────────────────────────────
 # The 3-D FFT brings each axis to the front (axis 1) before the 1-D transform. On
@@ -126,6 +140,163 @@ function _fft3d!(xr, xi, brdev, sgn::Int)
     return xr, xi
 end
 
+# ── Mixed-radix (2·3·5) Stockham autosort — non-power-of-two cubic grids ─────────
+# The radix-2 path above is in-place (bit-reversal); mixed radix uses a self-sorting
+# Stockham (no digit-reversal) that ping-pongs between two buffer pairs.  This is what
+# lets the gravity FFT run at 2ᵃ3ᵇ5ᶜ sizes (768/864/900/960/1024) with a SMALL, poolable
+# scratch instead of cuFFT's opaque ~18 B/cell work area.  Validated bit-close vs FFTW.
+_factorize235(n::Int) = begin
+    fs = Int[]; m = n
+    for p in (2, 3, 5); while m % p == 0; push!(fs, p); m ÷= p; end; end
+    m == 1 ? fs : nothing                              # nothing ⇒ has a prime factor > 5
+end
+
+# One Stockham stage along axis 1.  The twiddle is FUSED into the radix-R DFT (combined phase
+# r·((jz%Ns)+kk·Ns)/(Ns·R)) so each output reads the R inputs directly — no per-thread local
+# array (keeps it backend-agnostic; R ≤ 5 ⇒ ≤25 reads/butterfly).  Self-sorting scatter (idxD).
+@kernel function _stockham_stage_k!(outr, outi, @Const(inr), @Const(ini),
+                                    R::Int, Ns::Int, NR::Int, sgn, twopi)
+    j, a2, a3 = @index(Global, NTuple)
+    @inbounds begin
+        T = eltype(outr); jz = j - 1
+        base = jz % Ns; idxD = (jz ÷ Ns) * Ns * R + base
+        for kk in 0:R-1
+            ph0 = sgn * twopi * T(base + kk*Ns) / T(Ns*R)
+            sr = zero(T); si = zero(T)
+            for r in 0:R-1
+                xr = inr[jz + r*NR + 1, a2, a3]; xi = ini[jz + r*NR + 1, a2, a3]
+                c = cos(T(r)*ph0); s = sin(T(r)*ph0)
+                sr += c*xr - s*xi;  si += c*xi + s*xr
+            end
+            outr[idxD + kk*Ns + 1, a2, a3] = sr;  outi[idxD + kk*Ns + 1, a2, a3] = si
+        end
+    end
+end
+
+# 1-D Stockham along axis 1 (ping-pong cr↔or); result left in (cr,ci), (or,oi) free as scratch.
+function _stockham_axis1!(cr, ci, or, oi, factors, sgn::Int)
+    be = KA.get_backend(cr); T = eltype(cr); N1, N2, N3 = size(cr); tp = T(2) * T(pi)
+    ar, ai, brr, bii = cr, ci, or, oi; Ns = 1
+    for R in factors
+        _stockham_stage_k!(be)(brr, bii, ar, ai, R, Ns, N1 ÷ R, T(sgn), tp; ndrange = (N1 ÷ R, N2, N3))
+        ar, brr = brr, ar; ai, bii = bii, ai; Ns *= R
+    end
+    ar === cr || (copyto!(cr, ar); copyto!(ci, ai))    # odd #stages ⇒ result in scratch: copy back
+    return nothing
+end
+
+# 3-D mixed-radix FFT with ONLY two buffer pairs (xr,xi)+(sr,si): each axis Stockham leaves its
+# result in the first pair; the out-of-place transpose ping-pongs into the other — no 3rd buffer.
+function _fft3d_mixed!(xr, xi, sr, si, factors, sgn::Int)
+    be = KA.get_backend(xr)
+    _stockham_axis1!(xr, xi, sr, si, factors, sgn)                       # axis 1 → (xr,xi)
+    _transpose!(sr, xr, (2,1,3), be); _transpose!(si, xi, (2,1,3), be)   # (sr,si) ← transpose
+    _stockham_axis1!(sr, si, xr, xi, factors, sgn)                       # axis 2 → (sr,si)
+    _transpose!(xr, sr, (2,1,3), be); _transpose!(xi, si, (2,1,3), be)   # back → (xr,xi)
+    _transpose!(sr, xr, (3,2,1), be); _transpose!(si, xi, (3,2,1), be)   # (sr,si) ← axis1↔3
+    _stockham_axis1!(sr, si, xr, xi, factors, sgn)                       # axis 3 → (sr,si)
+    _transpose!(xr, sr, (3,2,1), be); _transpose!(xi, si, (3,2,1), be)   # back → (xr,xi)
+    return xr, xi
+end
+
+# ── Real-input FFT (rfft) Poisson — ~½ the FLOPs, memory, and transpose volume of the c2c path ──
+# rfft along axis-1: pack the n reals into M=n/2 complex, c2c(M), Hermitian split → the (M+1,n,n)
+# half-complex grid; then c2c along axes 2,3 on the half-grid, Green's, and the inverse.  Needs an
+# EVEN 2·3·5-smooth n (with M=n/2 also 2·3·5-smooth).  Validated bit-close vs the c2c solver / FFTW.
+@kernel function _rpack_k!(zr, zi, @Const(x))                 # (n,n,n) real → (M,n,n) complex
+    m, j, k = @index(Global, NTuple)
+    @inbounds begin zr[m,j,k] = x[2m-1,j,k]; zi[m,j,k] = x[2m,j,k] end
+end
+@kernel function _runpack_k!(x, @Const(zr), @Const(zi))       # (M,n,n) complex → (n,n,n) real
+    m, j, k = @index(Global, NTuple)
+    @inbounds begin x[2m-1,j,k] = zr[m,j,k]; x[2m,j,k] = zi[m,j,k] end
+end
+# Hermitian split Z (M,n,n) → X (M+1,n,n): E=½(Z[k]+conj Z[M-k]), O=(1/2i)(Z[k]−conj Z[M-k]), X=E+W_N^k O.
+@kernel function _rsplit_k!(Xr, Xi, @Const(Zr), @Const(Zi), M::Int, tw)
+    kk, j, k = @index(Global, NTuple)                         # kk∈1:M+1, k1=kk-1
+    @inbounds begin
+        T = eltype(Xr); k1 = kk-1; km = mod(M-k1, M)
+        zkr = Zr[k1%M+1,j,k]; zki = Zi[k1%M+1,j,k]; zcr = Zr[km+1,j,k]; zci = -Zi[km+1,j,k]
+        Er = T(0.5)*(zkr+zcr); Ei = T(0.5)*(zki+zci); Or = T(0.5)*(zki-zci); Oi = T(-0.5)*(zkr-zcr)
+        wv = tw*T(k1); wr = cos(wv); ws = sin(wv)             # W_N^{k1}=exp(sgn·2πk1/n)
+        Xr[kk,j,k] = Er + wr*Or - ws*Oi; Xi[kk,j,k] = Ei + wr*Oi + ws*Or
+    end
+end
+# inverse split X (M+1,n,n) → Z (M,n,n): E=½(X[k]+conj X[M-k]), O=½W^{-k}(X[k]−conj X[M-k]), Z=E+iO.
+@kernel function _runsplit_k!(Zr, Zi, @Const(Xr), @Const(Xi), M::Int, tw)
+    kk, j, k = @index(Global, NTuple)                         # kk∈1:M, k1=kk-1
+    @inbounds begin
+        T = eltype(Zr); k1 = kk-1; mk = M-k1
+        xkr = Xr[kk,j,k]; xki = Xi[kk,j,k]; xcr = Xr[mk+1,j,k]; xci = -Xi[mk+1,j,k]
+        Er = T(0.5)*(xkr+xcr); Ei = T(0.5)*(xki+xci); Dr = xkr-xcr; Di = xki-xci
+        wv = -tw*T(k1); wr = cos(wv); ws = sin(wv)            # W_N^{-k1}
+        Or = T(0.5)*(wr*Dr - ws*Di); Oi = T(0.5)*(wr*Di + ws*Dr)
+        Zr[kk,j,k] = Er - Oi; Zi[kk,j,k] = Ei + Or            # Z = E + i·O
+    end
+end
+# Green's −1/k² on the half-grid (M+1,n,n): kx = 0..M (the non-negative rfft half), ky,kz folded.
+@kernel function _scale_half_k!(Xr, Xi, coef, n::Int, w1, w2, w3)
+    i, j, k = @index(Global, NTuple)
+    @inbounds begin
+        T = eltype(Xr)
+        kx = w1*T(i-1); ky = w2*T((j-1)<=n÷2 ? (j-1) : (j-1-n)); kz = w3*T((k-1)<=n÷2 ? (k-1) : (k-1-n))
+        ks = kx*kx+ky*ky+kz*kz; c = ks==zero(T) ? zero(T) : coef*(-one(T)/ks)
+        Xr[i,j,k]*=c; Xi[i,j,k]*=c
+    end
+end
+# c2c along axis 2 or 3 of a complex (n1,n2,n3): transpose-to-front, Stockham, transpose back.
+# Only ONE extra pair (tr,ti): after the transpose Xr,Xi→tr,ti the source Xr,Xi is FREE, so it doubles
+# as the Stockham ping-pong (reshaped to the transposed layout) ⇒ the rfft needs just 2 buffer pairs.
+function _c2c_axis!(Xr, Xi, tr, ti, axis::Int, factors, sgn::Int, be)
+    dims = size(Xr); perm = axis == 2 ? (2,1,3) : (3,2,1); tsh = ntuple(d -> dims[perm[d]], 3); nel = prod(dims)
+    trv = reshape(view(vec(tr),1:nel),tsh); tiv = reshape(view(vec(ti),1:nel),tsh)
+    _transpose!(trv, Xr, perm, be); _transpose!(tiv, Xi, perm, be)   # Xr,Xi → tr,ti; Xr,Xi now free
+    srv = reshape(view(vec(Xr),1:nel),tsh); siv = reshape(view(vec(Xi),1:nel),tsh)   # ping-pong ← freed Xr,Xi
+    _stockham_axis1!(trv, tiv, srv, siv, factors, sgn)        # length dims[perm[1]] along axis 1
+    _transpose!(Xr, trv, perm, be); _transpose!(Xi, tiv, perm, be)   # perm is its own inverse
+    return nothing
+end
+# cached rfft buffers: 2 pairs of (M+1,n,n) ≈ 8 B/cell (the c2c path is 12).  Allocated once (warm-up).
+_rfft_bufs(be, ::Type{T}, n) where {T} = get!(_FFT_SCRATCH, (:rfft, typeof(be), T, n)) do
+    M = n÷2
+    (Xr=KA.zeros(be,T,M+1,n,n), Xi=KA.zeros(be,T,M+1,n,n), tr=KA.zeros(be,T,M+1,n,n), ti=KA.zeros(be,T,M+1,n,n))
+end
+
+"""
+    fft_poisson_rfft_ka!(phi, rho; G, a, boxsize) -> phi
+
+Periodic Poisson solve with the in-tree REAL FFT (rfft): ~half the work/memory of `fft_poisson_root_gpu!`
+(the half-complex grid is (n/2+1)×n×n).  Even, 2·3·5-smooth cubic `n` with n/2 also 2·3·5-smooth; else
+it delegates to the c2c solver.  Bit-close to `fft_poisson_root_gpu!` / FFTW.
+"""
+function fft_poisson_rfft_ka!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
+                              G::Real=1.0, a::Real=1.0, boxsize=1.0) where {T}
+    be = KA.get_backend(rho); N = size(rho); n = N[1]
+    all(==(n), N) || error("fft_poisson_rfft_ka!: cubic grid required, got $N")
+    M = n ÷ 2; facM = iseven(n) ? _factorize235(M) : nothing; facN = _factorize235(n)
+    (facM === nothing || facN === nothing) &&
+        return fft_poisson_root_gpu!(phi, rho; G=G, a=a, boxsize=boxsize)   # fall back to c2c
+    L = boxsize isa Number ? ntuple(_->Float64(boxsize),3) : ntuple(d->Float64(boxsize[d]),3)
+    w = ntuple(d->T(2π)/T(L[d]),3); coef = T(G)/T(a); tw = -T(2π)/T(n)
+    B = _rfft_bufs(be, T, n); Mnn = M*n*n                     # cached (allocated once in the warm-up)
+    zr  = reshape(view(vec(B.tr),1:Mnn),M,n,n); zi  = reshape(view(vec(B.ti),1:Mnn),M,n,n)  # packed/axis-1 ← tr,ti
+    zsr = reshape(view(vec(B.Xr),1:Mnn),M,n,n); zsi = reshape(view(vec(B.Xi),1:Mnn),M,n,n)  # axis-1 ping-pong ← Xr,Xi
+    _rpack_k!(be)(zr, zi, rho; ndrange=(M,n,n))
+    _stockham_axis1!(zr, zi, zsr, zsi, facM, -1)              # rfft axis-1: c2c(M) on packed
+    _rsplit_k!(be)(B.Xr, B.Xi, zr, zi, M, tw; ndrange=(M+1,n,n))       # → half-complex (Xr,Xi)
+    _c2c_axis!(B.Xr, B.Xi, B.tr, B.ti, 2, facN, -1, be)
+    _c2c_axis!(B.Xr, B.Xi, B.tr, B.ti, 3, facN, -1, be)
+    _scale_half_k!(be)(B.Xr, B.Xi, coef, n, w[1], w[2], w[3]; ndrange=(M+1,n,n))
+    _c2c_axis!(B.Xr, B.Xi, B.tr, B.ti, 3, facN, +1, be)
+    _c2c_axis!(B.Xr, B.Xi, B.tr, B.ti, 2, facN, +1, be)
+    _runsplit_k!(be)(zr, zi, B.Xr, B.Xi, M, tw; ndrange=(M,n,n))       # Xr,Xi → zr,zi (tr,ti)
+    _stockham_axis1!(zr, zi, zsr, zsi, facM, +1)              # irfft axis-1
+    _runpack_k!(be)(phi, zr, zi; ndrange=(M,n,n))
+    phi .*= T(2)/T(n)^3          # axis-1 round-trips ×M=×n/2 (inner c2c is length n/2) ⇒ total n³/2
+    KA.synchronize(be)
+    return phi
+end
+
 # full (c2c) periodic Green's function G(k) = -1/k², G(0)=0, on the device.
 function _greens_full(be, ::Type{T}, N::NTuple{3,Int}, L::NTuple{3,Float64}) where {T}
     Gk = Array{T,3}(undef, N)
@@ -154,6 +325,21 @@ const _GPUFFT_CACHE = Dict{Any,Any}()
     end
 end
 
+# On-the-fly Green's multiply: φ̂ = coef·(−1/k²)·ρ̂ with k² formed from the indices — no cached
+# N³ Gk array (−4 B/cell; at the grid ceiling that array is the difference between fitting and OOM).
+@kernel function _scale_by_k_onfly!(xr, xi, coef, n1::Int, n2::Int, n3::Int, w1, w2, w3)
+    i, j, k = @index(Global, NTuple)
+    @inbounds begin
+        T = eltype(xr)
+        kx = w1 * T((i-1) <= n1÷2 ? (i-1) : (i-1-n1))
+        ky = w2 * T((j-1) <= n2÷2 ? (j-1) : (j-1-n2))
+        kz = w3 * T((k-1) <= n3÷2 ? (k-1) : (k-1-n3))
+        ks = kx*kx + ky*ky + kz*kz
+        c = ks == zero(T) ? zero(T) : coef * (-one(T) / ks)
+        xr[i, j, k] *= c; xi[i, j, k] *= c
+    end
+end
+
 """
     fft_poisson_root_gpu!(phi, rho; G=1.0, a=1.0, boxsize=1.0) -> phi
 
@@ -165,17 +351,28 @@ the FFTW path. `phi`, `rho` are 3-D device arrays of the same shape.
 function fft_poisson_root_gpu!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
                                G::Real = 1.0, a::Real = 1.0, boxsize = 1.0) where {T}
     be = KA.get_backend(rho); N = size(rho)
-    all(_ispow2, N) || error("fft_poisson_root_gpu! needs power-of-two dims, got $N")
-    all(==(N[1]), N) || error("fft_poisson_root_gpu! currently needs a cubic grid (one bit-reversal table), got $N")
+    all(==(N[1]), N) || error("fft_poisson_root_gpu! needs a cubic grid, got $N")
+    factors = _factorize235(N[1])
+    factors === nothing && error("fft_poisson_root_gpu! needs a 2·3·5-smooth dim, got $(N[1])")
     L = boxsize isa Number ? ntuple(_ -> Float64(boxsize), 3) : ntuple(d -> Float64(boxsize[d]), 3)
-    ckey = (typeof(be), T, N, L)
-    brdev, Gk = get!(_GPUFFT_CACHE, ckey) do
-        (to_device(be, _bitrev_table(N[1]), Int32), _greens_full(be, T, N, L))
+    pow2 = _ispow2(N[1])
+    brdev = pow2 ? get!(() -> to_device(be, _bitrev_table(N[1]), Int32),
+                        _GPUFFT_CACHE, (:brev, typeof(be), T, N[1])) : nothing
+    w = ntuple(d -> T(2π) / T(L[d]), 3); coef = T(G) / T(a)   # G(k)=−1/k² formed on the fly (no Gk array)
+    # In-place when φ aliases ρ (the GRAV1BUF shared buffer): use `rho` as the real part directly —
+    # no N³ copy (−4 B/cell), and the FFT working set is ρ + xi + one scratch pair, not two copies.
+    xr = phi === rho ? rho : copyto!(similar(rho), rho)
+    xi = _fft_imag(be, T, N); fill!(xi, zero(T))       # cached (allocated once, in the warmup's clean pool)
+    if pow2                                           # radix-2, in-place bit-reversal (SB root grids)
+        _fft3d!(xr, xi, brdev, -1)
+        _scale_by_k_onfly!(be)(xr, xi, coef, N[1], N[2], N[3], w[1], w[2], w[3]; ndrange = N)
+        _fft3d!(xr, xi, brdev, +1)
+    else                                              # mixed radix 2·3·5, Stockham (2 buffer pairs)
+        sr, si = _fft_scratch(be, T, N)
+        _fft3d_mixed!(xr, xi, sr, si, factors, -1)
+        _scale_by_k_onfly!(be)(xr, xi, coef, N[1], N[2], N[3], w[1], w[2], w[3]; ndrange = N)
+        _fft3d_mixed!(xr, xi, sr, si, factors, +1)
     end
-    xr = copyto!(similar(rho), rho); xi = KA.zeros(be, T, N...)
-    xr, xi = _fft3d!(xr, xi, brdev, -1)               # forward
-    _scale_by_k!(be)(xr, xi, Gk, T(G) / T(a); ndrange = N)
-    xr, xi = _fft3d!(xr, xi, brdev, +1)               # inverse (unnormalized)
     invN = one(T) / T(prod(N))
     @inbounds phi .= xr .* invN                        # real part, normalized
     KA.synchronize(be)

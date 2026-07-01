@@ -120,25 +120,26 @@ positions; `gx,gy,gz` is the field from `particle_accel_field`.
 """
 function push_particles!(parts, φpad, leftedge::Real, cellsize::Real, dtau::Real;
                          scratch=nothing, nc=nothing)
+    # Global-φ path (`nc !== nothing`, the consolidated-gravity/dedup case): ONE fused KDK kernel —
+    # the per-particle accel stays in registers, so `axp,ayp,azp` (3·Nₚ) never materialize.  This is
+    # the ceiling lever (removes ~3·N³·4 B/cycle) AND matches "central-difference φ, don't store accel".
+    if nc !== nothing
+        PoissonKernels.push_particles_fused_global!(parts.px, parts.py, parts.pz,
+            parts.vx, parts.vy, parts.vz, φpad; dtau=dtau, nc=nc)
+        return scratch
+    end
+    # Padded-block path (np>1 / non-dedup): difference the ghosted φpad; needs the per-particle accel
+    # scratch (evaluated once at the half-drift, reused by both half-kicks).  axp=similar(px) ⇒ f32.
     if scratch === nothing
         axp = similar(parts.px); ayp = similar(parts.px); azp = similar(parts.px)
     else
         axp, ayp, azp = scratch
     end
     half = 0.5*dtau
-    # force = −∇φ central-differenced at the CIC cells (no stored accel).  `nc !== nothing`
-    # ⇒ read the GLOBAL nc³ φ with periodic wrap (no padded copy — the consolidated-gravity path);
-    # else read the ghosted padded block `φpad`.  axp is similar(px) ⇒ f32 even when velocities are f16.
-    if nc === nothing
-        le = (leftedge, leftedge, leftedge)
-        PoissonKernels.interp_force_from_potential!(axp, ayp, azp,
-            parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
-            dcoef=half, cellsize=cellsize, leftedge=le)
-    else
-        PoissonKernels.interp_force_from_global_potential!(axp, ayp, azp,
-            parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
-            dcoef=half, nc=nc)
-    end
+    le = (leftedge, leftedge, leftedge)
+    PoissonKernels.interp_force_from_potential!(axp, ayp, azp,
+        parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz, φpad;
+        dcoef=half, cellsize=cellsize, leftedge=le)
     PoissonKernels.particle_kick!(parts.vx, parts.vy, parts.vz, axp, ayp, azp; ts=half, coef=0.0)
     PoissonKernels.particle_drift!(parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz;
         coef=dtau, wrap=1.0)

@@ -111,6 +111,24 @@ const XH     = 0.76
 # ── load (or generate) the CICASS realization ──
 function load_snapshot()
     path = get(ENV, "CIC_SNAP", "")
+    # CIC_SYNTH_IC=1: build an in-memory synthetic snapshot at CIC_NGRID (Lagrangian grid + a tiny
+    # single-mode Zel'dovich displacement) — for MEMORY/ceiling tests at grid sizes whose real IC
+    # won't fit on disk.  Same array shapes as a real snapshot ⇒ identical GPU footprint.
+    if get(ENV, "CIC_SYNTH_IC", "0") == "1"
+        N = NGRID; Np = N^3; box = BOXMPCH
+        @printf("SYNTHETIC IC: %d³ (%d particles) box=%.3f — memory/ceiling probe\n", N, Np, box); flush(stdout)
+        A = 0.1                                            # displacement amplitude (cells) — tiny, valid
+        dmp = Matrix{Float64}(undef, Np, 3); dmv = zeros(Float64, Np, 3)
+        Threads.@threads for p in 0:Np-1
+            i = p % N; j = (p ÷ N) % N; k = p ÷ (N*N)
+            x = (i+0.5)/N; y = (j+0.5)/N; z = (k+0.5)/N
+            @inbounds dmp[p+1,1] = mod(x + (A/N)*sinpi(2x), 1.0); dmp[p+1,2] = y; dmp[p+1,3] = z
+            @inbounds dmv[p+1,1] = 10.0*sinpi(2x)          # small km/s Zel'dovich velocity
+        end
+        gd = zeros(Float64, Np); gv = zeros(Float64, Np, 3); gt = fill(2727.6, Np)
+        return CICASSLib.CICASSSnapshot(N, 1, box, ZSTART, 0.27, 0.046, 0.73, 0.71,
+                                        1.0, 1.0, VBC, 2727.6, dmp, dmv, gd, gv, gt)
+    end
     if !isempty(path)
         @printf("loading CICASS snapshot: %s\n", path); flush(stdout)
         return CICASSLib.read_snapshot(path)
@@ -265,12 +283,17 @@ function main()
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=3,
                              besym=BE, T=T, du=ck.du, lu=ck.lu, tu=ck.tu, deut=true, packed_species=PACKED)
         scatter_global!(pg, ck.fields)
-        parts = merge(NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP)),
+        # DEFERRED particle upload (thunk) — run_evolution creates it AFTER the dedup pre-build so
+        # the DM device arrays don't co-reside with the f32 patches + g.R/O (the transition peak).
+        make_parts = () -> begin
+            p = merge(NamedTuple{Symbol.(_CKP)}(Tuple(PPMKernels.to_device(pg.backend, getfield(ck.parts, Symbol(nm)), T) for nm in _CKP)),
                       (mass = T(ck.pmass),))
-        haskey(ck.parts, :id) && (parts = (; parts..., id=PPMKernels.to_device(pg.backend, ck.parts.id)))
+            haskey(ck.parts, :id) && (p = (; p..., id=PPMKernels.to_device(pg.backend, ck.parts.id)))
+            p
+        end
         @printf("RESTART %s: %d³ at z=%.2f a=%.5f cyc=%d  (→ z=%.0f)\n",
                 ENV["CIC_RESTART"], N, a_to_z(a_start), a_start, cyc_start, ZEND); flush(stdout)
-        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
+        return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, cyc_start)
     end
     snap = load_snapshot()
     N = snap.n
@@ -288,13 +311,19 @@ function main()
     pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
                          besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
     scatter_global!(pg, gas_ic(snap, c, a_start, u_i))
-    parts = dm_ic(snap, c, u_i, pg.backend)
-    return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, 0)
+    # DEFERRED particle upload (thunk): created AFTER the dedup pre-build inside run_evolution, so the
+    # DM device arrays (~N³·18 B) don't co-reside with the f32 patches + g.R/O at the dedup transition.
+    make_parts = () -> dm_ic(snap, c, u_i, pg.backend)
+    return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, 0)
 end
 
 # Shared gravity setup + cosmological evolution loop (IC start with cyc_start=0, or
 # resumed from a checkpoint at cyc_start).
-function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_start)
+function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, cyc_start)
+    parts = nothing   # DEFERRED: created by make_parts() AFTER the dedup pre-build below, so the DM
+                      # device upload doesn't peak alongside the f32 patches + g.R/O (the transition,
+                      # not the steady state, was the ceiling — see the 900³ probe).  Closures below
+                      # capture this binding; it's live before any of them are actually called.
     # parallel CPU FFT for the top-grid gravity: :fftw (FFTW threads) or :ka
     # (KernelAbstractions radix-2 on the CPU backend, parallel over Julia threads).
     fftsolver = Symbol(get(ENV, "CIC_FFT", "ka"))
@@ -391,6 +420,32 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
             flush(stdout)
         end
     end
+    # RECLAIM before the DM upload: the dedup DROPS the f32 patch references, but CUDA.reclaim()
+    # only returns blocks the GC has already collected — so GC.gc() FIRST, then reclaim returns the
+    # ~N³·28 B of freed patch memory to the OS (else the pool keeps ~19 GiB @900³ reserved and the
+    # DM upload / cuFFT plan OOM).
+    BE === :cuda && (CUDA.synchronize(); GC.gc(true); CUDA.reclaim())
+    # PLAN ONCE, HERE, while the pool is clean (g.R/O only, ~N³·28 B): the R2C Poisson plan is IDENTICAL
+    # every solve, and cuFFT holds its work area (its OWN cudaMalloc, OUTSIDE the pool) with the plan.
+    # If first created at cycle 0 — with g.R/O + particles + chat already filling memory — that work
+    # area can't allocate (CUFFT_INTERNAL_ERROR).  One warm-up solve caches the plan (+ work area) now,
+    # when there's ~N³·(44-28) B free, and every real solve reuses it.  (ρd is zero ⇒ φ=0, no-op state.)
+    if SOLVER === :fvgk && gravmode === :gpu && BE === :cuda
+        if get(ENV, "CIC_GRAV_KAFFT", "0") == "1"      # KA FFT: pre-alloc its poolable scratch (clean pool)
+            if get(ENV, "CIC_GRAV_KAFFT_C2C", "0") == "1"
+                PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)   # c2c Stockham
+            else
+                PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)    # real FFT (default)
+            end
+        else                                            # cuFFT: cache the plan + its out-of-pool work area
+            PoissonKernels.fft_poisson_rfft!(φd, ρd; G=1.0, a=1.0, boxsize=1.0)
+        end
+        CUDA.synchronize()
+    end
+    # NOW upload the DM particles — the f32 patch arrays are freed (dedup) and the plan is cached, so
+    # the DM device SoA peaks against only g.R/O + the (held) FFT work area, never patches+g.R/O.
+    parts = make_parts()
+    BE === :cuda && CUDA.synchronize()
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing
     if OVERLAP
