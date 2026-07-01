@@ -21,6 +21,8 @@ const NG   = parse(Int, get(ENV, "CIC_NG", "4"))   # patch ghost depth; FVGK use
 const NP   = parse(Int, get(ENV, "CIC_NP", "2"))
 const PACKED = get(ENV, "CIC_PACKED", "0") == "1"
 const PIDS   = get(ENV, "CIC_PIDS", "1") == "1"
+const VEL16  = get(ENV, "CIC_VEL16",  "0") == "1"   # f16 particle velocities (positions stay f32)
+const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1" # ρ/φ share one buffer (in-place solve)
 const NSPEC  = 1                              # analytic chem carries one colour (HII)
 const GAMMA  = 5/3
 ENV["CIC_FVGK_F16"]  = get(ENV, "CIC_FVGK_F16",  "1")
@@ -58,28 +60,30 @@ function probe(N)
                          besym=BE, T=T, du=1.0, lu=1.0, tu=1.0, deut=false, packed_species=PACKED)
     scatter_global!(pg, uniform_ic(ncell))
 
-    Npart = N^3
+    Npart = N^3; VT = VEL16 ? Float16 : T
     dev(v) = PoissonKernels.to_device(pg.backend, v, T)
     rnd() = dev(rand(T, Npart))
     parts = (px=rnd(), py=rnd(), pz=rnd(),
-             vx=dev(zeros(T, Npart)), vy=dev(zeros(T, Npart)), vz=dev(zeros(T, Npart)),
+             vx=PoissonKernels.to_device(pg.backend, zeros(VT, Npart), VT),
+             vy=PoissonKernels.to_device(pg.backend, zeros(VT, Npart), VT),
+             vz=PoissonKernels.to_device(pg.backend, zeros(VT, Npart), VT),
              mass=T(0.843))
     PIDS && (parts = (; parts..., id=PoissonKernels.to_device(pg.backend, collect(Int32, 0:Npart-1))))
 
     ρd = PoissonKernels.device_zeros(pg.backend, T, ncell)
-    φd = PoissonKernels.device_zeros(pg.backend, T, ncell)
+    φd = GRAV1BUF ? ρd : PoissonKernels.device_zeros(pg.backend, T, ncell)  # share ⇒ one nc³ field
 
     # build + run the FVGK grid once (allocates pg.fvgk = g.R/g.O) — global_gravity_gpu not
     # needed for the footprint; one hydro step is enough to realize the persistent buffers.
-    patch_step!(pg, 1.0e-4; a_value=1.0e-3, order=(1,2,3), accel=nothing, chem=false,
-                solver=:fvgk, do_hydro=true, do_chem=false, chemmode=:analytic)
+    patch_step!(pg, 0.0; a_value=1.0e-3, order=(1,2,3), accel=nothing, chem=false,
+                solver=:fvgk, do_hydro=true, do_chem=false, chemmode=:analytic)   # dt=0 ⇒ nsub=1, no dt_cfl/spd
     CUDA.synchronize()
 
     # per-component byte breakdown (device only)
     patch_b = sum(p -> sum(devbytes, MultiCode._allfields(p)), pg.patches)
     fvgk_b  = pg.fvgk === nothing ? 0 : sum(fvgk_bytes, pg.fvgk isa AbstractVector ? pg.fvgk : (pg.fvgk,))
     part_b  = sum(devbytes, values(parts))
-    grav_b  = devbytes(ρd) + devbytes(φd)
+    grav_b  = GRAV1BUF ? devbytes(ρd) : devbytes(ρd) + devbytes(φd)   # shared ⇒ count once
 
     GC.gc(); CUDA.reclaim()
     live = gib(CUDA.total_memory() - CUDA.available_memory())   # NOTE: under-reports at large N (pool quirk)

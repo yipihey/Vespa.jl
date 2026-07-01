@@ -164,13 +164,64 @@ function interp_force_from_potential!(axp::AbstractVector{T}, ayp, azp,
                                   half, T(0.5), T(1), e1, e2, e3, T(0.5)/T(cellsize); ndrange = length(axp))
     return axp, ayp, azp
 end
+# ── Ghost-FREE force interp: read the GLOBAL nc³ potential φg (no pad) with periodic index ────
+# wrap, so the per-solve padded-φ copy is unnecessary.  BIT-IDENTICAL to interp_force_from_potential!
+# on a periodically-padded φ: the pad offset cancels in the CIC weights and the ghost fill IS this
+# same periodic wrap.  The half-drift excursion stays within a cell, so wrapping the ±1 stencil
+# indices (range i1−1 … i1+2) covers every access for particles anywhere in [0,1).
+@inline _wrap1(i::Int, n::Int) = mod(i - 1, n) + 1
+@kernel function _interp_force_global_phi_kernel!(axp, ayp, azp,
+                                                  @Const(px), @Const(py), @Const(pz),
+                                                  @Const(vx), @Const(vy), @Const(vz), @Const(φg),
+                                                  dcoef, invcell, c05, c1, n1::Int, n2::Int, n3::Int, hc)
+    p = @index(Global)
+    @inbounds begin
+        xq = px[p] + dcoef*vx[p]; yq = py[p] + dcoef*vy[p]; zq = pz[p] + dcoef*vz[p]
+        xpos = xq*invcell; ypos = yq*invcell; zpos = zq*invcell        # cell units, leftedge 0 (pad cancels)
+        i1 = unsafe_trunc(Int, xpos+c05); j1 = unsafe_trunc(Int, ypos+c05); k1 = unsafe_trunc(Int, zpos+c05)
+        dxr = oftype(xpos,i1)+c05-xpos; dyr = oftype(ypos,j1)+c05-ypos; dzr = oftype(zpos,k1)+c05-zpos
+        ex = c1-dxr; ey = c1-dyr; ez = c1-dzr
+        φr(i,j,k) = φg[_wrap1(i,n1), _wrap1(j,n2), _wrap1(k,n3)]
+        gxc(i,j,k) = -hc*(φr(i+1,j,k)-φr(i-1,j,k))
+        gyc(i,j,k) = -hc*(φr(i,j+1,k)-φr(i,j-1,k))
+        gzc(i,j,k) = -hc*(φr(i,j,k+1)-φr(i,j,k-1))
+        w(a,b,c) = a*b*c
+        axp[p] = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ayp[p] = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        azp[p] = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
+                 gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+    end
+end
+
+"""
+    interp_force_from_global_potential!(axp,ayp,azp, px,py,pz, vx,vy,vz, φg; dcoef, nc) -> (axp,ayp,azp)
+
+Like [`interp_force_from_potential!`] but reads the GLOBAL `nc³` potential `φg` (no pad/ghosts) with
+periodic index wrap — no per-solve padded-φ copy.  Bit-identical to the padded path for particles in
+`[0,1)` (the pad offset cancels; the ghost fill is the same wrap).  `nc` is the cubic global dim.
+"""
+function interp_force_from_global_potential!(axp::AbstractVector{T}, ayp, azp,
+                                             px, py, pz, vx, vy, vz, φg::AbstractArray{<:Any,3};
+                                             dcoef::Real, nc) where {T}
+    be = KA.get_backend(axp); n1, n2, n3 = Int(nc[1]), Int(nc[2]), Int(nc[3])
+    _interp_force_global_phi_kernel!(be)(axp, ayp, azp, px, py, pz, vx, vy, vz, φg,
+                                         T(dcoef), T(n1), T(0.5), T(1), n1, n2, n3, T(0.5)*T(n1);
+                                         ndrange = length(axp))
+    return axp, ayp, azp
+end
+
 @kernel function _kick_kernel!(vx, vy, vz, @Const(axp), @Const(ayp), @Const(azp),
                                ts, coef1, coef2)
     p = @index(Global)
     @inbounds begin
-        vx[p] = (coef1 * vx[p] + axp[p] * ts) * coef2
-        vy[p] = (coef1 * vy[p] + ayp[p] * ts) * coef2
-        vz[p] = (coef1 * vz[p] + azp[p] * ts) * coef2
+        # coef1/ts/coef2 arrive in the compute type (≥Float32); f16-stored v[p] promotes
+        # into the mul/add, so the update runs in f32 and only the store is low-precision.
+        Tv = eltype(vx)
+        vx[p] = Tv((coef1 * vx[p] + axp[p] * ts) * coef2)
+        vy[p] = Tv((coef1 * vy[p] + ayp[p] * ts) * coef2)
+        vz[p] = Tv((coef1 * vz[p] + azp[p] * ts) * coef2)
     end
 end
 
@@ -184,12 +235,16 @@ output of [`interp_accel_to_particles!`] (already divided by `a`). Called twice
 per cycle, once on each side of the drift. With `coef = 0` this is the plain
 `v += g·ts` non-comoving kick.
 """
-function particle_kick!(vx::AbstractVector{T}, vy, vz, axp, ayp, azp;
-                        ts::Real, coef::Real) where {T}
+function particle_kick!(vx::AbstractVector, vy, vz, axp, ayp, azp;
+                        ts::Real, coef::Real)
     be = KA.get_backend(vx)
-    c = T(coef)
+    # Compute in ≥Float32 so f16-STORED velocities keep the kick — only the between-step
+    # storage is low precision, the update math is promoted.  For f32/f64 velocities
+    # C == eltype(vx) and this is bit-identical to the old eltype(vx) coefficients.
+    C = promote_type(eltype(vx), eltype(axp), Float32)
+    c = C(coef)
     _kick_kernel!(be)(vx, vy, vz, axp, ayp, azp,
-                      T(ts), one(T) - c, one(T) / (one(T) + c);
+                      C(ts), one(C) - c, one(C) / (one(C) + c);
                       ndrange = length(vx))
     return vx, vy, vz
 end
