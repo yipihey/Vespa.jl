@@ -28,18 +28,18 @@ wraps periodically over the whole `ncell` grid (no per-patch edge handling).  `d
 and `a` set the half-drift registration `disp = 0.5·dt/a` (Enzo GMF convention),
 matching the undecomposed deposit exactly.
 """
-function assemble_global_density!(ρg::Array{Float64,3}, pg::PatchGrid;
+function assemble_global_density!(ρg::Array{Tg,3}, pg::PatchGrid;
                                   particles=nothing, dt::Real=0.0, a::Real=1.0,
                                   meandens::Real=1.0, particle_density=nothing,
-                                  particle_host=nothing)
+                                  particle_host=nothing) where {Tg<:AbstractFloat}
     size(ρg) == pg.ncell || error("assemble_global_density!: ρg size $(size(ρg)) ≠ ncell $(pg.ncell)")
     all(==(pg.ncell[1]), pg.ncell) || error("assemble_global_density!: cubic ncell required for CIC")
-    fill!(ρg, 0.0)
+    fill!(ρg, zero(Tg))
     li, lj, lk = _interior(pg)
     for p in pg.patches                                   # baryon gas density
         gi, gj, gk = _octant(pg, p)
         h = _r3(PPMKernels.to_host(p.D), pg.nd)
-        @views ρg[gi, gj, gk] .= Float64.(h[li, lj, lk])
+        @views ρg[gi, gj, gk] .= Tg.(h[li, lj, lk])
     end
     if particles !== nothing                              # DM: global periodic CIC
         n = prod(pg.ncell)
@@ -54,14 +54,14 @@ function assemble_global_density!(ρg::Array{Float64,3}, pg::PatchGrid;
             copyto!(ρph, ρp)
         end
         @inbounds for i in eachindex(ρg)
-            ρg[i] += Float64(ρph[i])
+            ρg[i] += Tg(ρph[i])
         end
     end
     # the periodic gravity source is the overdensity δ = ρ − mean.  In a periodic
     # cosmological box the mean is FIXED by Ωb,Ω0 (mass conservation), so we subtract the
     # KNOWN constant `meandens` (=1 in code units: gas mean fb + DM mean 1−fb) — no sum
     # over the field, hence no √N·ε reduction error and no need for f64.
-    ρg .-= meandens
+    ρg .-= Tg(meandens)
     return ρg
 end
 
@@ -80,9 +80,9 @@ Top-grid Poisson solve on the global `ncell³` host arrays.  Two host backends:
 Both use the continuum −1/k² Green's function (`:spectral`), so they agree to
 round-off.  `:ka` keeps the whole gravity path in the KA programming model.
 """
-function solve_global_poisson!(φg::Array{Float64,3}, ρg::Array{Float64,3};
+function solve_global_poisson!(φg::Array{Tg,3}, ρg::Array{Tg,3};
                                G::Real=1.0, a::Real=1.0, boxsize::Real=1.0,
-                               greens::Symbol=:spectral, solver::Symbol=:fftw)
+                               greens::Symbol=:spectral, solver::Symbol=:fftw) where {Tg<:AbstractFloat}
     if solver === :ka
         PoissonKernels.fft_poisson_root_gpu!(φg, ρg; G=G, a=a, boxsize=boxsize)   # CPU() backend ⇒ host threads
     else
@@ -110,7 +110,7 @@ end
 # fill a patch's nd³ ghosted accel block from the global `src` by the segment copies.
 # `dst::Array{Tt}` is a TYPE-PARAMETER barrier so the `Tt`-conversion specializes (a
 # bare `pg.T(x)` per element is a dynamic dispatch — the real cost of the old gather).
-function _scatter_block!(dst::Array{Tt,3}, src::Array{Float64,3}, xs, ys, zs) where {Tt}
+function _scatter_block!(dst::Array{Tt,3}, src::Array{Ts,3}, xs, ys, zs) where {Tt,Ts<:AbstractFloat}
     @inbounds for (zl, zg) in zs, (yl, yg) in ys, (xl, xg) in xs
         @views dst[xl, yl, zl] .= Tt.(src[xg, yg, zg])
     end
@@ -125,7 +125,7 @@ per patch (periodic index wrap, incl. ghosts), uploaded to the device.  No accel
 formed or stored — `patch_step!` central-differences these φ blocks on the fly
 (`grav_kick_from_potential!`).  Returns per-patch φ device vectors (length nd³).
 """
-function patch_accel(pg::PatchGrid, φg::Array{Float64,3}; dx::Real)
+function patch_accel(pg::PatchGrid, φg::Array{Tg,3}; dx::Real) where {Tg<:AbstractFloat}
     ng = pg.ng; nc = pg.ncell; nd = pg.nd; npatch = length(pg.patches)
     hb = Vector{Array{pg.T,3}}(undef, npatch)
     Threads.@threads for pi in 1:npatch                  # host scatter of φ (one block/patch)
@@ -326,7 +326,7 @@ device arrays so `PoissonKernels.interp_accel_to_particles!` (which reads `g[i±
 has valid ghosts for particles anywhere in `[0,1)`.  `leftedge = -ng2/ncell`,
 `cellsize = 1/ncell` (box-normalized code coords).
 """
-function particle_accel_field(pg::PatchGrid, φg::Array{Float64,3}; ng2::Int=pg.ng)
+function particle_accel_field(pg::PatchGrid, φg::Array{Tg,3}; ng2::Int=pg.ng) where {Tg<:AbstractFloat}
     nc = pg.ncell
     a = zeros(pg.T, nc .+ 2ng2)                          # padded POTENTIAL (no accel formed)
     @views a[ng2+1:ng2+nc[1], ng2+1:ng2+nc[2], ng2+1:ng2+nc[3]] .= pg.T.(φg)
@@ -344,8 +344,8 @@ reallocating across cycles.
 """
 function global_gravity_accel(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Real=1.0,
                               greens::Symbol=:spectral, particles=nothing, dt::Real=0.0,
-                              ρg::Union{Nothing,Array{Float64,3}}=nothing,
-                              φg::Union{Nothing,Array{Float64,3}}=nothing)
+                              ρg::Union{Nothing,Array{<:AbstractFloat,3}}=nothing,
+                              φg::Union{Nothing,Array{<:AbstractFloat,3}}=nothing)
     ρg === nothing && (ρg = zeros(Float64, pg.ncell))
     φg === nothing && (φg = zeros(Float64, pg.ncell))
     assemble_global_density!(ρg, pg; particles=particles, dt=dt, a=a)

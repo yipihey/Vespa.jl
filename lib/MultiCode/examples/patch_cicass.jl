@@ -109,6 +109,9 @@ const VEL16 = get(ENV, "CIC_VEL16", "0") == "1"
 # read the global potential directly, avoiding the padded φ copy.
 const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1"
 GRAV1BUF && OVERLAP && error("CIC_GRAV1BUF shares the ρ/φ buffer; disable CIC_OVERLAP so particles read φ before it is overwritten.")
+# CIC_GRAV_HOST32=1: CPU-gravity host density/potential arrays are Float32. This is the
+# Metal hero default; CPU-f64 reference runs can leave it off.
+const GRAV_HOST32 = get(ENV, "CIC_GRAV_HOST32", "0") == "1"
 const PKMU   = parse(Int, get(ENV, "CIC_PKMU",   "4"))
 const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
@@ -234,9 +237,7 @@ function scatter_cicass_gas_stream!(pg, path::AbstractString, h, c::Cosmo, a_i, 
             @views host[li, lj, lk] .= T(c.fb * eint) .* (one(T) .+ T.(δb[gi, gj, gk]))
             copyto!(p.Ge, vec(host))
             if pg.packed
-                ubuf = fill(UInt16(0), pg.nd)
-                @views ubuf[li, lj, lk] .= ChemistryKernels.encode_log2sp(T(xHII0))
-                copyto!(p.species[1], vec(ubuf))
+                fill!(p.species[1], ChemistryKernels.encode_log2sp(T(xHII0)))
             else
                 fill!(host, zero(T))
                 @views host[li, lj, lk] .= T(c.fb * xHII0) .* (one(T) .+ T.(δb[gi, gj, gk]))
@@ -277,8 +278,8 @@ function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
     N3 = h.n^3; T = BE === :cpu ? Float64 : Float32
     VT = VEL16 ? Float16 : T
     raw = Vector{h.field_type}(undef, N3)
-    buf = Vector{T}(undef, N3)
-    vbuf = VT === T ? buf : Vector{VT}(undef, N3)
+    buf = h.field_type === T ? raw : Vector{T}(undef, N3)
+    vbuf = VT === h.field_type ? raw : (VT === T ? buf : Vector{VT}(undef, N3))
     vconv = 1.0e5 / u_i.v
     todev_pos() = (d = PPMKernels.to_device(backend, buf, T); BE === :metal && Metal.synchronize(); d)
     todev_vel() = (d = PPMKernels.to_device(backend, vbuf, VT); BE === :metal && Metal.synchronize(); d)
@@ -723,9 +724,11 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     tabbe   = chembk === :cpu ? :cpu : chembk
     ratetab = usetab ? ChemistryKernels.build_rate_tables(; precision=Float64, backend=tabbe) : nothing
     cooltab = usetab ? EmissionKernels.build_cooling_tables(; precision=Float64, backend=tabbe) : nothing
-    @printf("  gravity = %s (FFT=%s, scatter=%s)  chem = %s  (FFTW threads=%d, Julia threads=%d)\n",
-            gravmode, fftsolver, accelmode, chembk, nthr, Threads.nthreads()); flush(stdout)
-    ρg = zeros(Float64, ncell); φg = zeros(Float64, ncell)
+    GT = GRAV_HOST32 ? Float32 : Float64
+    @printf("  gravity = %s (FFT=%s, scatter=%s, host=%s)  chem = %s  (FFTW threads=%d, Julia threads=%d)\n",
+            gravmode, fftsolver, accelmode, GT, chembk, nthr, Threads.nthreads()); flush(stdout)
+    ρg = gravmode === :cpu ? zeros(GT, ncell) : nothing
+    φg = gravmode === :cpu ? zeros(GT, ncell) : nothing
     # full-GPU gravity scratch in pg.T (Float32) — the mean is the known Ω-fixed constant
     # (subtracted in assemble_global_density_gpu!), so no f64 reduction / no f64 arrays needed.
     ρd = gravmode === :gpu ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
@@ -739,7 +742,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     dedup_cpu_phi = gravmode === :cpu && SOLVER === :fvgk &&
         get(ENV, "CIC_FVGK_DEDUP", "0") == "1" && prod(np) == 1
     φkick_dev = dedup_cpu_phi ? PPMKernels.device_zeros(pg.backend, T, ncell) : nothing
-    φkick_host = dedup_cpu_phi ? Array{T}(undef, ncell) : nothing
+    φkick_host = dedup_cpu_phi && GT !== T ? Array{T}(undef, ncell) : nothing
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
@@ -773,17 +776,27 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         tp = time()
         ga = if pg.dedup
             φkick_dev === nothing && error("dedup CPU gravity requires persistent global potential scratch")
-            @. φkick_host = T(φg)
-            copyto!(φkick_dev, φkick_host)
+            if φkick_host === nothing
+                copyto!(φkick_dev, φg)
+            else
+                @. φkick_host = T(φg)
+                copyto!(φkick_dev, φkick_host)
+            end
             φkick_dev
         else
             accelmode === :gpu ? patch_accel_gpu(pg, φg; dx=dx) : patch_accel(pg, φg; dx=dx)
         end
         BE === :cuda && accelmode === :gpu && CUDA.synchronize()    # so the timer captures the device gather
         pacc_t[] += time()-tp
-        tq = time(); φpad, gle, gcs = particle_accel_field(pg, φg); pfld_t[] += time()-tq
+        tq = time()
+        if pg.dedup
+            pfld_t[] += time()-tq
+            ngrav[] += 1
+            return (gas=ga, phi=φkick_dev, le=0.0, cs=1.0/ncell[1], nc=ncell)
+        end
+        φpad, gle, gcs = particle_accel_field(pg, φg); pfld_t[] += time()-tq
         ngrav[] += 1
-        return (gas=ga, phi=φpad, le=gle, cs=gcs)
+        return (gas=ga, phi=φpad, le=gle, cs=gcs, nc=nothing)
     end
     # full gravity for scale factor a_ (and particle half-drift dt_): CPU (host FFT) path
     # needs the host density snapshot first; GPU path assembles + solves entirely on device.

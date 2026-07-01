@@ -20,6 +20,7 @@ export CIC_PSORT=0
 export CIC_PIDS="${CIC_PIDS:-0}"
 export CIC_VEL16="${CIC_VEL16:-1}"
 export CIC_GRAVITY="${CIC_GRAVITY:-cpu}"
+export CIC_GRAV_HOST32="${CIC_GRAV_HOST32:-1}"
 export CIC_FFT="${CIC_FFT:-ka}"
 export CIC_OVERLAP="${CIC_OVERLAP:-0}"
 export CIC_GRAV1BUF="${CIC_GRAV1BUF:-0}"

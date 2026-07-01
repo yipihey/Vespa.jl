@@ -58,7 +58,6 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         else
             sys = FV.EulerDEColors{nsp}(γ = γ);  z = (1f0, 0f0, 0f0, 0f0, 1f-6, 5f-7, ntuple(_ -> 0f0, nsp)...)
         end
-        U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # GE_SCALE lifts the COLD eint into f16's normal range: CICASS Ge=ρ·eint spans ~1e-8 (z=1000)
         # down to ~4e-11 (z=20), BELOW the f16 subnormal floor (~6e-8) → raw f16 flushes to 0 → NaN.
         # 1e7 maps that range to f16-normal [~4e-4, 0.12] (and E≲1e-4 → ≲1e3, no overflow).
@@ -69,10 +68,11 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
             recobj = rec === :plm ? FV.PLM() : rec === :pcm ? FV.PCM() : error("CIC_FVGK_RECON=$rec")
             riemobj = riem === :llf ? FV.LLF() : riem === :hllc ? FV.HLLC() : error("CIC_FVGK_RIEMANN=$riem")
             mtl = _fvgk_mtl_runtime()
-            return mtl.Grid3DMtlDE16(sys, U0; dx = Float32(pg.dx), dy = Float32(pg.dx), dz = Float32(pg.dx),
+            return mtl.Grid3DMtlDE16(sys, nc; dx = Float32(pg.dx), dy = Float32(pg.dx), dz = Float32(pg.dx),
                                      recon = recobj, rsol = riemobj, ge_scale = gesc,
                                      store = :f16, de_prec = :f16)
         end
+        U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
         # alloc); the gather/scatter GE_SCALE-lift the energy slots so the cold eint survives f16 storage.
         store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))

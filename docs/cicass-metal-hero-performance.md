@@ -41,6 +41,7 @@ CIC_PSORT=0
 CIC_PIDS=0
 CIC_VEL16=1
 CIC_GRAVITY=cpu
+CIC_GRAV_HOST32=1
 CIC_FFT=ka
 CIC_PK=1
 CIC_CELL_DUMP=0
@@ -255,42 +256,47 @@ CIC_FVGK_STORE=f16 CIC_FVGK_DEDUP=1 CIC_VEL16=1 CIC_GRAV1BUF=1 CIC_PIDS=0
   grav = 4.00 GiB (4 B/c)
   sum  =54 B/c
 
-real time             = 27.28 s
-max resident set size = 47,208,071,168 bytes
-peak footprint        = 138,352,233,104 bytes
+real time             = 20.05 s
+max resident set size = 1,339,457,536 bytes
+peak footprint        = 76,898,748,312 bytes
 ```
 
 The component sum is the reliable persistent-array budget. Metal's cumulative
 allocator stats can under-report or over-report the live set after large frees; use
 the per-array sum for the byte/cell model.
 
+The peak reduction in this probe comes from constructing the Metal DE16 FVGK grid
+empty, then gathering the patch IC into `g.U` directly. The old constructor first
+materialized a full host `Array{NTuple}` and a full host Float16 staging cube before
+uploading to Metal.
+
 Production-shaped 1024^3 one-cycle validation after the reorder, with `CIC_PK=0`
 and full dumps disabled so the timing isolates startup plus one step:
 
 ```text
-CIC_TAG=metal1024_orderfix_vel16_1cyc_20260701
-cycle 0 wall          = 143.37 s
-phase total           = 137.3188 s/cycle
+CIC_TAG=metal1024_peakfix_host32_1cyc_20260701
+cycle 0 wall          = 91.66 s
+phase total           = 87.1681 s/cycle
 mass drift            = 8.746e-08
-live Metal            = 50.00 GiB at 1024^3
-real time             = 201.76 s
-max resident set size = 70,698,778,624 bytes
-peak footprint        = 154,312,055,024 bytes
+live Metal            = 50.06 GiB at 1024^3
+real time             = 138.80 s
+max resident set size = 39,630,602,240 bytes
+peak footprint        = 114,024,757,560 bytes
 ```
 
 GPU-synchronized phase breakdown for that validation run:
 
 ```text
-gravity   = 68.7383 s
-hydro     = 17.3283 s
-chem      =  0.7546 s
-particles = 50.4976 s
+gravity   = 53.4501 s
+hydro     =  2.1641 s
+chem      =  0.5452 s
+particles = 31.0087 s
 
-top-grid gravity = 68.3601 s/solve
-  assemble    =  3.6562 s
-  FFT         = 62.3593 s
-  patch_accel =  0.6832 s
-  part_field  =  1.6614 s
+top-grid gravity = 52.9425 s/solve
+  assemble    =  3.8523 s
+  FFT         = 49.0083 s
+  patch_accel =  0.0819 s
+  part_field  =  0.0000 s
 ```
 
 That run confirms the lifecycle fix on hardware: the FVGK dedup happens before the
@@ -299,6 +305,18 @@ then particles arrive after the patch gas copy is gone. A fused output-summary
 reduction was also added so `CIC_CELL_DUMP=0` summaries no longer materialize
 decoded species, ionization, molecular-weight, and temperature arrays at each
 output.
+
+Additional peak cuts in the current run:
+
+- CPU-gravity host density and potential arrays use `CIC_GRAV_HOST32=1`, saving
+  one Float32 cube each relative to the prior Float64 host path.
+- Dedup CPU gravity reuses the global device potential for particle force
+  interpolation (`nc` periodic-wrap path), eliminating the padded particle
+  potential copy; `part_field` is now zero.
+- The f32 CICASS02 DM stream aliases the raw f32 field as the position conversion
+  buffer and only allocates a separate Float16 velocity buffer when `CIC_VEL16=1`.
+- Packed gas species are filled directly on device for the uniform initial HII
+  fraction instead of staging a full host UInt16 cube.
 
 Post-fusion 128^3 Metal compile smokes:
 
