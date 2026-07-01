@@ -150,7 +150,8 @@ express.  Implemented in `MultiCodeCICASSExt` — `using CICASSLib` activates it
 function write_grafic_streaming end
 
 """
-    run_cicass_streaming(; vbc=30.0, boxlength=0.2, zstart=100.0, ngrid=128) -> (; ...)
+    run_cicass_streaming(; vbc=30.0, boxlength=0.2, zstart=100.0, ngrid=128,
+                         real_bytes=8) -> (; ...)
 
 CICASS streaming-IC validation: generate ONE realization with relative velocity
 `vbc`, write the RAMSES-native grafic streaming set, and read it back to confirm

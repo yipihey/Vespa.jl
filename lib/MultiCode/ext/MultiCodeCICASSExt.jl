@@ -133,10 +133,11 @@ end
 
 function MultiCode.run_cicass_streaming(; vbc::Real = 30.0, boxlength::Real = 0.2,
                                         zstart::Real = 100.0, ngrid::Integer = 128,
+                                        real_bytes::Integer = 8,
                                         workdir::AbstractString = mktempdir())
     CICASSLib.available() || error("libcicass_capi not found — build cicass/deps/build_cicass_darwin.sh")
     spec = CICASSSpec(boxlength = boxlength, zstart = zstart, ngrid = ngrid,
-                      vbc = vbc, filename = "cic_stream")
+                      vbc = vbc, filename = "cic_stream", real_bytes = Int(real_bytes))
     res = CICASSLib.generate(spec; workdir = workdir)
     snap = CICASSLib.read_snapshot(res.output)
 

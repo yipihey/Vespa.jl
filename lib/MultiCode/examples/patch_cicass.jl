@@ -31,6 +31,8 @@ const BE = Symbol(get(ENV, "BACKEND", "cuda"))
 BE === :cuda && @eval import CUDA              # register the :cuda kernels backends
 BE === :metal && @eval import Metal            # register the :metal kernel backends
 const T  = BE === :cpu ? Float64 : Float32
+const IC_REAL_BYTES = parse(Int, get(ENV, "CICASS_REAL_BYTES", BE === :cpu ? "8" : "4"))
+IC_REAL_BYTES in (4, 8) || error("CICASS_REAL_BYTES must be 4 or 8 (got $IC_REAL_BYTES)")
 const NG = 4
 
 # ── parameters (defaults match the cicass cross-code comparison) ──
@@ -107,7 +109,8 @@ function load_snapshot()
     end
     @printf("generating CICASS realization: %d³ box=%.3f Mpc/h vbc=%.1f z=%.0f\n",
             NGRID, BOXMPCH, VBC, ZSTART); flush(stdout)
-    r = MultiCode.run_cicass_streaming(; vbc=VBC, boxlength=BOXMPCH, zstart=ZSTART, ngrid=NGRID)
+    r = MultiCode.run_cicass_streaming(; vbc=VBC, boxlength=BOXMPCH, zstart=ZSTART,
+                                       ngrid=NGRID, real_bytes=IC_REAL_BYTES)
     return CICASSLib.read_snapshot(r.output)
 end
 
@@ -116,20 +119,24 @@ const _CICASS_HEADER_BYTES = 8 + 4 + 4 + 10*sizeof(Float64)
 function cicass_header(path::AbstractString)
     open(path, "r") do io
         magic = read(io, 8)
-        String(magic) == "CICASS01" || error("not a CICASS snapshot: $path")
+        magic_s = String(magic)
+        real_bytes = magic_s == "CICASS01" ? 8 :
+                     magic_s == "CICASSF4" ? 4 :
+                     error("not a CICASS snapshot (bad magic $(repr(magic_s))): $path")
         n = Int(read(io, Int32)); nsp = Int(read(io, Int32))
         hd = Vector{Float64}(undef, 10); read!(io, hd)
         box, zinit, omm, omb, oml, h, mdm, mgas, vbc, tavg = hd
         return (; n, nsp, box, zinit, omega_m=omm, omega_b=omb, omega_l=oml,
-                hconst=h, m_dm=mdm, m_gas=mgas, vbc, tavg)
+                hconst=h, m_dm=mdm, m_gas=mgas, vbc, tavg, real_bytes,
+                field_type = real_bytes == 4 ? Float32 : Float64)
     end
 end
 
-@inline _cicass_field_offset(N3::Integer, field::Integer) =
-    _CICASS_HEADER_BYTES + (field - 1) * N3 * sizeof(Float64)
+@inline _cicass_field_offset(N3::Integer, field::Integer, real_bytes::Integer) =
+    _CICASS_HEADER_BYTES + (field - 1) * N3 * real_bytes
 
-function read_cicass_field!(io, buf::Vector{Float64}, N3::Integer, field::Integer)
-    seek(io, _cicass_field_offset(N3, field))
+function read_cicass_field!(io, buf::Vector, h, field::Integer)
+    seek(io, _cicass_field_offset(h.n^3, field, h.real_bytes))
     read!(io, buf)
     return buf
 end
@@ -195,10 +202,10 @@ function scatter_cicass_gas_stream!(pg, path::AbstractString, h, c::Cosmo, a_i, 
     @printf("gas IC: f_b=%.4f  T_gas=%.1f K (eint=%.3e code)  x_HII0=%.3e  v→code=%.4e\n",
             c.fb, Tg, eint, xHII0, vconv); flush(stdout)
 
-    raw = Vector{Float64}(undef, N3)
+    raw = Vector{h.field_type}(undef, N3)
     host = zeros(T, pg.nd)
     open(path, "r") do io
-        read_cicass_field!(io, raw, N3, 7) # gas delta
+        read_cicass_field!(io, raw, h, 7) # gas delta
         δb = reshape(raw, N, N, N)
         for p in pg.patches
             gi, gj, gk = MultiCode._octant(pg, p)
@@ -220,7 +227,7 @@ function scatter_cicass_gas_stream!(pg, path::AbstractString, h, c::Cosmo, a_i, 
         end
 
         for (field, slot) in zip(8:10, (:S1, :S2, :S3))
-            read_cicass_field!(io, raw, N3, field)
+            read_cicass_field!(io, raw, h, field)
             vel = reshape(raw, N, N, N)
             for p in pg.patches
                 gi, gj, gk = MultiCode._octant(pg, p)
@@ -250,27 +257,27 @@ end
 
 function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
     N3 = h.n^3; T = BE === :cpu ? Float64 : Float32
-    raw = Vector{Float64}(undef, N3)
+    raw = Vector{h.field_type}(undef, N3)
     buf = Vector{T}(undef, N3)
     vconv = 1.0e5 / u_i.v
     todev() = (d = PPMKernels.to_device(backend, buf, T); BE === :metal && Metal.synchronize(); d)
     open(path, "r") do io
-        read_cicass_field!(io, raw, N3, 1)
+        read_cicass_field!(io, raw, h, 1)
         @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
         px = todev()
-        read_cicass_field!(io, raw, N3, 2)
+        read_cicass_field!(io, raw, h, 2)
         @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
         py = todev()
-        read_cicass_field!(io, raw, N3, 3)
+        read_cicass_field!(io, raw, h, 3)
         @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
         pz = todev()
-        read_cicass_field!(io, raw, N3, 4)
+        read_cicass_field!(io, raw, h, 4)
         @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
         vx = todev()
-        read_cicass_field!(io, raw, N3, 5)
+        read_cicass_field!(io, raw, h, 5)
         @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
         vy = todev()
-        read_cicass_field!(io, raw, N3, 6)
+        read_cicass_field!(io, raw, h, 6)
         @inbounds for i in eachindex(buf); buf[i] = T(raw[i] * vconv); end
         vz = todev()
         mass = T(1 - c.fb)
@@ -330,10 +337,10 @@ function _max_signal_work(pg)
     end
 end
 
-function max_signal(pg)
+function max_signal(pg, work = nothing)
     smax = 0.0
     Tloc = pg.T; gm1 = Tloc(GAMMA * (GAMMA - 1))
-    work = _max_signal_work(pg)
+    work === nothing && (work = _max_signal_work(pg))
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
@@ -341,8 +348,8 @@ function max_signal(pg)
         _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
             nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3); ndrange=nblocks * MAX_SIGNAL_GROUP)
         PPMKernels.KA.synchronize(pg.backend)
-        copyto!(work.host, work.scratch)
-        smax = max(smax, Float64(maximum(work.host)))
+        copyto!(work.host, 1, work.scratch, 1, nblocks)
+        smax = max(smax, Float64(maximum(@view work.host[1:nblocks])))
     end
     return smax
 end
@@ -527,6 +534,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     ρp_scratch = (gravmode === :cpu && parts !== nothing) ?
         PPMKernels.device_zeros(pg.backend, T, (prod(ncell),)) : nothing
     ρp_host = ρp_scratch === nothing ? nothing : Vector{T}(undef, prod(ncell))
+    maxsig_work = ρp_scratch === nothing ? nothing : (; scratch=ρp_scratch, host=ρp_host)
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
@@ -582,7 +590,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
     # lag-free overlap: seed the accel from the IC density (used by cycle-0 hydro)
     acc = nothing
     if OVERLAP
-        sig0 = max_signal(pg); dτ0 = min(COURANT*dx/max(sig0,1e-30), dtau_for_dlna(c, a, MAXEXP))
+        sig0 = max_signal(pg, maxsig_work); dτ0 = min(COURANT*dx/max(sig0,1e-30), dtau_for_dlna(c, a, MAXEXP))
         acc = gravity!(a, dτ0)
     end
     @printf("%-5s %-9s %-9s %-9s %-9s %-7s\n", "cyc", "a", "z", "δb_rms", "ρmax", "sec")
@@ -632,7 +640,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, parts, cyc_
         a >= a_end && break
 
         # ── timestep: min(hydro CFL, particle CFL, Δln a cap, next-output) in super-conf τ ──
-        sig = max_signal(pg); vp = max_pvel(parts)
+        sig = max_signal(pg, maxsig_work); vp = max_pvel(parts)
         dτ_h = COURANT * dx / max(sig, 1e-30)
         dτ_p = PCOUR   * dx / max(vp, 1e-30)
         dτ_e = dtau_for_dlna(c, a, MAXEXP)

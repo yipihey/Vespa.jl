@@ -151,7 +151,7 @@ Follow-up changes on 2026-07-01 removed four per-call transients:
 - `fft_poisson_root!` and `fft_poisson_rfft!` now cache the complex rFFT buffer and use `mul!` for both transforms. On the root FFTW path, the inverse writes directly into the caller's `phi` host array when possible.
 - CPU-gravity particle deposition now reuses a device density scratch plus host staging vector instead of allocating a full device density and `Float64.(to_host(...))` conversion every solve.
 - Compton drag is now one fused per-cell KA kernel, eliminating the full-grid `ke0` and `ke1` broadcast temporaries.
-- CFL signal-speed reduction now uses a fused block-max KA kernel, eliminating the full-grid `cs` and `sig` broadcast temporaries in `max_signal`.
+- CFL signal-speed reduction now uses a fused block-max KA kernel, eliminating the full-grid `cs` and `sig` broadcast temporaries in `max_signal`. On the CPU-gravity path it borrows the prefix of the particle-density device/host scratch, so it does not allocate a separate reduction buffer.
 
 Allocation probe after warmup at 128^3:
 
@@ -181,6 +181,23 @@ The IC realizer now links `libfftw3_threads` and reads `CICASS_FFT_THREADS`, the
 ```text
 CICASS FFTW threads: 4
 ```
+
+The IC realizer can also write f32 field snapshots with `CICASS_REAL_BYTES=4`.
+The new magic is `CICASSF4`; the legacy f64 format remains `CICASS01`. Header
+metadata is still f64, while the 11 large field arrays are f32. A 128^3 f32 smoke
+wrote:
+
+```text
+magic        = CICASSF4
+field eltype = Float32
+file size    = 92,274,784 bytes
+```
+
+The corresponding f64 size at 128^3 is `184,549,472` bytes, so the f32 snapshot
+is exactly half-size apart from the fixed 96-byte header. Extrapolated to 1024^3,
+the `.cicass` IC file drops from about `88.0 GiB` to about `44.0 GiB`. A 128^3
+Metal/FVGK f16 one-cycle smoke from the f32 snapshot completed with finite output,
+mass drift `4.353e-07`, and top-grid gravity `1.1877 s/solve`.
 
 ## Validation context
 
