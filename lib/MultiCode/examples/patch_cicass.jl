@@ -693,11 +693,14 @@ function main()
         h = cicass_header(snap_path)
         N = h.n
         ncell = (N, N, N); np = (NPX, NPX, NPX)
-        c = Cosmo(; Om=h.omega_m, OL=h.omega_l, h0=h.hconst*100, box=h.box, Ob=h.omega_b)
+        Or = 4.15e-5 / h.hconst^2      # radiation (photons + 3 relativistic ν), matching transfer.x's
+        # OmegaR — the CICASS ICs & linear theory include it, so the expansion MUST too or the DM
+        # over-grows at high z (radiation is ~30% of matter at z=1000 → DM Δ² +33..43% too high).
+        c = Cosmo(; Om=h.omega_m, OL=h.omega_l - Or, h0=h.hconst*100, box=h.box, Ob=h.omega_b, Or=Or)
         a_start = z_to_a(ZSTART); a_end = z_to_a(ZEND)
         u_i = cosmo_units(c, a_start)
-        @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.3f h=%.3f\n",
-                N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.h0/100)
+        @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.5f Ωr=%.3e h=%.3f\n",
+                N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.Or, c.h0/100)
         @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
                 ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
         dx = 1.0 / N
@@ -710,11 +713,12 @@ function main()
     snap = load_snapshot()
     N = snap.n
     ncell = (N, N, N); np = (NPX, NPX, NPX)
-    c = Cosmo(; Om=snap.omega_m, OL=snap.omega_l, h0=snap.hconst*100, box=snap.box, Ob=snap.omega_b)
+    Or = 4.15e-5 / snap.hconst^2   # radiation (photons + 3 relativistic ν), matching transfer.x's OmegaR
+    c = Cosmo(; Om=snap.omega_m, OL=snap.omega_l - Or, h0=snap.hconst*100, box=snap.box, Ob=snap.omega_b, Or=Or)
     a_start = z_to_a(ZSTART); a_end = z_to_a(ZEND)
     u_i = cosmo_units(c, a_start)
-    @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.3f h=%.3f\n",
-            N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.h0/100)
+    @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.5f Ωr=%.3e h=%.3f\n",
+            N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.Or, c.h0/100)
     @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
             ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
 

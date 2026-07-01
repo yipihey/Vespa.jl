@@ -47,16 +47,35 @@ function cosmo_units(c::Cosmo, a)
     (d=sd, l=sl, t=st, v=sv, T2=_MH/_KB*sv^2, nH=c.XH/_MH*sd)
 end
 
-"Linear growth factor D(a) (Heath 1977; matter+Λ(+curv,rad))."
+"""
+    growth_D(c::Cosmo, a) -> D(a)
+
+Linear CDM growth factor, normalized D→a as a→0.  Integrates the growing-mode ODE in ln a,
+
+    D'' + (2 + dlnH/dlna) D' − (3/2) Ω_m(a) D = 0,
+
+where RADIATION enters ONLY through H(a) and Ω_m(a)=ρ_m/ρ_tot — it does not cluster.  (The old
+Heath integral H(a)∫da/(aH)³ is exact for matter+Λ but INVALID with radiation: its decaying mode
+δ⁻∝H(a) picks up a spurious (8/3)ρ_r term, so it over-predicts D at high z where Ω_r matters —
+which made the DM over-grow relative to the transfer.x linear theory.)
+"""
 function growth_D(c::Cosmo, a)
-    E(x) = sqrt(c.Om/x^3 + c.Or/x^4 + c.OL + c.Ok/x^2)
-    f(x) = 1.0 / (x*E(x))^3
-    n = 4000; h = a/n; s = 0.0
-    @inbounds for i in 1:n
-        x0 = (i-1)*h + 1e-12; x1 = i*h
-        s += 0.5*(f(x0)+f(x1))*h
+    E2(x)   = c.Om/x^3 + c.Or/x^4 + c.OL + c.Ok/x^2
+    Oma(x)  = (c.Om/x^3) / E2(x)                              # clustering source (matter only)
+    dlnH(x) = -(3*c.Om/x^3 + 4*c.Or/x^4 + 2*c.Ok/x^2) / (2*E2(x))
+    fr(u, D, Dp) = (Dp, -(2 + dlnH(exp(u)))*Dp + 1.5*Oma(exp(u))*D)
+    a0 = 1e-6; u = log(a0); h = (log(a) - u) / 3000
+    D = a0; Dp = a0                                          # growing mode D∝a: D=a0, dD/dlna=a0
+    @inbounds for _ in 1:3000                                # RK4 in u = ln a
+        k1D,k1P = fr(u,       D,          Dp)
+        k2D,k2P = fr(u+h/2,   D+h/2*k1D,  Dp+h/2*k1P)
+        k3D,k3P = fr(u+h/2,   D+h/2*k2D,  Dp+h/2*k2P)
+        k4D,k4P = fr(u+h,     D+h*k3D,    Dp+h*k3P)
+        D  += h/6*(k1D + 2k2D + 2k3D + k4D)
+        Dp += h/6*(k1P + 2k2P + 2k3P + k4P)
+        u  += h
     end
-    return E(a) * s
+    return D
 end
 
 "Compton drag rate Γ/H at redshift `z` given ionized fraction `xe` (cgs)."
