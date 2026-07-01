@@ -47,7 +47,8 @@ MultiCodeMusicDiscoDJExt = ["MusicLib", "DiscoDJLib"]
 MultiCodeAthenaExt = "AthenaLib"
 MultiCodeCICASSExt = "CICASSLib"
 MultiCodeDfmmExt = "dfmm"
-MultiCodeFVGKExt = ["FiniteVolumeGodunovKA", "Metal"]
+MultiCodeFVGKExt = "FiniteVolumeGodunovKA"
+MultiCodeFVGKMetalExt = ["FiniteVolumeGodunovKA", "Metal"]
 
 [sources]
 CICASSLib = {path = "../../../CICASS.jl/lib/CICASSLib"}

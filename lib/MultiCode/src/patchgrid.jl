@@ -108,6 +108,15 @@ function _fvgk_patch_hydro! end
 # patch↔g.R duplication.  Defined by MultiCodeFVGKExt (only meaningful for solver=:fvgk).
 function _fvgk_dedup! end
 
+# solver=:fvgk Metal grid constructor.  Metal.jl is Apple-only, so the Metal FVGK grid (and its
+# `using Metal` runtime) live in a SEPARATE extension `MultiCodeFVGKMetalExt` (trigger
+# [FiniteVolumeGodunovKA, Metal]) — keeping the common `MultiCodeFVGKExt` (CUDA/CPU) free of any
+# Metal reference so it loads on non-Apple platforms.  The common ext calls this hook on the
+# `:metal` backend; the Metal ext overrides it.  `sys` is the FVGK dual-energy system, `gesc` the
+# GE_SCALE, `rec`/`riem` the reconstruction/Riemann symbols.
+_fvgk_build_metal_grid(pg, sys, nc, rec, riem, gesc) =
+    error("solver=:fvgk on the :metal backend needs `using Metal` (Apple Silicon) to load MultiCodeFVGKMetalExt")
+
 # ── interior-only chemistry: strided, in-place, f32 storage / f64 network ──────────────────────
 # Processes ONLY the pdim³ interior cells: maps the linear interior thread → the strided nd³ index
 # and reads/writes the f32 patch arrays directly — no gather/scatter, no f64 materialization.  Each

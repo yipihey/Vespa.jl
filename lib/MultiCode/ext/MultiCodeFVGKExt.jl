@@ -29,12 +29,8 @@ using FiniteVolumeGodunovKA
 import ChemistryKernels
 
 const FV = FiniteVolumeGodunovKA
-module _FVGKMetalRuntime
-    using FiniteVolumeGodunovKA, Metal
-    include(joinpath(pkgdir(FiniteVolumeGodunovKA), "metal", "metal.jl"))
-end
-
-@inline _fvgk_mtl_runtime() = _FVGKMetalRuntime
+# The Metal FVGK runtime (`using Metal` + metal/metal.jl) lives in MultiCodeFVGKMetalExt — Metal.jl is
+# Apple-only, so this common extension carries NO Metal reference and loads on CUDA/CPU platforms.
 
 # number of passive species (colours) carried by the patches.
 @inline _nspecies(pg::MultiCode.PatchGrid) = length(pg.patches[1].species)
@@ -63,14 +59,8 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # 1e7 maps that range to f16-normal [~4e-4, 0.12] (and E≲1e-4 → ≲1e3, no overflow).
         gesc = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
         if pg.besym === :metal
-            store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))
-            store === :f16 || error("solver=:fvgk on Metal requires CIC_FVGK_STORE=f16 (got :$store)")
-            recobj = rec === :plm ? FV.PLM() : rec === :pcm ? FV.PCM() : error("CIC_FVGK_RECON=$rec")
-            riemobj = riem === :llf ? FV.LLF() : riem === :hllc ? FV.HLLC() : error("CIC_FVGK_RIEMANN=$riem")
-            mtl = _fvgk_mtl_runtime()
-            return mtl.Grid3DMtlDE16(sys, nc; dx = Float32(pg.dx), dy = Float32(pg.dx), dz = Float32(pg.dx),
-                                     recon = recobj, rsol = riemobj, ge_scale = gesc,
-                                     store = :f16, de_prec = :f16)
+            # Metal grid built by MultiCodeFVGKMetalExt (needs `using Metal`); no Metal ref here.
+            return MultiCode._fvgk_build_metal_grid(pg, sys, nc, rec, riem, gesc)
         end
         U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
@@ -227,16 +217,12 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspee
             mtl.mde16_step!(g, dts; rev = isodd(n))
         end
     elseif de
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
-        run_ctus_de16!(g, dtf / nsub, nsub)
+        run_ctus_de16!(g, dtf / nsub, nsub)      # nsub from the sigspeed/dt_cfl block above (no re-derive)
     elseif _nspecies(pg) == 0
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_ctus!(g, dtf / nsub, nsub)
     elseif get(ENV, "CIC_FVGK_INTEGRATOR", "ctu") == "rk2"
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_rk2!(g, dtf / nsub, nsub)
     else
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_ctu!(g, dtf / nsub, nsub)
     end
     pg.dedup || _fvgk_scatter!(g, pg)                           # dedup: g.R IS the state, no copy back
