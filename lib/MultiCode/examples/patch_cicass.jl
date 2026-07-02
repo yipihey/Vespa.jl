@@ -759,7 +759,10 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
     # CIC_CHEM_BACKEND = backend (default = BE, chem on GPU) | cpu (stiff chem on the host CPU —
     #   faster, no warp divergence; overlaps GPU gravity in the flip).
     chembk = Symbol(get(ENV, "CIC_CHEM_BACKEND", string(BE)))
-    nthr = parse(Int, get(ENV, "CIC_FFT_THREADS", string(min(8, Sys.CPU_THREADS))))
+    # FFTW threads for the CPU gravity/KA-FFT path (unused when gravity=gpu → cuFFT).  A 512³+ CPU transform
+    # wants many threads; the old min(8,·) cap badly under-parallelized it on this 64-core host.  Cap at 32
+    # (FFTW's parallel efficiency for one 3D transform plateaus by ~16–32); override with CIC_FFT_THREADS.
+    nthr = parse(Int, get(ENV, "CIC_FFT_THREADS", string(min(32, Sys.CPU_THREADS))))
     PoissonKernels.fft_set_num_threads!(nthr)
     # CIC_CHEM_TABLES=1 (default): log–log rate table for the chemistry hot path (~2.4× the
     # stiff network on GPU, <1e-5 vs the analytic fits); =0 falls back to the analytic fits.
