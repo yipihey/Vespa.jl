@@ -244,7 +244,10 @@ end
 "Fast analytic recombination + Compton on patch `p`'s interior (HII-only color; no stiff solver; needs Hz)."
 function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, nsub::Int)
     nd1, nd2, _ = pg.nd; pd1, pd2, pd3 = pg.pdim
-    R = pg.besym === :metal ? Float32 : Float64
+    # On consumer Ampere (A6000) FP64 is ~1/32–1/64 of FP32, and this kernel is transcendental-bound
+    # (recfast_alpha = 2 pow, Compton = 2 exp per cell), so CIC_CHEM_F32=1 runs it in Float32 — the
+    # T~10²–10³ K, x_HII~10⁻⁴ IGM state is comfortably within f32's 7 digits.  Metal is always f32.
+    R = (pg.besym === :metal || get(ENV, "CIC_CHEM_F32", "0") == "1") ? Float32 : Float64
     args = (p.D, p.Ge, p.Tau, p.species[1], R(du), R((lu/tu)^2), R(tu),
             R(dt), R(1.0/a_value - 1.0), R(hz), R(0.76), R(pg.gamma), Int(nsub), R(pg.gesc),
             nd1, nd2, pg.ng, pd1, pd2)
