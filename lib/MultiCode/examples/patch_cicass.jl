@@ -317,22 +317,22 @@ function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
     todev_vel() = (d = PPMKernels.to_device(backend, vbuf, VT); BE === :metal && Metal.synchronize(); d)
     open(path, "r") do io
         read_cicass_field!(io, raw, h, 1)
-        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        Threads.@threads for i in eachindex(buf); @inbounds buf[i] = T(mod(raw[i], 1.0)); end
         px = todev_pos()
         read_cicass_field!(io, raw, h, 2)
-        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        Threads.@threads for i in eachindex(buf); @inbounds buf[i] = T(mod(raw[i], 1.0)); end
         py = todev_pos()
         read_cicass_field!(io, raw, h, 3)
-        @inbounds for i in eachindex(buf); buf[i] = T(mod(raw[i], 1.0)); end
+        Threads.@threads for i in eachindex(buf); @inbounds buf[i] = T(mod(raw[i], 1.0)); end
         pz = todev_pos()
         read_cicass_field!(io, raw, h, 4)
-        @inbounds for i in eachindex(vbuf); vbuf[i] = VT(raw[i] * vconv); end
+        Threads.@threads for i in eachindex(vbuf); @inbounds vbuf[i] = VT(raw[i] * vconv); end
         vx = todev_vel()
         read_cicass_field!(io, raw, h, 5)
-        @inbounds for i in eachindex(vbuf); vbuf[i] = VT(raw[i] * vconv); end
+        Threads.@threads for i in eachindex(vbuf); @inbounds vbuf[i] = VT(raw[i] * vconv); end
         vy = todev_vel()
         read_cicass_field!(io, raw, h, 6)
-        @inbounds for i in eachindex(vbuf); vbuf[i] = VT(raw[i] * vconv); end
+        Threads.@threads for i in eachindex(vbuf); @inbounds vbuf[i] = VT(raw[i] * vconv); end
         vz = todev_vel()
         mass = T(1 - c.fb)
         @printf("DM IC: %d particles, mass_per=%.4f (1−f_b), v→code=%.4e%s\n",
