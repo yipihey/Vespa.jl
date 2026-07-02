@@ -340,7 +340,7 @@ end
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
                                             nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int,
-                                            gm1, three, gesc)
+                                            gm1, three, gesc, imsc)
     lane = KA.@index(Local, Linear)
     grp = KA.@index(Group, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
@@ -359,9 +359,9 @@ KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
             invd = one(d) / d
             ge = eltype(out)(Ge[idx])
             cs = sqrt(max(eltype(out)(gm1) * ge * invd / eltype(out)(gesc), zero(d)))
-            v = abs(eltype(out)(S1[idx]) * invd) +
+            v = eltype(out)(imsc) * (abs(eltype(out)(S1[idx]) * invd) +     # un-lift MOM_SCALE from |v|=|S|/ρ
                 abs(eltype(out)(S2[idx]) * invd) +
-                abs(eltype(out)(S3[idx]) * invd) +
+                abs(eltype(out)(S3[idx]) * invd)) +
                 eltype(out)(three) * cs
         end
     end
@@ -393,13 +393,13 @@ end
 function max_signal(pg, work = nothing)
     smax = 0.0
     work === nothing && (work = _max_signal_work(pg))
-    Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc)
+    Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc); ims = Tloc(1.0/pg.msc)
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
     for p in pg.patches                              # CFL timestep depends only on the physical
         _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
-            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs; ndrange=nblocks * MAX_SIGNAL_GROUP)
+            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs, ims; ndrange=nblocks * MAX_SIGNAL_GROUP)
         PPMKernels.KA.synchronize(pg.backend)
         copyto!(work.host, 1, work.scratch, 1, nblocks)
         smax = max(smax, Float64(maximum(@view work.host[1:nblocks])))

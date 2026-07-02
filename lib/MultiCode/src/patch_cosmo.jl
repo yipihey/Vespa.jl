@@ -90,16 +90,21 @@ a_to_z(a) = 1.0/a - 1.0
 # in per-cell Float32 (so cold-gas Sᵢ² doesn't underflow f16 g.R storage) with ZERO N³ temporaries —
 # the broadcast form materialized ~5·N³·4 B of scratch, which is the binding alloc near the grid ceiling.
 # gs = GE_SCALE lifts the KE increment into the f16-lifted Tau slot (1 in the non-dedup f32 path).
-@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs)
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs, msc)
+    # MOM_SCALE-aware: S1..S3 are stored LIFTED (×msc) in the FVGK dedup.  Un-lift to the TRUE momentum
+    # BEFORE the quadratic KE (else msc²≈1e8 amplifies the ke intermediates → f32 overflow → NaN), damp in
+    # true units, then re-lift on store.  vx,vy,vz are the TRUE bulk velocity; gs = GE_SCALE (true KE→Tau).
+    # msc=1 ⇒ every ×im/×msc is a no-op, so this is identical to the un-lifted path.
     i = @index(Global)
     @inbounds begin
         d = Float32(D[i])
         if d > 0f0
-            s1 = Float32(S1[i]); s2 = Float32(S2[i]); s3 = Float32(S3[i])
+            im = 1f0/Float32(msc); ms = Float32(msc)
+            s1 = Float32(S1[i])*im; s2 = Float32(S2[i])*im; s3 = Float32(S3[i])*im   # un-lift → true momentum
             ke0 = (s1*s1 + s2*s2 + s3*s3) / (2f0*d)
             n1 = d*vx + (s1 - d*vx)*ff; n2 = d*vy + (s2 - d*vy)*ff; n3 = d*vz + (s3 - d*vz)*ff
             ke1 = (n1*n1 + n2*n2 + n3*n3) / (2f0*d)
-            S1[i] = eltype(S1)(n1); S2[i] = eltype(S2)(n2); S3[i] = eltype(S3)(n3)
+            S1[i] = eltype(S1)(n1*ms); S2[i] = eltype(S2)(n2*ms); S3[i] = eltype(S3)(n3*ms)   # re-lift on store
             Tau[i] = eltype(Tau)(Float32(Tau[i]) + (ke1 - ke0)*gs)
         end
     end
@@ -121,9 +126,12 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         M  += _interior_sum(pg, p.D)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
-    ff = Float32(f); vx = Float32(px/M); vy = Float32(py/M); vz = Float32(pz/M); gs = Float32(pg.gesc)
+    # px is the LIFTED momentum sum (×msc in the dedup); un-lift the bulk velocity so the kernel works in TRUE
+    # units (it un-lifts each cell's S and re-lifts on store).  gs = GE_SCALE (the kernel forms the true KE).
+    ims = Float32(1.0/pg.msc)
+    ff = Float32(f); vx = Float32(px/M)*ims; vy = Float32(py/M)*ims; vz = Float32(pz/M)*ims; gs = Float32(pg.gesc)
     for p in pg.patches
-        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs; ndrange = length(p.D))
+        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs, Float32(pg.msc); ndrange = length(p.D))
     end
     return nothing
 end

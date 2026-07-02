@@ -69,7 +69,7 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # scratch=:minimal drops the rk2-only third state buffer (NV·VOL) — the DE path always
         # steps with run_ctus_de16! (R+O only), so this saves a full grid buffer (~14 B/cell @f16).
         return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec,
-                             de_prec = :f16, ge_scale = gesc, store = store, scratch = :minimal)
+                             de_prec = :f16, ge_scale = gesc, mom_scale = _msc(), store = store, scratch = :minimal)
     end
     pg.besym === :metal && error("solver=:fvgk on Metal currently requires CIC_FVGK_F16=1")
     if nsp == 0
@@ -93,6 +93,9 @@ end
 # f16-storage grid (g.R is __half)? then the energy slots (5=E,6=Ge) are stored GE_SCALE-lifted.
 @inline _f16store(g) = (hasproperty(g, :R) ? eltype(g.R) : eltype(g.U)) === Float16
 @inline _gesc() = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
+# MOM_SCALE: lift the conserved momenta S1,S2,S3 into f16's normal range (in a baryon-rest frame S=ρ·δv is a
+# small no-pedestal number that underflows the f16 store).  Default 1 (off); CIC_FVGK_MOM_SCALE=1e4 to enable.
+@inline _msc() = parse(Float32, get(ENV, "CIC_FVGK_MOM_SCALE", "1"))
 
 # Conserved fields map 1:1 onto the global var-major slots: (D,S1,S2,S3,Tau) then the species in slots
 # 6..5+nsp as LINEAR ρ·xᵢ (the EulerColors conserved colours). Ge is NOT carried (re-derived post-step).
@@ -103,13 +106,15 @@ end
 function _fvgk_gather!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5   # DE adds Ge as slot 6; species follow at hoff+q
-    f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0
+    f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0; msc = f16s ? _msc() : 1f0
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gridblock(g, nc, GVOL, c); src = MultiCode._r3(f, pg.nd)
             if f16s && c >= 5                                    # E (5), Ge (6): lift into f16's normal range
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* gesc
+            elseif f16s && 2 <= c <= 4                           # momenta S1,S2,S3: lift into f16's normal range
+                @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* msc
             else
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk]
             end
@@ -131,7 +136,7 @@ end
 function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5
-    f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0
+    f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0; imsc = f16s ? 1f0/_msc() : 1f0
     GD = _gridblock(g, nc, GVOL, 1)                                  # post-step global density ρ_post
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
@@ -139,6 +144,8 @@ function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
             Gblk = _gridblock(g, nc, GVOL, c); dst = MultiCode._r3(f, pg.nd)
             if f16s && c >= 5                                       # un-lift E, Ge back to physical f32
                 @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* igesc
+            elseif f16s && 2 <= c <= 4                              # un-lift momenta S1,S2,S3
+                @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* imsc
             else
                 @views dst[li, lj, lk] .= Gblk[gi, gj, gk]
             end
@@ -185,7 +192,7 @@ function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
                            [blk(6+q) for q in 1:nsp], ((1,1),(1,1),(1,1)))
     pg.patches = [newp]
     pg.ng = 0; pg.nd = pg.pdim                                   # gas fields are ghost-free now
-    pg.gesc = Float64(_gesc()); pg.packed = false; pg.dedup = true
+    pg.gesc = Float64(_gesc()); pg.msc = Float64(_msc()); pg.packed = false; pg.dedup = true
     return pg
 end
 
