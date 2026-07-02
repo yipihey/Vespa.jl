@@ -430,6 +430,14 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     # Needs a 2·3·5-smooth cubic grid (rfft additionally needs even n with n/2 smooth; else it self-falls-back).
     kafft = get(ENV, "CIC_GRAV_KAFFT", "0") == "1"
     rfft  = kafft && get(ENV, "CIC_GRAV_KAFFT_C2C", "0") != "1"
+    # CIC_GRAV_2GRID=1: EXPERIMENTAL two-grid solve (½-res cuFFT + N red-black GS sweeps) — 8× smaller FFT
+    # workspace and the intended 900³ path (full cuFFT OOMs there; the coarse ½-res cuFFT fits).  Needs separate
+    # φd/ρd (GS reads ρd while writing φd) ⇒ set CIC_GRAV1BUF=0.  It is FD gravity: the potential is ~0.02%
+    # accurate per solve, BUT the v_bc streaming baryon at k≈800 is HYPERSENSITIVE (Δ²_b ≈ 0.1% of Δ²_dm, a
+    # delicate gravity↔suppression balance), so the trilinear-prolong attenuation the GS corrects only slowly
+    # accumulates to a ~15% k=800 baryon shift vs the exact spectral cuFFT at 512³ (nsweeps helps but converges
+    # slowly).  So NOT a transparent drop-in for the spectral solve; for production 512³ use native cuFFT.
+    twogrid = get(ENV, "CIC_GRAV_2GRID", "0") == "1"
     depbuf = (kafft && !rfft) ? PoissonKernels.poisson_scratch_i32(be, pg.T, nc) : nothing  # only c2c has an N³ buffer to lend
     detail = get(ENV, "CIC_GRAV_DETAIL", "0") == "1"
     syncd() = detail ? PPMKernels.KA.synchronize(be) : nothing
@@ -440,7 +448,11 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
                                  timing=detail ? asm_ref : nothing)
     syncd(); asm_t = time() - tasm
     tfft = time()
-    if kafft
+    if twogrid
+        φd === ρd && error("CIC_GRAV_2GRID needs a separate φ buffer (the GS reads ρ while writing φ) — set CIC_GRAV1BUF=0")
+        PoissonKernels.fft_poisson_2grid!(φd, ρd; G=G, a=a, boxsize=boxsize,
+                                          nsweeps=parse(Int, get(ENV, "CIC_GRAV_2GRID_SWEEPS", "6")))
+    elseif kafft
         rfft ? PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=G, a=a, boxsize=boxsize) :
                PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=G, a=a, boxsize=boxsize)
     else

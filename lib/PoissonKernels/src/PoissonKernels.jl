@@ -37,7 +37,7 @@ const KA = KernelAbstractions
 
 export backend, has_backend, device_zeros, to_device, to_host
 export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!, gather_periodic_block!, grav_kick_from_potential!, grav_kick_from_global_potential!
-export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!, fft_poisson_rfft_ka!, fft_poisson_rfft!, fft_set_num_threads!
+export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!, fft_poisson_rfft_ka!, fft_poisson_rfft!, fft_poisson_2grid!, fft_set_num_threads!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
 export power_spectrum_gpu, power_spectrum_aniso_gpu, clear_fft_scratch!
@@ -111,7 +111,8 @@ include("prolong.jl")      # mg_prolong    — coarse→fine (trilinear)
 include("comp_accel.jl")   # comp_accel    — g = -∇φ finite-difference gradient
 include("vcycle.jl")       # MultigridSolver V-cycle host driver
 include("fft_poisson.jl")  # root-grid FFT Poisson solve (CPU-host FFTW + Green's -1/k²)
-include("gpu_fft.jl")      # GPU-resident radix-2 FFT + fft_poisson_root_gpu! (device root solve)
+include("gpu_fft.jl")
+include("twogrid_gpu.jl")   # two-grid: coarse cuFFT + fine red-black GS (memory + 900³ path)
 include("mg_batched.jl")   # batched multigrid: NB same-size subgrids per kernel launch
 include("masked_cg.jl")    # masked 7-point CG — the irregular-region Dirichlet solve
 include("deposit.jl")      # cic_deposit!  — KA Cloud-In-Cell particle→grid mass scatter

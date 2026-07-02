@@ -117,6 +117,11 @@ const VEL16  = get(ENV, "CIC_VEL16",  "0") == "1"
 # per-solve peak.  Bit-identical (in-place FFT + wrap == padded ghost fill).
 const GRAV1BUF = get(ENV, "CIC_GRAV1BUF", "0") == "1"
 GRAV1BUF && OVERLAP && error("CIC_GRAV1BUF shares the ρ/φ buffer; the async CIC_OVERLAP gravity would overwrite the live φ before the push reads it. Set CIC_OVERLAP=0.")
+# global_push (particles read the GLOBAL φ with periodic wrap — the validated force path) was tied to
+# GRAV1BUF, but the two-grid gravity NEEDS separate ρ/φ buffers (GRAV1BUF=0) while still wanting global_push.
+# Decouple: use global_push whenever GRAV1BUF OR the two-grid solve is on (both keep φ as the global field).
+const GRAV2GRID = get(ENV, "CIC_GRAV_2GRID", "0") == "1"
+const GLOBALPUSH = GRAV1BUF || GRAV2GRID
 # CIC_GRAV_HOST32=1: CPU-gravity host density/potential arrays are Float32. This is the
 # Metal hero default; CPU-f64 reference runs can leave it off.
 const GRAV_HOST32 = get(ENV, "CIC_GRAV_HOST32", "0") == "1"
@@ -842,7 +847,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
             tgpu = time()
             g = global_gravity_gpu(pg; G=1.5*c.Om*a_, a=1.0, boxsize=1.0,
                                    particles=parts, dt=dt_, ρd=ρd, φd=φd,
-                                   global_push=GRAV1BUF)
+                                   global_push=GLOBALPUSH)
             BE === :cuda && CUDA.synchronize()
             if GRAV_DETAIL && haskey(g, :timing)
                 gt = g.timing
@@ -988,7 +993,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
                     tgpu = time()
                     g = global_gravity_gpu(pg; G=1.5*c.Om*a_new, a=1.0, boxsize=1.0,
                                            particles=parts, dt=dτ, ρd=ρd, φd=φd,
-                                           global_push=GRAV1BUF)
+                                           global_push=GLOBALPUSH)
                     BE === :cuda && CUDA.synchronize()
                     fft_t[] += time() - tgpu
                     g
