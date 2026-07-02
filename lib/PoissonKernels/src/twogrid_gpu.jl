@@ -52,6 +52,38 @@ end
     end
 end
 
+# ── factor-2 CUBIC (Catmull-Rom) prolong (periodic, cell-centred): coarse → fine ──
+# Fine cell centres sit at ±¼ of a coarse cell from the nearest coarse centre.  The trilinear (2-point)
+# prolong attenuates modes below the coarse Nyquist (~12% at k≈0.4·k_Nyq); the 4-point Catmull-Rom is far
+# flatter (~2%), so the coarse SPECTRAL solve's mid-k (the streaming scale) survives the prolong intact.
+@inline function _tg_cr4(t::T) where {T}     # Catmull-Rom weights for offset t on [p₋₁,p₀,p₁,p₂]
+    t2 = t*t; t3 = t2*t
+    (T(-0.5)*t3 + t2 - T(0.5)*t,  T(1.5)*t3 - T(2.5)*t2 + one(T),
+     T(-1.5)*t3 + T(2)*t2 + T(0.5)*t,  T(0.5)*t3 - T(0.5)*t2)
+end
+@kernel function _tg_prolong2_cubic!(dst, @Const(src), nc::Int)
+    fi, fj, fk = @index(Global, NTuple)
+    @inbounds begin
+        T = eltype(dst)
+        cni = (fi+1) >> 1; cnj = (fj+1) >> 1; cnk = (fk+1) >> 1        # nearest coarse (1-based)
+        oi = isodd(fi) ? -2 : -1; oj = isodd(fj) ? -2 : -1; ok = isodd(fk) ? -2 : -1   # 4-cell start offset
+        wi = _tg_cr4(isodd(fi) ? T(0.75) : T(0.25))
+        wj = _tg_cr4(isodd(fj) ? T(0.75) : T(0.25))
+        wk = _tg_cr4(isodd(fk) ? T(0.75) : T(0.25))
+        s = zero(T)
+        for c in 1:4
+            kk = mod1(cnk + ok + (c-1), nc); wck = wk[c]
+            for b in 1:4
+                jj = mod1(cnj + oj + (b-1), nc); wbk = wck * wj[b]
+                for a in 1:4
+                    s += wbk * wi[a] * src[mod1(cni + oi + (a-1), nc), jj, kk]
+                end
+            end
+        end
+        dst[fi,fj,fk] = s
+    end
+end
+
 const _TG_SCRATCH = Dict{Any,Any}()
 _tg_bufs(be, ::Type{T}, nc) where {T} = get!(_TG_SCRATCH, (typeof(be), T, nc)) do
     (rc = KA.zeros(be, T, nc, nc, nc), pc = KA.zeros(be, T, nc, nc, nc))
@@ -65,7 +97,8 @@ Periodic Poisson solve `∇²φ = (G/a)·ρ` via a two-grid cycle: half-resoluti
 (a cubic device array; `rho` matching, even `n` with `n/2` cuFFT-able).  The coarse scratch is cached.
 """
 function fft_poisson_2grid!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
-                            G::Real=1.0, a::Real=1.0, boxsize=1.0, nsweeps::Int=6) where {T}
+                            G::Real=1.0, a::Real=1.0, boxsize=1.0, nsweeps::Int=6,
+                            prolong::Symbol=:cubic) where {T}
     be = KA.get_backend(rho); n = size(rho, 1); nc = n ÷ 2
     all(==(n), size(rho)) || error("fft_poisson_2grid!: cubic grid required, got $(size(rho))")
     iseven(n) || error("fft_poisson_2grid!: needs even n, got $n")
@@ -74,7 +107,7 @@ function fft_poisson_2grid!(phi::AbstractArray{T,3}, rho::AbstractArray{T,3};
     _tg_restrict2!(be)(buf.rc, rho; ndrange=(nc,nc,nc))
     copyto!(buf.pc, buf.rc)
     fft_poisson_rfft!(buf.pc, buf.pc; G=G, a=a, boxsize=boxsize)     # coarse cuFFT solve (½ the axes)
-    _tg_prolong2!(be)(phi, buf.pc, nc; ndrange=(n,n,n))
+    (prolong === :cubic ? _tg_prolong2_cubic! : _tg_prolong2!)(be)(phi, buf.pc, nc; ndrange=(n,n,n))
     ss = T((bx/n)^2 * (G/a))
     for _ in 1:nsweeps
         _tg_rbgs!(be)(phi, rho, ss, n, 0; ndrange=(n,n,n))
