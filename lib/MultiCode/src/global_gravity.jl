@@ -36,10 +36,15 @@ function assemble_global_density!(ρg::Array{Tg,3}, pg::PatchGrid;
     all(==(pg.ncell[1]), pg.ncell) || error("assemble_global_density!: cubic ncell required for CIC")
     fill!(ρg, zero(Tg))
     li, lj, lk = _interior(pg)
+    db = Tg(pg.dens_base); ids = Tg(1 / pg.dens_scale)
     for p in pg.patches                                   # baryon gas density
         gi, gj, gk = _octant(pg, p)
         h = _r3(PPMKernels.to_host(p.D), pg.nd)
-        @views ρg[gi, gj, gk] .= Tg.(h[li, lj, lk])
+        if db > zero(db)
+            @views ρg[gi, gj, gk] .= db .* (one(Tg) .+ Tg.(h[li, lj, lk]) .* ids)
+        else
+            @views ρg[gi, gj, gk] .= Tg.(h[li, lj, lk])
+        end
     end
     if particles !== nothing                              # DM: global periodic CIC
         n = prod(pg.ncell)
@@ -181,11 +186,7 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
     tgas = time()
     fill!(ρd, zero(T))
     li, lj, lk = _interior(pg)
-    for p in pg.patches                                   # gas octants, device→device
-        gi, gj, gk = _octant(pg, p)
-        D3 = reshape(p.D, pg.nd)
-        @views ρd[gi, gj, gk] .= D3[li, lj, lk]
-    end
+    _assemble_density_gpu!(ρd, pg)                         # gas octants, device→device
     syncd(); gas_t = time() - tgas
     dep_t = 0.0
     if particles !== nothing                              # DM periodic CIC on device
@@ -236,6 +237,21 @@ function _assemble_field_gpu!(dst, pg::PatchGrid, getf)
         gi, gj, gk = _octant(pg, p)
         f3 = reshape(getf(p), pg.nd)
         @views dst[gi, gj, gk] .= f3[li, lj, lk]
+    end
+    return dst
+end
+
+function _assemble_density_gpu!(dst, pg::PatchGrid)
+    li, lj, lk = _interior(pg)
+    T = eltype(dst); db = T(pg.dens_base); ids = T(1 / pg.dens_scale)
+    for p in pg.patches
+        gi, gj, gk = _octant(pg, p)
+        D3 = reshape(p.D, pg.nd)
+        if db > zero(db)
+            @views dst[gi, gj, gk] .= db .* (one(T) .+ D3[li, lj, lk] .* ids)
+        else
+            @views dst[gi, gj, gk] .= D3[li, lj, lk]
+        end
     end
     return dst
 end
@@ -338,16 +354,17 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
         end
     end
     # ── gas: overdensity + mass-weighted velocity from the resident patch fields ──
-    g = PPMKernels.device_zeros(be, T, nc); _assemble_field_gpu!(g, pg, p->p.D)
+    g = PPMKernels.device_zeros(be, T, nc); _assemble_density_gpu!(g, pg)
     μg = T(Float64(sum(g))/Ntot)
     Pvgas = nothing
     if velocity
         Psum = nothing; Nm = nothing; kk = nothing
         mom = PPMKernels.device_zeros(be, T, nc)
+        svgas = sv * T(1 / pg.msc)
         for pick in (p->p.S1, p->p.S2, p->p.S3)
             fill!(mom, zero(T))
             _assemble_field_gpu!(mom, pg, pick)
-            _momentum_to_velocity!(be, mom, g, sv, zero(T))
+            _momentum_to_velocity!(be, mom, g, svgas, zero(T))
             Pv = pk(mom)
             Psum = Psum === nothing ? copy(Pv.P) : (Psum .+ Pv.P)
             Nm === nothing && (Nm = Pv.Nmodes; kk = Pv.k)

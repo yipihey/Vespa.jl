@@ -38,6 +38,10 @@ BOX    = float(os.environ.get("BOX", "0.4"))          # Mpc/h (title only)
 NPART  = os.environ.get("NPART", "512")               # per-dim particle/grid count (title only)
 VBC    = os.environ.get("VBC", "1")                   # v_bc in units of σ_vbc (title only)
 BLUE, RED, BLACK = "#1f4fd8", "#e11", "0.15"
+SIMSTYLE = {
+    "dm":  dict(color=BLUE, marker="o", label=r"Simulation $\Delta_c^2$"),
+    "gas": dict(color=RED,  marker="s", label=r"Simulation $\Delta_b^2$"),
+}
 TWO_PI2 = 2.0 * np.pi**2
 
 def d2(k, P):                                          # Δ²(k) = k³ P / (2π²)
@@ -104,9 +108,11 @@ def main():
                 P = s[comp][j]; nm = s["nmodes"][j].astype(float)
                 m = good & np.isfinite(P) & (P > 0) & (nm > 0)
                 D = d2(k[m], P[m]); err = D * np.sqrt(2.0 / nm[m])
-                ax.plot(k[m], D, "-", color=BLACK, lw=0.6, zorder=4)
-                ax.errorbar(k[m], D, yerr=err, fmt="o", ms=3.0, mfc="none", mec=BLACK, mew=0.7,
-                            ecolor=BLACK, elinewidth=0.6, capsize=1.4, capthick=0.6, ls="none", zorder=5)
+                st = SIMSTYLE[comp]
+                ax.plot(k[m], D, "-", color=st["color"], lw=0.6, alpha=0.65, zorder=4)
+                ax.errorbar(k[m], D, yerr=err, fmt=st["marker"], ms=3.0, mfc="none",
+                            mec=st["color"], mew=0.7, ecolor=st["color"], elinewidth=0.6,
+                            capsize=1.4, capthick=0.6, ls="none", alpha=0.8, zorder=5)
             # linear theory: Δ²_c (blue), Δ²_b (red) at this μ column
             lc = lin_slice(B, z, "dm", cens[j])
             lb = lin_slice(B, z, "baryon", cens[j])
@@ -136,10 +142,13 @@ def main():
     fig.text(0.022, 0.5, r"$\Delta^2(k,\mu)$", va="center", rotation="vertical", fontsize=13)
 
     from matplotlib.lines import Line2D
-    leg = [Line2D([0],[0], color=BLUE, lw=2.4, label=r"$\Delta_c^2$"),
-           Line2D([0],[0], color=RED,  lw=2.4, label=r"$\Delta_b^2$"),
-           Line2D([0],[0], color=BLACK, marker="o", mfc="none", lw=0.6, label="Simulation")]
-    fig.legend(handles=leg, loc="lower center", ncol=3, frameon=False,
+    leg = [Line2D([0],[0], color=BLUE, lw=2.4, label=r"Linear $\Delta_c^2$"),
+           Line2D([0],[0], color=RED,  lw=2.4, label=r"Linear $\Delta_b^2$"),
+           Line2D([0],[0], color=BLUE, marker="o", mfc="none", lw=0.6,
+                  label=SIMSTYLE["dm"]["label"]),
+           Line2D([0],[0], color=RED, marker="s", mfc="none", lw=0.6,
+                  label=SIMSTYLE["gas"]["label"])]
+    fig.legend(handles=leg, loc="lower center", ncol=4, frameon=False,
                bbox_to_anchor=(0.5, 0.008), fontsize=11, columnspacing=2.5, handlelength=1.8)
 
     fig.savefig(OUT, dpi=150)

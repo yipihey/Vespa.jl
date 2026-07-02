@@ -107,6 +107,11 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
     return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec, scratch = scr)
 end
 
+function MultiCode._fvgk_prebuild_empty!(pg::MultiCode.PatchGrid)
+    pg.fvgk === nothing && (pg.fvgk = _build_fvgk_global(pg))
+    return pg
+end
+
 # var c of the global FVGK buffer, as a (ncell...) view (column-major, var-major flat).
 @inline _gblock(g, nc, GVOL, c) = reshape(view(g.R, (c-1)*GVOL+1 : c*GVOL), nc[1], nc[2], nc[3])
 @inline _metal_de16(g) = hasproperty(g, :U) && hasproperty(g, :gs) && ndims(g.U) == 4 && eltype(g.U) === Float16
@@ -120,6 +125,8 @@ end
 # MOM_SCALE: lift the conserved momenta S1,S2,S3 into f16's normal range (in a baryon-rest frame S=ρ·δv is a
 # small no-pedestal number that underflows the f16 store).  Default 1 (off); CIC_FVGK_MOM_SCALE=1e4 to enable.
 @inline _msc() = parse(Float32, get(ENV, "CIC_FVGK_MOM_SCALE", "1"))
+@inline _dbase(g) = hasproperty(g, :db) ? Float32(getfield(g, :db)) : 0f0
+@inline _dscale(g) = hasproperty(g, :ds) ? Float32(getfield(g, :ds)) : 1f0
 
 # Conserved fields map 1:1 onto the global var-major slots: (D,S1,S2,S3,Tau) then the species in slots
 # 6..5+nsp as LINEAR ρ·xᵢ (the EulerColors conserved colours). Ge is NOT carried (re-derived post-step).
@@ -131,11 +138,14 @@ function _fvgk_gather!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5   # DE adds Ge as slot 6; species follow at hoff+q
     f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0; msc = f16s ? _msc() : 1f0
+    db = _dbase(g); ds = _dscale(g)
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gridblock(g, nc, GVOL, c); src = MultiCode._r3(f, pg.nd)
-            if f16s && c >= 5                                    # E (5), Ge (6): lift into f16's normal range
+            if f16s && c == 1 && db > 0f0                        # density: pedestal-subtracted contrast
+                @views Gblk[gi, gj, gk] .= (src[li, lj, lk] ./ db .- 1f0) .* ds
+            elseif f16s && c >= 5                                # E (5), Ge (6): lift into f16's normal range
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* gesc
             elseif f16s && 2 <= c <= 4                           # momenta S1,S2,S3: lift into f16's normal range
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* msc
@@ -161,12 +171,15 @@ function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5
     f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0; imsc = f16s ? 1f0/_msc() : 1f0
+    db = _dbase(g); ds = _dscale(g); ids = 1f0 / ds
     GD = _gridblock(g, nc, GVOL, 1)                                  # post-step global density ρ_post
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gridblock(g, nc, GVOL, c); dst = MultiCode._r3(f, pg.nd)
-            if f16s && c >= 5                                       # un-lift E, Ge back to physical f32
+            if f16s && c == 1 && db > 0f0                           # density contrast -> physical ρ
+                @views dst[li, lj, lk] .= db .* (1f0 .+ Float32.(Gblk[gi, gj, gk]) .* ids)
+            elseif f16s && c >= 5                                   # un-lift E, Ge back to physical f32
                 @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* igesc
             elseif f16s && 2 <= c <= 4                              # un-lift momenta S1,S2,S3
                 @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* imsc
@@ -177,7 +190,12 @@ function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
         for (q, sf) in enumerate(p.species)
             Gblk = _gridblock(g, nc, GVOL, hoff + q); dst = MultiCode._r3(sf, pg.nd)
             if pg.packed
-                @views dst[li, lj, lk] .= ChemistryKernels.encode_log2sp.(Float32.(Gblk[gi, gj, gk]) ./ Float32.(GD[gi, gj, gk]))
+                if db > 0f0
+                    @views dst[li, lj, lk] .= ChemistryKernels.encode_log2sp.(
+                        Float32.(Gblk[gi, gj, gk]) ./ (db .* (1f0 .+ Float32.(GD[gi, gj, gk]) .* ids)))
+                else
+                    @views dst[li, lj, lk] .= ChemistryKernels.encode_log2sp.(Float32.(Gblk[gi, gj, gk]) ./ Float32.(GD[gi, gj, gk]))
+                end
             else
                 @views dst[li, lj, lk] .= Gblk[gi, gj, gk]
             end
@@ -201,7 +219,7 @@ end
 # Re-point the (np=1) patch gas fields onto the FVGK grid's ghost-free f16 blocks and free the f32
 # patch arrays — eliminating patch↔FVGK duplication.  CUDA stores var-major `g.R`; Metal stores
 # component-last `g.U[:,:,:,c]`.  Energies (slots 5=Tau, 6=Ge) are GE_SCALE-lifted in-grid, so
-# pg.gesc carries the scale for consumers (chem/drag/kick/outputs).  np=1 only (the patch IS the
+# pg.gesc/pg.msc/pg.dens_* carry the storage transforms for consumers (chem/drag/kick/outputs).  np=1 only (the patch IS the
 # whole grid ⇒ each block view is contiguous; np>1 octants would be strided).
 _free!(a) = (m = parentmodule(typeof(a)); isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a); nothing)
 function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
@@ -216,7 +234,9 @@ function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
                            [blk(6+q) for q in 1:nsp], ((1,1),(1,1),(1,1)))
     pg.patches = [newp]
     pg.ng = 0; pg.nd = pg.pdim                                   # gas fields are ghost-free now
-    pg.gesc = Float64(_gesc()); pg.msc = Float64(_msc()); pg.packed = false; pg.dedup = true
+    pg.gesc = Float64(_gesc()); pg.msc = Float64(_msc())
+    pg.dens_base = Float64(_dbase(g)); pg.dens_scale = Float64(_dscale(g))
+    pg.packed = false; pg.dedup = true
     return pg
 end
 

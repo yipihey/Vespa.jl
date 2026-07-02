@@ -58,33 +58,46 @@ mutable struct PatchGrid
                                          # gas fields are f16 g.R views in the FVGK dedup — see ext)
     msc     ::Float64                    # MOM_SCALE on the stored momenta S1,S2,S3 (1.0 normally; >1 in the
                                          # FVGK dedup — lifts ρ·δv out of the f16 subnormal range; consumers un-lift)
+    dens_base ::Float64                  # DENS_BASE for pedestal-subtracted f16 density storage (0.0 = raw ρ)
+    dens_scale::Float64                  # DENS_SCALE for stored (ρ/dens_base - 1) * dens_scale
     dedup   ::Bool                       # gas fields ARE the FVGK grid g.R (no patch copy, ng=0); ext-set
 end
 
 _lin(ix, iy, iz, np) = ix + np[1]*iy + np[1]*np[2]*iz + 1
 
+@inline _decode_density(x, base::Float32, invscale::Float32) =
+    base > 0f0 ? base * (1f0 + Float32(x) * invscale) : Float32(x)
+@inline _decode_density(x, base::Float64, invscale::Float64) =
+    base > 0.0 ? base * (1.0 + Float64(x) * invscale) : Float64(x)
+@inline _encode_density(x, base::Float32, scale::Float32) =
+    base > 0f0 ? (Float32(x) / base - 1f0) * scale : Float32(x)
+
 "All halo-exchanged fields of a patch, in a fixed order (conserved + dual energy + species)."
 _allfields(p::Patch) = (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge, p.species...)
 
 """
-    build_patchgrid(; ng, ncell, np, dx, gamma, nspecies, backend, T, du, lu, tu, deut)
+    build_patchgrid(; ng, ncell, np, dx, gamma, nspecies, backend, T, du, lu, tu, deut,
+                    defer_fields=false)
 
 Allocate `prod(np)` GPU-resident patches tiling a uniform periodic `ncell` grid,
 with periodic neighbor links.  Fields start zeroed; call `scatter_global!` to load
-an initial condition.
+an initial condition.  With `defer_fields=true`, only patch topology is built and
+field arrays are zero-length placeholders for startup paths that immediately deduplicate
+onto a solver-owned global grid.
 """
 function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                          dx::Real, gamma::Real, nspecies::Int, besym::Symbol, T::DataType,
                          du::Real=1.0, lu::Real=1.0, tu::Real=1.0, deut::Bool=true,
-                         packed_species::Bool=false)
+                         packed_species::Bool=false, defer_fields::Bool=false)
     backend = PPMKernels.backend(besym)
     all(ncell .% np .== 0) || error("build_patchgrid: ncell $ncell not divisible by np $np")
     pdim = ncell .÷ np
     nd   = pdim .+ 2ng
     n    = prod(nd)
-    zeros_dev()  = PPMKernels.device_zeros(backend, T, (n,))
+    nalloc = defer_fields ? 0 : n
+    zeros_dev()  = PPMKernels.device_zeros(backend, T, (nalloc,))
     # packed species: UInt16 fractions (UInt16(0) = the log2 floor ≈ 0); else f32 ρ·xᵢ
-    spec_zeros() = packed_species ? PPMKernels.device_zeros(backend, UInt16, (n,)) : zeros_dev()
+    spec_zeros() = packed_species ? PPMKernels.device_zeros(backend, UInt16, (nalloc,)) : zeros_dev()
     A  = typeof(zeros_dev()); SA = typeof(spec_zeros())
     patches = Vector{Patch{A,SA}}(undef, prod(np))
     for iz in 0:np[3]-1, iy in 0:np[2]-1, ix in 0:np[1]-1
@@ -97,7 +110,7 @@ function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                              zeros_dev(), zeros_dev(), SA[spec_zeros() for _ in 1:nspecies], nbr)
     end
     PatchGrid(backend, besym, T, ng, np, ncell, pdim, nd, Float64(dx), Float64(gamma),
-              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing, 1.0, 1.0, false)
+              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing, 1.0, 1.0, 0.0, 1.0, false)
 end
 
 # Hydro-solver hook for `solver=:fvgk`: overridden by `MultiCodeFVGKExt` when
@@ -109,6 +122,7 @@ function _fvgk_patch_hydro! end
 # views), free the f32 patch arrays, and set ng=0 / gesc=GE_SCALE / dedup=true.  Eliminates the
 # patch↔g.R duplication.  Defined by MultiCodeFVGKExt (only meaningful for solver=:fvgk).
 function _fvgk_dedup! end
+function _fvgk_prebuild_empty! end
 _fvgk_grav_kick!(pg, accel, dt) = false
 
 # solver=:fvgk Metal grid constructor.  Metal.jl is Apple-only, so the Metal FVGK grid (and its
@@ -210,6 +224,7 @@ end
 end
 
 @kernel function _chem_analytic_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int, gesc,
+                                   dbase, invdscale,
                                    nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -217,7 +232,7 @@ end
         R = typeof(du)
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = R(D[idx]); e0 = (R(Ge[idx])/R(gesc)) / d           # un-lift the stored energy slot
+        d = _decode_density(D[idx], R(dbase), R(invdscale)); e0 = (R(Ge[idx])/R(gesc)) / d
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, R(sp1[idx])*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
         Ge[idx]  = TT(d*enew*gesc); Tau[idx] = Tau[idx] + TT(d*(enew - e0)*gesc); sp1[idx] = eltype(sp1)(hii_n/du)
@@ -225,6 +240,7 @@ end
 end
 
 @kernel function _chem_analytic_packed_k!(D, Ge, Tau, sp1, du, vu2, tu, dt, z, Hz, fh, gamma, nsub::Int, gesc,
+                                          dbase, invdscale,
                                           nd1::Int, nd2::Int, ng::Int, pd1::Int, pd2::Int)
     t = @index(Global)
     @inbounds begin
@@ -232,7 +248,7 @@ end
         R = typeof(du)
         ix = t0 % pd1; q = t0 ÷ pd1; iy = q % pd2; iz = q ÷ pd2
         idx = (ng + ix) + nd1*(ng + iy) + nd1*nd2*(ng + iz) + 1
-        d = R(D[idx]); e0 = (R(Ge[idx])/R(gesc)) / d
+        d = _decode_density(D[idx], R(dbase), R(invdscale)); e0 = (R(Ge[idx])/R(gesc)) / d
         hii = R(ChemistryKernels.decode_log2sp(R, sp1[idx]))*d   # fraction → code mass dens
         e_n, hii_n = _recomb_compton_cell(d*du, e0*vu2, hii*du, dt*tu, z, Hz, fh, gamma, nsub)
         enew = e_n / vu2
@@ -247,6 +263,7 @@ function _chem_analytic!(pg::PatchGrid, p::Patch, a_value, dt, du, lu, tu, hz, n
     R = pg.besym === :metal ? Float32 : Float64
     args = (p.D, p.Ge, p.Tau, p.species[1], R(du), R((lu/tu)^2), R(tu),
             R(dt), R(1.0/a_value - 1.0), R(hz), R(0.76), R(pg.gamma), Int(nsub), R(pg.gesc),
+            R(pg.dens_base), R(1 / pg.dens_scale),
             nd1, nd2, pg.ng, pd1, pd2)
     (pg.packed ? _chem_analytic_packed_k! : _chem_analytic_k!)(pg.backend)(args...; ndrange = pd1*pd2*pd3)
     return nothing
@@ -302,6 +319,25 @@ end
     return eltype(fdev) === Float16 ? Float64(sum(x -> abs2(Float32(x)), v)) : Float64(sum(abs2, v))
 end
 
+@inline function _interior_density_sum(pg::PatchGrid, p)
+    if pg.dens_base > 0.0
+        n = prod(pg.pdim)
+        return pg.dens_base * (n + _interior_sum(pg, p.D) / pg.dens_scale)
+    end
+    return _interior_sum(pg, p.D)
+end
+
+@inline function _interior_density_sumsq(pg::PatchGrid, p)
+    if pg.dens_base > 0.0
+        n = prod(pg.pdim)
+        s = _interior_sum(pg, p.D)
+        s2 = _interior_sumsq(pg, p.D)
+        ids = 1 / pg.dens_scale
+        return pg.dens_base^2 * (n + 2 * ids * s + ids^2 * s2)
+    end
+    return _interior_sumsq(pg, p.D)
+end
+
 "Octant ranges of patch `p` in the global ncell grid (1-based)."
 function _octant(pg::PatchGrid, p::Patch)
     o = p.idx .* pg.pdim
@@ -349,26 +385,30 @@ end
     gather_global(pg) -> NamedTuple
 
 Reassemble the patch interiors into global `ncell³` host arrays (ghosts dropped),
-keys `D,S1,S2,S3,Tau,Ge,species`.  Used for I/O and validation.
+keys `D,S1,S2,S3,Tau,Ge,species`.  Used for I/O and validation.  FVGK-dedup
+storage lifts momenta and energies in-place; this returns physical fields.
 """
 function gather_global(pg::PatchGrid)
     li, lj, lk = _interior(pg)
     nsp = length(pg.patches[1].species)
+    db = Float64(pg.dens_base); ids = Float64(1 / pg.dens_scale)
     g = (D=zeros(pg.T, pg.ncell), S1=zeros(pg.T, pg.ncell), S2=zeros(pg.T, pg.ncell),
          S3=zeros(pg.T, pg.ncell), Tau=zeros(pg.T, pg.ncell), Ge=zeros(pg.T, pg.ncell),
          species=[zeros(pg.T, pg.ncell) for _ in 1:nsp])
     for p in pg.patches
         gi, gj, gk = _octant(pg, p)
-        store!(gdst, fdev) = (h = _r3(PPMKernels.to_host(fdev), pg.nd);
-                              @views gdst[gi, gj, gk] .= h[li, lj, lk])
-        store!(g.D, p.D); store!(g.S1, p.S1); store!(g.S2, p.S2)
-        store!(g.S3, p.S3); store!(g.Tau, p.Tau); store!(g.Ge, p.Ge)
+        store!(gdst, fdev, scale = one(pg.T)) = (h = _r3(PPMKernels.to_host(fdev), pg.nd);
+                                                  @views gdst[gi, gj, gk] .= pg.T(scale) .* h[li, lj, lk])
+        hD = _r3(PPMKernels.to_host(p.D), pg.nd)
+        @views g.D[gi, gj, gk] .= pg.T.(_decode_density.(hD[li, lj, lk], db, ids))
+        store!(g.S1, p.S1, 1 / pg.msc); store!(g.S2, p.S2, 1 / pg.msc)
+        store!(g.S3, p.S3, 1 / pg.msc)
+        store!(g.Tau, p.Tau, 1 / pg.gesc); store!(g.Ge, p.Ge, 1 / pg.gesc)
         if pg.packed
             # stored species are packed UInt16 fractions Xᵢ; return ρ·xᵢ = unpack(Xᵢ)·ρ (host)
-            Dh = _r3(PPMKernels.to_host(p.D), pg.nd)
             for s in 1:nsp
                 Xh = ChemistryKernels.decode_log2sp.(pg.T, _r3(PPMKernels.to_host(p.species[s]), pg.nd))
-                @views g.species[s][gi, gj, gk] .= pg.T.(Xh[li, lj, lk] .* Dh[li, lj, lk])
+                @views g.species[s][gi, gj, gk] .= pg.T.(Xh[li, lj, lk] .* g.D[gi, gj, gk])
             end
         else
             for s in 1:nsp; store!(g.species[s], p.species[s]); end
@@ -571,7 +611,7 @@ end
 # total active mass Σ D·dV over all patches (diagnostic / conservation check)
 function total_mass(pg::PatchGrid)
     s = 0.0
-    for p in pg.patches; s += _interior_sum(pg, p.D); end
+    for p in pg.patches; s += _interior_density_sum(pg, p); end
     return s * pg.dx^3
 end
 
@@ -584,7 +624,7 @@ the fast diagnostic replacement for `std(vec(gather_global(pg).D))/mean(...)`.
 function density_contrast_rms(pg::PatchGrid)
     N = prod(pg.ncell); s = 0.0; s2 = 0.0
     for p in pg.patches
-        s  += _interior_sum(pg, p.D); s2 += _interior_sumsq(pg, p.D)
+        s  += _interior_density_sum(pg, p); s2 += _interior_density_sumsq(pg, p)
     end
     μ = s / N; var = max(s2 / N - μ^2, 0.0)
     return sqrt(var) / μ

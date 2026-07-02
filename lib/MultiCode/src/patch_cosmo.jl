@@ -90,14 +90,14 @@ a_to_z(a) = 1.0/a - 1.0
 # in per-cell Float32 (so cold-gas Sᵢ² doesn't underflow f16 g.R storage) with ZERO N³ temporaries —
 # the broadcast form materialized ~5·N³·4 B of scratch, which is the binding alloc near the grid ceiling.
 # gs = GE_SCALE lifts the KE increment into the f16-lifted Tau slot (1 in the non-dedup f32 path).
-@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs, msc)
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs, msc, dbase, invdscale)
     # MOM_SCALE-aware: S1..S3 are stored LIFTED (×msc) in the FVGK dedup.  Un-lift to the TRUE momentum
     # BEFORE the quadratic KE (else msc²≈1e8 amplifies the ke intermediates → f32 overflow → NaN), damp in
     # true units, then re-lift on store.  vx,vy,vz are the TRUE bulk velocity; gs = GE_SCALE (true KE→Tau).
     # msc=1 ⇒ every ×im/×msc is a no-op, so this is identical to the un-lifted path.
     i = @index(Global)
     @inbounds begin
-        d = Float32(D[i])
+        d = _decode_density(D[i], Float32(dbase), Float32(invdscale))
         if d > 0f0
             im = 1f0/Float32(msc); ms = Float32(msc)
             s1 = Float32(S1[i])*im; s2 = Float32(S2[i])*im; s3 = Float32(S3[i])*im   # un-lift → true momentum
@@ -123,7 +123,7 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
     # gather/host-transfer — that copy was the dominant high-z per-cycle cost).
     M = 0.0; px = 0.0; py = 0.0; pz = 0.0
     for p in pg.patches
-        M  += _interior_sum(pg, p.D)
+        M  += _interior_density_sum(pg, p)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
     # px is the LIFTED momentum sum (×msc in the dedup); un-lift the bulk velocity so the kernel works in TRUE
@@ -131,7 +131,8 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
     ims = Float32(1.0/pg.msc)
     ff = Float32(f); vx = Float32(px/M)*ims; vy = Float32(py/M)*ims; vz = Float32(pz/M)*ims; gs = Float32(pg.gesc)
     for p in pg.patches
-        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs, Float32(pg.msc); ndrange = length(p.D))
+        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs, Float32(pg.msc),
+                                     Float32(pg.dens_base), Float32(1 / pg.dens_scale); ndrange = length(p.D))
     end
     return nothing
 end

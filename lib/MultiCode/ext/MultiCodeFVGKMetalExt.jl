@@ -31,6 +31,8 @@ function MultiCode._fvgk_build_metal_grid(pg, sys, nc, rec, riem, gesc)
     return _FVGKMetalRuntime.Grid3DMtlDE16(sys, nc; dx = Float32(pg.dx), dy = Float32(pg.dx),
                                            dz = Float32(pg.dx), recon = recobj, rsol = riemobj,
                                            ge_scale = gesc, mom_scale = _msc(),
+                                           dens_base = Float32(pg.dens_base),
+                                           dens_scale = Float32(pg.dens_scale),
                                            store = :f16, de_prec = :f16, speed_scratch = speed_scratch)
 end
 

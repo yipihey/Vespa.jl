@@ -90,6 +90,7 @@ const GRAV_DETAIL = get(ENV, "CIC_GRAV_DETAIL", "0") == "1"
 # coarse-bucket Morton reorder (CIC_PSORT_BUCKET, power-of-two, default ≤256) because Metal has no
 # native GPU sortperm; CUDA/CPU keep the stable full sort unless CIC_PSORT_MODE=bucket is forced.
 const PSORT = parse(Int, get(ENV, "CIC_PSORT", "0"))
+const PSORT_START = parse(Int, get(ENV, "CIC_PSORT_START", "0"))
 const SORT_TIMING = get(ENV, "CIC_SORT_TIMING", "0") == "1"
 
 const MAX_SIGNAL_GROUP = 256
@@ -301,6 +302,199 @@ function scatter_cicass_gas_stream!(pg, path::AbstractString, h, c::Cosmo, a_i, 
     return pg
 end
 
+function direct_fvgk_ic(np)
+    get(ENV, "CIC_FVGK_DIRECT_IC", "1") == "1" &&
+        SOLVER === :fvgk && BE === :metal &&
+        get(ENV, "CIC_FVGK_F16", "0") == "1" &&
+        get(ENV, "CIC_FVGK_DEDUP", "0") == "1" &&
+        prod(np) == 1
+end
+
+@inline _fvgk_store_density16(ρ::Float32, db::Float32, ds::Float32) =
+    Float16(db > 0f0 ? (ρ / db - 1f0) * ds : ρ)
+
+function _fvgk_direct_gas_params(c::Cosmo, a_i, u_i)
+    s = CICASSLib.thermal_state(ZSTART)
+    xHII0 = s.x_e
+    Tg = s.T_gas
+    μ = 1.22
+    eint = Tg / ((GAMMA - 1) * μ * u_i.T2)
+    vconv = 1.0e5 / u_i.v
+    @printf("gas IC: f_b=%.4f  T_gas=%.1f K (eint=%.3e code)  x_HII0=%.3e  v→code=%.4e\n",
+            c.fb, Tg, eint, xHII0, vconv)
+    flush(stdout)
+    return (; xHII0=Float32(xHII0), eint=Float32(eint), vconv=Float32(vconv))
+end
+
+function prepare_fvgk_direct_ic!(pg, c::Cosmo)
+    configure_fvgk_density_storage!(pg, c)
+    MultiCode._fvgk_prebuild_empty!(pg)
+    BE === :metal && Metal.synchronize()
+    MultiCode._fvgk_dedup!(pg)
+    BE === :metal && Metal.synchronize()
+    dmsg = pg.dens_base > 0 ? @sprintf(", dbase=%.6g dscale=%.0f", pg.dens_base, pg.dens_scale) : ""
+    @printf("  FVGK direct IC ON: gas fields load straight into Metal g.U f16 views%s\n", dmsg)
+    flush(stdout)
+    return pg
+end
+
+function _copy_fvgk_slot16!(dst, buf::Vector{Float16})
+    copyto!(dst, buf)
+    BE === :metal && Metal.synchronize()
+    return dst
+end
+
+function _load_fvgk_direct_from_fields!(pg, delta, gasvel, c::Cosmo, a_i, u_i)
+    pg.dedup || error("direct FVGK gas IC requires pg.dedup=true")
+    prod(pg.np) == 1 || error("direct FVGK gas IC requires np=1")
+    p = pg.patches[1]
+    N3 = prod(pg.ncell)
+    length(delta) == N3 || error("gas delta length $(length(delta)) != ncell product $N3")
+    size(gasvel, 1) == N3 && size(gasvel, 2) >= 3 || error("gas velocity has incompatible shape $(size(gasvel))")
+    pars = _fvgk_direct_gas_params(c, a_i, u_i)
+    ρ = Vector{Float32}(undef, N3)
+    tau = Vector{Float32}(undef, N3)
+    buf = Vector{Float16}(undef, N3)
+    fb = Float32(c.fb); db = Float32(pg.dens_base); ds = Float32(pg.dens_scale)
+    gesc = Float32(pg.gesc); msc = Float32(pg.msc)
+
+    Threads.@threads for m in 1:N3
+        @inbounds begin
+            r = fb * (1f0 + Float32(delta[m]))
+            ρ[m] = r
+            tau[m] = r * pars.eint
+            buf[m] = _fvgk_store_density16(r, db, ds)
+        end
+    end
+    _copy_fvgk_slot16!(p.D, buf)
+
+    Threads.@threads for m in 1:N3
+        @inbounds buf[m] = Float16(ρ[m] * pars.eint * gesc)
+    end
+    _copy_fvgk_slot16!(p.Ge, buf)
+
+    for (d, slot) in enumerate((:S1, :S2, :S3))
+        dst = getfield(p, slot)
+        Threads.@threads for m in 1:N3
+            @inbounds begin
+                s = ρ[m] * (Float32(gasvel[m, d]) * pars.vconv)
+                tau[m] += 0.5f0 * s * s / ρ[m]
+                buf[m] = Float16(s * msc)
+            end
+        end
+        _copy_fvgk_slot16!(dst, buf)
+    end
+
+    Threads.@threads for m in 1:N3
+        @inbounds buf[m] = Float16(tau[m] * gesc)
+    end
+    _copy_fvgk_slot16!(p.Tau, buf)
+    tau = nothing
+    GC.gc()
+
+    Threads.@threads for m in 1:N3
+        @inbounds buf[m] = Float16(ρ[m] * pars.xHII0)
+    end
+    _copy_fvgk_slot16!(p.species[1], buf)
+    if length(p.species) >= 2
+        Threads.@threads for m in 1:N3
+            @inbounds buf[m] = Float16(ρ[m] * 1f-6)
+        end
+        _copy_fvgk_slot16!(p.species[2], buf)
+    end
+    if length(p.species) >= 3
+        hdfac = Float32(6.8e-5) * pars.xHII0
+        Threads.@threads for m in 1:N3
+            @inbounds buf[m] = Float16(ρ[m] * hdfac)
+        end
+        _copy_fvgk_slot16!(p.species[3], buf)
+    end
+    ρ = nothing; buf = nothing; GC.gc()
+    return pg
+end
+
+function load_cicass_gas_fvgk_direct!(pg, snap, c::Cosmo, a_i, u_i)
+    _load_fvgk_direct_from_fields!(pg, snap.gas_delta, snap.gas_vel, c, a_i, u_i)
+    @printf("  FVGK direct IC: loaded in-memory CICASS gas into resident grid\n")
+    flush(stdout)
+    return pg
+end
+
+function load_cicass_gas_stream_fvgk_direct!(pg, path::AbstractString, h, c::Cosmo, a_i, u_i)
+    pg.dedup || error("direct FVGK gas IC requires pg.dedup=true")
+    prod(pg.np) == 1 || error("direct FVGK gas IC requires np=1")
+    p = pg.patches[1]
+    N3 = h.n^3
+    pars = _fvgk_direct_gas_params(c, a_i, u_i)
+    raw = Vector{h.field_type}(undef, N3)
+    ρ = Vector{Float32}(undef, N3)
+    tau = Vector{Float32}(undef, N3)
+    buf = Vector{Float16}(undef, N3)
+    fb = Float32(c.fb); db = Float32(pg.dens_base); ds = Float32(pg.dens_scale)
+    gesc = Float32(pg.gesc); msc = Float32(pg.msc)
+    open(path, "r") do io
+        read_cicass_field!(io, raw, h, 7)
+        Threads.@threads for m in 1:N3
+            @inbounds begin
+                r = fb * (1f0 + Float32(raw[m]))
+                ρ[m] = r
+                tau[m] = r * pars.eint
+                buf[m] = _fvgk_store_density16(r, db, ds)
+            end
+        end
+        _copy_fvgk_slot16!(p.D, buf)
+
+        Threads.@threads for m in 1:N3
+            @inbounds buf[m] = Float16(ρ[m] * pars.eint * gesc)
+        end
+        _copy_fvgk_slot16!(p.Ge, buf)
+
+        for (field, slot) in zip(8:10, (:S1, :S2, :S3))
+            read_cicass_field!(io, raw, h, field)
+            dst = getfield(p, slot)
+            Threads.@threads for m in 1:N3
+                @inbounds begin
+                    s = ρ[m] * (Float32(raw[m]) * pars.vconv)
+                    tau[m] += 0.5f0 * s * s / ρ[m]
+                    buf[m] = Float16(s * msc)
+                end
+            end
+            _copy_fvgk_slot16!(dst, buf)
+        end
+    end
+    raw = nothing
+    GC.gc()
+
+    Threads.@threads for m in 1:N3
+        @inbounds buf[m] = Float16(tau[m] * gesc)
+    end
+    _copy_fvgk_slot16!(p.Tau, buf)
+    tau = nothing
+    GC.gc()
+
+    Threads.@threads for m in 1:N3
+        @inbounds buf[m] = Float16(ρ[m] * pars.xHII0)
+    end
+    _copy_fvgk_slot16!(p.species[1], buf)
+    if length(p.species) >= 2
+        Threads.@threads for m in 1:N3
+            @inbounds buf[m] = Float16(ρ[m] * 1f-6)
+        end
+        _copy_fvgk_slot16!(p.species[2], buf)
+    end
+    if length(p.species) >= 3
+        hdfac = Float32(6.8e-5) * pars.xHII0
+        Threads.@threads for m in 1:N3
+            @inbounds buf[m] = Float16(ρ[m] * hdfac)
+        end
+        _copy_fvgk_slot16!(p.species[3], buf)
+    end
+    ρ = nothing; buf = nothing; GC.gc()
+    @printf("  FVGK direct IC: streamed CICASS gas into resident grid\n")
+    flush(stdout)
+    return pg
+end
+
 function dm_ic_stream(path::AbstractString, h, c::Cosmo, u_i, backend)
     N3 = h.n^3; T = BE === :cpu ? Float64 : Float32
     VT = VEL16 ? Float16 : T
@@ -341,7 +535,7 @@ end
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
                                             nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int,
-                                            gm1, three, gesc, imsc)
+                                            gm1, three, gesc, imsc, dbase, invdscale)
     lane = KA.@index(Local, Linear)
     grp = KA.@index(Group, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
@@ -355,7 +549,7 @@ KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
         jj = (q ÷ ni) % nj + ng + 1
         kk = q ÷ (ni * nj) + ng + 1
         idx = ii + nx * (jj - 1) + nx * ny * (kk - 1)
-        d = eltype(out)(D[idx])
+        d = MultiCode._decode_density(D[idx], eltype(out)(dbase), eltype(out)(invdscale))
         if d > zero(d)
             invd = one(d) / d
             ge = eltype(out)(Ge[idx])
@@ -395,12 +589,13 @@ function max_signal(pg, work = nothing)
     smax = 0.0
     work === nothing && (work = _max_signal_work(pg))
     Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc); ims = Tloc(1.0/pg.msc)
+    db = Tloc(pg.dens_base); ids = Tloc(1.0/pg.dens_scale)
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
     for p in pg.patches                              # CFL timestep depends only on the physical
         _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
-            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs, ims; ndrange=nblocks * MAX_SIGNAL_GROUP)
+            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs, ims, db, ids; ndrange=nblocks * MAX_SIGNAL_GROUP)
         PPMKernels.KA.synchronize(pg.backend)
         copyto!(work.host, 1, work.scratch, 1, nblocks)
         smax = max(smax, Float64(maximum(@view work.host[1:nblocks])))
@@ -415,7 +610,7 @@ max_pvel(parts) = max(Float64(maximum(abs, parts.vx)),   # maximum(abs, ·) fuse
 KA.@kernel function _cell_summary_packed_k!(out, D, Ge, HII,
                                             nx::Int, ny::Int, ng::Int,
                                             ni::Int, nj::Int, nk::Int,
-                                            xh, base_mu, tempfac, gesc)
+                                            xh, base_mu, tempfac, gesc, dbase, invdscale)
     grp = KA.@index(Group, Linear)
     lane = KA.@index(Local, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
@@ -432,7 +627,7 @@ KA.@kernel function _cell_summary_packed_k!(out, D, Ge, HII,
         jj = (q ÷ ni) % nj + ng + 1
         kk = q ÷ (ni * nj) + ng + 1
         idx = ii + nx * (jj - 1) + nx * ny * (kk - 1)
-        d = eltype(out)(D[idx])
+        d = MultiCode._decode_density(D[idx], eltype(out)(dbase), eltype(out)(invdscale))
         ge = eltype(out)(Ge[idx])
         if d > zero(d)
             xfrac = ChemistryKernels.decode_log2sp(eltype(out), HII[idx])
@@ -475,7 +670,7 @@ end
 KA.@kernel function _cell_summary_float_k!(out, D, Ge, HII,
                                            nx::Int, ny::Int, ng::Int,
                                            ni::Int, nj::Int, nk::Int,
-                                           xh, base_mu, tempfac, gesc)
+                                           xh, base_mu, tempfac, gesc, dbase, invdscale)
     grp = KA.@index(Group, Linear)
     lane = KA.@index(Local, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
@@ -492,7 +687,7 @@ KA.@kernel function _cell_summary_float_k!(out, D, Ge, HII,
         jj = (q ÷ ni) % nj + ng + 1
         kk = q ÷ (ni * nj) + ng + 1
         idx = ii + nx * (jj - 1) + nx * ny * (kk - 1)
-        d = eltype(out)(D[idx])
+        d = MultiCode._decode_density(D[idx], eltype(out)(dbase), eltype(out)(invdscale))
         ge = eltype(out)(Ge[idx])
         if d > zero(d)
             xfrac = eltype(out)(HII[idx]) / d
@@ -551,17 +746,18 @@ function cell_summary(pg, c::Cosmo, u)
     base_mu = Tloc(XH + (1 - XH) / 4)
     tempfac = Tloc((GAMMA - 1) * u.T2)
     gs = Tloc(pg.gesc)
+    db = Tloc(pg.dens_base); ids = Tloc(1 / pg.dens_scale)
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
     for p in pg.patches
         if eltype(p.species[1]) === UInt16
             _cell_summary_packed_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.Ge, p.species[1],
-                nx, ny, pg.ng, ni, nj, nk, xh, base_mu, tempfac, gs;
+                nx, ny, pg.ng, ni, nj, nk, xh, base_mu, tempfac, gs, db, ids;
                 ndrange=nblocks * MAX_SIGNAL_GROUP)
         else
             _cell_summary_float_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.Ge, p.species[1],
-                nx, ny, pg.ng, ni, nj, nk, xh, base_mu, tempfac, gs;
+                nx, ny, pg.ng, ni, nj, nk, xh, base_mu, tempfac, gs, db, ids;
                 ndrange=nblocks * MAX_SIGNAL_GROUP)
         end
         PPMKernels.KA.synchronize(pg.backend)
@@ -586,7 +782,7 @@ function write_cellcmp(pg, c::Cosmo, u, a, z)
     HII = Float64.(vec(g.species[1]))
     H2I = length(g.species) >= 2 ? Float64.(vec(g.species[2])) : zero(HII)
     HDI = length(g.species) >= 3 ? Float64.(vec(g.species[3])) : zero(HII)
-    eint = Float64.(vec(g.Ge)) ./ ρb ./ pg.gesc        # un-lift f16 g.R Ge (gesc=1 unless dedup)
+    eint = Float64.(vec(g.Ge)) ./ ρb
     xHIIv = HII ./ ρb ./ XH; fH2v = H2I ./ ρb ./ XH; fHDv = HDI ./ ρb
     μv = 1.0 ./ ((XH + (1-XH)/4) .+ XH .* (xHIIv .- 0.5 .* fH2v))
     Tcell = eint .* ((GAMMA-1) .* μv .* u.T2)                  # K
@@ -657,9 +853,19 @@ function prebuild_fvgk_before_particles!(pg, a, u_i)
         MultiCode._fvgk_dedup!(pg)
         BE === :cuda && CUDA.synchronize()
         BE === :metal && Metal.synchronize()
-        @printf("  FVGK dedup ON: patch gas → g.R views, ng=0, gesc=%.0e, f32 patch copy freed\n", pg.gesc)
+        dmsg = pg.dens_base > 0 ? @sprintf(", dbase=%.6g dscale=%.0f", pg.dens_base, pg.dens_scale) : ""
+        @printf("  FVGK dedup ON: patch gas → g.R views, ng=0, gesc=%.0e%s, f32 patch copy freed\n", pg.gesc, dmsg)
         flush(stdout)
     end
+    return pg
+end
+
+function configure_fvgk_density_storage!(pg, c::Cosmo)
+    SOLVER === :fvgk || return pg
+    (BE === :metal && get(ENV, "CIC_FVGK_F16", "0") == "1") || return pg
+    pg.dens_base = parse(Float64, get(ENV, "CIC_FVGK_DENS_BASE", string(c.fb)))
+    pg.dens_scale = parse(Float64, get(ENV, "CIC_FVGK_DENS_SCALE", "256"))
+    pg.dens_scale > 0 || error("CIC_FVGK_DENS_SCALE must be positive")
     return pg
 end
 
@@ -705,13 +911,21 @@ function main()
         @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
                 ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
         dx = 1.0 / N
+        direct_ic = direct_fvgk_ic(np)
         pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
-                             besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
-        scatter_cicass_gas_stream!(pg, snap_path, h, c, a_start, u_i)
+                             besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT,
+                             packed_species=PACKED, defer_fields=direct_ic)
+        if direct_ic
+            prepare_fvgk_direct_ic!(pg, c)
+            load_cicass_gas_stream_fvgk_direct!(pg, snap_path, h, c, a_start, u_i)
+        else
+            scatter_cicass_gas_stream!(pg, snap_path, h, c, a_start, u_i)
+        end
         make_parts = () -> dm_ic_stream(snap_path, h, c, u_i, pg.backend)
         return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, 0)
     end
     snap = load_snapshot()
+    snap_ref = Ref{Any}(snap)
     N = snap.n
     ncell = (N, N, N); np = (NPX, NPX, NPX)
     Or = 4.15e-5 / snap.hconst^2   # radiation (photons + 3 relativistic ν), matching transfer.x's OmegaR
@@ -725,14 +939,27 @@ function main()
 
     # build the decomposition (dx=1/ncell: super-comoving box=1, a absorbed into units)
     dx = 1.0 / N
+    direct_ic = direct_fvgk_ic(np)
     pg = build_patchgrid(; ng=NG, ncell=ncell, np=np, dx=dx, gamma=GAMMA, nspecies=NSPEC,
-                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT, packed_species=PACKED)
-    gas = gas_ic(snap, c, a_start, u_i)
-    scatter_global!(pg, gas)
-    gas = nothing; GC.gc()
+                         besym=BE, T=T, du=u_i.d, lu=u_i.l, tu=u_i.t, deut=DEUT,
+                         packed_species=PACKED, defer_fields=direct_ic)
+    if direct_ic
+        prepare_fvgk_direct_ic!(pg, c)
+        load_cicass_gas_fvgk_direct!(pg, snap_ref[], c, a_start, u_i)
+    else
+        gas = gas_ic(snap_ref[], c, a_start, u_i)
+        scatter_global!(pg, gas)
+        gas = nothing; GC.gc()
+    end
     # DEFERRED particle upload (thunk): created AFTER the dedup pre-build inside run_evolution, so the
     # DM device arrays (~N³·18 B) don't co-reside with the f32 patches + g.R/O at the dedup transition.
-    make_parts = () -> dm_ic(snap, c, u_i, pg.backend)
+    make_parts = () -> begin
+        parts = dm_ic(snap_ref[], c, u_i, pg.backend)
+        snap_ref[] = nothing
+        GC.gc()
+        parts
+    end
+    snap = nothing
     return run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts, 0)
 end
 
@@ -860,6 +1087,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
     end
 
     a = a_start
+    configure_fvgk_density_storage!(pg, c)
     prebuild_fvgk_before_particles!(pg, a, u_i)
     BE === :cuda && (CUDA.synchronize(); GC.gc(true); CUDA.reclaim())
     BE === :metal && (Metal.synchronize(); GC.gc(true); Metal.synchronize())
@@ -902,7 +1130,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
         z = a_to_z(a); u = cosmo_units(c, a)
 
         # ── Morton-resort the DM SoA every PSORT steps (keeps deposit/gather coalesced; bit-identical) ──
-        if PSORT > 0 && cyc % PSORT == 0
+        if PSORT > 0 && cyc >= PSORT_START && (cyc - PSORT_START) % PSORT == 0
             tsort = time()
             morton_sort_particles!(parts; N=N)
             if SORT_TIMING
@@ -1046,7 +1274,7 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
 
         sec = time() - t0
         if PRINT_EVERY > 0 && cyc % PRINT_EVERY == 0
-            ρmax = maximum(Float64(maximum(p.D)) for p in pg.patches)
+            ρmax = maximum((m = Float64(maximum(p.D)); pg.dens_base > 0 ? pg.dens_base * (1 + m / pg.dens_scale) : m) for p in pg.patches)
             δrms = density_contrast_rms(pg)            # on-device (no full-grid gather)
             @printf("%-5d %-9.5f %-9.3f %-9.3e %-9.3f %-7.2f\n", cyc, a, a_to_z(a), δrms, ρmax, sec)
             flush(stdout)
