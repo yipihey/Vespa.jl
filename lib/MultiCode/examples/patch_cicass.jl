@@ -160,10 +160,17 @@ function load_snapshot()
         @printf("loading CICASS snapshot: %s\n", path); flush(stdout)
         return CICASSLib.read_snapshot(path)
     end
-    @printf("generating CICASS realization: %d³ box=%.3f Mpc/h vbc=%.1f z=%.0f\n",
-            NGRID, BOXMPCH, VBC, ZSTART); flush(stdout)
+    # CIC_FIXAMP=1 → Angulo & Pontzen (2016) fixed-amplitude ICs (|δ_k|=√P(k) exactly, random phases):
+    # realized P(k) matches the input mode-by-mode, ~4× smaller box-to-box scatter.  CIC_FLIPPHASE=1 → the
+    # paired run (δ→−δ); average the {0,1} pair to cancel leading non-Gaussian variance.  CIC_ICSEED sets the seed.
+    fixamp = get(ENV, "CIC_FIXAMP", "0") == "1"; flipph = get(ENV, "CIC_FLIPPHASE", "0") == "1"
+    icseed = parse(Int, get(ENV, "CIC_ICSEED", "113334"))
+    @printf("generating CICASS realization: %d³ box=%.3f Mpc/h vbc=%.1f z=%.0f  seed=%d%s%s\n",
+            NGRID, BOXMPCH, VBC, ZSTART, icseed, fixamp ? " FIXED-AMPLITUDE" : "",
+            flipph ? " PHASE-FLIPPED(paired)" : ""); flush(stdout)
     r = MultiCode.run_cicass_streaming(; vbc=VBC, boxlength=BOXMPCH, zstart=ZSTART,
-                                       ngrid=NGRID, real_bytes=IC_REAL_BYTES)
+                                       ngrid=NGRID, real_bytes=IC_REAL_BYTES, seed=icseed,
+                                       fix_amplitude=fixamp, flip_phase=flipph)
     return CICASSLib.read_snapshot(r.output)
 end
 
