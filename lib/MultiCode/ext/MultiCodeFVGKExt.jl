@@ -27,6 +27,7 @@ module MultiCodeFVGKExt
 using MultiCode
 using FiniteVolumeGodunovKA
 import ChemistryKernels
+using Printf
 
 const FV = FiniteVolumeGodunovKA
 module _FVGKMetalRuntime
@@ -35,6 +36,29 @@ module _FVGKMetalRuntime
 end
 
 @inline _fvgk_mtl_runtime() = _FVGKMetalRuntime
+@inline _fvgk_timing_on() = get(ENV, "CIC_FVGK_TIMING", "0") == "1"
+
+const _fvgk_kick_t = Ref(0.0)
+const _fvgk_step_t = Ref(0.0)
+const _fvgk_kick_n = Ref(0)
+const _fvgk_step_n = Ref(0)
+const _fvgk_call_n = Ref(0)
+const _fvgk_nsub_sum = Ref(0)
+
+function __init__()
+    atexit() do
+        if _fvgk_timing_on() && (_fvgk_kick_n[] > 0 || _fvgk_step_n[] > 0)
+            kavg = _fvgk_kick_n[] == 0 ? 0.0 : _fvgk_kick_t[] / _fvgk_kick_n[]
+            savg = _fvgk_step_n[] == 0 ? 0.0 : _fvgk_step_t[] / _fvgk_step_n[]
+            nsub = _fvgk_call_n[] == 0 ? 0.0 : _fvgk_nsub_sum[] / _fvgk_call_n[]
+            @printf("\nFVGK-TIMING: kicks %.4f s / %d = %.4f s | de16 steps %.4f s / %d = %.4f s | hydro calls %d avg_nsub %.2f\n",
+                    _fvgk_kick_t[], _fvgk_kick_n[], kavg,
+                    _fvgk_step_t[], _fvgk_step_n[], savg,
+                    _fvgk_call_n[], nsub)
+            flush(stdout)
+        end
+    end
+end
 
 # number of passive species (colours) carried by the patches.
 @inline _nspecies(pg::MultiCode.PatchGrid) = length(pg.patches[1].species)
@@ -68,9 +92,10 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
             recobj = rec === :plm ? FV.PLM() : rec === :pcm ? FV.PCM() : error("CIC_FVGK_RECON=$rec")
             riemobj = riem === :llf ? FV.LLF() : riem === :hllc ? FV.HLLC() : error("CIC_FVGK_RIEMANN=$riem")
             mtl = _fvgk_mtl_runtime()
+            speed_scratch = get(ENV, "CIC_FVGK_SPEED_SCRATCH", "0") == "1"
             return mtl.Grid3DMtlDE16(sys, nc; dx = Float32(pg.dx), dy = Float32(pg.dx), dz = Float32(pg.dx),
                                      recon = recobj, rsol = riemobj, ge_scale = gesc,
-                                     store = :f16, de_prec = :f16)
+                                     store = :f16, de_prec = :f16, speed_scratch = speed_scratch)
         end
         U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
@@ -199,10 +224,30 @@ function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
     return pg
 end
 
+function MultiCode._fvgk_grav_kick!(pg::MultiCode.PatchGrid, accel, dt)
+    get(ENV, "CIC_FVGK_DIRECT_KICK", "1") == "1" || return false
+    g = pg.fvgk
+    if _metal_de16(g) && _de(g, pg)
+        mtl = _fvgk_mtl_runtime()
+        if _fvgk_timing_on()
+            t0 = time()
+            mtl.mde16_grav_kick_global_potential!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
+            mtl.Metal.synchronize()
+            _fvgk_kick_t[] += time() - t0
+            _fvgk_kick_n[] += 1
+        else
+            mtl.mde16_grav_kick_global_potential!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
+        end
+        return true
+    end
+    return false
+end
+
 function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspeed=nothing)
     pg.fvgk === nothing && (pg.fvgk = _build_fvgk_global(pg))
     g = pg.fvgk; dtf = Float32(dt)
     pg.dedup || _fvgk_gather!(g, pg)                             # dedup: patches ARE g.R, no copy
+    dtf <= 0f0 && return nothing                                  # prebuild/dedup allocation path only
     # one 2nd-order CTU step; sub-cycle if the driver dt exceeds FVGK's CTU CFL. With species the
     # colours are primitives in the kernel, so use the f32 path (run_ctu!) — the f16-tiled run_ctus!
     # would underflow trace species (X~1e-30 → __half 0); pure hydro keeps the fast f16 tiled kernel.
@@ -219,12 +264,24 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspee
     # pure hydro uses the fast f16-tiled run_ctus!.
     if _metal_de16(g) && de
         mtl = _fvgk_mtl_runtime()
-        c = mtl.mde16_max_wavespeed(g)
+        c = max(sigspeed === nothing ? mtl.mde16_max_wavespeed(g) : Float32(sigspeed), eps(Float32))
         dtmax = 0.45f0 * min(g.dx, g.dy, g.dz) / c
         nsub = max(1, ceil(Int, dtf / dtmax))
         dts = dtf / nsub
-        for n in 0:(nsub-1)
-            mtl.mde16_step!(g, dts; rev = isodd(n))
+        if _fvgk_timing_on()
+            t0 = time()
+            for n in 0:(nsub-1)
+                mtl.mde16_step!(g, dts; rev = isodd(n))
+            end
+            mtl.Metal.synchronize()
+            _fvgk_step_t[] += time() - t0
+            _fvgk_step_n[] += nsub
+            _fvgk_call_n[] += 1
+            _fvgk_nsub_sum[] += nsub
+        else
+            for n in 0:(nsub-1)
+                mtl.mde16_step!(g, dts; rev = isodd(n))
+            end
         end
     elseif de
         nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))

@@ -124,16 +124,30 @@ function _mps_forward_rfft_plan(::Type{Float32}, N::NTuple{3,Int})
     end
 end
 
-function _mps_forward_rfft!(x::Metal.MtlArray{Float32,3})
+function _mps_forward_rfft!(x::Metal.MtlArray{Float32,3}, chat=nothing)
     P = _mps_forward_rfft_plan(Float32, size(x))
-    feeds = Dict{MPSGraphTensor,MPSGraphTensorData}(P.rho => MPSGraphTensorData(x))
-    results = Dict{MPSGraphTensor,MPSGraphTensorData}(P.out => MPSGraphTensorData(P.chat))
-    cmdbuf = MG.MPSCommandBuffer(Metal.global_queue(Metal.device()))
-    MG.encode!(cmdbuf, P.graph, NSDictionary(feeds), NSDictionary(results),
-               MG.nil, MG.MPSGraphExecutionDescriptor())
-    MG.commit!(cmdbuf)
-    MG.wait_completed(cmdbuf)
-    return P.chat
+    chat === nothing && (chat = P.chat)
+    MG.@autoreleasepool begin
+        feeds = Dict{MPSGraphTensor,MPSGraphTensorData}(P.rho => MPSGraphTensorData(x))
+        results = Dict{MPSGraphTensor,MPSGraphTensorData}(P.out => MPSGraphTensorData(chat))
+        cmdbuf = MG.MPSCommandBuffer(Metal.global_queue(Metal.device()))
+        MG.encode!(cmdbuf, P.graph, NSDictionary(feeds), NSDictionary(results),
+                   MG.nil, MG.MPSGraphExecutionDescriptor())
+        MG.commit!(cmdbuf)
+        MG.wait_completed(cmdbuf)
+    end
+    return chat
+end
+
+function PoissonKernels.clear_fft_scratch!(::Metal.MetalBackend)
+    Metal.synchronize()
+    if isdefined(Metal, :unsafe_free!)
+        for P in values(_MPS_FORWARD_RFFT_CACHE)
+            P.chat === nothing || Metal.unsafe_free!(P.chat)
+        end
+    end
+    empty!(_MPS_FORWARD_RFFT_CACHE)
+    return nothing
 end
 
 @kernel function _pkmu_bin_rfft_k!(psum, ksum, cnt, @Const(chat),
@@ -181,25 +195,56 @@ function PoissonKernels.fft_poisson_rfft!(φ::Metal.MtlArray{T,3},
                                           greens::Symbol=:spectral) where {T}
     N = size(ρ)
     size(φ) == N || error("fft_poisson_rfft!: φ size $(size(φ)) != ρ size $N")
+    trace = get(ENV, "CIC_MPS_RFFT_TRACE", "0") == "1"
+    live0 = if trace
+        s0 = Metal.alloc_stats
+        max(0, s0.alloc_bytes - s0.free_bytes) / 2^30
+    else
+        0.0
+    end
+    t0 = time()
     L = boxsize isa Number ? ntuple(_ -> Float64(boxsize), 3) :
         ntuple(d -> Float64(boxsize[d]), 3)
     P = _mps_rfft_plan(T, N, L, greens)
+    tplan = time()
     P.coefh[1] = Float32(G) / Float32(a)
     copyto!(P.coefd, P.coefh)
+    tcoef = time()
 
-    feeds = Dict{MPSGraphTensor,MPSGraphTensorData}(
-        P.rho => MPSGraphTensorData(ρ),
-        P.gk => MPSGraphTensorData(P.Gk),
-        P.coef => MPSGraphTensorData(P.coefd),
-    )
-    results = Dict{MPSGraphTensor,MPSGraphTensorData}(
-        P.out => MPSGraphTensorData(φ),
-    )
-    cmdbuf = MG.MPSCommandBuffer(Metal.global_queue(Metal.device()))
-    MG.encode!(cmdbuf, P.graph, NSDictionary(feeds), NSDictionary(results),
-               MG.nil, MG.MPSGraphExecutionDescriptor())
-    MG.commit!(cmdbuf)
-    MG.wait_completed(cmdbuf)
+    tprep = tcoef
+    tenc = tcoef
+    twait = 0.0
+    MG.@autoreleasepool begin
+        feeds = Dict{MPSGraphTensor,MPSGraphTensorData}(
+            P.rho => MPSGraphTensorData(ρ),
+            P.gk => MPSGraphTensorData(P.Gk),
+            P.coef => MPSGraphTensorData(P.coefd),
+        )
+        results = Dict{MPSGraphTensor,MPSGraphTensorData}(
+            P.out => MPSGraphTensorData(φ),
+        )
+        cmdbuf = MG.MPSCommandBuffer(Metal.global_queue(Metal.device()))
+        tprep = time()
+        MG.encode!(cmdbuf, P.graph, NSDictionary(feeds), NSDictionary(results),
+                   MG.nil, MG.MPSGraphExecutionDescriptor())
+        MG.commit!(cmdbuf)
+        tenc = time()
+        MG.wait_completed(cmdbuf)
+        twait = time() - tenc
+    end
+    if trace
+        s = Metal.alloc_stats
+        live = max(0, s.alloc_bytes - s.free_bytes) / 2^30
+        total = time() - t0
+        println("  MPS_RFFT_TRACE default N=$(N[1]) live=$(round(live0; digits=2))->$(round(live; digits=2)) GiB",
+                " plan=$(round(tplan-t0; digits=4))",
+                " coef=$(round(tcoef-tplan; digits=4))",
+                " prep=$(round(tprep-tcoef; digits=4))",
+                " encode=$(round(tenc-tprep; digits=4))",
+                " wait=$(round(twait; digits=4))",
+                " total=$(round(total; digits=4))")
+        flush(stdout)
+    end
     return φ
 end
 

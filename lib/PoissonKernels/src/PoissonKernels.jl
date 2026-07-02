@@ -40,7 +40,7 @@ export mg_relax!, mg_calc_defect!, mg_restrict!, mg_prolong!, comp_accel!, gathe
 export mg_dims_schedule, vcycle_solve!, fft_poisson_root!, fft_poisson_root_gpu!, fft_poisson_rfft_ka!, fft_poisson_rfft!, fft_set_num_threads!
 export vcycle_batched!, comp_accel_batched!, mg_relax_batched!
 export masked_cg!
-export power_spectrum_gpu, power_spectrum_aniso_gpu
+export power_spectrum_gpu, power_spectrum_aniso_gpu, clear_fft_scratch!
 export cic_deposit!, cic_deposit_det!, cic_deposit_fixed!, cic_deposit_bits!, cic_bits_scale
 export interp_accel_to_particles!, interp_force_from_potential!, interp_force_from_global_potential!, particle_kdk_from_global_potential!, push_particles_fused_global!, particle_kick!, particle_drift!
 export copy_field!, fill_periodic_ghosts!
@@ -78,6 +78,10 @@ A zero-filled array of element type `T` and shape `dims` living on backend `be`.
 The CPU default is `zeros(T, dims)`; the Metal extension returns an `MtlArray`.
 """
 device_zeros(::CPU, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)
+
+"Release optional backend FFT scratch that is safe to rebuild lazily."
+clear_fft_scratch!() = nothing
+clear_fft_scratch!(be) = nothing
 
 """
     to_device(be, a, T = eltype(a)) -> AbstractArray{T}

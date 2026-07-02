@@ -169,7 +169,92 @@ end
 # on a periodically-padded φ: the pad offset cancels in the CIC weights and the ghost fill IS this
 # same periodic wrap.  The half-drift excursion stays within a cell, so wrapping the ±1 stencil
 # indices (range i1−1 … i1+2) covers every access for particles anywhere in [0,1).
-@inline _wrap1(i::Int, n::Int) = mod(i - 1, n) + 1
+# Stencil indices are only one cell outside the periodic domain in this path.
+# Avoiding `mod` here is the point of the one-buffer particle fast path.
+@inline _wrap_near1(i::Int, n::Int) = ifelse(i < 1, i + n, ifelse(i > n, i - n, i))
+
+@inline function _global_phi_force(phi, i1::Int, j1::Int, k1::Int,
+                                   dxr, dyr, dzr, ex, ey, ez,
+                                   n1::Int, n2::Int, n3::Int, hc)
+    im = _wrap_near1(i1 - 1, n1)
+    i0 = _wrap_near1(i1,     n1)
+    ip = _wrap_near1(i1 + 1, n1)
+    i2 = _wrap_near1(i1 + 2, n1)
+
+    jm = _wrap_near1(j1 - 1, n2)
+    j0 = _wrap_near1(j1,     n2)
+    jp = _wrap_near1(j1 + 1, n2)
+    j2 = _wrap_near1(j1 + 2, n2)
+
+    km = _wrap_near1(k1 - 1, n3)
+    k0 = _wrap_near1(k1,     n3)
+    kp = _wrap_near1(k1 + 1, n3)
+    k2 = _wrap_near1(k1 + 2, n3)
+
+    sj = n1
+    sk = n1 * n2
+    oj0k0 = (j0 - 1) * sj + (k0 - 1) * sk
+    ojpk0 = (jp - 1) * sj + (k0 - 1) * sk
+    oj0kp = (j0 - 1) * sj + (kp - 1) * sk
+    ojpkp = (jp - 1) * sj + (kp - 1) * sk
+
+    ojmk0 = (jm - 1) * sj + (k0 - 1) * sk
+    oj2k0 = (j2 - 1) * sj + (k0 - 1) * sk
+    ojmkp = (jm - 1) * sj + (kp - 1) * sk
+    oj2kp = (j2 - 1) * sj + (kp - 1) * sk
+
+    oj0km = (j0 - 1) * sj + (km - 1) * sk
+    ojpkm = (jp - 1) * sj + (km - 1) * sk
+    oj0k2 = (j0 - 1) * sj + (k2 - 1) * sk
+    ojpk2 = (jp - 1) * sj + (k2 - 1) * sk
+
+    w000 = dxr * dyr * dzr
+    w100 = ex  * dyr * dzr
+    w010 = dxr * ey  * dzr
+    w110 = ex  * ey  * dzr
+    w001 = dxr * dyr * ez
+    w101 = ex  * dyr * ez
+    w011 = dxr * ey  * ez
+    w111 = ex  * ey  * ez
+
+    @inbounds begin
+        gx000 = -hc * (phi[ip + oj0k0] - phi[im + oj0k0])
+        gx100 = -hc * (phi[i2 + oj0k0] - phi[i0 + oj0k0])
+        gx010 = -hc * (phi[ip + ojpk0] - phi[im + ojpk0])
+        gx110 = -hc * (phi[i2 + ojpk0] - phi[i0 + ojpk0])
+        gx001 = -hc * (phi[ip + oj0kp] - phi[im + oj0kp])
+        gx101 = -hc * (phi[i2 + oj0kp] - phi[i0 + oj0kp])
+        gx011 = -hc * (phi[ip + ojpkp] - phi[im + ojpkp])
+        gx111 = -hc * (phi[i2 + ojpkp] - phi[i0 + ojpkp])
+
+        gy000 = -hc * (phi[i0 + ojpk0] - phi[i0 + ojmk0])
+        gy100 = -hc * (phi[ip + ojpk0] - phi[ip + ojmk0])
+        gy010 = -hc * (phi[i0 + oj2k0] - phi[i0 + oj0k0])
+        gy110 = -hc * (phi[ip + oj2k0] - phi[ip + oj0k0])
+        gy001 = -hc * (phi[i0 + ojpkp] - phi[i0 + ojmkp])
+        gy101 = -hc * (phi[ip + ojpkp] - phi[ip + ojmkp])
+        gy011 = -hc * (phi[i0 + oj2kp] - phi[i0 + oj0kp])
+        gy111 = -hc * (phi[ip + oj2kp] - phi[ip + oj0kp])
+
+        gz000 = -hc * (phi[i0 + oj0kp] - phi[i0 + oj0km])
+        gz100 = -hc * (phi[ip + oj0kp] - phi[ip + oj0km])
+        gz010 = -hc * (phi[i0 + ojpkp] - phi[i0 + ojpkm])
+        gz110 = -hc * (phi[ip + ojpkp] - phi[ip + ojpkm])
+        gz001 = -hc * (phi[i0 + oj0k2] - phi[i0 + oj0k0])
+        gz101 = -hc * (phi[ip + oj0k2] - phi[ip + oj0k0])
+        gz011 = -hc * (phi[i0 + ojpk2] - phi[i0 + ojpk0])
+        gz111 = -hc * (phi[ip + ojpk2] - phi[ip + ojpk0])
+    end
+
+    ax = gx000 * w000 + gx100 * w100 + gx010 * w010 + gx110 * w110 +
+         gx001 * w001 + gx101 * w101 + gx011 * w011 + gx111 * w111
+    ay = gy000 * w000 + gy100 * w100 + gy010 * w010 + gy110 * w110 +
+         gy001 * w001 + gy101 * w101 + gy011 * w011 + gy111 * w111
+    az = gz000 * w000 + gz100 * w100 + gz010 * w010 + gz110 * w110 +
+         gz001 * w001 + gz101 * w101 + gz011 * w011 + gz111 * w111
+    return ax, ay, az
+end
+
 @kernel function _interp_force_global_phi_kernel!(axp, ayp, azp,
                                                   @Const(px), @Const(py), @Const(pz),
                                                   @Const(vx), @Const(vy), @Const(vz), @Const(φg),
@@ -181,17 +266,10 @@ end
         i1 = unsafe_trunc(Int, xpos+c05); j1 = unsafe_trunc(Int, ypos+c05); k1 = unsafe_trunc(Int, zpos+c05)
         dxr = oftype(xpos,i1)+c05-xpos; dyr = oftype(ypos,j1)+c05-ypos; dzr = oftype(zpos,k1)+c05-zpos
         ex = c1-dxr; ey = c1-dyr; ez = c1-dzr
-        φr(i,j,k) = φg[_wrap1(i,n1), _wrap1(j,n2), _wrap1(k,n3)]
-        gxc(i,j,k) = -hc*(φr(i+1,j,k)-φr(i-1,j,k))
-        gyc(i,j,k) = -hc*(φr(i,j+1,k)-φr(i,j-1,k))
-        gzc(i,j,k) = -hc*(φr(i,j,k+1)-φr(i,j,k-1))
-        w(a,b,c) = a*b*c
-        axp[p] = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-                 gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
-        ayp[p] = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-                 gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
-        azp[p] = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-                 gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ax, ay, az = _global_phi_force(φg, i1, j1, k1, dxr, dyr, dzr, ex, ey, ez, n1, n2, n3, hc)
+        axp[p] = ax
+        ayp[p] = ay
+        azp[p] = az
     end
 end
 
@@ -237,17 +315,7 @@ end
         dyr = oftype(ypos, j1) + c05 - ypos
         dzr = oftype(zpos, k1) + c05 - zpos
         ex = c1 - dxr; ey = c1 - dyr; ez = c1 - dzr
-        φr(i,j,k) = φg[_wrap1(i, n1), _wrap1(j, n2), _wrap1(k, n3)]
-        gxc(i,j,k) = -hc * (φr(i+1,j,k) - φr(i-1,j,k))
-        gyc(i,j,k) = -hc * (φr(i,j+1,k) - φr(i,j-1,k))
-        gzc(i,j,k) = -hc * (φr(i,j,k+1) - φr(i,j,k-1))
-        w(a,b,c) = a * b * c
-        ax = gxc(i1,j1,k1)*w(dxr,dyr,dzr)+gxc(i1+1,j1,k1)*w(ex,dyr,dzr)+gxc(i1,j1+1,k1)*w(dxr,ey,dzr)+gxc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-             gxc(i1,j1,k1+1)*w(dxr,dyr,ez)+gxc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gxc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gxc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
-        ay = gyc(i1,j1,k1)*w(dxr,dyr,dzr)+gyc(i1+1,j1,k1)*w(ex,dyr,dzr)+gyc(i1,j1+1,k1)*w(dxr,ey,dzr)+gyc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-             gyc(i1,j1,k1+1)*w(dxr,dyr,ez)+gyc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gyc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gyc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
-        az = gzc(i1,j1,k1)*w(dxr,dyr,dzr)+gzc(i1+1,j1,k1)*w(ex,dyr,dzr)+gzc(i1,j1+1,k1)*w(dxr,ey,dzr)+gzc(i1+1,j1+1,k1)*w(ex,ey,dzr)+
-             gzc(i1,j1,k1+1)*w(dxr,dyr,ez)+gzc(i1+1,j1,k1+1)*w(ex,dyr,ez)+gzc(i1,j1+1,k1+1)*w(dxr,ey,ez)+gzc(i1+1,j1+1,k1+1)*w(ex,ey,ez)
+        ax, ay, az = _global_phi_force(φg, i1, j1, k1, dxr, dyr, dzr, ex, ey, ez, n1, n2, n3, hc)
 
         Tv = eltype(vx)
         nvx = Tv(vx[p] + ax * ts)

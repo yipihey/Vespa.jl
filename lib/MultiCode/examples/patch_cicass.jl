@@ -84,6 +84,7 @@ const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full
 # barriers that serialize the GPU, so it INFLATES the wall a bit — use it only for the breakdown,
 # never to quote production throughput (the uninstrumented sec/cyc is the real number).
 const PHASE = get(ENV, "CIC_PHASE_TIMING", "0") == "1"
+const GRAV_DETAIL = get(ENV, "CIC_GRAV_DETAIL", "0") == "1"
 # CIC_PSORT=K: Morton-sort the DM particle SoA every K steps to keep the CIC deposit/force-gather
 # coalesced as the DM clusters.  0 = off.  On Metal, CIC_PSORT_MODE=auto uses a low-memory
 # coarse-bucket Morton reorder (CIC_PSORT_BUCKET, power-of-two, default ≤256) because Metal has no
@@ -776,6 +777,8 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
     pscratch = nothing
     grav_t = Ref(0.0); fft_t = Ref(0.0); ngrav = Ref(0)
     asm_t = Ref(0.0); pacc_t = Ref(0.0); pfld_t = Ref(0.0)
+    gd_asm_t = Ref(0.0); gd_gas_t = Ref(0.0); gd_dep_t = Ref(0.0); gd_mean_t = Ref(0.0)
+    gd_fft_t = Ref(0.0); gd_pacc_t = Ref(0.0); gd_pfld_t = Ref(0.0); gd_n = Ref(0)
     gph_t = Ref(0.0); hyd_t = Ref(0.0); chm_t = Ref(0.0); prt_t = Ref(0.0); nph = Ref(0)  # CIC_PHASE_TIMING
 
     # output checkpoints in a: explicit CIC_ZOUT="z1,z2,…" (the cross-code list) or log-spaced.
@@ -837,6 +840,12 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
                                    particles=parts, dt=dt_, ρd=ρd, φd=φd,
                                    global_push=GRAV1BUF)
             BE === :cuda && CUDA.synchronize()
+            if GRAV_DETAIL && haskey(g, :timing)
+                gt = g.timing
+                gd_asm_t[] += gt.assemble; gd_gas_t[] += gt.gas; gd_dep_t[] += gt.deposit
+                gd_mean_t[] += gt.mean; gd_fft_t[] += gt.fft; gd_pacc_t[] += gt.patch_accel
+                gd_pfld_t[] += gt.particle_field; gd_n[] += 1
+            end
             fft_t[] += time() - tgpu
             ngrav[] += 1
             return g
@@ -1070,6 +1079,12 @@ function run_evolution(c, N, ncell, np, a_start, a_end, u_i, dx, pg, make_parts,
         if gravmode === :gpu
             @printf("top-grid gravity (%s): %.4f s/solve  [device assemble+rFFT+field] over %d solves\n",
                     fftlabel, fft_t[]/n, ngrav[])
+            if GRAV_DETAIL && gd_n[] > 0
+                m = gd_n[]
+                @printf("  GPU gravity detail: assemble %.4f [gas %.4f | deposit %.4f | mean %.4f] | FFT %.4f | patch_accel %.4f | particle_field %.4f over %d solves\n",
+                        gd_asm_t[]/m, gd_gas_t[]/m, gd_dep_t[]/m, gd_mean_t[]/m,
+                        gd_fft_t[]/m, gd_pacc_t[]/m, gd_pfld_t[]/m, m)
+            end
         else
             gavg = (asm_t[] + fft_t[] + pacc_t[] + pfld_t[]) / n
             @printf("top-grid gravity (%s): %.4f s/solve  [assemble %.4f | FFT %.4f | patch_accel %.4f | part_field %.4f] over %d solves\n",

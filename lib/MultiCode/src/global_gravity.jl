@@ -172,9 +172,13 @@ is fixed by Ωb,Ω0 (mass conservation in a periodic box), there is NO reduction
 field, so f32 carries the overdensity fine (no √N·ε mean error) — no f64 needed.
 """
 function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt::Real=0.0,
-                                      a::Real=1.0, meandens::Real=1.0, depbuf=nothing)
+                                      a::Real=1.0, meandens::Real=1.0, depbuf=nothing,
+                                      timing=nothing)
     be = pg.backend; T = pg.T; nc = pg.ncell; Ntot = prod(nc)
     all(==(nc[1]), nc) || error("assemble_global_density_gpu!: cubic ncell required")
+    detail = timing !== nothing
+    syncd() = detail ? PPMKernels.KA.synchronize(be) : nothing
+    tgas = time()
     fill!(ρd, zero(T))
     li, lj, lk = _interior(pg)
     for p in pg.patches                                   # gas octants, device→device
@@ -182,7 +186,10 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
         D3 = reshape(p.D, pg.nd)
         @views ρd[gi, gj, gk] .= D3[li, lj, lk]
     end
+    syncd(); gas_t = time() - tgas
+    dep_t = 0.0
     if particles !== nothing                              # DM periodic CIC on device
+        tdep = time()
         # DETERMINISTIC integer deposit (quantized weights + integer atomics, order-
         # independent) so the gravity — and hence checkpoint/restart and run-to-run — is
         # bit-reproducible.  The float `cic_deposit!`'s atomicAdd is order-dependent: the
@@ -203,13 +210,22 @@ function assemble_global_density_gpu!(ρd, pg::PatchGrid; particles=nothing, dt:
         # once freed, keeps the CUDA.jl pool reservation high and starves cuFFT's out-of-pool work
         # area at the grid ceiling).  reshape(ρpi) is a view; Int32*Float32 promotes per-element.
         ρd .+= reshape(ρpi, nc) .* T(2.0^-23)
-        # Release the freshly-allocated deposit buffer NOW (before the FFT allocates its scratch): the
-        # FFT then REUSES this pool block instead of growing the pool.  (Skip when borrowed — not ours.)
-        borrowed || let m = parentmodule(typeof(ρpi))
-            isdefined(m, :unsafe_free!) && m.unsafe_free!(ρpi)
+        # Release the freshly-allocated deposit buffer before the FFT.  On Metal the producer kernels
+        # and the following MPSGraph command are separate command buffers, so make the release
+        # stream-safe; otherwise the 1024³ Int32 accumulator can linger/retire late and inflate the
+        # next FFT's live set by a full 4 GiB.
+        if !borrowed
+            occursin("Metal", string(typeof(be))) && PPMKernels.KA.synchronize(be)
+            let m = parentmodule(typeof(ρpi))
+                isdefined(m, :unsafe_free!) && m.unsafe_free!(ρpi)
+            end
         end
+        syncd(); dep_t = time() - tdep
     end
+    tmean = time()
     ρd .-= T(meandens)                                    # known constant — no reduction, no f64
+    syncd(); mean_t = time() - tmean
+    timing !== nothing && (timing[] = (gas=gas_t, deposit=dep_t, mean=mean_t))
     return ρd
 end
 
@@ -284,6 +300,13 @@ function _deposit_weighted_unif!(be, ρ, parts, w; N::Integer)
     return reshape(ρ, (N, N, N))
 end
 
+function _free_device_buffer!(a)
+    a === nothing && return nothing
+    m = parentmodule(typeof(a))
+    isdefined(m, :unsafe_free!) && getfield(m, :unsafe_free!)(a)
+    return nothing
+end
+
 """
     patch_power_spectra(pg, parts; box, nmu=4, nbins=0, axis=1, scale_v=1.0, velocity=true)
         -> (; k, gas_delta, dm_delta, gas_vel, Nmodes)
@@ -330,11 +353,11 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
             Nm === nothing && (Nm = Pv.Nmodes; kk = Pv.k)
         end
         Pvgas = (k=kk, P=Psum, Nmodes=Nm)
-        mom = nothing
+        _free_device_buffer!(mom); mom = nothing
     end
     _normalize_delta!(be, g, μg)
     Pgas = pk(g)
-    g = nothing
+    _free_device_buffer!(g); g = nothing
     # ── DM: overdensity + mass-weighted velocity via the deterministic CIC deposit ──
     ρpi = PPMKernels.device_zeros(be, metal ? T : Int64, (Ntot,))
     ρd  = dep!(ρpi, parts.mass)
@@ -356,10 +379,12 @@ function patch_power_spectra(pg::PatchGrid, parts; box::Real, nmu::Integer=4, nb
             Nm === nothing && (Nm = Pv.Nmodes; kk = Pv.k)
         end
         Pvdm = (k=kk, P=Psum, Nmodes=Nm)
-        pc = nothing
+        _free_device_buffer!(pc); pc = nothing
     end
     _normalize_delta!(be, ρd, μd)
     Pdm = pk(ρd)
+    _free_device_buffer!(ρpi)
+    pg.besym === :metal && PoissonKernels.clear_fft_scratch!(pg.backend)
     return (; k=Pgas.k, gas_delta=Pgas.P, dm_delta=Pdm.P,
             gas_vel=(Pvgas===nothing ? nothing : Pvgas.P),
             dm_vel =(Pvdm ===nothing ? nothing : Pvdm.P), Nmodes=Pgas.Nmodes)
@@ -406,22 +431,48 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     kafft = get(ENV, "CIC_GRAV_KAFFT", "0") == "1"
     rfft  = kafft && get(ENV, "CIC_GRAV_KAFFT_C2C", "0") != "1"
     depbuf = (kafft && !rfft) ? PoissonKernels.poisson_scratch_i32(be, pg.T, nc) : nothing  # only c2c has an N³ buffer to lend
-    assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a, meandens=meandens, depbuf=depbuf)
+    detail = get(ENV, "CIC_GRAV_DETAIL", "0") == "1"
+    syncd() = detail ? PPMKernels.KA.synchronize(be) : nothing
+    asm_ref = Ref{Any}(nothing)
+    tasm = time()
+    assemble_global_density_gpu!(ρd, pg; particles=particles, dt=dt, a=a,
+                                 meandens=meandens, depbuf=depbuf,
+                                 timing=detail ? asm_ref : nothing)
+    syncd(); asm_t = time() - tasm
+    tfft = time()
     if kafft
         rfft ? PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=G, a=a, boxsize=boxsize) :
                PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=G, a=a, boxsize=boxsize)
     else
         PoissonKernels.fft_poisson_rfft!(φd, ρd; G=G, a=a, boxsize=boxsize)   # native rfft; φd may === ρd
     end
+    syncd(); fft_t = time() - tfft
     # dedup: the gas kick reads the GLOBAL φ directly (grav_kick_from_global_potential!), so the
     # per-patch ghosted φ-block copy is unnecessary — pass φd itself as the "accel".
+    tpacc = time()
     gas = pg.dedup ? φd : patch_accel_gpu(pg, φd; dx=pg.dx)
+    syncd(); pacc_t = time() - tpacc
+    mk_timing(pfield_t) = detail ? (;
+        assemble = asm_t,
+        gas = asm_ref[] === nothing ? 0.0 : asm_ref[].gas,
+        deposit = asm_ref[] === nothing ? 0.0 : asm_ref[].deposit,
+        mean = asm_ref[] === nothing ? 0.0 : asm_ref[].mean,
+        fft = fft_t,
+        patch_accel = pacc_t,
+        particle_field = pfield_t,
+    ) : nothing
     if global_push
         # particles read the GLOBAL φ (periodic wrap) — no padded (ncell+2ng2)³ copy, no fill work.
-        return (gas=gas, phi=φd, le=0.0, cs=1.0/nc[1], nc=nc)
+        timing = mk_timing(0.0)
+        return detail ? (gas=gas, phi=φd, le=0.0, cs=1.0/nc[1], nc=nc, timing=timing) :
+                        (gas=gas, phi=φd, le=0.0, cs=1.0/nc[1], nc=nc)
     end
+    tpfld = time()
     φpad, le, cs = particle_accel_field_gpu(pg, φd; ng2=ng2)
-    return (gas=gas, phi=φpad, le=le, cs=cs, nc=nothing)
+    syncd(); pfld_t = time() - tpfld
+    timing = mk_timing(pfld_t)
+    return detail ? (gas=gas, phi=φpad, le=le, cs=cs, nc=nothing, timing=timing) :
+                    (gas=gas, phi=φpad, le=le, cs=cs, nc=nothing)
 end
 
 """

@@ -107,6 +107,7 @@ function _fvgk_patch_hydro! end
 # views), free the f32 patch arrays, and set ng=0 / gesc=GE_SCALE / dedup=true.  Eliminates the
 # patch↔g.R duplication.  Defined by MultiCodeFVGKExt (only meaningful for solver=:fvgk).
 function _fvgk_dedup! end
+_fvgk_grav_kick!(pg, accel, dt) = false
 
 # ── interior-only chemistry: strided, in-place, f32 storage / f64 network ──────────────────────
 # Processes ONLY the pdim³ interior cells: maps the linear interior thread → the strided nd³ index
@@ -376,6 +377,7 @@ end
 # GE_SCALE-aware so the f16-lifted Tau slot stays consistent).
 function _apply_grav_kick!(pg::PatchGrid, accel, dt)
     if pg.dedup
+        _fvgk_grav_kick!(pg, accel, dt) && return nothing
         p = pg.patches[1]
         PoissonKernels.grav_kick_from_global_potential!(accel, p.D, p.S1, p.S2, p.S3, p.Tau;
             nc=pg.ncell, dx=pg.dx, halfdt=0.5*dt, gesc=pg.gesc)
