@@ -341,7 +341,7 @@ end
 # ── per-patch signal speed (code units): max(|vx|+|vy|+|vz|+3·cs) over all patches ──
 KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
                                             nx::Int, ny::Int, ng::Int, ni::Int, nj::Int, nk::Int,
-                                            gm1, three, gesc)
+                                            gm1, three, gesc, imsc)
     lane = KA.@index(Local, Linear)
     grp = KA.@index(Group, Linear)
     lanes = KA.@uniform prod(KA.@groupsize())
@@ -360,9 +360,9 @@ KA.@kernel function _max_signal_partials_k!(out, D, S1, S2, S3, Ge,
             invd = one(d) / d
             ge = eltype(out)(Ge[idx])
             cs = sqrt(max(eltype(out)(gm1) * ge * invd / eltype(out)(gesc), zero(d)))
-            v = abs(eltype(out)(S1[idx]) * invd) +
+            v = eltype(out)(imsc) * (abs(eltype(out)(S1[idx]) * invd) +     # un-lift MOM_SCALE from |v|=|S|/ρ
                 abs(eltype(out)(S2[idx]) * invd) +
-                abs(eltype(out)(S3[idx]) * invd) +
+                abs(eltype(out)(S3[idx]) * invd)) +
                 eltype(out)(three) * cs
         end
     end
@@ -394,13 +394,13 @@ end
 function max_signal(pg, work = nothing)
     smax = 0.0
     work === nothing && (work = _max_signal_work(pg))
-    Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc)
+    Tloc = eltype(work.host); gm1 = Tloc(GAMMA * (GAMMA - 1)); gs = Tloc(pg.gesc); ims = Tloc(1.0/pg.msc)
     nblocks = cld(prod(pg.pdim), MAX_SIGNAL_GROUP)
     nx, ny, _ = pg.nd
     ni, nj, nk = pg.pdim
     for p in pg.patches                              # CFL timestep depends only on the physical
         _max_signal_partials_k!(pg.backend, MAX_SIGNAL_GROUP)(work.scratch, p.D, p.S1, p.S2, p.S3, p.Ge,
-            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs; ndrange=nblocks * MAX_SIGNAL_GROUP)
+            nx, ny, pg.ng, ni, nj, nk, gm1, Tloc(3), gs, ims; ndrange=nblocks * MAX_SIGNAL_GROUP)
         PPMKernels.KA.synchronize(pg.backend)
         copyto!(work.host, 1, work.scratch, 1, nblocks)
         smax = max(smax, Float64(maximum(@view work.host[1:nblocks])))
@@ -694,11 +694,14 @@ function main()
         h = cicass_header(snap_path)
         N = h.n
         ncell = (N, N, N); np = (NPX, NPX, NPX)
-        c = Cosmo(; Om=h.omega_m, OL=h.omega_l, h0=h.hconst*100, box=h.box, Ob=h.omega_b)
+        Or = 4.15e-5 / h.hconst^2      # radiation (photons + 3 relativistic ν), matching transfer.x's
+        # OmegaR — the CICASS ICs & linear theory include it, so the expansion MUST too or the DM
+        # over-grows at high z (radiation is ~30% of matter at z=1000 → DM Δ² +33..43% too high).
+        c = Cosmo(; Om=h.omega_m, OL=h.omega_l - Or, h0=h.hconst*100, box=h.box, Ob=h.omega_b, Or=Or)
         a_start = z_to_a(ZSTART); a_end = z_to_a(ZEND)
         u_i = cosmo_units(c, a_start)
-        @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.3f h=%.3f\n",
-                N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.h0/100)
+        @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.5f Ωr=%.3e h=%.3f\n",
+                N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.Or, c.h0/100)
         @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
                 ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
         dx = 1.0 / N
@@ -711,11 +714,12 @@ function main()
     snap = load_snapshot()
     N = snap.n
     ncell = (N, N, N); np = (NPX, NPX, NPX)
-    c = Cosmo(; Om=snap.omega_m, OL=snap.omega_l, h0=snap.hconst*100, box=snap.box, Ob=snap.omega_b)
+    Or = 4.15e-5 / snap.hconst^2   # radiation (photons + 3 relativistic ν), matching transfer.x's OmegaR
+    c = Cosmo(; Om=snap.omega_m, OL=snap.omega_l - Or, h0=snap.hconst*100, box=snap.box, Ob=snap.omega_b, Or=Or)
     a_start = z_to_a(ZSTART); a_end = z_to_a(ZEND)
     u_i = cosmo_units(c, a_start)
-    @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.3f h=%.3f\n",
-            N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.h0/100)
+    @printf("CICASS patch run: %d³ → %d patches of %d³, box=%.4f Mpc/h, Ωm=%.3f Ωb=%.4f ΩΛ=%.5f Ωr=%.3e h=%.3f\n",
+            N, prod(np), N÷NPX, c.box, c.Om, c.fb*c.Om, c.OL, c.Or, c.h0/100)
     @printf("  z=%.0f→%.0f  a=%.3e→%.3e  scale_v(a_i)=%.4e cm/s  D(a_i)=%.4e\n",
             ZSTART, ZEND, a_start, a_end, u_i.v, growth_D(c, a_start)); flush(stdout)
 

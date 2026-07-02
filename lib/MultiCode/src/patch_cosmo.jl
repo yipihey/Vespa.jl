@@ -47,16 +47,35 @@ function cosmo_units(c::Cosmo, a)
     (d=sd, l=sl, t=st, v=sv, T2=_MH/_KB*sv^2, nH=c.XH/_MH*sd)
 end
 
-"Linear growth factor D(a) (Heath 1977; matter+Λ(+curv,rad))."
+"""
+    growth_D(c::Cosmo, a) -> D(a)
+
+Linear CDM growth factor, normalized D→a as a→0.  Integrates the growing-mode ODE in ln a,
+
+    D'' + (2 + dlnH/dlna) D' − (3/2) Ω_m(a) D = 0,
+
+where RADIATION enters ONLY through H(a) and Ω_m(a)=ρ_m/ρ_tot — it does not cluster.  (The old
+Heath integral H(a)∫da/(aH)³ is exact for matter+Λ but INVALID with radiation: its decaying mode
+δ⁻∝H(a) picks up a spurious (8/3)ρ_r term, so it over-predicts D at high z where Ω_r matters —
+which made the DM over-grow relative to the transfer.x linear theory.)
+"""
 function growth_D(c::Cosmo, a)
-    E(x) = sqrt(c.Om/x^3 + c.Or/x^4 + c.OL + c.Ok/x^2)
-    f(x) = 1.0 / (x*E(x))^3
-    n = 4000; h = a/n; s = 0.0
-    @inbounds for i in 1:n
-        x0 = (i-1)*h + 1e-12; x1 = i*h
-        s += 0.5*(f(x0)+f(x1))*h
+    E2(x)   = c.Om/x^3 + c.Or/x^4 + c.OL + c.Ok/x^2
+    Oma(x)  = (c.Om/x^3) / E2(x)                              # clustering source (matter only)
+    dlnH(x) = -(3*c.Om/x^3 + 4*c.Or/x^4 + 2*c.Ok/x^2) / (2*E2(x))
+    fr(u, D, Dp) = (Dp, -(2 + dlnH(exp(u)))*Dp + 1.5*Oma(exp(u))*D)
+    a0 = 1e-6; u = log(a0); h = (log(a) - u) / 3000
+    D = a0; Dp = a0                                          # growing mode D∝a: D=a0, dD/dlna=a0
+    @inbounds for _ in 1:3000                                # RK4 in u = ln a
+        k1D,k1P = fr(u,       D,          Dp)
+        k2D,k2P = fr(u+h/2,   D+h/2*k1D,  Dp+h/2*k1P)
+        k3D,k3P = fr(u+h/2,   D+h/2*k2D,  Dp+h/2*k2P)
+        k4D,k4P = fr(u+h,     D+h*k3D,    Dp+h*k3P)
+        D  += h/6*(k1D + 2k2D + 2k3D + k4D)
+        Dp += h/6*(k1P + 2k2P + 2k3P + k4P)
+        u  += h
     end
-    return E(a) * s
+    return D
 end
 
 "Compton drag rate Γ/H at redshift `z` given ionized fraction `xe` (cgs)."
@@ -71,16 +90,21 @@ a_to_z(a) = 1.0/a - 1.0
 # in per-cell Float32 (so cold-gas Sᵢ² doesn't underflow f16 g.R storage) with ZERO N³ temporaries —
 # the broadcast form materialized ~5·N³·4 B of scratch, which is the binding alloc near the grid ceiling.
 # gs = GE_SCALE lifts the KE increment into the f16-lifted Tau slot (1 in the non-dedup f32 path).
-@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs)
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), vx, vy, vz, ff, gs, msc)
+    # MOM_SCALE-aware: S1..S3 are stored LIFTED (×msc) in the FVGK dedup.  Un-lift to the TRUE momentum
+    # BEFORE the quadratic KE (else msc²≈1e8 amplifies the ke intermediates → f32 overflow → NaN), damp in
+    # true units, then re-lift on store.  vx,vy,vz are the TRUE bulk velocity; gs = GE_SCALE (true KE→Tau).
+    # msc=1 ⇒ every ×im/×msc is a no-op, so this is identical to the un-lifted path.
     i = @index(Global)
     @inbounds begin
         d = Float32(D[i])
         if d > 0f0
-            s1 = Float32(S1[i]); s2 = Float32(S2[i]); s3 = Float32(S3[i])
+            im = 1f0/Float32(msc); ms = Float32(msc)
+            s1 = Float32(S1[i])*im; s2 = Float32(S2[i])*im; s3 = Float32(S3[i])*im   # un-lift → true momentum
             ke0 = (s1*s1 + s2*s2 + s3*s3) / (2f0*d)
             n1 = d*vx + (s1 - d*vx)*ff; n2 = d*vy + (s2 - d*vy)*ff; n3 = d*vz + (s3 - d*vz)*ff
             ke1 = (n1*n1 + n2*n2 + n3*n3) / (2f0*d)
-            S1[i] = eltype(S1)(n1); S2[i] = eltype(S2)(n2); S3[i] = eltype(S3)(n3)
+            S1[i] = eltype(S1)(n1*ms); S2[i] = eltype(S2)(n2*ms); S3[i] = eltype(S3)(n3*ms)   # re-lift on store
             Tau[i] = eltype(Tau)(Float32(Tau[i]) + (ke1 - ke0)*gs)
         end
     end
@@ -102,9 +126,12 @@ function compton_drag_patches!(pg::PatchGrid, f::Real)
         M  += _interior_sum(pg, p.D)
         px += _interior_sum(pg, p.S1); py += _interior_sum(pg, p.S2); pz += _interior_sum(pg, p.S3)
     end
-    ff = Float32(f); vx = Float32(px/M); vy = Float32(py/M); vz = Float32(pz/M); gs = Float32(pg.gesc)
+    # px is the LIFTED momentum sum (×msc in the dedup); un-lift the bulk velocity so the kernel works in TRUE
+    # units (it un-lifts each cell's S and re-lifts on store).  gs = GE_SCALE (the kernel forms the true KE).
+    ims = Float32(1.0/pg.msc)
+    ff = Float32(f); vx = Float32(px/M)*ims; vy = Float32(py/M)*ims; vz = Float32(pz/M)*ims; gs = Float32(pg.gesc)
     for p in pg.patches
-        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs; ndrange = length(p.D))
+        _compton_drag_k!(pg.backend)(p.S1, p.S2, p.S3, p.Tau, p.D, vx, vy, vz, ff, gs, Float32(pg.msc); ndrange = length(p.D))
     end
     return nothing
 end

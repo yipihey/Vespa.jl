@@ -30,12 +30,8 @@ import ChemistryKernels
 using Printf
 
 const FV = FiniteVolumeGodunovKA
-module _FVGKMetalRuntime
-    using FiniteVolumeGodunovKA, Metal
-    include(joinpath(pkgdir(FiniteVolumeGodunovKA), "metal", "metal.jl"))
-end
-
-@inline _fvgk_mtl_runtime() = _FVGKMetalRuntime
+# The Metal FVGK runtime (`using Metal` + metal/metal.jl) lives in MultiCodeFVGKMetalExt — Metal.jl is
+# Apple-only, so this common extension carries NO Metal reference and loads on CUDA/CPU platforms.
 @inline _fvgk_timing_on() = get(ENV, "CIC_FVGK_TIMING", "0") == "1"
 
 const _fvgk_kick_t = Ref(0.0)
@@ -87,15 +83,8 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # 1e7 maps that range to f16-normal [~4e-4, 0.12] (and E≲1e-4 → ≲1e3, no overflow).
         gesc = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
         if pg.besym === :metal
-            store = Symbol(get(ENV, "CIC_FVGK_STORE", "f16"))
-            store === :f16 || error("solver=:fvgk on Metal requires CIC_FVGK_STORE=f16 (got :$store)")
-            recobj = rec === :plm ? FV.PLM() : rec === :pcm ? FV.PCM() : error("CIC_FVGK_RECON=$rec")
-            riemobj = riem === :llf ? FV.LLF() : riem === :hllc ? FV.HLLC() : error("CIC_FVGK_RIEMANN=$riem")
-            mtl = _fvgk_mtl_runtime()
-            speed_scratch = get(ENV, "CIC_FVGK_SPEED_SCRATCH", "0") == "1"
-            return mtl.Grid3DMtlDE16(sys, nc; dx = Float32(pg.dx), dy = Float32(pg.dx), dz = Float32(pg.dx),
-                                     recon = recobj, rsol = riemobj, ge_scale = gesc,
-                                     store = :f16, de_prec = :f16, speed_scratch = speed_scratch)
+            # Metal grid built by MultiCodeFVGKMetalExt (needs `using Metal`); no Metal ref here.
+            return MultiCode._fvgk_build_metal_grid(pg, sys, nc, rec, riem, gesc)
         end
         U0 = [z for _ in 1:nc[1], _ in 1:nc[2], _ in 1:nc[3]]
         # CIC_FVGK_STORE=f16 (default) makes g.R/g.O __half → HALVES the grid buffer (the biggest persistent
@@ -104,7 +93,7 @@ function _build_fvgk_global(pg::MultiCode.PatchGrid)
         # scratch=:minimal drops the rk2-only third state buffer (NV·VOL) — the DE path always
         # steps with run_ctus_de16! (R+O only), so this saves a full grid buffer (~14 B/cell @f16).
         return Grid3DCuMarch(sys, U0; dx = Float32(pg.dx), riemann = riem, recon = rec,
-                             de_prec = :f16, ge_scale = gesc, store = store, scratch = :minimal)
+                             de_prec = :f16, ge_scale = gesc, mom_scale = _msc(), store = store, scratch = :minimal)
     end
     pg.besym === :metal && error("solver=:fvgk on Metal currently requires CIC_FVGK_F16=1")
     if nsp == 0
@@ -128,6 +117,9 @@ end
 # f16-storage grid (g.R is __half)? then the energy slots (5=E,6=Ge) are stored GE_SCALE-lifted.
 @inline _f16store(g) = (hasproperty(g, :R) ? eltype(g.R) : eltype(g.U)) === Float16
 @inline _gesc() = parse(Float32, get(ENV, "CIC_FVGK_GE_SCALE", "1e7"))
+# MOM_SCALE: lift the conserved momenta S1,S2,S3 into f16's normal range (in a baryon-rest frame S=ρ·δv is a
+# small no-pedestal number that underflows the f16 store).  Default 1 (off); CIC_FVGK_MOM_SCALE=1e4 to enable.
+@inline _msc() = parse(Float32, get(ENV, "CIC_FVGK_MOM_SCALE", "1"))
 
 # Conserved fields map 1:1 onto the global var-major slots: (D,S1,S2,S3,Tau) then the species in slots
 # 6..5+nsp as LINEAR ρ·xᵢ (the EulerColors conserved colours). Ge is NOT carried (re-derived post-step).
@@ -138,13 +130,15 @@ end
 function _fvgk_gather!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5   # DE adds Ge as slot 6; species follow at hoff+q
-    f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0
+    f16s = _f16store(g); gesc = f16s ? _gesc() : 1f0; msc = f16s ? _msc() : 1f0
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
         for (c, f) in enumerate(de ? (p.D, p.S1, p.S2, p.S3, p.Tau, p.Ge) : (p.D, p.S1, p.S2, p.S3, p.Tau))
             Gblk = _gridblock(g, nc, GVOL, c); src = MultiCode._r3(f, pg.nd)
             if f16s && c >= 5                                    # E (5), Ge (6): lift into f16's normal range
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* gesc
+            elseif f16s && 2 <= c <= 4                           # momenta S1,S2,S3: lift into f16's normal range
+                @views Gblk[gi, gj, gk] .= src[li, lj, lk] .* msc
             else
                 @views Gblk[gi, gj, gk] .= src[li, lj, lk]
             end
@@ -166,7 +160,7 @@ end
 function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
     li, lj, lk = MultiCode._interior(pg); nc = pg.ncell; GVOL = prod(nc)
     de = _de(g, pg); hoff = de ? 6 : 5
-    f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0
+    f16s = _f16store(g); igesc = f16s ? 1f0/_gesc() : 1f0; imsc = f16s ? 1f0/_msc() : 1f0
     GD = _gridblock(g, nc, GVOL, 1)                                  # post-step global density ρ_post
     for p in pg.patches
         gi, gj, gk = MultiCode._octant(pg, p)
@@ -174,6 +168,8 @@ function _fvgk_scatter!(g, pg::MultiCode.PatchGrid)
             Gblk = _gridblock(g, nc, GVOL, c); dst = MultiCode._r3(f, pg.nd)
             if f16s && c >= 5                                       # un-lift E, Ge back to physical f32
                 @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* igesc
+            elseif f16s && 2 <= c <= 4                              # un-lift momenta S1,S2,S3
+                @views dst[li, lj, lk] .= Float32.(Gblk[gi, gj, gk]) .* imsc
             else
                 @views dst[li, lj, lk] .= Gblk[gi, gj, gk]
             end
@@ -220,7 +216,7 @@ function MultiCode._fvgk_dedup!(pg::MultiCode.PatchGrid)
                            [blk(6+q) for q in 1:nsp], ((1,1),(1,1),(1,1)))
     pg.patches = [newp]
     pg.ng = 0; pg.nd = pg.pdim                                   # gas fields are ghost-free now
-    pg.gesc = Float64(_gesc()); pg.packed = false; pg.dedup = true
+    pg.gesc = Float64(_gesc()); pg.msc = Float64(_msc()); pg.packed = false; pg.dedup = true
     return pg
 end
 
@@ -228,15 +224,14 @@ function MultiCode._fvgk_grav_kick!(pg::MultiCode.PatchGrid, accel, dt)
     get(ENV, "CIC_FVGK_DIRECT_KICK", "1") == "1" || return false
     g = pg.fvgk
     if _metal_de16(g) && _de(g, pg)
-        mtl = _fvgk_mtl_runtime()
         if _fvgk_timing_on()
             t0 = time()
-            mtl.mde16_grav_kick_global_potential!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
-            mtl.Metal.synchronize()
+            MultiCode._fvgk_metal_grav_kick!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
+            MultiCode._fvgk_metal_synchronize!(g)
             _fvgk_kick_t[] += time() - t0
             _fvgk_kick_n[] += 1
         else
-            mtl.mde16_grav_kick_global_potential!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
+            MultiCode._fvgk_metal_grav_kick!(g, accel; dx = Float32(pg.dx), halfdt = Float32(0.5 * dt))
         end
         return true
     end
@@ -263,37 +258,24 @@ function MultiCode._fvgk_patch_hydro!(pg::MultiCode.PatchGrid, dt::Real, sigspee
     # single-energy f32: run_ctu! (CTU, accurate) or run_rk2! (CIC_FVGK_INTEGRATOR=rk2; ≈CTU cost), and
     # pure hydro uses the fast f16-tiled run_ctus!.
     if _metal_de16(g) && de
-        mtl = _fvgk_mtl_runtime()
-        c = max(sigspeed === nothing ? mtl.mde16_max_wavespeed(g) : Float32(sigspeed), eps(Float32))
-        dtmax = 0.45f0 * min(g.dx, g.dy, g.dz) / c
-        nsub = max(1, ceil(Int, dtf / dtmax))
-        dts = dtf / nsub
         if _fvgk_timing_on()
             t0 = time()
-            for n in 0:(nsub-1)
-                mtl.mde16_step!(g, dts; rev = isodd(n))
-            end
-            mtl.Metal.synchronize()
+            nsub = MultiCode._fvgk_metal_step!(g, dtf, sigspeed, Float32(pg.dx))
+            MultiCode._fvgk_metal_synchronize!(g)
             _fvgk_step_t[] += time() - t0
             _fvgk_step_n[] += nsub
             _fvgk_call_n[] += 1
             _fvgk_nsub_sum[] += nsub
         else
-            for n in 0:(nsub-1)
-                mtl.mde16_step!(g, dts; rev = isodd(n))
-            end
+            MultiCode._fvgk_metal_step!(g, dtf, sigspeed, Float32(pg.dx))
         end
     elseif de
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
-        run_ctus_de16!(g, dtf / nsub, nsub)
+        run_ctus_de16!(g, dtf / nsub, nsub)      # nsub from the sigspeed/dt_cfl block above (no re-derive)
     elseif _nspecies(pg) == 0
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_ctus!(g, dtf / nsub, nsub)
     elseif get(ENV, "CIC_FVGK_INTEGRATOR", "ctu") == "rk2"
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_rk2!(g, dtf / nsub, nsub)
     else
-        nsub = max(1, ceil(Int, dtf / dt_cfl(g; cfl = 0.45f0)))
         run_ctu!(g, dtf / nsub, nsub)
     end
     pg.dedup || _fvgk_scatter!(g, pg)                           # dedup: g.R IS the state, no copy back

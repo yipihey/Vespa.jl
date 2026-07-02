@@ -56,6 +56,8 @@ mutable struct PatchGrid
     fvgk    ::Any                        # nothing, or per-patch FiniteVolumeGodunovKA grids (solver=:fvgk)
     gesc    ::Float64                    # GE_SCALE on the stored energy slots (1.0 normally; >1 when the
                                          # gas fields are f16 g.R views in the FVGK dedup — see ext)
+    msc     ::Float64                    # MOM_SCALE on the stored momenta S1,S2,S3 (1.0 normally; >1 in the
+                                         # FVGK dedup — lifts ρ·δv out of the f16 subnormal range; consumers un-lift)
     dedup   ::Bool                       # gas fields ARE the FVGK grid g.R (no patch copy, ng=0); ext-set
 end
 
@@ -95,7 +97,7 @@ function build_patchgrid(; ng::Int, ncell::NTuple{3,Int}, np::NTuple{3,Int},
                              zeros_dev(), zeros_dev(), SA[spec_zeros() for _ in 1:nspecies], nbr)
     end
     PatchGrid(backend, besym, T, ng, np, ncell, pdim, nd, Float64(dx), Float64(gamma),
-              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing, 1.0, false)
+              Float64(du), Float64(lu), Float64(tu), deut, packed_species, patches, nothing, 1.0, 1.0, false)
 end
 
 # Hydro-solver hook for `solver=:fvgk`: overridden by `MultiCodeFVGKExt` when
@@ -108,6 +110,19 @@ function _fvgk_patch_hydro! end
 # patch↔g.R duplication.  Defined by MultiCodeFVGKExt (only meaningful for solver=:fvgk).
 function _fvgk_dedup! end
 _fvgk_grav_kick!(pg, accel, dt) = false
+
+# solver=:fvgk Metal grid constructor.  Metal.jl is Apple-only, so the Metal FVGK grid (and its
+# `using Metal` runtime) live in a SEPARATE extension `MultiCodeFVGKMetalExt` (trigger
+# [FiniteVolumeGodunovKA, Metal]) — keeping the common `MultiCodeFVGKExt` (CUDA/CPU) free of any
+# Metal reference so it loads on non-Apple platforms.  The common ext calls this hook on the
+# `:metal` backend; the Metal ext implements it.  `sys` is the FVGK dual-energy system, `gesc` the
+# GE_SCALE, `rec`/`riem` the reconstruction/Riemann symbols.
+function _fvgk_build_metal_grid end
+_fvgk_metal_step!(g, dtf::Float32, sigspeed, dx::Float32) =
+    error("solver=:fvgk on the :metal backend needs `using Metal` (Apple Silicon) to load MultiCodeFVGKMetalExt")
+_fvgk_metal_grav_kick!(g, accel; dx, halfdt) =
+    error("solver=:fvgk on the :metal backend needs `using Metal` (Apple Silicon) to load MultiCodeFVGKMetalExt")
+_fvgk_metal_synchronize!(g) = nothing
 
 # ── interior-only chemistry: strided, in-place, f32 storage / f64 network ──────────────────────
 # Processes ONLY the pdim³ interior cells: maps the linear interior thread → the strided nd³ index
@@ -380,7 +395,7 @@ function _apply_grav_kick!(pg::PatchGrid, accel, dt)
         _fvgk_grav_kick!(pg, accel, dt) && return nothing
         p = pg.patches[1]
         PoissonKernels.grav_kick_from_global_potential!(accel, p.D, p.S1, p.S2, p.S3, p.Tau;
-            nc=pg.ncell, dx=pg.dx, halfdt=0.5*dt, gesc=pg.gesc)
+            nc=pg.ncell, dx=pg.dx, halfdt=0.5*dt, gesc=pg.gesc, msc=pg.msc)
     else
         for (p, φb) in zip(pg.patches, accel)
             PoissonKernels.grav_kick_from_potential!(φb, p.D, p.S1, p.S2, p.S3, p.Tau;
