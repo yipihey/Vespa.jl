@@ -447,6 +447,14 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
     # Needs a 2·3·5-smooth cubic grid (rfft additionally needs even n with n/2 smooth; else it self-falls-back).
     kafft = get(ENV, "CIC_GRAV_KAFFT", "0") == "1"
     rfft  = kafft && get(ENV, "CIC_GRAV_KAFFT_C2C", "0") != "1"
+    # CIC_GRAV_2GRID=1: two-grid solve (½-res cuFFT + CUBIC prolong + N red-black GS sweeps) — 8× smaller FFT
+    # workspace and the 900³ path (full cuFFT OOMs there; the coarse ½-res cuFFT fits).  Needs separate φd/ρd
+    # (GS reads ρd while writing φd) ⇒ set CIC_GRAV1BUF=0.  The v_bc streaming baryon at k≈800 is HYPERSENSITIVE
+    # (Δ²_b ≈ 0.1% of Δ²_dm), so it exposes the prolong error: a TRILINEAR prolong drifts k=800 ~15% vs the exact
+    # spectral cuFFT, but the CUBIC prolong (default) + enough sweeps closes it — 512³, cubic, 12 sweeps: k=800
+    # μ=0.875 baryon = 1.31 vs cuFFT's 1.33 (~1.5%), full μ-profile matched.  So it IS a near-spectral drop-in
+    # now; still, production 512³ uses native cuFFT (faster). CIC_GRAV_2GRID_SWEEPS default 12 for that precision.
+    twogrid = get(ENV, "CIC_GRAV_2GRID", "0") == "1"
     depbuf = (kafft && !rfft) ? PoissonKernels.poisson_scratch_i32(be, pg.T, nc) : nothing  # only c2c has an N³ buffer to lend
     detail = get(ENV, "CIC_GRAV_DETAIL", "0") == "1"
     syncd() = detail ? PPMKernels.KA.synchronize(be) : nothing
@@ -457,7 +465,11 @@ function global_gravity_gpu(pg::PatchGrid; G::Real=1.0, a::Real=1.0, boxsize::Re
                                  timing=detail ? asm_ref : nothing)
     syncd(); asm_t = time() - tasm
     tfft = time()
-    if kafft
+    if twogrid
+        φd === ρd && error("CIC_GRAV_2GRID needs a separate φ buffer (the GS reads ρ while writing φ) — set CIC_GRAV1BUF=0")
+        PoissonKernels.fft_poisson_2grid!(φd, ρd; G=G, a=a, boxsize=boxsize,
+                                          nsweeps=parse(Int, get(ENV, "CIC_GRAV_2GRID_SWEEPS", "12")))
+    elseif kafft
         rfft ? PoissonKernels.fft_poisson_rfft_ka!(φd, ρd; G=G, a=a, boxsize=boxsize) :
                PoissonKernels.fft_poisson_root_gpu!(φd, ρd; G=G, a=a, boxsize=boxsize)
     else
