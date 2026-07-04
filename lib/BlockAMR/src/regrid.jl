@@ -87,6 +87,23 @@ end
 _project(cells::Set{NTuple{3,Int128}}) =
     Set{NTuple{3,Int128}}((g[1] >> 1, g[2] >> 1, g[3] >> 1) for g in cells)
 
+# Coarse flags forced by fine structure: flag each unique Bh-aligned footprint
+# tile containing a (projected) fine flag, grown by `rim` cells.
+function _tile_rim(fine::Set{NTuple{3,Int128}}, Bh::Int, rim::Int, P::Origin)
+    tiles = Set{NTuple{3,Int128}}()
+    for g in fine
+        push!(tiles, ntuple(d -> ((g[d] >> 1) ÷ Bh) * Bh, 3))
+    end
+    out = Set{NTuple{3,Int128}}()
+    for t in tiles
+        for dk in -rim:Bh-1+rim, dj in -rim:Bh-1+rim, di in -rim:Bh-1+rim
+            push!(out, (Int128(wrapc(t[1] + di, P[1])), Int128(wrapc(t[2] + dj, P[2])),
+                        Int128(wrapc(t[3] + dk, P[3]))))
+        end
+    end
+    return out
+end
+
 """
     regrid!(hier, pol) -> nothing
 
@@ -101,9 +118,15 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy)
     # fine→coarse projection (with margin), dilation
     fl = [ l + 1 <= length(hier.levels) ? _criterion_cells(hier, l, pol) :
            Set{NTuple{3,Int128}}() for l in 0:Ltarget ]          # fl[l+1] = level-l flags
-    for l in Ltarget-1:-1:1
-        union!(fl[l + 1], _dilate(_project(fl[l + 2]), 1 + cld(pol.nbuf, 2),
-                                  level_period(hier.nbase, l)))
+    # Project fine flags down ONLY where level l+2 can exist (l ≤ Ltarget−2): the
+    # deepest level's flags have no children to support, and projecting them
+    # would only widen the coarse footprint (sticky refinement, no de-refines).
+    # A fine flag forces its whole Bh-lattice footprint TILE (child origins are
+    # multiples of B ⇒ tiles globally Bh-aligned at level l); flag each unique
+    # tile's box + nesting rim — O(unique tiles), not O(cells·dilation³).
+    for l in Ltarget-2:-1:0
+        union!(fl[l + 1], _tile_rim(fl[l + 2], hier.B ÷ 2, 2 + cld(pol.nbuf, 2),
+                                    level_period(hier.nbase, l)))
     end
     for l in 0:Ltarget-1
         fl[l + 1] = _dilate(fl[l + 1], pol.nbuf, level_period(hier.nbase, l))

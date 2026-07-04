@@ -39,8 +39,8 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     spo      :: Vector{U}
     # ── per-block power-of-two f32 scales (identity until the f16 phase) ──
     Dsc::F; Ssc::F; Esc::F
-    # ── gravity: level potential + rhs pools (always f32; ghosts inline) ──
-    phi::F; rhs::F
+    # ── gravity: level potential + rhs + particle-deposit pools (f32, ghosts inline) ──
+    phi::F; rhs::F; dm::F
     live_d   :: I                        # device copy of `live`
     tabs     :: Dict{Symbol,Any}         # device RectJobTables; rebuilt at regrid only
 end
@@ -78,6 +78,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         ones32(cap0), ones32(cap0), ones32(cap0),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
+        device_zeros(be, Float32, (cap0 * stride,)),
         to_device(be, Int32[], Int32), Dict{Symbol,Any}())
 end
 
@@ -96,7 +97,7 @@ function _grow!(lev::Level, newcap::Int)
     growsc(a) = (b = to_device(lev.be, ones(Float32, newcap), Float32);
                  copyto!(view(b, 1:lev.cap), view(a, 1:lev.cap)); b)
     lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc)
-    lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs)
+    lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs); lev.dm = grow(lev.dm)
     append!(lev.meta, [BlockMeta() for _ in 1:(newcap - lev.cap)])
     lev.cap = newcap
     return nothing

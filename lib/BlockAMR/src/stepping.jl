@@ -81,10 +81,13 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     # levels ≥ 1 SOLVE their own Poisson (warm-started red-black on the block
     # union, Dirichlet from the parent φ pool) and kick from it; level 0 kicks
     # from the external topgrid φ (whose pool copy seeds the level-1 BCs).
-    if selfgrav !== nothing && l >= 1
+    if selfgrav !== nothing && (l >= 1 || φ === nothing)
+        # l = 0 without an external φ: fully-periodic base solve (rho_mean needed)
         solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
-                             nsweep = get(selfgrav, :nsweep, 30),
-                             rho_ext = get(selfgrav, :rho_ext, nothing))
+                             nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :
+                                               get(selfgrav, :nsweep, 30),
+                             rho_ext = get(selfgrav, :rho_ext, nothing),
+                             rho_mean = l == 0 ? get(selfgrav, :rho_mean, 0) : 0)
         grav_kick_level_pool!(hier, l, 0.5 * dt_l)
     elseif φ !== nothing
         grav_kick_level!(hier, l, φ, 0.5 * dt_l)
@@ -97,7 +100,7 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
     l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
     haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
-    if selfgrav !== nothing && l >= 1                              # KDK: K2
+    if selfgrav !== nothing && (l >= 1 || φ === nothing)           # KDK: K2
         grav_kick_level_pool!(hier, l, 0.5 * dt_l)
     elseif φ !== nothing
         grav_kick_level!(hier, l, φ, 0.5 * dt_l)

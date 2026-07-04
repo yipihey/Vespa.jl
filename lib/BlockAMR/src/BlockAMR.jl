@@ -52,6 +52,7 @@ export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
 export chem_level!
 export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
+export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -103,5 +104,6 @@ include("scales.jl")       # per-block power-of-two f32 scale maintenance (f16)
 include("regrid.jl")       # dynamic refinement: flag → cluster → rebuild
 include("gravity.jl")      # KDK half-kicks from the topgrid potential
 include("chem.jl")         # fast analytic H+H2 chemistry over block batches
+include("particles.jl")    # DM particles: per-level deposit + finest-level accel gather
 
 end # module BlockAMR

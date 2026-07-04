@@ -157,7 +157,8 @@ end
 # DM density living on the topgrid enters the fine source this way)
 @kernel function _grav_rhs_k!(rhs, @Const(D), @Const(Dsc), @Const(live_d),
                               @Const(gi0), @Const(gfr), ext, hasext::Bool,
-                              h2coef::Float32, hlev::Float32,
+                              dmp, hasdm::Bool,
+                              h2coef::Float32, rho0::Float32, hlev::Float32,
                               n1::Int32, n2::Int32, n3::Int32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
@@ -170,6 +171,7 @@ end
         ci = c % B; cj = (c ÷ B) % B; ck = c ÷ (B * B)
         idx = base + _lidx(ci + ng, cj + ng, ck + ng, nd)
         ρ = Float32(D[idx]) * Dsc[slot]
+        hasdm && (ρ += Float32(dmp[idx]))
         if hasext
             x = Float32(gi0[3*(slot-Int32(1))+Int32(1)]) + gfr[3*(slot-Int32(1))+Int32(1)] +
                 (Float32(ci) + 0.5f0) * hlev
@@ -179,7 +181,7 @@ end
                 (Float32(ck) + 0.5f0) * hlev
             ρ += _phi_tl(ext, x, y, z, n1, n2, n3)
         end
-        rhs[idx] = h2coef * ρ
+        rhs[idx] = h2coef * (ρ - rho0)
     end
 end
 
@@ -224,19 +226,22 @@ end
 
 """
     solve_gravity_level!(hier, l; source_coef, nsweep = 60, rho_ext = nothing,
-                         init = :warm) -> residual∞
+                         rho_mean = 0, init = :warm) -> residual∞
 
-Solve ∇²φ = source_coef·(ρ_gas [+ ρ_ext interpolated from the topgrid field
-`rho_ext`]) on level `l ≥ 1`'s block union with Dirichlet boundaries prolonged
-trilinearly from the parent φ pool.  `init = :parent` seeds the interior from
-the parent (fresh hierarchies); `:warm` keeps the existing φ.  Returns the final
+Solve ∇²φ = source_coef·(ρ_gas − rho_mean [+ ρ_ext interpolated from the topgrid
+field `rho_ext`]) on level `l`'s block union.  l ≥ 1: Dirichlet boundaries
+prolonged trilinearly from the parent φ pool.  l = 0: fully periodic (the base
+tiling covers the box, so the sibling exchange IS the periodic BC) — pass the
+mean density in `rho_mean` so the source is solvable.  `init = :parent` seeds
+the interior from the parent; `:warm` keeps the existing φ.  Returns the final
 ∞-norm residual (h²-scaled units).
 """
 function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
                               nsweep::Int = 60, rho_ext = nothing,
-                              init::Symbol = :warm)
-    @assert l >= 1
-    lev = hier.levels[l + 1]; plev = hier.levels[l]
+                              rho_mean::Real = 0, init::Symbol = :warm,
+                              use_dm::Bool = false)
+    lev = hier.levels[l + 1]
+    plev = l >= 1 ? hier.levels[l] : lev
     isempty(lev.live) && return 0.0f0
     haskey(lev.tabs, :gi0) || sync_block_geometry!(lev)
     n  = length(lev.live) * lev.B^3
@@ -245,12 +250,12 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     _grav_rhs_k!(lev.be)(lev.rhs, lev.D, lev.Dsc, lev.live_d,
                          lev.tabs[:gi0], lev.tabs[:gfr],
                          rho_ext === nothing ? lev.rhs : rho_ext,
-                         rho_ext !== nothing,
-                         Float32(h^2 * source_coef), Float32(exp2(-l)),
+                         rho_ext !== nothing, lev.dm, use_dm,
+                         Float32(h^2 * source_coef), Float32(rho_mean), Float32(exp2(-l)),
                          n1, n2, n3, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                          Int32(lev.stride); ndrange = n)
-    pro = lev.tabs[:pro]::RectJobTable                     # ghost-shell rectangles
     sib = lev.tabs[:sib]::RectJobTable
+    pro = l >= 1 ? (lev.tabs[:pro]::RectJobTable) : RectJobTable()
     if pro.total > 0                                       # Dirichlet BCs (once)
         _rect_prolong_tl_k!(lev.be)(lev.phi, plev.phi, pro.jobs, pro.cellstart,
                                     Int32(pro.njobs), Int32(lev.nd),
@@ -259,7 +264,7 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
         # immediately so a warm restart resumes from the converged state
         _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
     end
-    if init === :parent                                    # interior seed
+    if init === :parent && l >= 1                          # interior seed
         tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true))
         _run_prolong!(lev.be, tab, lev.phi, plev.phi, plev.phi, 0.0f0,
                       lev.nd, lev.stride)
