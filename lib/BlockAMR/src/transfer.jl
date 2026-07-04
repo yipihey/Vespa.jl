@@ -255,10 +255,10 @@ regrid or pool growth.
 """
 function build_level_tables!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
-    # Morton-order the launch list: neighbouring blocks land adjacent in the
-    # batch → L2 locality in the fused hydro/ghost kernels (slots don't move).
-    sort!(lev.live; by = s -> _morton(lev.meta[s], hier.B))
-    sync_live!(lev)
+    # NOTE: Morton-ordering the LAUNCH list alone regressed throughput 10× —
+    # slots don't move, so spatially-adjacent launch order scatters pool
+    # accesses that allocation order kept contiguous.  _morton stays for the
+    # future slot-COMPACTION pass (physically reordering block data at regrid).
     lev.tabs[:sib] = to_device_table(lev.be, build_sibling_jobs(lev))
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
@@ -283,15 +283,17 @@ advected in the validation phases).
 function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R)
     lev = hier.levels[l + 1]
     dst = buf === :R ? gasfields(lev) : gasfields_o(lev)
+    # NOTE: fused 6-field variants (_rect_copy6_k!/_rect_prolong6_k!) regressed
+    # GPU throughput ~10× — runtime tuple indexing defeats coalescing.  Kept in
+    # the file for a future revisit (compile-time unrolled variant); the
+    # per-field launch train stands.
     if l >= 1
         plev = hier.levels[l]
         pro  = lev.tabs[:pro]::RectJobTable
-        if pro.total > 0
-            _rect_prolong6_k!(lev.be)(dst, gasfields(plev), gasfields_o(plev),
-                                      classes(lev), classes(plev), Float32(θ),
-                                      pro.jobs, pro.cellstart, Int32(pro.njobs),
-                                      Int32(pro.total), Int32(lev.nd),
-                                      Int32(lev.stride); ndrange = 6 * pro.total)
+        for (fd, fR, fO, scd, scs) in zip(dst, gasfields(plev), gasfields_o(plev),
+                                          classes(lev), classes(plev))
+            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
+                          scd, scs)
         end
         spdst = buf === :R ? lev.sp : lev.spo
         for (sd, sR, sO) in zip(spdst, plev.sp, plev.spo)
@@ -299,10 +301,8 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
         end
     end
     sib = lev.tabs[:sib]::RectJobTable
-    if sib.total > 0
-        _rect_copy6_k!(lev.be)(dst, classes(lev), sib.jobs, sib.cellstart,
-                               Int32(sib.njobs), Int32(sib.total), Int32(lev.nd),
-                               Int32(lev.stride); ndrange = 6 * sib.total)
+    for (fd, sc) in zip(dst, classes(lev))
+        _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
     end
     for sd in (buf === :R ? lev.sp : lev.spo)
         _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
