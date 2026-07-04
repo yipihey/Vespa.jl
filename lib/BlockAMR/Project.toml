@@ -1,0 +1,26 @@
+name = "BlockAMR"
+uuid = "1a2b3c4d-0014-4000-8000-000000000014"
+authors = ["T. Abel and contributors"]
+version = "0.1.0"
+
+# Lean block-based AMR on top of the MultiCode patch topgrid: fixed-size B³ blocks
+# placed by INTEGER offsets in their parents (exact to 60+ levels, no float grid
+# coordinates), strict 2:1 binary subcycling with ONE global λ = dt/dx fraction,
+# per-level fused KernelAbstractions launches (all blocks of a level in one kernel),
+# f16 physical variables with per-block power-of-two f32 scales, u16 log₂ species.
+# CUDA is a weak dependency (extension); the CPU backend is the parity oracle.
+[deps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+
+[extensions]
+BlockAMRCUDAExt = "CUDA"
+
+[compat]
+KernelAbstractions = "0.9"
+CUDA = "5"
+julia = "1.10"

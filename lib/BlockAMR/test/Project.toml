@@ -1,0 +1,11 @@
+[deps]
+BlockAMR = "1a2b3c4d-0014-4000-8000-000000000014"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+BlockAMR = {path = ".."}
+ChemistryKernels = {path = "../../../../ChemistryKernels.jl"}
