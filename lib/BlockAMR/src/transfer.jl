@@ -234,6 +234,17 @@ function _run_restrict!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
     return nothing
 end
 
+"Interleave the low 21 bits of the block-lattice coords (locality sort key)."
+function _morton(m::BlockMeta, B::Int)
+    k = ntuple(d -> UInt64(m.origin[d] ÷ UInt128(B)) & 0x1fffff, 3)
+    z = UInt64(0)
+    for b in 0:20
+        z |= ((k[1] >> b) & 1) << (3b) | ((k[2] >> b) & 1) << (3b + 1) |
+             ((k[3] >> b) & 1) << (3b + 2)
+    end
+    return z
+end
+
 """
     build_level_tables!(hier, l)
 
@@ -244,6 +255,10 @@ regrid or pool growth.
 """
 function build_level_tables!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
+    # Morton-order the launch list: neighbouring blocks land adjacent in the
+    # batch → L2 locality in the fused hydro/ghost kernels (slots don't move).
+    sort!(lev.live; by = s -> _morton(lev.meta[s], hier.B))
+    sync_live!(lev)
     lev.tabs[:sib] = to_device_table(lev.be, build_sibling_jobs(lev))
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
@@ -271,10 +286,12 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     if l >= 1
         plev = hier.levels[l]
         pro  = lev.tabs[:pro]::RectJobTable
-        for (fd, fR, fO, scd, scs) in zip(dst, gasfields(plev), gasfields_o(plev),
-                                          classes(lev), classes(plev))
-            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
-                          scd, scs)
+        if pro.total > 0
+            _rect_prolong6_k!(lev.be)(dst, gasfields(plev), gasfields_o(plev),
+                                      classes(lev), classes(plev), Float32(θ),
+                                      pro.jobs, pro.cellstart, Int32(pro.njobs),
+                                      Int32(pro.total), Int32(lev.nd),
+                                      Int32(lev.stride); ndrange = 6 * pro.total)
         end
         spdst = buf === :R ? lev.sp : lev.spo
         for (sd, sR, sO) in zip(spdst, plev.sp, plev.spo)
@@ -282,8 +299,10 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
         end
     end
     sib = lev.tabs[:sib]::RectJobTable
-    for (fd, sc) in zip(dst, classes(lev))
-        _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
+    if sib.total > 0
+        _rect_copy6_k!(lev.be)(dst, classes(lev), sib.jobs, sib.cellstart,
+                               Int32(sib.njobs), Int32(sib.total), Int32(lev.nd),
+                               Int32(lev.stride); ndrange = 6 * sib.total)
     end
     for sd in (buf === :R ? lev.sp : lev.spo)
         _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
@@ -342,5 +361,46 @@ end
             acc += w(aq) * w(bq) * w(cq) * g(aq, bq, cq)
         end
         dst[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] = acc
+    end
+end
+
+# ── fused 6-field variants: one launch moves ALL gas fields through a table
+# (the per-field launch train was the latency floor for small deep levels).
+# Field index = t0 ÷ total; homogeneous-tuple indexing compiles to a select
+# chain on the GPU.  Scale classes ride along per field.
+@kernel function _rect_copy6_k!(F, SC, @Const(jobs), @Const(cellstart),
+                                njobs::Int32, total::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    fi = t0 ÷ total + Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0 % total)
+    @inbounds begin
+        A = F[fi]; sc = SC[fi]
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ri; sj = jobs[b+7] + rj; sk = jobs[b+8] + rk
+        ratio = sc[jobs[b+2]] / sc[jobs[b+1]]
+        A[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(A), Float32(A[(jobs[b+2] - Int32(1)) * stride +
+                                         (sk * nd + sj) * nd + si + Int32(1)]) * ratio)
+    end
+end
+
+@kernel function _rect_prolong6_k!(F, FR, FO, SC, SCP, θ::Float32,
+                                   @Const(jobs), @Const(cellstart),
+                                   njobs::Int32, total::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    fi = t0 ÷ total + Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0 % total)
+    @inbounds begin
+        A = F[fi]; AR = FR[fi]; AO = FO[fi]; scd = SC[fi]; scs = SCP[fi]
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        sidx = (jobs[b+2] - Int32(1)) * stride + (sk * nd + sj) * nd + si + Int32(1)
+        phys = ((1.0f0 - θ) * Float32(AR[sidx]) + θ * Float32(AO[sidx])) * scs[jobs[b+2]]
+        A[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(A), phys / scd[jobs[b+1]])
     end
 end

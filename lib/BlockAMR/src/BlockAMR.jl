@@ -53,7 +53,7 @@ export grav_kick_level!, sync_block_geometry!
 export chem_level!
 export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
-export global_from_level0!
+export global_from_level0!, compton_drag!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())

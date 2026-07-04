@@ -13,9 +13,11 @@
 #   BACKEND=cuda BAM_NGRID=32 BAM_LMAX=2 CIC_ZSTART=1000 CIC_ZEND=600 \
 #     julia --project=lib/MultiCode/test lib/MultiCode/examples/blockamr_cicass.jl
 #
-# v1 notes: particle KDK uses the root-step φ for both kicks; Compton DRAG
-# (momentum) is not yet applied (Compton COOLING is, inside analytic_h2 chem);
-# P(k) output is deferred — the phase dump feeds the H2(ρ) scatter pipeline.
+# v1 notes: particle KDK uses the root-step φ for both kicks; P(k) output is
+# deferred — the phase dump feeds the H2(ρ) scatter pipeline.  Compton momentum
+# DRAG (CIC_COMPTON_DRAG=1, default on): peculiar velocities damp toward the
+# global mass-weighted bulk by exp(−Γ/H·Δln a), with the mean x_e refreshed from
+# the level-0 species every 10 steps (Compton COOLING lives in the chemistry).
 
 using MultiCode, BlockAMR, CICASSLib, Printf
 import PoissonKernels, ChemistryKernels
@@ -37,6 +39,7 @@ const OMEGAM  = parse(Float64, get(ENV, "CIC_OMEGAM", "0.27"))
 const OMEGAB  = parse(Float64, get(ENV, "CIC_OMEGAB", "0.046"))
 const HCONST  = parse(Float64, get(ENV, "CIC_H0", "71.0"))
 const GAMMA   = 5.0 / 3.0
+const DODRAG  = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
 const TAG     = get(ENV, "CIC_TAG", "_bamr$(NGRID)")
 const REPORTS = MultiCode.run_dir("bamr")
 
@@ -106,7 +109,7 @@ function main()
     pay = BlockAMR.device_zeros(hier.be, Float32, (Np,))
     paz = BlockAMR.device_zeros(hier.be, Float32, (Np,))
 
-    nstep = 0; t0 = time()
+    nstep = 0; t0 = time(); xe_mean = xHII0
     while a < a_end
         # ── timestep: hydro CFL (global λ), particle CFL, expansion cap ──
         λ = compute_lambda!(hier)
@@ -154,10 +157,28 @@ function main()
         particles_drift!(hier, parts, dτ)
         particles_kick!(hier, parts, pax, pay, paz, 0.5 * dτ)
 
+        # ── Compton momentum drag (frame-agnostic, exp(−Γ/H·Δln a)) ──
+        if DODRAG
+            dlna = MultiCode.dadtau(c, a) * dτ / a
+            gam = MultiCode.compton_drag_over_H(c, 1/a - 1, xe_mean)
+            compton_drag!(hier, exp(-gam * dlna); scratch = ρg)
+        end
+
         # ── a-advance (RK2 midpoint on da/dτ) + maintenance ──
         k1 = MultiCode.dadtau(c, a); amid = a + 0.5 * k1 * dτ
         a = min(a + MultiCode.dadtau(c, amid) * dτ, a_end)
         nstep += 1
+        if nstep % 10 == 0                             # refresh the mean x_e estimate
+            h1s = Array(hier.levels[1].sp[1])
+            acc = 0.0; cnt = 0
+            for s_ in hier.levels[1].live
+                b_ = (Int(s_) - 1) * hier.levels[1].stride
+                for cix in 1:64:hier.levels[1].nd^3    # strided subsample
+                    acc += ChemistryKernels.decode_log2sp(Float64, h1s[b_ + cix]); cnt += 1
+                end
+            end
+            xe_mean = max(acc / cnt / c.XH, 1e-6)
+        end
         for l in 0:length(hier.levels)-1
             update_scales!(hier, l)
         end

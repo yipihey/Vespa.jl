@@ -360,3 +360,64 @@ function global_from_level0!(hier::AMRHierarchy, g; f::Symbol = :D)
                                    Int32(lev.stride); ndrange = n)
     return g
 end
+
+# ── Compton momentum drag ─────────────────────────────────────────────────────
+# Damp each cell's peculiar velocity toward the GLOBAL mass-weighted bulk by
+# f = exp(−Γ/H·Δln a) (frame-agnostic — never damps the coherent streaming
+# bulk), keeping the KE bookkeeping exact in Tau.  Mirrors the patchgrid
+# compton_drag_patches! semantics on the block pools, scale-aware.
+@kernel function _compton_drag_k!(S1, S2, S3, Tau, @Const(D), @Const(live_d),
+                                  @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                  f::Float32, vbx::Float32, vby::Float32, vbz::Float32,
+                                  B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        idx = base + _lidx(i, j, k, nd)
+        ρ  = max(Float32(D[idx]) * dsc, 1.0f-30)
+        s1 = Float32(S1[idx]) * ssc; s2 = Float32(S2[idx]) * ssc; s3 = Float32(S3[idx]) * ssc
+        ke0 = (s1*s1 + s2*s2 + s3*s3) / (2.0f0 * ρ)
+        n1 = ρ*vbx + (s1 - ρ*vbx) * f
+        n2 = ρ*vby + (s2 - ρ*vby) * f
+        n3 = ρ*vbz + (s3 - ρ*vbz) * f
+        ke1 = (n1*n1 + n2*n2 + n3*n3) / (2.0f0 * ρ)
+        S1[idx]  = _narrow(eltype(S1), n1 / ssc)
+        S2[idx]  = _narrow(eltype(S2), n2 / ssc)
+        S3[idx]  = _narrow(eltype(S3), n3 / ssc)
+        Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ke1 - ke0)) / esc)
+    end
+end
+
+"""
+    compton_drag!(hier, f; scratch) -> nothing
+
+Apply Compton drag with factor `f = exp(−Γ/H·Δln a)` to every level: the global
+mass-weighted bulk velocity is computed from the level-0 composite (device
+gathers + reductions via `scratch`, a global nbase³ f32 array), then each
+level's cells damp toward it (KE-exact in Tau).
+"""
+function compton_drag!(hier::AMRHierarchy, f::Real; scratch)
+    lev0 = hier.levels[1]
+    isempty(lev0.live) && return nothing
+    global_from_level0!(hier, scratch; f = :D);  M  = Float64(sum(scratch))
+    global_from_level0!(hier, scratch; f = :S1); p1 = Float64(sum(scratch))
+    global_from_level0!(hier, scratch; f = :S2); p2 = Float64(sum(scratch))
+    global_from_level0!(hier, scratch; f = :S3); p3 = Float64(sum(scratch))
+    vb = (Float32(p1 / M), Float32(p2 / M), Float32(p3 / M))
+    for l in 0:length(hier.levels)-1
+        lev = hier.levels[l + 1]
+        isempty(lev.live) && continue
+        n = length(lev.live) * lev.B^3
+        _compton_drag_k!(lev.be)(lev.S1, lev.S2, lev.S3, lev.Tau, lev.D, lev.live_d,
+                                 lev.Dsc, lev.Ssc, lev.Esc, Float32(f), vb...,
+                                 Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                                 Int32(lev.stride); ndrange = n)
+    end
+    return nothing
+end
