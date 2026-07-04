@@ -29,6 +29,9 @@ Base.@kwdef struct BlockRefinementPolicy
     nbuf    :: Int = 2
     every   :: Int = 4
     lmax    :: Int = 1
+    lfac    :: Float64 = 1.0   # threshold scales ×lfac per level (Enzo-style
+                               # Lagrangian refinement: lfac=8 ⇒ ~constant
+                               # cell mass triggers; 1.0 = flat threshold)
 end
 
 @kernel function _flag_k!(flags, count, @Const(D), @Const(live_d), @Const(Dsc),
@@ -57,7 +60,8 @@ function _criterion_cells(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
     n = length(lev.live) * lev.B^3
-    _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, lev.Dsc, Float32(pol.dthresh),
+    _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, lev.Dsc,
+                     Float32(pol.dthresh * pol.lfac^l),
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = n)
     hc = Array(count); hf = Array(flags)

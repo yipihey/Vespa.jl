@@ -30,6 +30,7 @@ const LMAX    = parse(Int, get(ENV, "BAM_LMAX", "2"))
 const DTHRESH = parse(Float64, get(ENV, "BAM_DTHRESH", "1.5"))   # gas overdensity ρ/ρ̄_b
 const REGRIDN = parse(Int, get(ENV, "BAM_REGRID", "4"))
 const NSWEEP  = parse(Int, get(ENV, "BAM_NSWEEP", "30"))
+const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac per level
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -102,7 +103,7 @@ function main()
             c.fb, Tg0, xHII0, Np); flush(stdout)
 
     pol = BlockRefinementPolicy(; dthresh = DTHRESH * c.fb, nbuf = 2,
-                                every = REGRIDN, lmax = LMAX)
+                                every = REGRIDN, lmax = LMAX, lfac = LFAC)
     ρg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     φg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     pax = BlockAMR.device_zeros(hier.be, Float32, (Np,))
