@@ -556,6 +556,32 @@ function patch_step!(pg::PatchGrid, dt::Real; a_value::Real, order=(1,2,3),
             for p in pg.patches
                 _chem_analytic!(pg, p, a_value, dt, du, lu, tu, hz, chemnsub)
             end
+        elseif do_chem && chem && !isempty(pg.patches[1].species) && chemmode === :analytic_h2
+            # FAST analytic H+H₂ path (ChemistryKernels.evolve_cell_analytic): closed-form
+            # Riccati x_HII + H₂ formation quadrature + analytic Compton — the fast GPU path
+            # WITH H₂, u16 species / Float32 compute (NOT the stiff network's forced Float64).
+            # Enabled by the k9/11/14/15 integer-power fix (warm-gas H₂ rates no longer NaN on
+            # CUDA f32).  Interior gather/scatter as in the stiff path; HDI (species[3], if any)
+            # is not advected here (primordial H+H₂ only) and rides along unchanged.
+            pg.packed || error("CIC_CHEM=analytic_h2 needs CIC_PACKED=1 (u16 species fast path)")
+            li2, lj2, lk2 = _interior(pg)
+            agi(f)     = vec(_r3(f, pg.nd)[li2, lj2, lk2])
+            asi!(f, v) = (@views _r3(f, pg.nd)[li2, lj2, lk2] .= _r3(v, pg.pdim); nothing)
+            asa!(f, v) = (@views _r3(f, pg.nd)[li2, lj2, lk2] .+= _r3(v, pg.pdim); nothing)
+            for p in pg.patches
+                Dint = agi(p.D); Geint = agi(p.Ge)
+                r32 = Float32.(Dint); e32 = Float32.(Geint) ./ r32; e0 = copy(e32)
+                s1 = agi(p.species[1]); s2 = agi(p.species[2])        # u16 log₂ mass fractions
+                # analytic cooling fits (NO cool_tables): the tabulated-cooling path
+                # heap-allocates on the GPU, and tables are a documented wash for this mode.
+                ChemistryKernels.solve_chem_analytic_device_u16!(r32, e32, s1, s2;
+                    a_value=a_value, dt=dt, density_units=du, length_units=lu, time_units=tu,
+                    backend=pg.besym, precision=Float32,
+                    hubble=cosmo_h0, Om=cosmo_Om, OL=cosmo_OL)
+                asa!(p.Tau, Dint .* T.(e32 .- e0))
+                asi!(p.Ge,  Dint .* T.(e32))
+                asi!(p.species[1], s1); asi!(p.species[2], s2)
+            end
         elseif do_chem && chem && !isempty(pg.patches[1].species)
             haveHD = pg.deut && length(pg.patches[1].species) >= 3
             oncpu = chem_backend === :cpu && pg.besym !== :cpu     # run chem on the HOST

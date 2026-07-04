@@ -79,12 +79,25 @@ function chem_step!(rho, eint, HII, H2I, HDI=nothing; a_value, dt,
                     " nH=", nH, " eint_cgs=", ecgs, " xe_in=", xe0,
                     " dt_s=", dt*cfg.time_units, " du=", du, " vu2=", vu2); flush(stdout)
         end
+        # CIC_CHEM_MODE=analytic: the FAST closed-form H+H₂ mode
+        # (ChemistryKernels.evolve_cell_analytic) — Riccati x_HII + H₂ formation
+        # quadrature + analytic Compton, no stiff/BDF sub-cycling.  ~4× the full network
+        # on the GPU; primordial H+H₂ only, so HDI is held fixed (no deuterium network).
+        # Default :full = the full reduced network (solve_chem!).
+        _mode = Symbol(get(ENV, "CIC_CHEM_MODE", "full"))
         # CIC_CHEM_BINNED=1: phase-space-binned solve — one stiff solve per occupied
         # state-space bin (ρ,e,x_i), response mapped back to every cell. Big win at
         # high z where the gas is near-uniform (recombination is the costliest step).
         # CIC_CHEM_BIN_TOL = bin width in dex (default 0.02; smaller = more accurate).
         _binned = get(ENV, "CIC_CHEM_BINNED", "0") == "1"
-        if _binned
+        if _mode === :analytic
+            ChemistryKernels.solve_chem_analytic!(rho, eint, HII, H2I;
+                a_value=a_value, dt=dt, density_units=cfg.density_units,
+                length_units=cfg.length_units, time_units=cfg.time_units,
+                hubble=cfg.hubble, Om=cfg.Om, OL=cfg.OL, fh=cfg.fh,
+                hubble_expansion=cfg.hubble_expansion, adot_over_a=adot_over_a,
+                backend=backend, precision=precision)
+        elseif _binned
             _btol = parse(Float64, get(ENV, "CIC_CHEM_BIN_TOL", "0.02"))
             _bmap = Symbol(get(ENV, "CIC_CHEM_BIN_MAP", "linear"))   # :linear | :ratio | :broadcast
             _bdev = backend !== :cpu                                  # GPU → fully on-device binning

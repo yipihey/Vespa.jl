@@ -72,14 +72,19 @@ const OVERLAP = get(ENV, "CIC_OVERLAP", "0") == "1"
 # CIC_CHEM=analytic: fast closed-form chemistry for the post-recombination IGM — ONLY HII Case-B
 # recombination + Compton heat/cool off the CMB (the processes that touch the energy eq here), no
 # stiff subcycler.  CIC_CHEM=full (default) runs the general ChemistryKernels network.
+# CIC_CHEM=analytic_h2: the fast closed-form path WITH H₂ (ChemistryKernels.evolve_cell_analytic —
+# Riccati x_HII + H₂ formation quadrature + analytic Compton), u16 species / f32 compute (needs
+# CIC_PACKED=1).  Same 3-color setup as :full (HII,H2I,HDI) but HDI is inert; ~4× the stiff network.
 const CHEMMODE = Symbol(get(ENV, "CIC_CHEM", "full"))
 # CIC_CHEM_NSUB: analytic sub-steps per hydro step (default 1 = fastest).  >1 tracks the evolving
 # T so k2(T) follows the Compton heating within the step → tighter match to the stiff network.
 const CHEMNSUB = parse(Int, get(ENV, "CIC_CHEM_NSUB", "1"))
 # analytic chem only evolves HII, so carry a SINGLE color (HII) — H2I/HDI are unused tracers.
 # Fewer colors = less advection AND a normal-valued color the FVGK f16-tiled path can carry.
-const NSPEC = CHEMMODE === :analytic ? 1 : 3
-const DEUT  = CHEMMODE !== :analytic            # HDI/deuterium only in the full network
+# :analytic → 1 color (HII only); :analytic_h2 → 2 (HII, H2I — the fast solver does NOT do HD);
+# :full → 3 (HII, H2I, HDI + deuterium network).
+const NSPEC = CHEMMODE === :analytic ? 1 : (CHEMMODE === :analytic_h2 ? 2 : 3)
+const DEUT  = CHEMMODE === :full                # HDI/deuterium only in the full network
 # CIC_PHASE_TIMING=1: GPU-synced per-phase split (gravity | hydro | chem | particles).  Adds
 # barriers that serialize the GPU, so it INFLATES the wall a bit — use it only for the breakdown,
 # never to quote production throughput (the uninstrumented sec/cyc is the real number).
@@ -131,7 +136,7 @@ const PKAXIS = parse(Int, get(ENV, "CIC_PKAXIS", "1"))
 const PKNB   = parse(Int, get(ENV, "CIC_PKNB",   "0"))    # k-bins (0 ⇒ ncell÷2)
 const PKVEL  = get(ENV, "CIC_PK_VEL", "1") == "1"
 const CELLDUMP = get(ENV, "CIC_CELL_DUMP", PKMEAS ? "0" : "1") == "1"
-const REPORTS= joinpath(@__DIR__, "..", "..", "..", "reports", "multicode")
+const REPORTS= MultiCode.run_dir("patch")   # scratch run dir via vrun (never the repo); see runout.jl
 const TAG    = get(ENV, "CIC_TAG", "")
 const XH     = 0.76
 
@@ -228,7 +233,9 @@ function gas_ic(snap, c::Cosmo, a_i, u_i)
     end
     @printf("gas IC: f_b=%.4f  T_gas=%.1f K (eint=%.3e code)  x_HII0=%.3e  v→code=%.4e\n",
             c.fb, Tg, eint, xHII0, vconv); flush(stdout)
-    species = NSPEC == 1 ? [HII] : [HII, H2I, HDI]    # analytic: HII-only color
+    species = NSPEC == 1 ? [HII] :                     # :analytic → HII-only color
+              NSPEC == 2 ? [HII, H2I] :                # :analytic_h2 → HII + H2 (no HD)
+                           [HII, H2I, HDI]             # :full → + HDI/deuterium
     return (D=Float64.(D), S1=S1, S2=S2, S3=S3, Tau=Tau, Ge=Ge, species=species)
 end
 
