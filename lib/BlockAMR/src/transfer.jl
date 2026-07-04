@@ -218,6 +218,7 @@ regrid or pool growth.
 function build_level_tables!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
     lev.tabs[:sib] = to_device_table(lev.be, build_sibling_jobs(lev))
+    sync_block_geometry!(lev)
     if l >= 1
         plev = hier.levels[l]
         lev.tabs[:pro] = to_device_table(lev.be, build_prolong_jobs(lev, plev))

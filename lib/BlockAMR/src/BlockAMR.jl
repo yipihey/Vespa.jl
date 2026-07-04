@@ -48,6 +48,7 @@ export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
 export BlockRefinementPolicy, regrid!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
 export update_scales!, encode_from_host!
+export grav_kick_level!, sync_block_geometry!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -97,5 +98,6 @@ include("reflux.jl")       # C/F face registry + recompute capture/apply
 include("stepping.jl")     # hierarchy integrator + conservation diagnostics
 include("scales.jl")       # per-block power-of-two f32 scale maintenance (f16)
 include("regrid.jl")       # dynamic refinement: flag → cluster → rebuild
+include("gravity.jl")      # KDK half-kicks from the topgrid potential
 
 end # module BlockAMR
