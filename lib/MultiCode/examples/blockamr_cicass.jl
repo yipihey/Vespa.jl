@@ -153,7 +153,8 @@ function main()
         BlockAMR.advance_level_w!(hier, 0, hier.λ;
             selfgrav = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
                         rho_mean = 1.0, use_dm = true),
-            chem = (a_value = a, density_units = u.d, length_units = u.l,
+            chem = get(ENV, "BAM_NOCHEM", "0") == "1" ? nothing :
+                   (a_value = a, density_units = u.d, length_units = u.l,
                     time_units = u.t, hubble = c.h0, Om = c.Om, OL = c.OL,
                     fh = c.XH))
         # level 0 uses the FFT φ pool directly (nsweep0=0 keeps its Dirichlet-free
@@ -191,6 +192,47 @@ function main()
             update_scales!(hier, l)
         end
         nstep % REGRIDN == 0 && regrid!(hier, pol)
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            for l in 0:length(hier.levels)-1
+                isempty(hier.levels[l+1].live) && continue
+                sm = BlockAMR.max_signal(hier.levels[l+1], hier.gamma)
+                if !isfinite(sm)
+                    lev = hier.levels[l+1]
+                    hDn = Array(lev.D); hGn = Array(lev.Ge); hTn = Array(lev.Tau); hSn = Array(lev.S1)
+                    nb_ = count(!isfinite, Float32.(hDn)); ng_ = count(!isfinite, Float32.(hGn))
+                    nt_ = count(!isfinite, Float32.(hTn)); ns_ = count(!isfinite, Float32.(hSn))
+                    @printf("NANHUNT step %d z=%.3f level %d: smax=%s  nonfinite D=%d Ge=%d Tau=%d S1=%d  blocks=%d\n",
+                            nstep, 1/a - 1, l, string(sm), nb_, ng_, nt_, ns_, length(lev.live))
+                    # locate up to 8 offenders: block origin, local cell, C/F adjacency
+                    shown = 0
+                    flev = l + 2 <= length(hier.levels) ? hier.levels[l + 2] : nothing
+                    for s_ in lev.live
+                        shown >= 8 && break
+                        m_ = lev.meta[s_]; base_ = (Int(s_) - 1) * lev.stride
+                        for kk in 1:lev.B, jj in 1:lev.B, ii in 1:lev.B
+                            idx_ = base_ + ((lev.ng+kk-1)*lev.nd + (lev.ng+jj-1))*lev.nd + (lev.ng+ii-1) + 1
+                            if !isfinite(Float32(hGn[idx_])) || !isfinite(Float32(hTn[idx_]))
+                                g_ = (Int(m_.origin[1]) + ii - 1, Int(m_.origin[2]) + jj - 1,
+                                      Int(m_.origin[3]) + kk - 1)
+                                cov = flev !== nothing && !isempty(flev.live) &&
+                                      !isempty(overlapping_blocks(flev,
+                                          (Int128(2g_[1]), Int128(2g_[2]), Int128(2g_[3])), (2,2,2)))
+                                nbcf = flev !== nothing && !isempty(flev.live) &&
+                                       !isempty(overlapping_blocks(flev,
+                                          (Int128(2g_[1]-2), Int128(2g_[2]-2), Int128(2g_[3]-2)), (6,6,6)))
+                                @printf("  cell %s D=%.4g Ge=%s Tau=%s covered=%s nearCF=%s\n",
+                                        string(g_), Float32(hDn[idx_]) * Array(lev.Dsc)[s_],
+                                        string(Float32(hGn[idx_])), string(Float32(hTn[idx_])),
+                                        string(cov), string(nbcf))
+                                shown += 1; shown >= 8 && break
+                            end
+                        end
+                    end
+                    flush(stdout)
+                    error("NaN detected at level $l step $nstep")
+                end
+            end
+        end
         if nstep % 10 == 0
             nb = [length(hier.levels[l+1].live) for l in 0:length(hier.levels)-1]
             @printf("step %4d  z=%8.2f  dτ=%.3e  blocks=%s  λ=%.3e\n",

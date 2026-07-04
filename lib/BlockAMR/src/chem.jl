@@ -78,9 +78,35 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
                             lev.live_d, lev.Dsc, lev.Esc, Int32(lev.B), Int32(lev.ng),
                             Int32(lev.nd), Int32(lev.stride); ndrange = n)
+    dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
+    local rin, ein, hin, min_
+    if dbg
+        rin = Array(rho32); ein = Array(e32); hin = Array(h16); min_ = Array(m16)
+    end
     ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
         a_value, dt, density_units, length_units, time_units,
         hubble, Om, OL, fh, backend = hier.besym, precision = Float32)
+    if dbg
+        nb = mapreduce(x -> !isfinite(x), +, e32)
+        if nb > 0
+            eo = Array(e32)
+            shown = 0
+            for i in eachindex(eo)
+                if !isfinite(eo[i]) && shown < 6
+                    println("CHEMDBG l=", l, " dt=", dt, " a=", a_value,
+                            " IN: rho=", rin[i], " e=", ein[i],
+                            " hii_code=", hin[i], " h2_code=", min_[i],
+                            " xHII=", ChemistryKernels.decode_log2sp(Float64, hin[i]),
+                            " xH2=", ChemistryKernels.decode_log2sp(Float64, min_[i]),
+                            " du=", density_units, " tu=", time_units,
+                            " vu2=", (length_units/time_units)^2)
+                    shown += 1
+                end
+            end
+            flush(stdout)
+            error("chem NaN: $nb cells at level $l")
+        end
+    end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
                              rho32, e32, h16, m16, lev.live_d, lev.Esc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
