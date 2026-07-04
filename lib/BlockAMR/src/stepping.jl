@@ -68,16 +68,27 @@ Reflux weights: fine ¼ per fine stage (RK ½ × time-average ½), coarse ½ per
 coarse stage; the apply multiplies the single global λ.
 """
 function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
-                          φ = nothing, chem = nothing)
+                          φ = nothing, chem = nothing, selfgrav = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     haskids = l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
     if haskids                                    # fine first (frozen parent state)
-        advance_level_w!(hier, l + 1, λ; φ, chem)
-        advance_level_w!(hier, l + 1, λ; φ, chem)
+        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
+        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
     end
     dt_l = Float64(λ) * level_dx(hier, l)
-    φ === nothing || grav_kick_level!(hier, l, φ, 0.5 * dt_l)      # KDK: K1
+    # KDK K1.  Native self-gravity (selfgrav = (coef=…, nsweep=…, rho_ext=…)):
+    # levels ≥ 1 SOLVE their own Poisson (warm-started red-black on the block
+    # union, Dirichlet from the parent φ pool) and kick from it; level 0 kicks
+    # from the external topgrid φ (whose pool copy seeds the level-1 BCs).
+    if selfgrav !== nothing && l >= 1
+        solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
+                             nsweep = get(selfgrav, :nsweep, 30),
+                             rho_ext = get(selfgrav, :rho_ext, nothing))
+        grav_kick_level_pool!(hier, l, 0.5 * dt_l)
+    elseif φ !== nothing
+        grav_kick_level!(hier, l, φ, 0.5 * dt_l)
+    end
     fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
     stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
     l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
@@ -86,7 +97,11 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
     l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
     haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
-    φ === nothing || grav_kick_level!(hier, l, φ, 0.5 * dt_l)      # KDK: K2
+    if selfgrav !== nothing && l >= 1                              # KDK: K2
+        grav_kick_level_pool!(hier, l, 0.5 * dt_l)
+    elseif φ !== nothing
+        grav_kick_level!(hier, l, φ, 0.5 * dt_l)
+    end
     chem === nothing || chem_level!(hier, l, dt_l; chem...)        # analytic H+H₂
     if haskids
         restrict_level!(hier, l + 1)
@@ -102,9 +117,11 @@ end
 One root step of the strict-2:1 W-cycle: λ from the global CFL, then the
 recursive fine-first advance.  Level l takes exactly 2^l substeps of λ·dx_l.
 """
-function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing)
+function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing,
+                            selfgrav = nothing)
     λ = compute_lambda!(hier)
-    advance_level_w!(hier, 0, λ; φ, chem)
+    selfgrav !== nothing && φ !== nothing && phi_from_global!(hier, φ)
+    advance_level_w!(hier, 0, λ; φ, chem, selfgrav)
     return λ * level_dx(hier, 0)
 end
 

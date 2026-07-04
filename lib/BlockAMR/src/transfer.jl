@@ -312,3 +312,34 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
     end
     return nothing
 end
+
+# ── trilinear prolongation (gravity Dirichlet BCs) ────────────────────────────
+# Fine value = trilinear interpolation of the parent field at the fine cell
+# CENTER: per axis the center sits at parent fraction ¼ or ¾ (weights ¾/¼ toward
+# the containing parent cell and its ± neighbour, direction from fine parity).
+# Non-conservative — used for POTENTIAL boundary values only.  Parent ±1 taps may
+# reach the parent's ghost ring, which must be current (parent solved first).
+@kernel function _rect_prolong_tl_k!(dst, @Const(src), @Const(jobs), @Const(cellstart),
+                                     njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        pi_ = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        pj_ = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        pk_ = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        d1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? Int32(-1) : Int32(1)
+        d2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? Int32(-1) : Int32(1)
+        d3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? Int32(-1) : Int32(1)
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        g(a, bq, cq) = Float32(src[sbase + ((pk_ + cq * d3) * nd + (pj_ + bq * d2)) * nd +
+                                   (pi_ + a * d1) + Int32(1)])
+        w(q) = q == Int32(0) ? 0.75f0 : 0.25f0
+        acc = 0.0f0
+        for cq in Int32(0):Int32(1), bq in Int32(0):Int32(1), aq in Int32(0):Int32(1)
+            acc += w(aq) * w(bq) * w(cq) * g(aq, bq, cq)
+        end
+        dst[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] = acc
+    end
+end

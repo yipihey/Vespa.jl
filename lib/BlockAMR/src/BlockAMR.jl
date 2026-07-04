@@ -51,6 +51,7 @@ export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, cap
 export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
 export chem_level!
+export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
