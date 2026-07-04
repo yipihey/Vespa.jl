@@ -1,4 +1,5 @@
 [deps]
+BlockAMR = "1a2b3c4d-0014-4000-8000-000000000014"
 ArepoLib = "53ab7c8a-d661-4fc8-8a1b-438dce0114bd"
 AthenaLib = "f5df054c-8ce1-49d2-8985-d9d11c9a8f1d"
 CICASSLib = "faf74867-2ca8-40c5-abb4-1e9353a0082c"
@@ -78,3 +79,6 @@ path = "../../../../RamsesNG.jl/lib/RamsesLib"
 
 [sources.dfmm]
 path = "../../../../dfmm"
+
+[sources.BlockAMR]
+path = "../../BlockAMR"

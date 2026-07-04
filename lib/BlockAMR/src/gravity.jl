@@ -324,3 +324,39 @@ function grav_kick_level_pool!(hier::AMRHierarchy, l::Int, halfdt::Real)
                                Int32(lev.nd), Int32(lev.stride); ndrange = n)
     return nothing
 end
+
+# scatter a level-0 pool field (D by default, scale-decoded) into a global
+# nbase³ f32 array — the gas side of the topgrid FFT source.  Level-0 blocks
+# tile disjointly: no atomics.
+@kernel function _global_from_level0_k!(g, @Const(F), @Const(sc), @Const(live_d),
+                                        @Const(gi0), n1::Int32, n2::Int32, n3::Int32,
+                                        B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        ci = c % B; cj = (c ÷ B) % B; ck = c ÷ (B * B)
+        gi = gi0[3*(slot-Int32(1))+Int32(1)] + ci
+        gj = gi0[3*(slot-Int32(1))+Int32(2)] + cj
+        gk = gi0[3*(slot-Int32(1))+Int32(3)] + ck
+        idx = base + _lidx(ci + ng, cj + ng, ck + ng, nd)
+        g[(gk * n2 + gj) * n1 + gi + Int32(1)] = Float32(F[idx]) * sc[slot]
+    end
+end
+
+"Gather level-0 field `f` (default :D, scale-decoded) into global array `g` (nbase³)."
+function global_from_level0!(hier::AMRHierarchy, g; f::Symbol = :D)
+    lev = hier.levels[1]
+    isempty(lev.live) && return g
+    haskey(lev.tabs, :gi0) || sync_block_geometry!(lev)
+    sc = f === :D ? lev.Dsc : (f in (:S1, :S2, :S3) ? lev.Ssc : lev.Esc)
+    n = length(lev.live) * lev.B^3
+    _global_from_level0_k!(lev.be)(g, getfield(lev, f), sc, lev.live_d,
+                                   lev.tabs[:gi0], Int32.(hier.nbase)...,
+                                   Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                                   Int32(lev.stride); ndrange = n)
+    return g
+end

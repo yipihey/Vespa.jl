@@ -82,12 +82,15 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     # union, Dirichlet from the parent φ pool) and kick from it; level 0 kicks
     # from the external topgrid φ (whose pool copy seeds the level-1 BCs).
     if selfgrav !== nothing && (l >= 1 || φ === nothing)
-        # l = 0 without an external φ: fully-periodic base solve (rho_mean needed)
+        # cosmological convention: the source is coef·(ρ_tot − rho_mean) = coef·δ
+        # at EVERY level (matching the mean-subtracted topgrid FFT that feeds the
+        # level-1 Dirichlet BCs); use_dm adds the per-level particle deposit.
         solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
                              nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :
                                                get(selfgrav, :nsweep, 30),
                              rho_ext = get(selfgrav, :rho_ext, nothing),
-                             rho_mean = l == 0 ? get(selfgrav, :rho_mean, 0) : 0)
+                             rho_mean = get(selfgrav, :rho_mean, 0),
+                             use_dm = get(selfgrav, :use_dm, false))
         grav_kick_level_pool!(hier, l, 0.5 * dt_l)
     elseif φ !== nothing
         grav_kick_level!(hier, l, φ, 0.5 * dt_l)
