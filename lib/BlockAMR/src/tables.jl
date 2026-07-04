@@ -65,7 +65,7 @@ function build_sibling_jobs(lev::Level)
     for s in lev.live
         m = lev.meta[s]
         lo  = ntuple(d -> Int128(m.origin[d]) - ng, 3)     # stored-frame global lo
-        cands = overlapping_blocks(lev, lo, ntuple(_ -> lev.nd, 3))
+        cands = lattice_neighbors(lev, m.origin, B)        # O(1) hits, lattice-aligned
         for c in cands
             cm = lev.meta[c]
             imgs = ntuple(d -> axis_images(lo[d], lev.nd, Int128(cm.origin[d]), B,

@@ -150,6 +150,30 @@ function _unregister!(lev::Level, s::Int32)
 end
 
 """
+    lattice_neighbors(lev, origin, B) -> Vector{Int32}
+
+Live slots of the ≤26 B-lattice neighbours of the block at `origin` (all block
+origins are lattice-aligned — the clusterer guarantee — so neighbour lookup is
+26 O(1) `byorigin` hits instead of a tilemap walk).  Includes the block itself
+in the periodic self-wrap sense the sibling builder expects (caller filters).
+"""
+function lattice_neighbors(lev::Level, origin::Origin, B::Int)
+    out = Int32[]
+    for dk in -1:1, dj in -1:1, di in -1:1
+        o = (wrapc(Int128(origin[1]) + di * B, lev.P[1]),
+             wrapc(Int128(origin[2]) + dj * B, lev.P[2]),
+             wrapc(Int128(origin[3]) + dk * B, lev.P[3]))
+        s = get(lev.byorigin, o, Int32(0))
+        s != 0 && !(s in out) && push!(out, s)
+    end
+    return out
+end
+
+"O(1) owner of the block-lattice cell containing level cell `q` (0 if none)."
+lattice_owner(lev::Level, q::NTuple{3,UInt128}, B::Int) =
+    get(lev.byorigin, ntuple(d -> (q[d] ÷ UInt128(B)) * UInt128(B), 3), Int32(0))
+
+"""
     overlapping_blocks(lev, lo, len) -> Vector{Int32}
 
 Live slots whose ACTIVE region [origin, origin+B) overlaps the (wrapped) query

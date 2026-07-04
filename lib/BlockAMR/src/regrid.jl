@@ -135,17 +135,24 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy)
     for l in 0:Ltarget-1
         fl[l + 1] = _dilate(fl[l + 1], pol.nbuf, level_period(hier.nbase, l))
     end
-    # 4–6: rebuild children levels coarse→fine
+    # 4–6: rebuild children levels coarse→fine, then rebuild tables ONLY where
+    # topology changed (a level's :pro/:res/:cf also depend on its PARENT, so a
+    # change at l dirties l and l+1; level 0 never changes here — its sibling
+    # table, the largest, survives every regrid).
+    changed = falses(length(hier.levels) + 2)
     for lc in 1:Ltarget
-        _rebuild_level!(hier, lc, fl[lc])
+        changed[lc + 1] = _rebuild_level!(hier, lc, fl[lc]) > 0
     end
     for l in 0:length(hier.levels)-1
-        build_level_tables!(hier, l)
-        l >= 1 && build_cf_register!(hier, l)
+        if changed[l + 1] || (l >= 1 && changed[l])
+            build_level_tables!(hier, l)
+            l >= 1 && build_cf_register!(hier, l)
+        end
     end
     return nothing
 end
 
+"Rebuild one level's block set from flags; returns the number of adds+frees."
 function _rebuild_level!(hier::AMRHierarchy, lc::Int, flags::Set{NTuple{3,Int128}})
     plev = hier.levels[lc]
     lev  = ensure_level!(hier, lc)
@@ -153,24 +160,26 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int, flags::Set{NTuple{3,Int128
     # footprints: per parent, lattice tiles (Bh) containing flagged cells
     want = Dict{Origin,Tuple{Int32,NTuple{3,Int16}}}()
     for g in flags
-        for p in overlapping_blocks(plev, ntuple(d -> Int128(g[d]), 3), (1, 1, 1))
-            pm = plev.meta[p]
-            loc = ntuple(d -> Int(mod(Int128(g[d]) - Int128(pm.origin[d]),
-                                      Int128(plev.P[d]))), 3)
-            all(loc .< B) || continue
-            off = ntuple(d -> Int16((loc[d] ÷ Bh) * Bh), 3)
-            org = child_origin(pm.origin, off, lev.P)
-            want[org] = (p, off)
-        end
+        gq = ntuple(d -> UInt128(g[d]), 3)
+        p = lattice_owner(plev, gq, B)
+        p == 0 && continue
+        pm = plev.meta[p]
+        loc = ntuple(d -> Int(mod(Int128(g[d]) - Int128(pm.origin[d]),
+                                  Int128(plev.P[d]))), 3)
+        off = ntuple(d -> Int16((loc[d] ÷ Bh) * Bh), 3)
+        org = child_origin(pm.origin, off, lev.P)
+        want[org] = (p, off)
     end
     # persistence: free vanished, create missing (data via interior prolongation)
+    nchg = 0
     for s in copy(lev.live)
-        haskey(want, lev.meta[s].origin) || remove_block!(hier, lc, s)
+        haskey(want, lev.meta[s].origin) || (remove_block!(hier, lc, s); nchg += 1)
     end
     news = Int32[]
     for (org, (p, off)) in want
         haskey(lev.byorigin, org) && continue
         push!(news, add_block!(hier, lc, p, Int.(off)))
+        nchg += 1
     end
     if !isempty(news)
         # new blocks inherit their parent's class scales (power-of-two, so the
@@ -195,5 +204,5 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int, flags::Set{NTuple{3,Int128
             lev.meta[s].flags &= ~FLAG_NEW
         end
     end
-    return nothing
+    return nchg
 end

@@ -31,6 +31,13 @@ const DTHRESH = parse(Float64, get(ENV, "BAM_DTHRESH", "1.5"))   # gas overdensi
 const REGRIDN = parse(Int, get(ENV, "BAM_REGRID", "4"))
 const NSWEEP  = parse(Int, get(ENV, "BAM_NSWEEP", "30"))
 const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac per level
+# Deepest level receiving DIRECT DM particle deposits.  Topgrid-mass particles
+# CIC-deposited at level l are 8^l-amplified point sources (one particle per
+# 2^3l fine cells) — beyond l≈1 the shot noise spikes the level Poisson solves
+# until the kicks blow up (the z≈15 NaN of the first L4 run).  Deeper levels see
+# DM through their Dirichlet boundaries, the correct treatment for particles far
+# below their native resolution (gas dominates collapsed cores anyway).
+const LDM     = parse(Int, get(ENV, "BAM_LDM", "1"))
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -136,7 +143,7 @@ function main()
         PoissonKernels.fft_poisson_rfft!(φ3, ρ3; G = 1.5 * c.Om * a, a = 1.0,
                                          boxsize = 1.0)
         phi_from_global!(hier, φg)
-        for l in 1:length(hier.levels)-1
+        for l in 1:min(length(hier.levels) - 1, LDM)
             isempty(hier.levels[l+1].live) && continue
             deposit_particles_level!(hier, l, parts; mass_code)
         end

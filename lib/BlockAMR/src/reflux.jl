@@ -33,7 +33,7 @@ function build_cf_faces(lev::Level, plev::Level)
                 Int128(m.origin[d]), 3)
             slab_len = ntuple(d -> d == ax ? 1 : B, 3)
             covered = falses(B, B)                      # transverse (t1, t2), 1-based
-            for c in overlapping_blocks(lev, slab_lo, slab_len)
+            for c in lattice_neighbors(lev, m.origin, B)
                 cm = lev.meta[c]
                 isempty(axis_images(slab_lo[ax], 1, Int128(cm.origin[ax]), B,
                                     Int128(lev.P[ax]))) && continue
@@ -55,16 +55,16 @@ function build_cf_faces(lev::Level, plev::Level)
                 q[t1] = (Int128(m.origin[t1]) + f1) >> 1
                 q[t2] = (Int128(m.origin[t2]) + f2) >> 1
                 qw = ntuple(d -> wrapc(q[d], plev.P[d]), 3)
-                owner = overlapping_blocks(plev, ntuple(d -> Int128(qw[d]), 3), (1, 1, 1))
-                length(owner) == 1 ||
-                    error("C/F face target not uniquely owned (nesting violation?)")
-                po = plev.meta[owner[1]]
+                own = lattice_owner(plev, qw, B)
+                own != 0 ||
+                    error("C/F face target not owned (nesting violation?)")
+                po = plev.meta[own]
                 cc = ntuple(d -> Int32(Int(mod(Int128(qw[d]) - Int128(po.origin[d]),
                                                Int128(plev.P[d]))) + plev.ng), 3)
                 fc = Vector{Int32}(undef, 3)
                 fc[ax] = side == 1 ? Int32(ng + B - 1) : Int32(ng)
                 fc[t1] = Int32(ng + f1); fc[t2] = Int32(ng + f2)
-                append!(ent, Int32[owner[1], cc..., ax, side, s, fc..., 0, 0, 0, 0, 0, 0])
+                append!(ent, Int32[own, cc..., ax, side, s, fc..., 0, 0, 0, 0, 0, 0])
             end
         end
     end
