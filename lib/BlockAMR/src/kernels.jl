@@ -21,9 +21,11 @@
 
 @inline _lidx(i::Int32, j::Int32, k::Int32, nd::Int32) = (k * nd + j) * nd + i + Int32(1)
 
-@inline function _loadU(D, S1, S2, S3, Tau, Ge, idx::Int32)
-    @inbounds (Float32(D[idx]), Float32(S1[idx]), Float32(S2[idx]),
-               Float32(S3[idx]), Float32(Tau[idx]), Float32(Ge[idx]))
+# load one cell's conserved state as PHYSICAL f32 (per-block class scales un-lift)
+@inline function _loadU(D, S1, S2, S3, Tau, Ge, idx::Int32,
+                        dsc::Float32, ssc::Float32, esc::Float32)
+    @inbounds (Float32(D[idx]) * dsc, Float32(S1[idx]) * ssc, Float32(S2[idx]) * ssc,
+               Float32(S3[idx]) * ssc, Float32(Tau[idx]) * esc, Float32(Ge[idx]) * esc)
 end
 
 # primitives (ρ,u,v,w,P) with DUAL-ENERGY pressure P = (γ−1)·Ge, floored.
@@ -118,16 +120,17 @@ end
 # mass flux) and the contact speeds for the pdV source.
 @inline function _axis_update(D, S1, S2, S3, Tau, Ge, base::Int32,
                               i::Int32, j::Int32, k::Int32, nd::Int32,
-                              γ::Float32, ax::Int32)
+                              γ::Float32, ax::Int32,
+                              dsc::Float32, ssc::Float32, esc::Float32)
     di = ax == Int32(1) ? Int32(1) : Int32(0)
     dj = ax == Int32(2) ? Int32(1) : Int32(0)
     dk = ax == Int32(3) ? Int32(1) : Int32(0)
     idx(m) = base + _lidx(i + m * di, j + m * dj, k + m * dk, nd)
-    Um2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-2)))
-    Um1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-1)))
-    Uc  = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(0)))
-    Up1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(1)))
-    Up2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(2)))
+    Um2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-2)), dsc, ssc, esc)
+    Um1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-1)), dsc, ssc, esc)
+    Uc  = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(0)), dsc, ssc, esc)
+    Up1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(1)), dsc, ssc, esc)
+    Up2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(2)), dsc, ssc, esc)
     Wm2 = _prim_de(Um2, γ); Wm1 = _prim_de(Um1, γ); Wc = _prim_de(Uc, γ)
     Wp1 = _prim_de(Up1, γ); Wp2 = _prim_de(Up2, γ)
     Flo, Sslo = _face_flux(Wm2, Wm1, Wc, Wp1, γ, ax)
@@ -148,6 +151,7 @@ end
                               @Const(Tau), @Const(Ge),
                               OldD, OldS1, OldS2, OldS3, OldTau, OldGe,
                               w::Float32, @Const(live_d),
+                              @Const(Dsc), @Const(Ssc), @Const(Esc),
                               λ::Float32, γ::Float32, η::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
@@ -157,10 +161,11 @@ end
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
-        Fx0, Fx1, dgex, dux, Uc = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(1))
-        Fy0, Fy1, dgey, duy, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(2))
-        Fz0, Fz1, dgez, duz, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(3))
+        Fx0, Fx1, dgex, dux, Uc = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(1), dsc, ssc, esc)
+        Fy0, Fy1, dgey, duy, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(2), dsc, ssc, esc)
+        Fz0, Fz1, dgez, duz, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(3), dsc, ssc, esc)
         P_c = (γ - 1.0f0) * max(Uc[6], 1.0f-30)
         dU1 = (Fx1[1] - Fx0[1]) + (Fy1[1] - Fy0[1]) + (Fz1[1] - Fz0[1])
         dU2 = (Fx1[2] - Fx0[2]) + (Fy1[2] - Fy0[2]) + (Fz1[2] - Fz0[2])
@@ -176,28 +181,29 @@ end
         nT  = Uc[5] - λ * dU5
         nG  = Uc[6] - λ * dU6
         wo = w; wi = 1.0f0 - w
-        nD  = wo * Float32(OldD[idx])   + wi * nD
-        nS1 = wo * Float32(OldS1[idx])  + wi * nS1
-        nS2 = wo * Float32(OldS2[idx])  + wi * nS2
-        nS3 = wo * Float32(OldS3[idx])  + wi * nS3
-        nT  = wo * Float32(OldTau[idx]) + wi * nT
-        nG  = wo * Float32(OldGe[idx])  + wi * nG
+        nD  = wo * Float32(OldD[idx])   * dsc + wi * nD
+        nS1 = wo * Float32(OldS1[idx])  * ssc + wi * nS1
+        nS2 = wo * Float32(OldS2[idx])  * ssc + wi * nS2
+        nS3 = wo * Float32(OldS3[idx])  * ssc + wi * nS3
+        nT  = wo * Float32(OldTau[idx]) * esc + wi * nT
+        nG  = wo * Float32(OldGe[idx])  * esc + wi * nG
         # dual-energy selection: trust Tau−KE where it is well-resolved
         nD = max(nD, 1.0f-30)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
         (nT - KE) > η * nT && (nG = nT - KE)
-        Do_[idx]   = _narrow(eltype(Do_), nD)
-        S1o_[idx]  = _narrow(eltype(S1o_), nS1)
-        S2o_[idx]  = _narrow(eltype(S2o_), nS2)
-        S3o_[idx]  = _narrow(eltype(S3o_), nS3)
-        Tauo_[idx] = _narrow(eltype(Tauo_), nT)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30))
+        Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
+        S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
+        S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
+        S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
+        Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
+        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
     end
 end
 
 # ── batched CFL reduction ─────────────────────────────────────────────────────
 @kernel function _max_signal_k!(out, @Const(D), @Const(S1), @Const(S2), @Const(S3),
-                                @Const(Ge), @Const(live_d), γ::Float32,
+                                @Const(Ge), @Const(live_d),
+                                @Const(Dsc), @Const(Ssc), @Const(Esc), γ::Float32,
                                 B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -206,11 +212,13 @@ end
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        ρ = max(Float32(D[idx]), 1.0f-30); inv = 1.0f0 / ρ
-        vx = Float32(S1[idx]) * inv; vy = Float32(S2[idx]) * inv; vz = Float32(S3[idx]) * inv
-        cs = sqrt(γ * (γ - 1.0f0) * max(Float32(Ge[idx]), 1.0f-30) * inv)
+        ρ = max(Float32(D[idx]) * dsc, 1.0f-30); inv = 1.0f0 / ρ
+        vx = Float32(S1[idx]) * ssc * inv; vy = Float32(S2[idx]) * ssc * inv
+        vz = Float32(S3[idx]) * ssc * inv
+        cs = sqrt(γ * (γ - 1.0f0) * max(Float32(Ge[idx]) * esc, 1.0f-30) * inv)
         out[Int32(t)] = max(abs(vx), max(abs(vy), abs(vz))) + cs
     end
 end
@@ -221,6 +229,7 @@ function max_signal(lev::Level, γ::Real)
     n == 0 && return 0.0f0
     out = device_zeros(lev.be, Float32, (n,))
     _max_signal_k!(lev.be)(out, lev.D, lev.S1, lev.S2, lev.S3, lev.Ge, lev.live_d,
+                           lev.Dsc, lev.Ssc, lev.Esc,
                            Float32(γ), Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                            Int32(lev.stride); ndrange = n)
     return maximum(out)                       # device reduction
@@ -242,7 +251,8 @@ function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     fout = OUT === :R ? gasfields(lev) : gasfields_o(lev)
     fold = gasfields(lev)
     n = length(lev.live) * lev.B^3
-    _rk_stage_k!(lev.be)(fout..., fin..., fold..., w, lev.live_d, λ,
+    _rk_stage_k!(lev.be)(fout..., fin..., fold..., w, lev.live_d,
+                         lev.Dsc, lev.Ssc, lev.Esc, λ,
                          Float32(hier.gamma), η, Int32(lev.B), Int32(lev.ng),
                          Int32(lev.nd), Int32(lev.stride); ndrange = n)
     return nothing

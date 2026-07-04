@@ -10,6 +10,7 @@
 # narrowing store: plain convert for floats; round for u16 species codes (the
 # θ-interpolation of log₂ codes is a geometric interpolation of fractions).
 @inline _narrow(::Type{T}, v::Float32) where {T} = T(v)
+@inline _narrow(::Type{Float16}, v::Float32) = Float16(clamp(v, -65504.0f0, 65504.0f0))
 @inline _narrow(::Type{UInt16}, v::Float32) = UInt16(unsafe_trunc(Int32, v + 0.5f0))
 
 # largest j (1-based) with cellstart[j] ≤ t0 (0-based cell id); cellstart[1] = 0.
@@ -99,27 +100,110 @@ end
     end
 end
 
+# ── per-block-scaled variants (f16 phase): values cross blocks as PHYSICAL f32,
+#    encoded with the destination block's power-of-two scale (exact rescaling). ──
+@kernel function _rect_copy_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
+                                  @Const(jobs), @Const(cellstart),
+                                  njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ri; sj = jobs[b+7] + rj; sk = jobs[b+8] + rk
+        ratio = scs[jobs[b+2]] / scd[jobs[b+1]]
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(dst), Float32(src[sbase + (sk * nd + sj) * nd + si + Int32(1)]) * ratio)
+    end
+end
+
+@kernel function _rect_prolong_sc_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
+                                     @Const(scd), @Const(scs),
+                                     @Const(jobs), @Const(cellstart),
+                                     njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        sidx  = sbase + (sk * nd + sj) * nd + si + Int32(1)
+        phys = ((1.0f0 - θ) * Float32(srcR[sidx]) + θ * Float32(srcO[sidx])) * scs[jobs[b+2]]
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(dst), phys / scd[jobs[b+1]])
+    end
+end
+
+@kernel function _rect_restrict_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
+                                      @Const(jobs), @Const(cellstart),
+                                      njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + Int32(2) * ri
+        sj = jobs[b+7] + Int32(2) * rj
+        sk = jobs[b+8] + Int32(2) * rk
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        acc = 0.0f0
+        for ck in Int32(0):Int32(1), cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+            acc += Float32(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
+        end
+        phys = acc * 0.125f0 * scs[jobs[b+2]]
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(dst), phys / scd[jobs[b+1]])
+    end
+end
+
 # ── host orchestration ────────────────────────────────────────────────────────
-function _run_copy!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int)
+function _run_copy!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
+                    scd = nothing, scs = nothing)
     tab.total == 0 && return nothing
-    _rect_copy_k!(be)(dst, src, tab.jobs, tab.cellstart, Int32(tab.njobs),
-                      Int32(nd), Int32(stride); ndrange = tab.total)
+    if scd === nothing
+        _rect_copy_k!(be)(dst, src, tab.jobs, tab.cellstart, Int32(tab.njobs),
+                          Int32(nd), Int32(stride); ndrange = tab.total)
+    else
+        _rect_copy_sc_k!(be)(dst, src, scd, scs, tab.jobs, tab.cellstart,
+                             Int32(tab.njobs), Int32(nd), Int32(stride);
+                             ndrange = tab.total)
+    end
     return nothing
 end
 
 function _run_prolong!(be, tab::RectJobTable, dst, srcR, srcO, θ::Float32,
-                       nd::Int, stride::Int)
+                       nd::Int, stride::Int, scd = nothing, scs = nothing)
     tab.total == 0 && return nothing
-    _rect_prolong_pc_k!(be)(dst, srcR, srcO, θ, tab.jobs, tab.cellstart,
-                            Int32(tab.njobs), Int32(nd), Int32(stride);
-                            ndrange = tab.total)
+    if scd === nothing
+        _rect_prolong_pc_k!(be)(dst, srcR, srcO, θ, tab.jobs, tab.cellstart,
+                                Int32(tab.njobs), Int32(nd), Int32(stride);
+                                ndrange = tab.total)
+    else
+        _rect_prolong_sc_k!(be)(dst, srcR, srcO, θ, scd, scs, tab.jobs,
+                                tab.cellstart, Int32(tab.njobs), Int32(nd),
+                                Int32(stride); ndrange = tab.total)
+    end
     return nothing
 end
 
-function _run_restrict!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int)
+function _run_restrict!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
+                        scd = nothing, scs = nothing)
     tab.total == 0 && return nothing
-    _rect_restrict_k!(be)(dst, src, tab.jobs, tab.cellstart, Int32(tab.njobs),
-                          Int32(nd), Int32(stride); ndrange = tab.total)
+    if scd === nothing
+        _rect_restrict_k!(be)(dst, src, tab.jobs, tab.cellstart, Int32(tab.njobs),
+                              Int32(nd), Int32(stride); ndrange = tab.total)
+    else
+        _rect_restrict_sc_k!(be)(dst, src, scd, scs, tab.jobs, tab.cellstart,
+                                 Int32(tab.njobs), Int32(nd), Int32(stride);
+                                 ndrange = tab.total)
+    end
     return nothing
 end
 
@@ -158,8 +242,10 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     if l >= 1
         plev = hier.levels[l]
         pro  = lev.tabs[:pro]::RectJobTable
-        for (fd, fR, fO) in zip(dst, gasfields(plev), gasfields_o(plev))
-            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride)
+        for (fd, fR, fO, scd, scs) in zip(dst, gasfields(plev), gasfields_o(plev),
+                                          classes(lev), classes(plev))
+            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
+                          scd, scs)
         end
         if buf === :R
             for (sd, sR, sO) in zip(lev.sp, plev.sp, plev.spo)
@@ -168,8 +254,8 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
         end
     end
     sib = lev.tabs[:sib]::RectJobTable
-    for fd in dst
-        _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride)
+    for (fd, sc) in zip(dst, classes(lev))
+        _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
     end
     if buf === :R
         for sd in lev.sp
@@ -189,8 +275,9 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
     @assert l >= 1
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     res = lev.tabs[:res]::RectJobTable
-    for (fc, ff) in zip(gasfields(plev), gasfields(lev))
-        _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride)
+    for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
+                                  classes(plev), classes(lev))
+        _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs)
     end
     # species restriction needs the u16 codec (decode→mean→encode) — f16 phase.
     return nothing

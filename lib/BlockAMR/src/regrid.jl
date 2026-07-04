@@ -31,7 +31,8 @@ Base.@kwdef struct BlockRefinementPolicy
     lmax    :: Int = 1
 end
 
-@kernel function _flag_k!(flags, count, @Const(D), @Const(live_d), thresh::Float32,
+@kernel function _flag_k!(flags, count, @Const(D), @Const(live_d), @Const(Dsc),
+                          thresh::Float32,
                           B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -42,7 +43,7 @@ end
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        f = Float32(D[idx]) > thresh
+        f = Float32(D[idx]) * Dsc[slot] > thresh
         flags[idx] = UInt8(f)
         f && (KA.@atomic count[slot] += Int32(1))
     end
@@ -56,7 +57,7 @@ function _criterion_cells(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
     n = length(lev.live) * lev.B^3
-    _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, Float32(pol.dthresh),
+    _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, lev.Dsc, Float32(pol.dthresh),
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = n)
     hc = Array(count); hf = Array(flags)
@@ -145,10 +146,20 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int, flags::Set{NTuple{3,Int128
         push!(news, add_block!(hier, lc, p, Int.(off)))
     end
     if !isempty(news)
+        # new blocks inherit their parent's class scales (power-of-two, so the
+        # prolongation ratio is exact); update_scales! re-windows them later.
+        hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc); hEsc = Array(lev.Esc)
+        pDsc = Array(plev.Dsc); pSsc = Array(plev.Ssc); pEsc = Array(plev.Esc)
+        for s in news
+            p = lev.meta[s].parent
+            hDsc[s] = pDsc[p]; hSsc[s] = pSsc[p]; hEsc[s] = pEsc[p]
+        end
+        copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc)
         tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true,
                                                          only_slots = news))
-        for (fd, fR) in zip(gasfields(lev), gasfields(plev))
-            _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride)
+        for (fd, fR, scd, scs) in zip(gasfields(lev), gasfields(plev),
+                                      classes(lev), classes(plev))
+            _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride, scd, scs)
         end
         for (sd, sR) in zip(lev.sp, plev.sp)
             _run_prolong!(lev.be, tab, sd, sR, sR, 0.0f0, lev.nd, lev.stride)

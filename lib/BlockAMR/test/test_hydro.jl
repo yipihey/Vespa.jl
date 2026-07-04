@@ -7,11 +7,13 @@
 #   * fine-region L1 agreement with an equivalent single-level uniform-fine run.
 const BA = BlockAMR
 
-# set (ρ,u,v,w,P) from an analytic profile on every ACTIVE cell (Ge = P/(γ−1))
+# set (ρ,u,v,w,P) from an analytic profile on every ACTIVE cell (Ge = P/(γ−1));
+# staged in f64 then encoded through the per-block scale path (identity for f32).
 function set_ic!(hier, l, prof)
     lev = hier.levels[l + 1]
     dx = BA.level_dx(hier, l)
-    h = Dict(f => Array(getfield(lev, f)) for f in (:D, :S1, :S2, :S3, :Tau, :Ge))
+    n = lev.cap * lev.stride
+    h = Dict(f => zeros(Float64, n) for f in (:D, :S1, :S2, :S3, :Tau, :Ge))
     γ = hier.gamma
     for s in lev.live
         m = lev.meta[s]; base = (Int(s) - 1) * lev.stride
@@ -26,14 +28,12 @@ function set_ic!(hier, l, prof)
             h[:Tau][idx] = ge + 0.5 * ρ * (u^2 + v^2 + w^2)
         end
     end
-    for f in (:D, :S1, :S2, :S3, :Tau, :Ge)
-        copyto!(getfield(lev, f), h[f])
-    end
+    BA.encode_from_host!(lev, h[:D], h[:S1], h[:S2], h[:S3], h[:Tau], h[:Ge])
 end
 
 # static center refinement: 8 level-1 children covering parent cells [B/2,3B/2)³
-function center_refined(; nbase = (32, 32, 32), B = 16, backend = :cpu)
-    hier = AMRHierarchy(; nbase, B, backend)
+function center_refined(; nbase = (32, 32, 32), B = 16, backend = :cpu, T = Float32)
+    hier = AMRHierarchy(; nbase, B, backend, T)
     lev0 = init_base_level!(hier)
     Bh = B ÷ 2
     for cz in 0:1, cy in 0:1, cx in 0:1

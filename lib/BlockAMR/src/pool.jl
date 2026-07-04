@@ -45,6 +45,8 @@ end
 
 gasfields(lev::Level)   = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge)
 gasfields_o(lev::Level) = (lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo)
+"Per-field scale-class vectors, field order (D,S1,S2,S3,Tau,Ge)."
+classes(lev::Level)     = (lev.Dsc, lev.Ssc, lev.Ssc, lev.Ssc, lev.Esc, lev.Esc)
 
 "Swap the R and O gas/species buffers (after a level substep)."
 function swap_buffers!(lev::Level)

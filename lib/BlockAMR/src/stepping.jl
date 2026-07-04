@@ -130,8 +130,10 @@ function total_conserved(hier::AMRHierarchy)
         flev = l + 1 <= length(hier.levels) - 1 ? hier.levels[l+2] : nothing
         hD  = Array(lev.D); hS1 = Array(lev.S1); hS2 = Array(lev.S2)
         hS3 = Array(lev.S3); hT = Array(lev.Tau)
+        hdsc = Array(lev.Dsc); hssc = Array(lev.Ssc); hesc = Array(lev.Esc)
         for s in lev.live
             m = lev.meta[s]; base = (Int(s) - 1) * lev.stride
+            dsc = Float64(hdsc[s]); ssc = Float64(hssc[s]); esc = Float64(hesc[s])
             # per-cell covered mask from the fine level (host, test-grade)
             for k in 0:lev.B-1, j in 0:lev.B-1, i in 0:lev.B-1
                 if flev !== nothing && !isempty(flev.live)
@@ -143,11 +145,11 @@ function total_conserved(hier::AMRHierarchy)
                 end
                 idx = base + ((k + lev.ng) * lev.nd + (j + lev.ng)) * lev.nd +
                       (i + lev.ng) + 1
-                tot[1] += Float64(hD[idx])  * dV
-                tot[2] += Float64(hS1[idx]) * dV
-                tot[3] += Float64(hS2[idx]) * dV
-                tot[4] += Float64(hS3[idx]) * dV
-                tot[5] += Float64(hT[idx])  * dV
+                tot[1] += Float64(hD[idx])  * dsc * dV
+                tot[2] += Float64(hS1[idx]) * ssc * dV
+                tot[3] += Float64(hS2[idx]) * ssc * dV
+                tot[4] += Float64(hS3[idx]) * ssc * dV
+                tot[5] += Float64(hT[idx])  * esc * dV
             end
         end
     end

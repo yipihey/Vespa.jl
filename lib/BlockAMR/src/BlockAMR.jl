@@ -47,6 +47,7 @@ export stage_level!, max_signal, hierarchy_rk2_step!, compute_dt, total_conserve
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
 export BlockRefinementPolicy, regrid!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
+export update_scales!, encode_from_host!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -94,6 +95,7 @@ include("transfer.jl")     # batched copy/prolong/restrict kernels + fill_ghosts
 include("kernels.jl")      # fused batched SSP-RK2 PLM+HLLC dual-energy hydro
 include("reflux.jl")       # C/F face registry + recompute capture/apply
 include("stepping.jl")     # hierarchy integrator + conservation diagnostics
+include("scales.jl")       # per-block power-of-two f32 scale maintenance (f16)
 include("regrid.jl")       # dynamic refinement: flag → cluster → rebuild
 
 end # module BlockAMR
