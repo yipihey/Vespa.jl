@@ -37,6 +37,7 @@ module BlockAMR
 
 using KernelAbstractions
 const KA = KernelAbstractions
+import ChemistryKernels
 
 export backend, has_backend, device_zeros, to_device, to_host
 export BlockMeta, Level, AMRHierarchy
@@ -49,6 +50,7 @@ export BlockRefinementPolicy, regrid!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
 export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
+export chem_level!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -99,5 +101,6 @@ include("stepping.jl")     # hierarchy integrator + conservation diagnostics
 include("scales.jl")       # per-block power-of-two f32 scale maintenance (f16)
 include("regrid.jl")       # dynamic refinement: flag → cluster → rebuild
 include("gravity.jl")      # KDK half-kicks from the topgrid potential
+include("chem.jl")         # fast analytic H+H2 chemistry over block batches
 
 end # module BlockAMR

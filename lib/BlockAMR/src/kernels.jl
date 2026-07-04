@@ -19,6 +19,8 @@
 # / `_narrow()` so the same kernel serves f32 (validation) and f16 (production,
 # with per-block scales layered on in the f16 phase).
 
+import ChemistryKernels: encode_log2sp, decode_log2sp
+
 @inline _lidx(i::Int32, j::Int32, k::Int32, nd::Int32) = (k * nd + j) * nd + i + Int32(1)
 
 # load one cell's conserved state as PHYSICAL f32 (per-block class scales un-lift)
@@ -146,14 +148,15 @@ end
 # OUT = w_old·OLD + (1−w_old)·(IN − λ·ΔF(IN))   per active cell of every block.
 #   stage 1: OUT=O, IN=R, OLD=R, w=0        (O = R − λΔF(R))
 #   stage 2: OUT=R, IN=O, OLD=R, w=½        (in-place R is safe: only own-cell R read)
-@kernel function _rk_stage_k!(Do_, S1o_, S2o_, S3o_, Tauo_, Geo_,
+@kernel function _rk_stage_k!(Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
-                              @Const(Tau), @Const(Ge),
-                              OldD, OldS1, OldS2, OldS3, OldTau, OldGe,
+                              @Const(Tau), @Const(Ge), spin,
+                              OldD, OldS1, OldS2, OldS3, OldTau, OldGe, spold,
                               w::Float32, @Const(live_d),
                               @Const(Dsc), @Const(Ssc), @Const(Esc),
                               λ::Float32, γ::Float32, η::Float32,
-                              B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                              B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                              ::Val{NS}) where {NS}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = B * B * B
@@ -197,6 +200,27 @@ end
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
         Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
+        # ── species CMA: X rides the six HLLC mass fluxes, upwinded per face; the
+        # conserved quantity is ρX (fractions decode from the absolute u16 codec) ──
+        if NS > 0
+            ρR = Float32(OldD[idx]) * dsc                 # OLD physical density (R)
+            ixm = base + _lidx(i - Int32(1), j, k, nd); ixp = base + _lidx(i + Int32(1), j, k, nd)
+            iym = base + _lidx(i, j - Int32(1), k, nd); iyp = base + _lidx(i, j + Int32(1), k, nd)
+            izm = base + _lidx(i, j, k - Int32(1), nd); izp = base + _lidx(i, j, k + Int32(1), nd)
+            for q in 1:NS
+                sq = spin[q]
+                Xc  = decode_log2sp(Float32, sq[idx])
+                aX  = Fx1[1] * (Fx1[1] >= 0.0f0 ? Xc : decode_log2sp(Float32, sq[ixp])) -
+                      Fx0[1] * (Fx0[1] >= 0.0f0 ? decode_log2sp(Float32, sq[ixm]) : Xc) +
+                      Fy1[1] * (Fy1[1] >= 0.0f0 ? Xc : decode_log2sp(Float32, sq[iyp])) -
+                      Fy0[1] * (Fy0[1] >= 0.0f0 ? decode_log2sp(Float32, sq[iym]) : Xc) +
+                      Fz1[1] * (Fz1[1] >= 0.0f0 ? Xc : decode_log2sp(Float32, sq[izp])) -
+                      Fz0[1] * (Fz0[1] >= 0.0f0 ? decode_log2sp(Float32, sq[izm]) : Xc)
+                ρXold = decode_log2sp(Float32, spold[q][idx]) * ρR
+                ρXnew = wo * ρXold + wi * (Xc * Uc[1] - λ * aX)
+                spout[q][idx] = encode_log2sp(max(ρXnew, 0.0f0) / max(nD, 1.0f-30))
+            end
+        end
     end
 end
 
@@ -250,10 +274,14 @@ function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     fin  = IN === :R ? gasfields(lev) : gasfields_o(lev)
     fout = OUT === :R ? gasfields(lev) : gasfields_o(lev)
     fold = gasfields(lev)
+    NS = lev.nsp
+    sin_  = IN === :R ? ntuple(q -> lev.sp[q], NS)  : ntuple(q -> lev.spo[q], NS)
+    sout_ = OUT === :R ? ntuple(q -> lev.sp[q], NS) : ntuple(q -> lev.spo[q], NS)
+    sold_ = ntuple(q -> lev.sp[q], NS)
     n = length(lev.live) * lev.B^3
-    _rk_stage_k!(lev.be)(fout..., fin..., fold..., w, lev.live_d,
+    _rk_stage_k!(lev.be)(fout..., sout_, fin..., sin_, fold..., sold_, w, lev.live_d,
                          lev.Dsc, lev.Ssc, lev.Esc, λ,
                          Float32(hier.gamma), η, Int32(lev.B), Int32(lev.ng),
-                         Int32(lev.nd), Int32(lev.stride); ndrange = n)
+                         Int32(lev.nd), Int32(lev.stride), Val(NS); ndrange = n)
     return nothing
 end

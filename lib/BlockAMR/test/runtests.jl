@@ -19,4 +19,5 @@ const BACKENDS = has_backend(:cuda) ? (:cpu, :cuda) : (:cpu,)
     include("test_subcycle.jl")
     include("test_f16.jl")
     include("test_gravity.jl")
+    include("test_chem.jl")
 end

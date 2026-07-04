@@ -67,14 +67,17 @@ in and the (l, l+1) reflux corrects this level's uncovered boundary cells.
 Reflux weights: fine ¼ per fine stage (RK ½ × time-average ½), coarse ½ per
 coarse stage; the apply multiplies the single global λ.
 """
-function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32)
+function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
+                          φ = nothing, chem = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     haskids = l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
     if haskids                                    # fine first (frozen parent state)
-        advance_level_w!(hier, l + 1, λ)
-        advance_level_w!(hier, l + 1, λ)
+        advance_level_w!(hier, l + 1, λ; φ, chem)
+        advance_level_w!(hier, l + 1, λ; φ, chem)
     end
+    dt_l = Float64(λ) * level_dx(hier, l)
+    φ === nothing || grav_kick_level!(hier, l, φ, 0.5 * dt_l)      # KDK: K1
     fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
     stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
     l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
@@ -83,6 +86,8 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32)
     stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
     l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
     haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
+    φ === nothing || grav_kick_level!(hier, l, φ, 0.5 * dt_l)      # KDK: K2
+    chem === nothing || chem_level!(hier, l, dt_l; chem...)        # analytic H+H₂
     if haskids
         restrict_level!(hier, l + 1)
         reflux_apply!(hier, l + 1, λ)
@@ -97,9 +102,9 @@ end
 One root step of the strict-2:1 W-cycle: λ from the global CFL, then the
 recursive fine-first advance.  Level l takes exactly 2^l substeps of λ·dx_l.
 """
-function advance_hierarchy!(hier::AMRHierarchy)
+function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing)
     λ = compute_lambda!(hier)
-    advance_level_w!(hier, 0, λ)
+    advance_level_w!(hier, 0, λ; φ, chem)
     return λ * level_dx(hier, 0)
 end
 

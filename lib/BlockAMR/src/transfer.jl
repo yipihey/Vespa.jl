@@ -163,6 +163,33 @@ end
     end
 end
 
+# species restriction: mass-weighted fraction mean over the 2³ fine cells.  The
+# fine block's density scale cancels in the ratio (one src slot per job).
+@kernel function _rect_restrict_sp_k!(spc, @Const(spf), @Const(Df),
+                                      @Const(jobs), @Const(cellstart),
+                                      njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + Int32(2) * ri
+        sj = jobs[b+7] + Int32(2) * rj
+        sk = jobs[b+8] + Int32(2) * rk
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        num = 0.0f0; den = 0.0f0
+        for ck in Int32(0):Int32(1), cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+            sidx = sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)
+            ρ̂ = Float32(Df[sidx])
+            num += ρ̂ * ChemistryKernels.decode_log2sp(Float32, spf[sidx])
+            den += ρ̂
+        end
+        spc[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            ChemistryKernels.encode_log2sp(num / max(den, 1.0f-30))
+    end
+end
+
 # ── host orchestration ────────────────────────────────────────────────────────
 function _run_copy!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
                     scd = nothing, scs = nothing)
@@ -248,20 +275,17 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
             _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
                           scd, scs)
         end
-        if buf === :R
-            for (sd, sR, sO) in zip(lev.sp, plev.sp, plev.spo)
-                _run_prolong!(lev.be, pro, sd, sR, sO, Float32(θ), lev.nd, lev.stride)
-            end
+        spdst = buf === :R ? lev.sp : lev.spo
+        for (sd, sR, sO) in zip(spdst, plev.sp, plev.spo)
+            _run_prolong!(lev.be, pro, sd, sR, sO, Float32(θ), lev.nd, lev.stride)
         end
     end
     sib = lev.tabs[:sib]::RectJobTable
     for (fd, sc) in zip(dst, classes(lev))
         _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
     end
-    if buf === :R
-        for sd in lev.sp
-            _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
-        end
+    for sd in (buf === :R ? lev.sp : lev.spo)
+        _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
     end
     return nothing
 end
@@ -280,6 +304,11 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
                                   classes(plev), classes(lev))
         _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs)
     end
-    # species restriction needs the u16 codec (decode→mean→encode) — f16 phase.
+    for (sc, sf) in zip(plev.sp, lev.sp)                # mass-weighted X mean
+        res.total == 0 && continue
+        _rect_restrict_sp_k!(lev.be)(sc, sf, lev.D, res.jobs, res.cellstart,
+                                     Int32(res.njobs), Int32(lev.nd),
+                                     Int32(lev.stride); ndrange = res.total)
+    end
     return nothing
 end
