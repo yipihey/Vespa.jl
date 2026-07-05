@@ -144,6 +144,70 @@ end
     end
 end
 
+# CTU variants: same registry walk, the flux recomputed through the CTU chain
+# (`_ctu_face6` replicates the f16 hat-tile rounding, so it reproduces the
+# tiled/per-cell kernels' applied flux bit-exactly).  λ is the predictor's.
+@kernel function _capture_coarse_ctu_k!(reg, @Const(ent),
+                                        @Const(D), @Const(S1), @Const(S2), @Const(S3),
+                                        @Const(Tau), @Const(Ge),
+                                        @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                        wc::Float32, λ::Float32, γ::Float32,
+                                        nd::Int32, stride::Int32)
+    e = @index(Global)
+    b = (Int32(e) - Int32(1)) * Int32(16)
+    @inbounds begin
+        base = (ent[b+1] - Int32(1)) * stride
+        dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]
+        ci = ent[b+2]; cj = ent[b+3]; ck = ent[b+4]
+        ax = ent[b+5]; side = ent[b+6]
+        sh = side == Int32(1) ? Int32(-1) : Int32(0)
+        i = ci + (ax == Int32(1) ? sh : Int32(0))
+        j = cj + (ax == Int32(2) ? sh : Int32(0))
+        k = ck + (ax == Int32(3) ? sh : Int32(0))
+        F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
+                           dsc, ssc, esc)
+        r = (Int32(e) - Int32(1)) * Int32(6)
+        reg[r+1] -= wc * F[1]; reg[r+2] -= wc * F[2]; reg[r+3] -= wc * F[3]
+        reg[r+4] -= wc * F[4]; reg[r+5] -= wc * F[5]; reg[r+6] -= wc * gf
+    end
+end
+
+@kernel function _capture_fine_ctu_k!(reg, @Const(ent),
+                                      @Const(D), @Const(S1), @Const(S2), @Const(S3),
+                                      @Const(Tau), @Const(Ge),
+                                      @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                      wf::Float32, λ::Float32, γ::Float32,
+                                      nd::Int32, stride::Int32)
+    e = @index(Global)
+    b = (Int32(e) - Int32(1)) * Int32(16)
+    @inbounds begin
+        base = (ent[b+7] - Int32(1)) * stride
+        dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]
+        fi = ent[b+8]; fj = ent[b+9]; fk = ent[b+10]
+        ax = ent[b+5]; side = ent[b+6]
+        sh = side == Int32(1) ? Int32(0) : Int32(-1)
+        a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
+        t1i = ax == Int32(1) ? Int32(0) : Int32(1)
+        t1j = ax == Int32(1) ? Int32(1) : Int32(0)
+        t1k = Int32(0)
+        t2i = Int32(0)
+        t2j = ax == Int32(3) ? Int32(1) : Int32(0)
+        t2k = ax == Int32(3) ? Int32(0) : Int32(1)
+        for s2 in Int32(0):Int32(1), s1 in Int32(0):Int32(1)
+            i = fi + (ax == Int32(1) ? sh : Int32(0)) + s1 * t1i + s2 * t2i
+            j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
+            k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
+            F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
+                               dsc, ssc, esc)
+            a1 += F[1]; a2 += F[2]; a3 += F[3]; a4 += F[4]; a5 += F[5]; a6 += gf
+        end
+        r = (Int32(e) - Int32(1)) * Int32(6)
+        q = 0.25f0 * wf
+        reg[r+1] += q * a1; reg[r+2] += q * a2; reg[r+3] += q * a3
+        reg[r+4] += q * a4; reg[r+5] += q * a5; reg[r+6] += q * a6
+    end
+end
+
 # reg += wf · ¼ Σ_{2×2 subfaces} F_fine
 @kernel function _capture_fine_k!(reg, @Const(ent),
                                   @Const(D), @Const(S1), @Const(S2), @Const(S3),
@@ -221,15 +285,23 @@ Accumulate `+w·¼ΣF_fine` into the (l−1, l) register from level `l`'s stage-
 buffer `buf`.  Weights: same-dt integration w=½ per RK stage; strict 2:1
 subcycling w=¼ per stage (the extra ½ is the dt_f/dt_c time average).
 """
-function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32)
+function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
+                       λ::Float32 = hier.λ)
     lev = hier.levels[l + 1]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
     ff = buf === :R ? gasfields(lev) : gasfields_o(lev)
-    _capture_fine_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], ff...,
-                             lev.Dsc, lev.Ssc, lev.Esc, w,
-                             Float32(hier.gamma), Int32(lev.nd),
-                             Int32(lev.stride); ndrange = n)
+    if hier.scheme === :ctu
+        _capture_fine_ctu_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], ff...,
+                                     lev.Dsc, lev.Ssc, lev.Esc, w, λ,
+                                     Float32(hier.gamma), Int32(lev.nd),
+                                     Int32(lev.stride); ndrange = n)
+    else
+        _capture_fine_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], ff...,
+                                 lev.Dsc, lev.Ssc, lev.Esc, w,
+                                 Float32(hier.gamma), Int32(lev.nd),
+                                 Int32(lev.stride); ndrange = n)
+    end
     return nothing
 end
 
@@ -239,15 +311,23 @@ end
 Accumulate `−w·F_coarse` into the (l−1, l) register from level `l−1`'s stage-input
 buffer `buf` (w=½ per coarse RK stage in all integration modes).
 """
-function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32)
+function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
+                         λ::Float32 = hier.λ)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
     fc = buf === :R ? gasfields(plev) : gasfields_o(plev)
-    _capture_coarse_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], fc...,
-                               plev.Dsc, plev.Ssc, plev.Esc, w,
-                               Float32(hier.gamma), Int32(plev.nd),
-                               Int32(plev.stride); ndrange = n)
+    if hier.scheme === :ctu
+        _capture_coarse_ctu_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], fc...,
+                                       plev.Dsc, plev.Ssc, plev.Esc, w, λ,
+                                       Float32(hier.gamma), Int32(plev.nd),
+                                       Int32(plev.stride); ndrange = n)
+    else
+        _capture_coarse_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], fc...,
+                                   plev.Dsc, plev.Ssc, plev.Esc, w,
+                                   Float32(hier.gamma), Int32(plev.nd),
+                                   Int32(plev.stride); ndrange = n)
+    end
     return nothing
 end
 

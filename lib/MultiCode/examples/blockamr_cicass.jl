@@ -72,7 +72,8 @@ function main()
 
     hier = AMRHierarchy(; nbase = (NGRID, NGRID, NGRID), B = BBLK, backend = BE,
                         T = Float16, nsp = 2, gamma = GAMMA, cfl = 0.3,
-                        Lcap = LMAX)
+                        Lcap = LMAX,
+                        scheme = Symbol(get(ENV, "BAM_SCHEME", "rk2")))
     lev0 = init_base_level!(hier); build_level_tables!(hier, 0)
 
     # gas → level-0 pools (host stage in the pool layout, then encode)

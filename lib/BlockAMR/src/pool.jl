@@ -221,6 +221,7 @@ mutable struct AMRHierarchy{L<:Level}
     cfl    :: Float64
     λ      :: Float32
     nstep  :: Vector{Int64}              # per-level substep counters (exact time)
+    scheme :: Symbol                     # hydro integrator: :rk2 (oracle) | :ctu (perf)
 end
 
 level_dx(hier::AMRHierarchy, l::Int) = hier.box / (hier.nbase[1] * exp2(l))
@@ -229,11 +230,12 @@ lmax(hier::AMRHierarchy) = findlast(lv -> !isempty(lv.live), hier.levels) - 1
 function AMRHierarchy(; nbase::NTuple{3,Int}, box::Real = 1.0, B::Int = 16,
                         ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
                         nsp::Int = 0, Lcap::Int = 60, gamma::Real = 5/3,
-                        cfl::Real = 0.4, cap0::Int = 8)
+                        cfl::Real = 0.4, cap0::Int = 8, scheme::Symbol = :rk2)
+    @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
     be = BlockAMR.backend(backend)
     lev0 = Level(; l = 0, B, ng, nbase, be, T, nsp, cap0)
     AMRHierarchy{typeof(lev0)}([lev0], B, ng, nbase, Float64(box), Lcap, be, backend,
-                               Float64(gamma), Float64(cfl), 1.0f0, Int64[0])
+                               Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme)
 end
 
 "Extend `hier.levels` (and `nstep`) so AMR level `l` exists."

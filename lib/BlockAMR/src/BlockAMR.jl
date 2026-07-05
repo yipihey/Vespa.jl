@@ -45,6 +45,7 @@ export add_block!, remove_block!, init_base_level!, overlapping_blocks, check_ne
 export build_sibling_jobs, build_prolong_jobs, build_restrict_jobs, RectJobTable
 export fill_ghosts!, restrict_level!, blockview
 export stage_level!, max_signal, hierarchy_rk2_step!, compute_dt, total_conserved
+export ctu_level!
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
 export BlockRefinementPolicy, regrid!, compact_level!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
@@ -99,6 +100,7 @@ include("pool.jl")         # Level block pool, slot alloc/free/grow, AMRHierarch
 include("tables.jl")       # RectJobTable + sibling/prolong/restrict builders
 include("transfer.jl")     # batched copy/prolong/restrict kernels + fill_ghosts!
 include("kernels.jl")      # fused batched SSP-RK2 PLM+HLLC dual-energy hydro
+include("kernels_ctu.jl")  # tiled single-pass CTU (GPU) + per-cell oracle
 include("reflux.jl")       # C/F face registry + recompute capture/apply
 include("stepping.jl")     # hierarchy integrator + conservation diagnostics
 include("scales.jl")       # per-block power-of-two f32 scale maintenance (f16)

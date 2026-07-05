@@ -95,14 +95,26 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     elseif φ !== nothing
         grav_kick_level!(hier, l, φ, 0.5 * dt_l)
     end
-    fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
-    stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
-    l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
-    haskids  && capture_coarse!(hier, l + 1, :R, 0.5f0)
-    fill_ghosts!(hier, l; θ = 0.0f0, buf = :O)
-    stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
-    l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
-    haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
+    if hier.scheme === :ctu
+        # single-pass CTU: one ghost fill, one fused launch (R→O), captures from
+        # the intact R, then swap.  Single-stage weights: fine ½/substep (time
+        # average over the 2:1 pair), coarse 1 — same per-coarse-step totals as
+        # the RK2 path's (¼,½)×2.
+        fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
+        ctu_level!(hier, l, λ)
+        l >= 1   && capture_fine!(hier, l, :R, 0.5f0; λ)
+        haskids  && capture_coarse!(hier, l + 1, :R, 1.0f0; λ)
+        swap_buffers!(lev)
+    else
+        fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
+        stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
+        l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
+        haskids  && capture_coarse!(hier, l + 1, :R, 0.5f0)
+        fill_ghosts!(hier, l; θ = 0.0f0, buf = :O)
+        stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
+        l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
+        haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
+    end
     if selfgrav !== nothing && (l >= 1 || φ === nothing)           # KDK: K2
         grav_kick_level_pool!(hier, l, 0.5 * dt_l)
     elseif φ !== nothing
