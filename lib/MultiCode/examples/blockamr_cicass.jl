@@ -29,6 +29,7 @@ const BBLK    = parse(Int, get(ENV, "BAM_B", "16"))
 const LMAX    = parse(Int, get(ENV, "BAM_LMAX", "2"))
 const DTHRESH = parse(Float64, get(ENV, "BAM_DTHRESH", "1.5"))   # gas overdensity ρ/ρ̄_b
 const REGRIDN = parse(Int, get(ENV, "BAM_REGRID", "4"))
+const COMPACT = get(ENV, "BAM_COMPACT", "1") == "1"   # Morton slot compaction at regrid
 const NSWEEP  = parse(Int, get(ENV, "BAM_NSWEEP", "30"))
 const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac per level
 # Deepest level receiving DIRECT DM particle deposits.  Topgrid-mass particles
@@ -191,7 +192,7 @@ function main()
         for l in 0:length(hier.levels)-1
             update_scales!(hier, l)
         end
-        nstep % REGRIDN == 0 && regrid!(hier, pol)
+        nstep % REGRIDN == 0 && regrid!(hier, pol; compact = COMPACT)
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
             for l in 0:length(hier.levels)-1
                 isempty(hier.levels[l+1].live) && continue

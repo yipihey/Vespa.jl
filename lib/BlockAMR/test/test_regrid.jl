@@ -69,4 +69,55 @@ for BE in BACKENDS
     dist = sqrt(sum(d -> (mod((gbest[d] + 0.5) * dxf - xc[d] + 0.5, 1.0) - 0.5)^2, 1:3))
     @test dist < 4σ                                   # tracked through wrap + boundaries
 end
+
+@testset "slot compaction: pure data movement + Morton order [$BE]" begin
+    # twin hierarchies through the same advected-pulse regrid churn — the ONLY
+    # difference is the Morton compaction pass, so every field must agree
+    # bit-exactly per block origin (compaction is data movement, nothing else).
+    σ = 0.05; vx = 0.5; vy = 0.5; x0 = (0.30, 0.30, 0.50)
+    prof = x -> begin
+        r2 = sum(d -> (mod(x[d] - x0[d] + 0.5, 1.0) - 0.5)^2, 1:3)
+        (1.0 + 0.5 * exp(-r2 / (2σ^2)), vx, vy, 0.0, 1.0)
+    end
+    pol = BlockRefinementPolicy(; dthresh = 1.05, nbuf = 2, every = 4, lmax = 1)
+    mk() = (h = AMRHierarchy(; nbase = (32, 32, 32), B = 16, backend = BE, cap0 = 2);
+            init_base_level!(h); set_ic!(h, 0, prof); build_level_tables!(h, 0); h)
+    ha, hb = mk(), mk()
+    regrid!(ha, pol; compact = true); regrid!(hb, pol; compact = false)
+    for h in (ha, hb)
+        set_ic!(h, 0, prof); set_ic!(h, 1, prof)
+    end
+    dtsame = true
+    for n in 1:60
+        dt = compute_dt(ha)
+        dtsame &= (dt == compute_dt(hb))
+        hierarchy_rk2_step!(ha, dt); hierarchy_rk2_step!(hb, dt)
+        if n % pol.every == 0
+            regrid!(ha, pol; compact = true)
+            regrid!(hb, pol; compact = false)
+            @test check_nesting(ha)
+        end
+    end
+    @test dtsame
+    # compacted invariants: dense Morton-sorted slots, empty freelist
+    lev = ha.levels[2]; n1 = length(lev.live)
+    @test n1 > 0
+    @test lev.live == Int32.(1:n1)
+    @test issorted([BA._morton(lev.meta[s], lev.B) for s in lev.live])
+    @test isempty(lev.freelist)
+    @test !compact_level!(ha, 1)                      # idempotent once compacted
+    # bit-exact agreement, keyed by origin, every gas field, both levels
+    blockmap(lv, fld) = begin
+        h = Array(getfield(lv, fld))
+        Dict(lv.meta[s].origin =>
+             [h[(Int(s)-1)*lv.stride + ((lv.ng+k-1)*lv.nd + (lv.ng+j-1))*lv.nd + (lv.ng+i-1) + 1]
+              for i in 1:lv.B, j in 1:lv.B, k in 1:lv.B]
+             for s in lv.live)
+    end
+    for lidx in 1:2, fld in (:D, :S1, :S2, :S3, :Tau, :Ge)
+        ma = blockmap(ha.levels[lidx], fld); mb = blockmap(hb.levels[lidx], fld)
+        @test keys(ma) == keys(mb)
+        @test all(ma[k] == mb[k] for k in keys(ma))
+    end
+end
 end # for BE

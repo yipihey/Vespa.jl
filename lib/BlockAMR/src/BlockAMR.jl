@@ -46,7 +46,7 @@ export build_sibling_jobs, build_prolong_jobs, build_restrict_jobs, RectJobTable
 export fill_ghosts!, restrict_level!, blockview
 export stage_level!, max_signal, hierarchy_rk2_step!, compute_dt, total_conserved
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
-export BlockRefinementPolicy, regrid!
+export BlockRefinementPolicy, regrid!, compact_level!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
 export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!

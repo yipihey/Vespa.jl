@@ -245,6 +245,23 @@ function _morton(m::BlockMeta, B::Int)
     return z
 end
 
+# Slot compaction: gather old slot `perm[i]`'s full stored block (stride elements,
+# ghosts included) into new slot `i` of `dst`.  Pure data movement — dst must be
+# a different array (the O twin / a scratch pool).
+@kernel function _permute_slots_k!(dst, @Const(src), @Const(perm), stride::Int32)
+    t = @index(Global)
+    t0 = Int(t) - 1
+    i = t0 ÷ Int(stride) + 1               # new slot (1-based)
+    r = t0 % Int(stride)
+    @inbounds dst[t0 + 1] = src[(Int(perm[i]) - 1) * Int(stride) + r + 1]
+end
+
+function _permute_slots!(be, dst, src, perm_d, n::Int, stride::Int)
+    n == 0 && return nothing
+    _permute_slots_k!(be)(dst, src, perm_d, Int32(stride); ndrange = n * stride)
+    return nothing
+end
+
 """
     build_level_tables!(hier, l)
 

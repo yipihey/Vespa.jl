@@ -109,14 +109,72 @@ function _tile_rim(fine::Set{NTuple{3,Int128}}, Bh::Int, rim::Int, P::Origin)
 end
 
 """
-    regrid!(hier, pol) -> nothing
+    compact_level!(hier, l) -> Bool
+
+Physically re-pack level `l`'s live blocks into slots `1:nlive` in Morton order.
+This is the form in which locality ordering pays: spatially adjacent blocks get
+adjacent pool storage (reordering only the LAUNCH list regressed 10× — see the
+note in `build_level_tables!`).  Gas + species permute through the O twins
+(stale at a root-step boundary, which regridding already requires); `phi` and
+the DM pool chain through `rhs` (rewritten at every solve).  Children's
+`parent` references on level `l+1` are remapped; the caller must rebuild the
+tables / C/F registers of `l` AND `l+1` afterwards.
+"""
+function compact_level!(hier::AMRHierarchy, l::Int)
+    lev = hier.levels[l + 1]
+    n = length(lev.live)
+    n == 0 && return false
+    order = sort(lev.live; by = s -> _morton(lev.meta[s], lev.B))
+    order == Int32.(1:n) && return false           # already dense + Morton
+    perm_d = to_device(lev.be, order, Int32)
+    for (r, o) in zip(gasfields(lev), gasfields_o(lev))
+        _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+    end
+    for (r, o) in zip(lev.sp, lev.spo)
+        _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+    end
+    swap_buffers!(lev)                             # permuted O twins become R
+    _permute_slots!(lev.be, lev.rhs, lev.phi, perm_d, n, lev.stride)
+    lev.phi, lev.rhs = lev.rhs, lev.phi
+    _permute_slots!(lev.be, lev.rhs, lev.dm, perm_d, n, lev.stride)
+    lev.dm, lev.rhs = lev.rhs, lev.dm              # rhs ends as scratch garbage
+    # per-block scales (host-side; power-of-two, so the move is exact)
+    for f in (:Dsc, :Ssc, :Esc)
+        h = Array(getfield(lev, f))
+        hn = ones(Float32, lev.cap); hn[1:n] .= h[order]
+        copyto!(getfield(lev, f), hn)
+    end
+    # host topology: meta shuffle, dense live list, fresh registries
+    old2new = zeros(Int32, lev.cap)
+    for (i, s) in enumerate(order)
+        old2new[s] = Int32(i)
+    end
+    lev.meta = vcat(lev.meta[order], [BlockMeta() for _ in 1:lev.cap - n])
+    lev.live = Int32.(1:n); empty!(lev.freelist)
+    empty!(lev.tilemap); empty!(lev.byorigin)
+    for s in Int32(1):Int32(n)
+        _register!(lev, s)
+    end
+    sync_live!(lev)
+    if l + 2 <= length(hier.levels)
+        clev = hier.levels[l + 2]
+        for s in clev.live
+            clev.meta[s].parent = old2new[clev.meta[s].parent]
+        end
+    end
+    return true
+end
+
+"""
+    regrid!(hier, pol; compact = true) -> nothing
 
 Rebuild every refinable level from fresh criterion flags (+ fine-structure
-projection + dilation).  Persistent blocks keep their slots and data untouched;
-new blocks are conservatively prolonged from their parents; vanished blocks are
-freed.  All tables and C/F registers are rebuilt.
+projection + dilation).  Persistent blocks keep their slots and data untouched
+(until the Morton compaction pass, pure data movement); new blocks are
+conservatively prolonged from their parents; vanished blocks are freed.  All
+tables and C/F registers are rebuilt.
 """
-function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy)
+function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true)
     Ltarget = min(pol.lmax, hier.Lcap)
     # 1–3: flags per level (empty where the level does not exist yet),
     # fine→coarse projection (with margin), dilation
@@ -139,9 +197,17 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy)
     # topology changed (a level's :pro/:res/:cf also depend on its PARENT, so a
     # change at l dirties l and l+1; level 0 never changes here — its sibling
     # table, the largest, survives every regrid).
-    changed = falses(length(hier.levels) + 2)
+    changed = falses(Ltarget + 2)          # sized by TARGET (ensure_level! grows hier.levels)
     for lc in 1:Ltarget
         changed[lc + 1] = _rebuild_level!(hier, lc, fl[lc]) > 0
+    end
+    # Morton slot compaction of the churned levels, coarse→fine (parent remaps
+    # cascade), BEFORE the table rebuild — every table references slot ids, and
+    # the changed-flag propagation below already re-dirties both l and l+1.
+    if compact
+        for lc in 1:Ltarget
+            changed[lc + 1] && compact_level!(hier, lc)
+        end
     end
     for l in 0:length(hier.levels)-1
         if changed[l + 1] || (l >= 1 && changed[l])
