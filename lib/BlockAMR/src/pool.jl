@@ -45,6 +45,14 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     tabs     :: Dict{Symbol,Any}         # device RectJobTables; rebuilt at regrid only
 end
 
+# typed table accessors: `tabs` is Dict{Symbol,Any}, so bare lookups make every
+# downstream kernel launch a dynamic dispatch (~1 ms/launch measured on the
+# gravity solve path).  The Level type parameters pin the concrete types.
+@inline _tabt(lev::Level{V,U,F,I}, k::Symbol) where {V,U,F,I} =
+    lev.tabs[k]::RectJobTable{I}
+@inline _tabi(lev::Level{V,U,F,I}, k::Symbol) where {V,U,F,I} = lev.tabs[k]::I
+@inline _tabf(lev::Level{V,U,F,I}, k::Symbol) where {V,U,F,I} = lev.tabs[k]::F
+
 gasfields(lev::Level)   = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge)
 gasfields_o(lev::Level) = (lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo)
 "Per-field scale-class vectors, field order (D,S1,S2,S3,Tau,Ge)."

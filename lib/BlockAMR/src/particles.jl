@@ -132,7 +132,7 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code::
                          Int32(length(lev.live)), ρ1, N, Int32(hier.B),
                          Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                          ndrange = length(parts.px))
-    sib = lev.tabs[:sib]::RectJobTable
+    sib = _tabt(lev, :sib)
     if sib.total > 0
         _rect_accum_rev_k!(lev.be)(lev.dm, sib.jobs, sib.cellstart,
                                    Int32(sib.njobs), Int32(lev.nd),

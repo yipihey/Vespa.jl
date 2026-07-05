@@ -273,4 +273,14 @@ function main()
             zi, sum(xh)/NC, sum(fh2)/NC, sum(Tc)/NC, REPORTS); flush(stdout)
 end
 
-main()
+import Profile
+if get(ENV, "BAM_JLPROF", "0") == "1"
+    Profile.init(n = 10^7, delay = 0.001)
+    Profile.@profile main()
+    open("/tmp/claude-1002/bamr_jlprof.txt", "w") do io
+        Profile.print(IOContext(io, :displaysize => (2000, 240));
+                      format = :flat, sortedby = :count, mincount = 30)
+    end
+else
+    main()
+end

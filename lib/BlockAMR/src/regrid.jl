@@ -239,7 +239,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         sum(cnt[l]) == 0 && (delete!(Fd, l); continue)
         lev = hier.levels[l + 1]
         F = Fd[l]
-        _run_copy!(lev.be, lev.tabs[:sib]::RectJobTable, F, F, lev.nd, lev.stride)
+        _run_copy!(lev.be, _tabt(lev, :sib), F, F, lev.nd, lev.stride)
         G = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
         _dilate_flags_k!(lev.be)(G, F, lev.live_d, Int32(nbuf), Int32(lev.B),
                                  Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);

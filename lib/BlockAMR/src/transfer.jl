@@ -306,7 +306,7 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     # per-field launch train stands.
     if l >= 1
         plev = hier.levels[l]
-        pro  = lev.tabs[:pro]::RectJobTable
+        pro  = _tabt(lev, :pro)
         for (fd, fR, fO, scd, scs) in zip(dst, gasfields(plev), gasfields_o(plev),
                                           classes(lev), classes(plev))
             _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
@@ -317,7 +317,7 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
             _run_prolong!(lev.be, pro, sd, sR, sO, Float32(θ), lev.nd, lev.stride)
         end
     end
-    sib = lev.tabs[:sib]::RectJobTable
+    sib = _tabt(lev, :sib)
     for (fd, sc) in zip(dst, classes(lev))
         _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
     end
@@ -336,7 +336,7 @@ level l−1 (2³ mean of the R buffers into the parent's R buffers).
 function restrict_level!(hier::AMRHierarchy, l::Int)
     @assert l >= 1
     lev = hier.levels[l + 1]; plev = hier.levels[l]
-    res = lev.tabs[:res]::RectJobTable
+    res = _tabt(lev, :res)
     for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
                                   classes(plev), classes(lev))
         _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs)

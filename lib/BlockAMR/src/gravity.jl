@@ -106,7 +106,7 @@ function grav_kick_level!(hier::AMRHierarchy, l::Int, φ, halfdt::Real)
     invh = Float32(1.0 / (2.0 * hcell))
     n = length(lev.live) * lev.B^3
     _grav_kick_k!(lev.be)(lev.S1, lev.S2, lev.S3, lev.Tau, lev.D, φ,
-                          lev.live_d, lev.tabs[:gi0], lev.tabs[:gfr],
+                          lev.live_d, _tabi(lev, :gi0), _tabf(lev, :gfr),
                           lev.Dsc, lev.Ssc, lev.Esc,
                           Float32(halfdt), invh, Float32(exp2(-l)),
                           n1, n2, n3, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
@@ -147,7 +147,7 @@ function phi_from_global!(hier::AMRHierarchy, φg)
     isempty(lev.live) && return nothing
     haskey(lev.tabs, :gi0) || sync_block_geometry!(lev)
     n = length(lev.live) * lev.nd^3
-    _phi_from_global_k!(lev.be)(lev.phi, φg, lev.live_d, lev.tabs[:gi0],
+    _phi_from_global_k!(lev.be)(lev.phi, φg, lev.live_d, _tabi(lev, :gi0),
                                 Int32.(hier.nbase)..., Int32(lev.ng), Int32(lev.nd),
                                 Int32(lev.stride); ndrange = n)
     return nothing
@@ -248,7 +248,7 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     h  = level_dx(hier, l)
     n1, n2, n3 = Int32.(hier.nbase)
     _grav_rhs_k!(lev.be)(lev.rhs, lev.D, lev.Dsc, lev.live_d,
-                         lev.tabs[:gi0], lev.tabs[:gfr],
+                         _tabi(lev, :gi0), _tabf(lev, :gfr),
                          rho_ext === nothing ? lev.rhs : rho_ext,
                          rho_ext !== nothing,
                          isempty(lev.dm) ? lev.rhs : lev.dm,     # dm lazy: dummy when absent
@@ -256,8 +256,8 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
                          Float32(h^2 * source_coef), Float32(rho_mean), Float32(exp2(-l)),
                          n1, n2, n3, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                          Int32(lev.stride); ndrange = n)
-    sib = lev.tabs[:sib]::RectJobTable
-    pro = l >= 1 ? (lev.tabs[:pro]::RectJobTable) : RectJobTable()
+    sib = _tabt(lev, :sib)
+    pro = l >= 1 ? _tabt(lev, :pro) : RectJobTable()
     if pro.total > 0                                       # Dirichlet BCs (once)
         _rect_prolong_tl_k!(lev.be)(lev.phi, plev.phi, pro.jobs, pro.cellstart,
                                     Int32(pro.njobs), Int32(lev.nd),
@@ -357,7 +357,7 @@ function global_from_level0!(hier::AMRHierarchy, g; f::Symbol = :D)
     sc = f === :D ? lev.Dsc : (f in (:S1, :S2, :S3) ? lev.Ssc : lev.Esc)
     n = length(lev.live) * lev.B^3
     _global_from_level0_k!(lev.be)(g, getfield(lev, f), sc, lev.live_d,
-                                   lev.tabs[:gi0], Int32.(hier.nbase)...,
+                                   _tabi(lev, :gi0), Int32.(hier.nbase)...,
                                    Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                                    Int32(lev.stride); ndrange = n)
     return g

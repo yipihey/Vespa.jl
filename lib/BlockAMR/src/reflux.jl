@@ -292,12 +292,12 @@ function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     n == 0 && return nothing
     ff = buf === :R ? gasfields(lev) : gasfields_o(lev)
     if hier.scheme === :ctu
-        _capture_fine_ctu_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], ff...,
+        _capture_fine_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
                                      lev.Dsc, lev.Ssc, lev.Esc, w, λ,
                                      Float32(hier.gamma), Int32(lev.nd),
                                      Int32(lev.stride); ndrange = n)
     else
-        _capture_fine_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], ff...,
+        _capture_fine_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
                                  lev.Dsc, lev.Ssc, lev.Esc, w,
                                  Float32(hier.gamma), Int32(lev.nd),
                                  Int32(lev.stride); ndrange = n)
@@ -318,12 +318,12 @@ function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     n == 0 && return nothing
     fc = buf === :R ? gasfields(plev) : gasfields_o(plev)
     if hier.scheme === :ctu
-        _capture_coarse_ctu_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], fc...,
+        _capture_coarse_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
                                        plev.Dsc, plev.Ssc, plev.Esc, w, λ,
                                        Float32(hier.gamma), Int32(plev.nd),
                                        Int32(plev.stride); ndrange = n)
     else
-        _capture_coarse_k!(lev.be)(lev.tabs[:cfreg], lev.tabs[:cf], fc...,
+        _capture_coarse_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
                                    plev.Dsc, plev.Ssc, plev.Esc, w,
                                    Float32(hier.gamma), Int32(plev.nd),
                                    Int32(plev.stride); ndrange = n)
@@ -351,9 +351,9 @@ function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
     ng_ = lev.tabs[:cfng]::Int
     ng_ == 0 && return nothing
     _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc,
-                             lev.tabs[:cf], lev.tabs[:cfreg],
-                             lev.tabs[:cfperm], lev.tabs[:cfgs], λc,
+                             _tabi(lev, :cf), _tabf(lev, :cfreg),
+                             _tabi(lev, :cfperm), _tabi(lev, :cfgs), λc,
                              Int32(plev.nd), Int32(plev.stride); ndrange = ng_)
-    fill!(lev.tabs[:cfreg], 0.0f0)
+    fill!(_tabf(lev, :cfreg), 0.0f0)
     return nothing
 end
