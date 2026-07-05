@@ -64,7 +64,7 @@ if lf:
     dxs = np.r_[ldx, np.full(ext.sum(), 1.0 / N)]
     rhs = np.r_[lrho, rho0[ext]]; xhs = np.r_[lxh, xh0[ext]]
     f2s = np.r_[lf2, f20[ext]];   Ts  = np.r_[lT, T0[ext]]
-    src = f"leaf cells (all levels, r<{RP:.3f}) + level-0 exterior; finest dx={ldx.min()*BOX*1e3:.1f} kpc/h"
+    src = f"leaf cells (all levels, r<{RP:.3f}) + level-0 exterior; finest dx={ldx.min()*BOX*1e6:.0f} pc/h"
 else:
     xs, ys, zs, dxs = x0, y0, z0c, np.full(m, 1.0 / N)
     rhs, xhs, f2s, Ts = rho0, xh0, f20, T0
