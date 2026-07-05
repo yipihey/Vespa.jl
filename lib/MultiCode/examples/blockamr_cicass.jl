@@ -271,6 +271,73 @@ function main()
                    "T" => Tc])
     @printf("z=%d: <x_HII>=%.3e <f_H2>=%.3e <T>=%.1fK  → %s\n",
             zi, sum(xh)/NC, sum(fh2)/NC, sum(Tc)/NC, REPORTS); flush(stdout)
+
+    # ── leaf-cell dump around the density peak (ALL levels, finest covering) ──
+    # Columns (Int64 n header + 8 × Float64[n]): x,y,z,dx in box units (exact
+    # from the integer origins), rho (code, level-0 mean ≈ 1), x_HII, f_H2, T[K].
+    # Coverage is per OCTANT (regrid children are always half-block octants).
+    if get(ENV, "BAM_PROFDUMP", "1") == "1"
+        Rp = parse(Float64, get(ENV, "BAM_PROFR", "0.1875"))      # box units
+        pg = argmax(ρb) - 1
+        pc = (((pg % NGRID) + 0.5) / NGRID, (((pg ÷ NGRID) % NGRID) + 0.5) / NGRID,
+              ((pg ÷ NGRID^2) + 0.5) / NGRID)
+        cols = ntuple(_ -> Float64[], 8)                # x,y,z,dx,rho,xHII,fH2,T
+        for l in 0:length(hier.levels)-1
+            lv = hier.levels[l + 1]
+            isempty(lv.live) && continue
+            Nl = NGRID * 2^l
+            cov = Dict{Int32,UInt8}()                   # parent slot → covered octants
+            if l + 2 <= length(hier.levels)
+                for cs in hier.levels[l + 2].live
+                    cm = hier.levels[l + 2].meta[cs]
+                    ob = (cm.offset[1] > 0 ? 1 : 0) | ((cm.offset[2] > 0 ? 1 : 0) << 1) |
+                         ((cm.offset[3] > 0 ? 1 : 0) << 2)
+                    cov[cm.parent] = get(cov, cm.parent, 0x00) | (UInt8(1) << ob)
+                end
+            end
+            hD = Array(lv.D); hG = Array(lv.Ge)
+            hs1 = Array(lv.sp[1]); hs2 = Array(lv.sp[2])
+            hdsc = Array(lv.Dsc); hesc = Array(lv.Esc)
+            Bh = BBLK ÷ 2
+            for s in lv.live
+                m = lv.meta[s]
+                bc = ntuple(d -> (Float64(m.origin[d]) + BBLK / 2) / Nl, 3)
+                bd = sqrt(sum(d -> (mod(bc[d] - pc[d] + 0.5, 1.0) - 0.5)^2, 1:3))
+                bd > Rp + BBLK * 0.87 / Nl && continue
+                cb = get(cov, s, 0x00)
+                base = (Int(s) - 1) * lv.stride
+                for k in 1:BBLK, j in 1:BBLK, i in 1:BBLK
+                    ob = (i > Bh ? 1 : 0) | ((j > Bh ? 1 : 0) << 1) | ((k > Bh ? 1 : 0) << 2)
+                    (cb >> ob) & 0x01 == 0x01 && continue        # covered by a child
+                    x = (Float64(m.origin[1]) + i - 0.5) / Nl
+                    y = (Float64(m.origin[2]) + j - 0.5) / Nl
+                    zc = (Float64(m.origin[3]) + k - 0.5) / Nl
+                    # cut by the CONTAINING level-0 cell center: the leaf set
+                    # is then the exact complement of the level-0 dump's r>Rp
+                    # exterior (no boundary double-count/gap in the profile)
+                    r0 = sqrt(sum(q -> (mod((floor((x, y, zc)[q] * NGRID) + 0.5) / NGRID -
+                                            pc[q] + 0.5, 1.0) - 0.5)^2, 1:3))
+                    r0 > Rp && continue
+                    idx = base + ((lv.ng+k-1) * lv.nd + (lv.ng+j-1)) * lv.nd + (lv.ng+i-1) + 1
+                    ρ = Float64(hD[idx]) * hdsc[s]
+                    e = Float64(hG[idx]) * hesc[s] / max(ρ, 1e-30)
+                    push!(cols[1], x); push!(cols[2], y); push!(cols[3], zc)
+                    push!(cols[4], 1.0 / Nl); push!(cols[5], ρ)
+                    push!(cols[6], ChemistryKernels.decode_log2sp(Float64, hs1[idx]) / c.XH)
+                    push!(cols[7], ChemistryKernels.decode_log2sp(Float64, hs2[idx]) / c.XH)
+                    push!(cols[8], e * (GAMMA - 1) * μ * u.T2)
+                end
+            end
+        end
+        open(joinpath(REPORTS, "bamr_leafprof$(TAG)_z$(zi).bin"), "w") do io
+            write(io, Int64(length(cols[1])))
+            for col in cols
+                write(io, col)
+            end
+        end
+        @printf("leafprof: %d leaf cells within R=%.4f of peak (%.4f,%.4f,%.4f)\n",
+                length(cols[1]), Rp, pc[1], pc[2], pc[3]); flush(stdout)
+    end
 end
 
 import Profile
