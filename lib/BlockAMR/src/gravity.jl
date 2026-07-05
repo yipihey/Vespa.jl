@@ -239,7 +239,7 @@ the interior from the parent; `:warm` keeps the existing φ.  Returns the final
 function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
                               nsweep::Int = 60, rho_ext = nothing,
                               rho_mean::Real = 0, init::Symbol = :warm,
-                              use_dm::Bool = false)
+                              use_dm::Bool = false, residual::Bool = true)
     lev = hier.levels[l + 1]
     plev = l >= 1 ? hier.levels[l] : lev
     isempty(lev.live) && return 0.0f0
@@ -271,14 +271,21 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
         _run_prolong!(lev.be, tab, lev.phi, plev.phi, plev.phi, 0.0f0,
                       lev.nd, lev.stride)
     end
+    # per-sweep exchange: FACES ONLY (the 7-point stencil never reads
+    # edge/corner ghosts; the full 26-rect shell per sweep was ~20% of all GPU
+    # time at 128³) — one full-shell exchange after the loop restores the
+    # corners for trilinear consumers (particle gather).
+    sibf = _tabt(lev, :sibf)
     for _ in 1:nsweep
         _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(0), Int32(lev.B),
                              Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
         _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(1), Int32(lev.B),
                              Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
-        _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+        _run_copy!(lev.be, sibf, lev.phi, lev.phi, lev.nd, lev.stride)
     end
-    res = device_zeros(lev.be, Float32, (n,))
+    nsweep > 0 && _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+    residual || return 0.0f0                     # skip the diagnostic reduce +
+    res = device_zeros(lev.be, Float32, (n,))    # D→H sync on the hot path
     _residual_k!(lev.be)(res, lev.phi, lev.rhs, lev.live_d, Int32(lev.B),
                          Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
     return maximum(res)

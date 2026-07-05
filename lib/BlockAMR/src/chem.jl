@@ -63,6 +63,21 @@ Advance the fast analytic H+H₂ chemistry over every active cell of level `l`
 `ChemistryKernels.solve_chem_analytic!`).  Needs `hier` built with `nsp ≥ 2`
 (sp[1] = HII, sp[2] = H2I).  Updates Ge, Tau (ΔGe-consistent) and the species.
 """
+# cached per-level chem staging buffers (cap·B³; reallocated only on pool
+# growth — the previous 4×device_zeros per call was per-substep alloc churn)
+function _chembufs(lev::Level{V,U,F,I}) where {V,U,F,I}
+    nb = lev.cap * lev.B^3
+    cb = get(lev.tabs, :chembuf, nothing)
+    if cb === nothing || length((cb::Tuple{F,F,U,U})[1]) < nb
+        cb = (device_zeros(lev.be, Float32, (nb,)),
+              device_zeros(lev.be, Float32, (nb,)),
+              device_zeros(lev.be, UInt16, (nb,)),
+              device_zeros(lev.be, UInt16, (nb,)))
+        lev.tabs[:chembuf] = cb
+    end
+    return cb::Tuple{F,F,U,U}
+end
+
 function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      a_value::Real, density_units::Real, length_units::Real,
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
@@ -71,10 +86,11 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     isempty(lev.live) && return nothing
     @assert lev.nsp >= 2 "chem_level! needs nsp ≥ 2 (HII, H2I)"
     n = length(lev.live) * lev.B^3
-    rho32 = device_zeros(lev.be, Float32, (n,))
-    e32   = device_zeros(lev.be, Float32, (n,))
-    h16   = device_zeros(lev.be, UInt16, (n,))
-    m16   = device_zeros(lev.be, UInt16, (n,))
+    bufs = _chembufs(lev)
+    rho32 = view(bufs[1], 1:n)
+    e32   = view(bufs[2], 1:n)
+    h16   = view(bufs[3], 1:n)
+    m16   = view(bufs[4], 1:n)
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
                             lev.live_d, lev.Dsc, lev.Esc, Int32(lev.B), Int32(lev.ng),
                             Int32(lev.nd), Int32(lev.stride); ndrange = n)

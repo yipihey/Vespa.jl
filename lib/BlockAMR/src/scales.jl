@@ -11,24 +11,32 @@
 # order like their bit patterns, so `atom.max.u32` does a float max natively.
 # (The previous one-thread-per-block serial scan was 12.8 ms/launch at 128³ —
 # 67% of ALL GPU time in a CICASS step.)
+# Each thread pre-reduces 32 cells (stride K = nd³/32, exact — nd is a multiple
+# of 4 so nd³ ≡ 0 mod 64; consecutive threads read consecutive cells) before
+# ONE atomic per class: naive per-cell atomics serialized on the 3 slot
+# addresses (6.4 ms/launch at 128³ — still 9% of GPU time).
 @kernel function _blockmax_k!(maxD, maxS, maxE,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
                               @Const(Tau), @Const(Ge), @Const(live_d),
                               nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    n3 = nd * nd * nd
-    bi = t0 ÷ n3; c = t0 % n3
+    K = (nd * nd * nd) ÷ Int32(32)
+    bi = t0 ÷ K; r = t0 % K
     @inbounds begin
         slot = live_d[bi + Int32(1)]
-        idx = (slot - Int32(1)) * stride + c + Int32(1)
-        aD = abs(Float32(D[idx]))
-        aS = max(abs(Float32(S1[idx])),
-                 max(abs(Float32(S2[idx])), abs(Float32(S3[idx]))))
-        aE = max(abs(Float32(Tau[idx])), abs(Float32(Ge[idx])))
-        KA.@atomic max(maxD[slot], reinterpret(UInt32, aD))
-        KA.@atomic max(maxS[slot], reinterpret(UInt32, aS))
-        KA.@atomic max(maxE[slot], reinterpret(UInt32, aE))
+        base = (slot - Int32(1)) * stride
+        mD = 0.0f0; mS = 0.0f0; mE = 0.0f0
+        for k in Int32(0):Int32(31)
+            idx = base + r + k * K + Int32(1)
+            mD = max(mD, abs(Float32(D[idx])))
+            mS = max(mS, max(abs(Float32(S1[idx])),
+                             max(abs(Float32(S2[idx])), abs(Float32(S3[idx])))))
+            mE = max(mE, max(abs(Float32(Tau[idx])), abs(Float32(Ge[idx]))))
+        end
+        KA.@atomic max(maxD[slot], reinterpret(UInt32, mD))
+        KA.@atomic max(maxS[slot], reinterpret(UInt32, mS))
+        KA.@atomic max(maxE[slot], reinterpret(UInt32, mE))
     end
 end
 
@@ -63,7 +71,8 @@ function update_scales!(hier::AMRHierarchy, l::Int; hyst::Int = 1)
     maxS = device_zeros(lev.be, UInt32, (lev.cap,))
     maxE = device_zeros(lev.be, UInt32, (lev.cap,))
     _blockmax_k!(lev.be)(maxD, maxS, maxE, gasfields(lev)..., lev.live_d,
-                         Int32(lev.nd), Int32(lev.stride); ndrange = nb * lev.nd^3)
+                         Int32(lev.nd), Int32(lev.stride);
+                         ndrange = nb * (lev.nd^3 ÷ 32))
     hmx = (reinterpret(Float32, Array(maxD)), reinterpret(Float32, Array(maxS)),
            reinterpret(Float32, Array(maxE)))
     scs = (lev.Dsc, lev.Ssc, lev.Esc)

@@ -84,6 +84,44 @@ function build_sibling_jobs(lev::Level)
     return _finish(acc)
 end
 
+"""
+    build_sibling_face_jobs(lev) -> RectJobTable (host)
+
+Faces-only sibling exchange: just the 6 face slabs (ng×B×B, no edge/corner
+strips) of every block's ghost shell.  The 7-point gravity relax reads ONLY
+face ghosts, and the full 26-rect shell exchange ran once per RB sweep — 20% of
+ALL GPU time at 128³.  Consumers that touch edge/corner ghosts (trilinear
+particle gather) must run one full `:sib` exchange after the sweep loop.
+"""
+function build_sibling_face_jobs(lev::Level)
+    acc = _JobAcc(); B = lev.B; ng = lev.ng
+    for s in lev.live
+        m = lev.meta[s]
+        lo = ntuple(d -> Int128(m.origin[d]) - ng, 3)
+        cands = lattice_neighbors(lev, m.origin, B)
+        for ax in 1:3, side in (0, 1)
+            slo = ntuple(d -> d == ax ?
+                (side == 0 ? lo[d] : Int128(m.origin[d]) + B) :
+                Int128(m.origin[d]), 3)
+            sext = ntuple(d -> d == ax ? ng : B, 3)
+            for c in cands
+                cm = lev.meta[c]
+                imgs = ntuple(d -> axis_images(slo[d], sext[d], Int128(cm.origin[d]), B,
+                                               Int128(lev.P[d])), 3)
+                for i1 in imgs[1], i2 in imgs[2], i3 in imgs[3]
+                    glo  = (i1[1], i2[1], i3[1])
+                    ext  = (i1[2], i2[2], i3[2])
+                    doff = ntuple(d -> Int(glo[d] - lo[d]), 3)
+                    soff = ntuple(d -> Int(glo[d] - (i1, i2, i3)[d][3] -
+                                           (Int128(cm.origin[d]) - ng)), 3)
+                    _push_job!(acc, s, c, doff, soff, ext)
+                end
+            end
+        end
+    end
+    return _finish(acc)
+end
+
 # ── coarse→fine prolongation rectangles ──────────────────────────────────────
 # Decompose a fine block's target region (ghost shell, or full interior for new
 # blocks) into rectangles, each sourced from exactly ONE coarse block image (the

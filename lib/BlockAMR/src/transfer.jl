@@ -276,7 +276,8 @@ function build_level_tables!(hier::AMRHierarchy, l::Int)
     # slots don't move, so spatially-adjacent launch order scatters pool
     # accesses that allocation order kept contiguous.  _morton stays for the
     # future slot-COMPACTION pass (physically reordering block data at regrid).
-    lev.tabs[:sib] = to_device_table(lev.be, build_sibling_jobs(lev))
+    lev.tabs[:sib]  = to_device_table(lev.be, build_sibling_jobs(lev))
+    lev.tabs[:sibf] = to_device_table(lev.be, build_sibling_face_jobs(lev))
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
     if l >= 1

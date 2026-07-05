@@ -90,7 +90,8 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                                                get(selfgrav, :nsweep, 30),
                              rho_ext = get(selfgrav, :rho_ext, nothing),
                              rho_mean = get(selfgrav, :rho_mean, 0),
-                             use_dm = get(selfgrav, :use_dm, false))
+                             use_dm = get(selfgrav, :use_dm, false),
+                             residual = false)         # no diagnostic sync per substep
         grav_kick_level_pool!(hier, l, 0.5 * dt_l)
     elseif φ !== nothing
         grav_kick_level!(hier, l, φ, 0.5 * dt_l)
