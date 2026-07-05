@@ -106,7 +106,9 @@ end
 function alloc_slot!(lev::Level)::Int32
     isempty(lev.freelist) || return pop!(lev.freelist)
     s = Int32(length(lev.live) + length(lev.freelist) + 1)
-    s > lev.cap && _grow!(lev, max(2lev.cap, Int(s)))
+    # 1.25× growth: 2× doubling at production caps (~65k slots × ~8k stride)
+    # overshoots by tens of GB and tipped the 256³ lmax=6 run into OOM.
+    s > lev.cap && _grow!(lev, max(cld(5 * lev.cap, 4), Int(s)))
     return s
 end
 
