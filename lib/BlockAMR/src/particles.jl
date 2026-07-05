@@ -120,6 +120,10 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code::
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)
+    # dm is lazy: first deposit on this level allocates it (levels that never
+    # deposit — l > the driver's LDM cap — never pay the cap·stride f32 pool)
+    length(lev.dm) < lev.cap * lev.stride &&
+        (lev.dm = device_zeros(lev.be, Float32, (lev.cap * lev.stride,)))
     fill!(lev.dm, 0.0f0)
     N = Float32(hier.nbase[1] * exp2(l))
     ρ1 = Float32(mass_code / level_dx(hier, l)^3)

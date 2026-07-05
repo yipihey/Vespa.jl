@@ -250,7 +250,9 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     _grav_rhs_k!(lev.be)(lev.rhs, lev.D, lev.Dsc, lev.live_d,
                          lev.tabs[:gi0], lev.tabs[:gfr],
                          rho_ext === nothing ? lev.rhs : rho_ext,
-                         rho_ext !== nothing, lev.dm, use_dm,
+                         rho_ext !== nothing,
+                         isempty(lev.dm) ? lev.rhs : lev.dm,     # dm lazy: dummy when absent
+                         use_dm && !isempty(lev.dm),
                          Float32(h^2 * source_coef), Float32(rho_mean), Float32(exp2(-l)),
                          n1, n2, n3, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                          Int32(lev.stride); ndrange = n)

@@ -146,8 +146,10 @@ function compact_level!(hier::AMRHierarchy, l::Int)
     swap_buffers!(lev)                             # permuted O twins become R
     _permute_slots!(lev.be, lev.rhs, lev.phi, perm_d, n, lev.stride)
     lev.phi, lev.rhs = lev.rhs, lev.phi
-    _permute_slots!(lev.be, lev.rhs, lev.dm, perm_d, n, lev.stride)
-    lev.dm, lev.rhs = lev.rhs, lev.dm              # rhs ends as scratch garbage
+    if !isempty(lev.dm)                            # dm is lazy (deposit levels only)
+        _permute_slots!(lev.be, lev.rhs, lev.dm, perm_d, n, lev.stride)
+        lev.dm, lev.rhs = lev.rhs, lev.dm          # rhs ends as scratch garbage
+    end
     # per-block scales (host-side; power-of-two, so the move is exact)
     for f in (:Dsc, :Ssc, :Esc)
         h = Array(getfield(lev, f))

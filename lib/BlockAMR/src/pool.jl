@@ -78,7 +78,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         ones32(cap0), ones32(cap0), ones32(cap0),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
-        device_zeros(be, Float32, (cap0 * stride,)),
+        device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
         to_device(be, Int32[], Int32), Dict{Symbol,Any}())
 end
 
@@ -100,7 +100,8 @@ function _grow!(lev::Level, newcap::Int)
     growsc(a) = (b = to_device(lev.be, ones(Float32, newcap), Float32);
                  copyto!(view(b, 1:lev.cap), view(a, 1:lev.cap)); b)
     lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc)
-    lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs); lev.dm = grow(lev.dm)
+    lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs)
+    length(lev.dm) > 0 && (lev.dm = grow(lev.dm))      # dm is lazy (deposit levels only)
     append!(lev.meta, [BlockMeta() for _ in 1:(newcap - lev.cap)])
     lev.cap = newcap
     return nothing
