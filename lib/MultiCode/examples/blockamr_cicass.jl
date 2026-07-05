@@ -157,6 +157,15 @@ function main()
                                     Float32(mass_code * NGRID^3);
                                     N = NGRID, disp = 0.0f0, shift = -0.5f0)
         ρg .-= 1.0f0                                     # δ (total mean = 1)
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            hρ = Array(ρg); nbad = count(!isfinite, hρ)
+            vpx = maximum(abs, Array(parts.vx)); vpz = maximum(abs, Array(parts.vz))
+            if nbad > 0 || !isfinite(vpx) || !isfinite(vpz)
+                @printf("SRCHUNT step %d: rhog nonfinite=%d  max|vx|=%.3e max|vz|=%.3e  rhog max=%.3e min=%.3e\n",
+                        nstep, nbad, vpx, vpz, maximum(hρ), minimum(hρ)); flush(stdout)
+                nbad > 0 && error("nonfinite gravity source at step $nstep")
+            end
+        end
         ρ3 = reshape(ρg, NGRID, NGRID, NGRID)
         φ3 = reshape(φg, NGRID, NGRID, NGRID)
         PoissonKernels.fft_poisson_rfft!(φ3, ρ3; G = 1.5 * c.Om * a, a = 1.0,
@@ -275,6 +284,10 @@ function main()
             @printf("step %4d  z=%8.2f  dτ=%.3e  blocks=%s  λ=%.3e\n",
                     nstep, 1/a - 1, dτ, string(nb), hier.λ); flush(stdout)
         end
+    end
+    if !isfinite(a)
+        @printf("ABORTED: a went nonfinite at step %d — no dumps\n", nstep)
+        return nothing
     end
     @printf("done: %d root steps to z=%.1f in %.1f s\n", nstep, 1/a - 1, time() - t0)
 

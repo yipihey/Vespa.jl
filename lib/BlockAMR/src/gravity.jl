@@ -419,6 +419,14 @@ function compton_drag!(hier::AMRHierarchy, f::Real; scratch)
     global_from_level0!(hier, scratch; f = :S2); p2 = Float64(sum(scratch))
     global_from_level0!(hier, scratch; f = :S3); p3 = Float64(sum(scratch))
     vb = (Float32(p1 / M), Float32(p2 / M), Float32(p3 / M))
+    # containment guard: a local nonfinite cell must NOT globalize through the
+    # bulk (one NaN in the gathers poisons EVERY S/Tau on every level — the
+    # bamr256L10 z=7 failure mode).  Skip the drag; the local fault stays
+    # local and diagnosable.
+    if !(isfinite(vb[1]) && isfinite(vb[2]) && isfinite(vb[3]) && isfinite(f))
+        @warn "compton_drag!: nonfinite bulk/factor — drag skipped" vb f maxlog = 10
+        return nothing
+    end
     for l in 0:length(hier.levels)-1
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
