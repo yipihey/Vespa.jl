@@ -86,8 +86,11 @@ end
 "Grow every device array of `lev` to `newcap` slots, preserving existing data."
 function _grow!(lev::Level, newcap::Int)
     T = eltype(lev.D); n_old = lev.cap * lev.stride; n_new = newcap * lev.stride
+    # finalize the old array NOW: at production scale (20+ GB of pools) waiting
+    # for GC to reclaim each superseded field is what turns a 1 GB grow into an
+    # OOM (stream-ordered, so the pending copy completes first).
     grow(a) = (b = device_zeros(lev.be, eltype(a), (n_new,));
-               copyto!(view(b, 1:n_old), view(a, 1:n_old)); b)
+               copyto!(view(b, 1:n_old), view(a, 1:n_old)); finalize(a); b)
     lev.D  = grow(lev.D);  lev.S1 = grow(lev.S1); lev.S2 = grow(lev.S2)
     lev.S3 = grow(lev.S3); lev.Tau = grow(lev.Tau); lev.Ge = grow(lev.Ge)
     lev.Do = grow(lev.Do); lev.S1o = grow(lev.S1o); lev.S2o = grow(lev.S2o)
