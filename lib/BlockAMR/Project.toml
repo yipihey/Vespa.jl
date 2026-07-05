@@ -10,6 +10,7 @@ version = "0.1.0"
 # f16 physical variables with per-block power-of-two f32 scales, u16 log₂ species.
 # CUDA is a weak dependency (extension); the CPU backend is the parity oracle.
 [deps]
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"

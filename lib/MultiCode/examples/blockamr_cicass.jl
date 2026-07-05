@@ -30,6 +30,9 @@ const LMAX    = parse(Int, get(ENV, "BAM_LMAX", "2"))
 const DTHRESH = parse(Float64, get(ENV, "BAM_DTHRESH", "1.5"))   # gas overdensity ρ/ρ̄_b
 const REGRIDN = parse(Int, get(ENV, "BAM_REGRID", "4"))
 const COMPACT = get(ENV, "BAM_COMPACT", "1") == "1"   # Morton slot compaction at regrid
+const CKPTN   = parse(Int, get(ENV, "BAM_CKPT", "0"))     # checkpoint every N root steps (0=off)
+const RESTART = get(ENV, "BAM_RESTART", "")               # checkpoint path to resume from
+const STOPL   = parse(Int, get(ENV, "BAM_STOPLEVEL", "99"))  # stop once this level populates
 const NSWEEP  = parse(Int, get(ENV, "BAM_NSWEEP", "30"))
 const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac per level
 # Deepest level receiving DIRECT DM particle deposits.  Topgrid-mass particles
@@ -60,13 +63,26 @@ function main()
     @printf("BlockAMR CICASS: %d³ (B=%d, lmax=%d) box=%.4f Mpc/h  z=%.0f→%.0f  [%s]\n",
             NGRID, BBLK, LMAX, BOXMPCH, ZSTART, ZEND, BE); flush(stdout)
 
-    # ── ICs: CICASS realization (gas δ,v + DM positions/velocities) ──
+    # ── ICs: CICASS realization, or restart from a checkpoint ──
+    μ = 1.22
+    local hier, parts, mass_code, xHII0, Np
+    if RESTART != ""
+    hier, ex = BlockAMR.load_checkpoint(RESTART; backend = BE, Lcap = LMAX)
+    devr = v -> BlockAMR.to_device(hier.be, v, Float32)
+    parts = (px = devr(ex.px), py = devr(ex.py), pz = devr(ex.pz),
+             vx = devr(ex.vx), vy = devr(ex.vy), vz = devr(ex.vz))
+    Np = length(ex.px); mass_code = ex.mass_code
+    a = ex.a; xHII0 = ex.xe_mean
+    @printf("RESTART %s: z=%.3f  nstep=%d  blocks=%s\n", RESTART, 1/a - 1,
+            Int(hier.nstep[1]),
+            string([length(hier.levels[l+1].live) for l in 0:length(hier.levels)-1]))
+    flush(stdout)
+    else
     r = MultiCode.run_cicass_streaming(; vbc = VBC, boxlength = BOXMPCH,
                                        zstart = ZSTART, ngrid = NGRID)
     snap = CICASSLib.read_snapshot(r.output)
     ts = CICASSLib.thermal_state(ZSTART)
     xHII0 = ts.x_e; Tg0 = ts.T_gas
-    μ = 1.22
     eint0 = Tg0 / ((GAMMA - 1) * μ * u0.T2)
     vconv = 1.0e5 / u0.v
 
@@ -110,6 +126,7 @@ function main()
     mass_code = (1 - c.fb) / Np
     @printf("gas IC: f_b=%.4f T=%.1fK x_HII=%.3e;  DM: %d particles\n",
             c.fb, Tg0, xHII0, Np); flush(stdout)
+    end                                          # if RESTART
 
     pol = BlockRefinementPolicy(; dthresh = DTHRESH * c.fb, nbuf = 2,
                                 every = REGRIDN, lmax = LMAX, lfac = LFAC)
@@ -119,7 +136,7 @@ function main()
     pay = BlockAMR.device_zeros(hier.be, Float32, (Np,))
     paz = BlockAMR.device_zeros(hier.be, Float32, (Np,))
 
-    nstep = 0; t0 = time(); xe_mean = xHII0
+    nstep = Int(hier.nstep[1]); t0 = time(); xe_mean = xHII0
     while a < a_end
         # ── timestep: hydro CFL (global λ), particle CFL, expansion cap ──
         λ = compute_lambda!(hier)
@@ -194,6 +211,24 @@ function main()
             update_scales!(hier, l)
         end
         nstep % REGRIDN == 0 && regrid!(hier, pol; compact = COMPACT)
+        ckextra() = (a = a, mass_code = mass_code, xe_mean = xe_mean,
+                     px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
+                     vx = Array(parts.vx), vy = Array(parts.vy), vz = Array(parts.vz))
+        if CKPTN > 0 && nstep % CKPTN == 0
+            ckf = joinpath(REPORTS, "bamr_ckpt$(TAG)_" *
+                           (isodd(nstep ÷ CKPTN) ? "A" : "B") * ".jls")
+            BlockAMR.save_checkpoint(ckf, hier; extra = ckextra())
+            @printf("ckpt @ step %d z=%.3f → %s\n", nstep, 1/a - 1, ckf); flush(stdout)
+        end
+        if STOPL < 99 && length(hier.levels) > STOPL &&
+           !isempty(hier.levels[STOPL + 1].live)
+            @printf("LEVEL %d POPULATED at z=%.4f (blocks=%s) — stopping\n", STOPL,
+                    1/a - 1,
+                    string([length(hier.levels[l+1].live) for l in 0:length(hier.levels)-1]))
+            BlockAMR.save_checkpoint(joinpath(REPORTS, "bamr_ckpt$(TAG)_L$(STOPL).jls"),
+                                     hier; extra = ckextra())
+            break
+        end
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
             for l in 0:length(hier.levels)-1
                 isempty(hier.levels[l+1].live) && continue

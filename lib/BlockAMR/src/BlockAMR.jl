@@ -55,6 +55,7 @@ export chem_level!
 export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
 export global_from_level0!, compton_drag!
+export save_checkpoint, load_checkpoint
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -108,5 +109,6 @@ include("regrid.jl")       # dynamic refinement: flag → cluster → rebuild
 include("gravity.jl")      # KDK half-kicks from the topgrid potential
 include("chem.jl")         # fast analytic H+H2 chemistry over block batches
 include("particles.jl")    # DM particles: per-level deposit + finest-level accel gather
+include("checkpoint.jl")   # root-boundary save/restore (topology+fields+scales+phi)
 
 end # module BlockAMR
