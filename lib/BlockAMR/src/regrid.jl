@@ -1,21 +1,32 @@
-# regrid.jl — dynamic refinement: device flagging → host clustering → rebuild.
+# regrid.jl — dynamic refinement: device flagging → tile cascade → rebuild.
 #
-# Flow (Enzo-style rebuild, coarse→fine, flags first):
+# Flow (Enzo-style rebuild, coarse→fine, flags first) — ALL per-cell flag work
+# stays on the device as dense per-block UInt8 arrays; the host only ever sees
+# per-block quantities (counts, 8 octant bits, footprint tiles).  The previous
+# Set{NTuple{3,Int128}}-of-cells pipeline hashed every flagged cell ×125 during
+# dilation and stalled 256³ deep runs for minutes per regrid.
+#
 #   1. per-level criterion flags on device (one fused kernel, per-block counts);
-#   2. fine flags projected DOWN (a flagged fine cell forces its parent cell to
-#      stay flagged, + margin) so surviving deep structure stays nested;
-#   3. flags dilated by nbuf cells (across block boundaries — sets are global);
-#   4. per-parent clustering on the Bh = B÷2 lattice: a child footprint is created
-#      for every lattice tile containing a flagged cell.  Lattice snapping makes
-#      all block origins multiples of B ⇒ any two footprints are IDENTICAL or
-#      DISJOINT: persistence is a pure origin match and no overlap copies exist;
+#   2. tile CASCADE fine→coarse (host, O(#blocks)): T[lf] = forced level-lf
+#      child footprints = footprints of level-lf blocks holding ≥1 criterion
+#      flag ∪ tiles touched by the projection boxes of T[lf+1] — so surviving
+#      deep structure stays nested (a box is footprint+rim, [t−R, t+Bh+R));
+#   3. criterion flags ghost-exchanged (sibling tables wrap periodically) and
+#      dilated ±nbuf on device, then reduced to 8 octant-any bits per block;
+#   4. `want` per child level: octant bits name (parent, octant) directly —
+#      parents revalidated by origin AFTER coarser rebuilds (persistence keeps
+#      surviving slots; vanished parents drop their flags, exactly the old
+#      owner-at-rebuild-time semantics) — plus the T[lc] tiles expanded through
+#      their (nbuf-grown) boxes onto the parent lattice, again by origin, which
+#      correctly reaches parents CREATED earlier in this same pass;
 #   5. new blocks fill by conservative interior prolongation from the parent;
 #      vanished blocks are simply freed (their information already lives in the
 #      parent through the per-step restriction);
-#   6. every level's data-motion tables + C/F registers are rebuilt.
+#   6. Morton slot compaction of churned levels; every affected level's
+#      data-motion tables + C/F registers are rebuilt.
 #
-# Criterion (Phase 2): overdensity threshold on D.  The policy carries plain
-# numbers (device-evaluable), not closures.
+# Criterion: overdensity threshold on D (×lfac per level).  The policy carries
+# plain numbers (device-evaluable), not closures.
 
 """
     BlockRefinementPolicy(; dthresh, nbuf = 2, every = 4, lmax = 1)
@@ -52,60 +63,59 @@ end
     end
 end
 
-"Global level-l cells where the criterion fires (host Set from one device pass)."
-function _criterion_cells(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy)
+# ±nbuf box dilation of the criterion flags; reads the ghost frame (filled by
+# the sibling exchange, so spill crosses block boundaries and the periodic
+# wrap), writes interior only.  Requires nbuf ≤ ng.
+@kernel function _dilate_flags_k!(out, @Const(fin), @Const(live_d), nbuf::Int32,
+                                  B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        v = UInt8(0)
+        for dk in -nbuf:nbuf, dj in -nbuf:nbuf, di in -nbuf:nbuf
+            v |= fin[base + _lidx(i + di, j + dj, k + dk, nd)]
+        end
+        out[base + _lidx(i, j, k, nd)] = v
+    end
+end
+
+# one thread per (block, octant): any-flag over the Bh³ interior cells of the
+# octant — the entire per-cell → per-child-tile clustering reduction.
+@kernel function _octant_any_k!(oct, @Const(flags), @Const(live_d),
+                                B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    bi = t0 ÷ Int32(8); o = t0 % Int32(8)
+    Bh = B ÷ Int32(2)
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        oi = (o & Int32(1)) * Bh + ng
+        oj = ((o >> 0x01) & Int32(1)) * Bh + ng
+        ok = ((o >> 0x02) & Int32(1)) * Bh + ng
+        v = UInt8(0)
+        for k in Int32(0):Bh-Int32(1), j in Int32(0):Bh-Int32(1), i in Int32(0):Bh-Int32(1)
+            v |= flags[base + _lidx(oi + i, oj + j, ok + k, nd)]
+        end
+        oct[t0 + Int32(1)] = v
+    end
+end
+
+"Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
+function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy)
     lev = hier.levels[l + 1]
-    out = Set{NTuple{3,Int128}}()
-    isempty(lev.live) && return out
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
-    n = length(lev.live) * lev.B^3
     _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, lev.Dsc,
                      Float32(pol.dthresh * pol.lfac^l),
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                     ndrange = n)
-    hc = Array(count); hf = Array(flags)
-    for s in lev.live
-        hc[s] == 0 && continue
-        m = lev.meta[s]; base = (Int(s) - 1) * lev.stride
-        for k in 0:lev.B-1, j in 0:lev.B-1, i in 0:lev.B-1
-            idx = base + ((k + lev.ng) * lev.nd + (j + lev.ng)) * lev.nd + (i + lev.ng) + 1
-            hf[idx] == 0 && continue
-            push!(out, (Int128(m.origin[1]) + i, Int128(m.origin[2]) + j,
-                        Int128(m.origin[3]) + k))
-        end
-    end
-    return out
-end
-
-function _dilate(cells::Set{NTuple{3,Int128}}, n::Int, P::Origin)
-    n == 0 && return cells
-    out = Set{NTuple{3,Int128}}()
-    for g in cells, dk in -n:n, dj in -n:n, di in -n:n
-        push!(out, (Int128(wrapc(g[1] + di, P[1])), Int128(wrapc(g[2] + dj, P[2])),
-                    Int128(wrapc(g[3] + dk, P[3]))))
-    end
-    return out
-end
-
-_project(cells::Set{NTuple{3,Int128}}) =
-    Set{NTuple{3,Int128}}((g[1] >> 1, g[2] >> 1, g[3] >> 1) for g in cells)
-
-# Coarse flags forced by fine structure: flag each unique Bh-aligned footprint
-# tile containing a (projected) fine flag, grown by `rim` cells.
-function _tile_rim(fine::Set{NTuple{3,Int128}}, Bh::Int, rim::Int, P::Origin)
-    tiles = Set{NTuple{3,Int128}}()
-    for g in fine
-        push!(tiles, ntuple(d -> ((g[d] >> 1) ÷ Bh) * Bh, 3))
-    end
-    out = Set{NTuple{3,Int128}}()
-    for t in tiles
-        for dk in -rim:Bh-1+rim, dj in -rim:Bh-1+rim, di in -rim:Bh-1+rim
-            push!(out, (Int128(wrapc(t[1] + di, P[1])), Int128(wrapc(t[2] + dj, P[2])),
-                        Int128(wrapc(t[3] + dk, P[3]))))
-        end
-    end
-    return out
+                     ndrange = length(lev.live) * lev.B^3)
+    return flags, Array(count)
 end
 
 """
@@ -176,30 +186,114 @@ tables and C/F registers are rebuilt.
 """
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true)
     Ltarget = min(pol.lmax, hier.Lcap)
-    # 1–3: flags per level (empty where the level does not exist yet),
-    # fine→coarse projection (with margin), dilation
-    fl = [ l + 1 <= length(hier.levels) ? _criterion_cells(hier, l, pol) :
-           Set{NTuple{3,Int128}}() for l in 0:Ltarget ]          # fl[l+1] = level-l flags
-    # Project fine flags down ONLY where level l+2 can exist (l ≤ Ltarget−2): the
-    # deepest level's flags have no children to support, and projecting them
-    # would only widen the coarse footprint (sticky refinement, no de-refines).
-    # A fine flag forces its whole Bh-lattice footprint TILE (child origins are
-    # multiples of B ⇒ tiles globally Bh-aligned at level l); flag each unique
-    # tile's box + nesting rim — O(unique tiles), not O(cells·dilation³).
-    for l in Ltarget-2:-1:0
-        union!(fl[l + 1], _tile_rim(fl[l + 2], hier.B ÷ 2, 2 + cld(pol.nbuf, 2),
-                                    level_period(hier.nbase, l)))
+    nbuf = pol.nbuf
+    @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
+    R  = 2 + cld(nbuf, 2)                  # projection rim (nesting margin)
+    Bh = hier.B ÷ 2
+    ltop = min(Ltarget - 1, length(hier.levels) - 1)   # deepest level that clusters
+    # 1) criterion flags on device, levels 0..Ltarget−1 (the deepest level's
+    #    flags have no children to force and are never consumed)
+    Fd  = Dict{Int,Any}()
+    cnt = Dict{Int,Vector{Int32}}()
+    for l in 0:ltop
+        lev = hier.levels[l + 1]
+        isempty(lev.live) && continue
+        Fd[l], cnt[l] = _criterion_flags(hier, l, pol)
     end
-    for l in 0:Ltarget-1
-        fl[l + 1] = _dilate(fl[l + 1], pol.nbuf, level_period(hier.nbase, l))
+    # 2) tile cascade fine→coarse: T[lf] = forced level-lf child footprints as
+    #    level-(lf−1)-cell tile origins (multiples of Bh; every block spans
+    #    exactly one parent tile).  Pure tile arithmetic — no per-cell state —
+    #    so flags forced OUTSIDE currently-live blocks still cascade down.
+    T = Dict{Int,Set{NTuple{3,Int128}}}()
+    for lf in ltop:-1:1
+        tset = Set{NTuple{3,Int128}}()
+        lev = hier.levels[lf + 1]
+        if haskey(cnt, lf)
+            for s in lev.live
+                cnt[lf][s] == 0 && continue
+                m = lev.meta[s]
+                push!(tset, ntuple(d -> Int128(m.origin[d] >> 1), 3))
+            end
+        end
+        if haskey(T, lf + 1)
+            Pp = level_period(hier.nbase, lf - 1)
+            for t in T[lf + 1]             # box [t−R, t+Bh+R) in level-lf cells
+                rng = ntuple(d -> fld(fld(t[d] - R, 2), Bh):fld(fld(t[d] + Bh + R - 1, 2), Bh), 3)
+                for tk in rng[3], tj in rng[2], ti in rng[1]
+                    push!(tset, (Int128(wrapc(Int128(ti) * Bh, Pp[1])),
+                                 Int128(wrapc(Int128(tj) * Bh, Pp[2])),
+                                 Int128(wrapc(Int128(tk) * Bh, Pp[3]))))
+                end
+            end
+        end
+        isempty(tset) || (T[lf] = tset)
     end
-    # 4–6: rebuild children levels coarse→fine, then rebuild tables ONLY where
-    # topology changed (a level's :pro/:res/:cf also depend on its PARENT, so a
-    # change at l dirties l and l+1; level 0 never changes here — its sibling
-    # table, the largest, survives every regrid).
+    # 3) ghost-exchange + dilate the criterion flags, reduce to octant bits
+    #    (8 per block) — captured with block ORIGINS so step 4 can revalidate
+    #    parents after coarser levels rebuild.
+    oct = Dict{Int,Tuple{Vector{Origin},Vector{UInt8}}}()
+    for l in 0:ltop
+        haskey(cnt, l) || continue
+        sum(cnt[l]) == 0 && (delete!(Fd, l); continue)
+        lev = hier.levels[l + 1]
+        F = Fd[l]
+        _run_copy!(lev.be, lev.tabs[:sib]::RectJobTable, F, F, lev.nd, lev.stride)
+        G = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
+        _dilate_flags_k!(lev.be)(G, F, lev.live_d, Int32(nbuf), Int32(lev.B),
+                                 Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
+                                 ndrange = length(lev.live) * lev.B^3)
+        nb = length(lev.live)
+        o = device_zeros(lev.be, UInt8, (8 * nb,))
+        _octant_any_k!(lev.be)(o, G, lev.live_d, Int32(lev.B), Int32(lev.ng),
+                               Int32(lev.nd), Int32(lev.stride); ndrange = 8 * nb)
+        ho = Array(o)
+        bits = zeros(UInt8, nb)
+        for bi in 1:nb, oo in 0:7
+            ho[8 * (bi - 1) + oo + 1] != 0 && (bits[bi] |= UInt8(1) << oo)
+        end
+        oct[l] = (Origin[lev.meta[s].origin for s in lev.live], bits)
+        delete!(Fd, l)                     # release the flag pools eagerly
+    end
+    # 4–6: rebuild children levels coarse→fine from `want` maps, then compact
+    # churned levels, then rebuild tables ONLY where topology changed (a level's
+    # :pro/:res/:cf also depend on its PARENT, so a change at l dirties l and
+    # l+1; level 0 never changes here — its sibling table, the largest,
+    # survives every regrid).
     changed = falses(Ltarget + 2)          # sized by TARGET (ensure_level! grows hier.levels)
     for lc in 1:Ltarget
-        changed[lc + 1] = _rebuild_level!(hier, lc, fl[lc]) > 0
+        plev = hier.levels[lc]
+        Pc = level_period(hier.nbase, lc)
+        want = Dict{Origin,Tuple{Int32,NTuple{3,Int16}}}()
+        if haskey(oct, lc - 1)             # criterion octants, parents by origin
+            origins, bits = oct[lc - 1]
+            for bi in eachindex(origins)
+                b8 = bits[bi]; b8 == 0x00 && continue
+                s = get(plev.byorigin, origins[bi], Int32(0))
+                s == Int32(0) && continue  # parent vanished this pass → dropped
+                for oo in 0:7
+                    (b8 >> oo) & 0x01 == 0x01 || continue
+                    off = ntuple(d -> Int16(((oo >> (d - 1)) & 1) * Bh), 3)
+                    want[child_origin(origins[bi], off, Pc)] = (s, off)
+                end
+            end
+        end
+        if haskey(T, lc)                   # projection boxes → parent lattice tiles
+            g = R + nbuf                   # painted boxes were dilated by nbuf too
+            Pp = level_period(hier.nbase, lc - 1)
+            for t in T[lc]
+                rng = ntuple(d -> fld(t[d] - g, Bh):fld(t[d] + Bh + g - 1, Bh), 3)
+                for tk in rng[3], tj in rng[2], ti in rng[1]
+                    τ = (wrapc(Int128(ti) * Bh, Pp[1]), wrapc(Int128(tj) * Bh, Pp[2]),
+                         wrapc(Int128(tk) * Bh, Pp[3]))
+                    porg = ntuple(d -> (τ[d] ÷ UInt128(hier.B)) * UInt128(hier.B), 3)
+                    s = get(plev.byorigin, porg, Int32(0))
+                    s == Int32(0) && continue          # unowned space → dropped
+                    off = ntuple(d -> Int16(Int(τ[d] - porg[d])), 3)
+                    want[child_origin(porg, off, Pc)] = (s, off)
+                end
+            end
+        end
+        changed[lc + 1] = _rebuild_level!(hier, lc, want) > 0
     end
     # Morton slot compaction of the churned levels, coarse→fine (parent remaps
     # cascade), BEFORE the table rebuild — every table references slot ids, and
@@ -218,24 +312,11 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     return nothing
 end
 
-"Rebuild one level's block set from flags; returns the number of adds+frees."
-function _rebuild_level!(hier::AMRHierarchy, lc::Int, flags::Set{NTuple{3,Int128}})
+"Rebuild one level's block set from its `want` footprint map; returns adds+frees."
+function _rebuild_level!(hier::AMRHierarchy, lc::Int,
+                         want::Dict{Origin,Tuple{Int32,NTuple{3,Int16}}})
     plev = hier.levels[lc]
     lev  = ensure_level!(hier, lc)
-    B = hier.B; Bh = B ÷ 2
-    # footprints: per parent, lattice tiles (Bh) containing flagged cells
-    want = Dict{Origin,Tuple{Int32,NTuple{3,Int16}}}()
-    for g in flags
-        gq = ntuple(d -> UInt128(g[d]), 3)
-        p = lattice_owner(plev, gq, B)
-        p == 0 && continue
-        pm = plev.meta[p]
-        loc = ntuple(d -> Int(mod(Int128(g[d]) - Int128(pm.origin[d]),
-                                  Int128(plev.P[d]))), 3)
-        off = ntuple(d -> Int16((loc[d] ÷ Bh) * Bh), 3)
-        org = child_origin(pm.origin, off, lev.P)
-        want[org] = (p, off)
-    end
     # persistence: free vanished, create missing (data via interior prolongation)
     nchg = 0
     for s in copy(lev.live)
