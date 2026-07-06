@@ -171,6 +171,25 @@ function main()
         PoissonKernels.fft_poisson_rfft!(φ3, ρ3; G = 1.5 * c.Om * a, a = 1.0,
                                          boxsize = 1.0)
         phi_from_global!(hier, φg)
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            # ordered probes: particle state → (deposits) → φ-live → (gather)
+            mpx = maximum(Array(parts.px)); mvx = maximum(abs, Array(parts.vx))
+            (isfinite(mpx) && isfinite(mvx)) ||
+                (@printf("PHUNT step %d: PARTICLE STATE nonfinite pre-deposit (px=%.3e vx=%.3e)\n",
+                         nstep, mpx, mvx); flush(stdout); error("particle state"))
+            for l in 0:length(hier.levels)-1
+                lv = hier.levels[l+1]; isempty(lv.live) && continue
+                hph = Array(lv.phi); bad = 0
+                for s_ in lv.live
+                    b_ = (Int(s_) - 1) * lv.stride
+                    for cix in 1:97:lv.nd^3
+                        isfinite(hph[b_ + cix]) || (bad += 1)
+                    end
+                end
+                bad > 0 && (@printf("PHUNT step %d: level %d LIVE phi nonfinite (strided hits=%d) PRE-advance\n",
+                                    nstep, l, bad); flush(stdout); error("phi pre-advance"))
+            end
+        end
         for l in 1:min(length(hier.levels) - 1, LDM)
             isempty(hier.levels[l+1].live) && continue
             deposit_particles_level!(hier, l, parts; mass_code)
@@ -178,6 +197,96 @@ function main()
 
         # ── one root step: hydro + native gravity + chem on every level ──
         u = MultiCode.cosmo_units(c, a)
+        if get(ENV, "BAM_DISSECT", "") == string(nstep + 1)
+            # replicate advance_level_w!(0) stage by stage with finite probes
+            λv = hier.λ
+            sg = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
+                  rho_mean = 1.0, use_dm = true)
+            ch = (a_value = a, density_units = u.d, length_units = u.l,
+                  time_units = u.t, hubble = c.h0, Om = c.Om, OL = c.OL,
+                  fh = c.XH)
+            lev0d = hier.levels[1]
+            probe(tag) = begin
+                for lp in 0:length(hier.levels)-1
+                    lvp = hier.levels[lp + 1]
+                    isempty(lvp.live) && continue
+                    sm = BlockAMR.max_signal(lvp, hier.gamma)
+                    nT = count(x -> !isfinite(Float32(x)), Array(lvp.Tau))
+                    nD = count(x -> !isfinite(Float32(x)), Array(lvp.D))
+                    (isfinite(sm) && nT == 0 && nD == 0) ||
+                        @printf("DISSECT[%s]: L%d smax=%s Tau-bad=%d D-bad=%d\n",
+                                tag, lp, string(sm), nT, nD)
+                end
+                @printf("DISSECT[%s]: done\n", tag); flush(stdout)
+            end
+            probe("start")
+            # decompose level 1's FIRST pass: level-2 substeps inline with probes
+            lev1d = hier.levels[2]; lev2d = hier.levels[3]
+            dt1 = Float64(λv) * BlockAMR.level_dx(hier, 1)
+            dt2 = Float64(λv) * BlockAMR.level_dx(hier, 2)
+            for pass2 in 1:2
+                BlockAMR.solve_gravity_level!(hier, 2; source_coef = sg.coef,
+                    nsweep = NSWEEP, rho_mean = 1.0, use_dm = true, residual = false)
+                probe("L2p$(pass2)-solve(phi-only)")
+                BlockAMR.grav_kick_level_pool!(hier, 2, 0.5 * dt2)
+                probe("L2p$(pass2)-K1")
+                BlockAMR.fill_ghosts!(hier, 2; θ = 0.0f0, buf = :R)
+                probe("L2p$(pass2)-ghosts")
+                BlockAMR.ctu_level!(hier, 2, λv)
+                BlockAMR.capture_fine!(hier, 2, :R, 0.5f0; λ = λv)
+                BlockAMR.swap_buffers!(lev2d)
+                probe("L2p$(pass2)-ctu")
+                BlockAMR.grav_kick_level_pool!(hier, 2, 0.5 * dt2)
+                probe("L2p$(pass2)-K2")
+                BlockAMR.chem_level!(hier, 2, dt2; ch...)
+                probe("L2p$(pass2)-chem")
+                hier.nstep[3] += 1
+            end
+            BlockAMR.solve_gravity_level!(hier, 1; source_coef = sg.coef,
+                nsweep = NSWEEP, rho_mean = 1.0, use_dm = true, residual = false)
+            BlockAMR.grav_kick_level_pool!(hier, 1, 0.5 * dt1)
+            probe("L1-K1")
+            BlockAMR.fill_ghosts!(hier, 1; θ = 0.0f0, buf = :R)
+            BlockAMR.ctu_level!(hier, 1, λv)
+            BlockAMR.capture_fine!(hier, 1, :R, 0.5f0; λ = λv)
+            BlockAMR.capture_coarse!(hier, 2, :R, 1.0f0; λ = λv)
+            BlockAMR.swap_buffers!(lev1d)
+            probe("L1-ctu")
+            BlockAMR.grav_kick_level_pool!(hier, 1, 0.5 * dt1)
+            BlockAMR.chem_level!(hier, 1, dt1; ch...)
+            probe("L1-K2chem")
+            BlockAMR.restrict_level!(hier, 2)
+            BlockAMR.reflux_apply!(hier, 2, λv)
+            hier.nstep[2] += 1
+            probe("child-pass-1")
+            BlockAMR.advance_level_w!(hier, 1, λv; φ = nothing, chem = ch, selfgrav = sg)
+            probe("child-pass-2")
+            dt0 = Float64(λv) * BlockAMR.level_dx(hier, 0)
+            BlockAMR.solve_gravity_level!(hier, 0; source_coef = sg.coef, nsweep = 0,
+                                          rho_mean = 1.0, use_dm = true, residual = false)
+            BlockAMR.grav_kick_level_pool!(hier, 0, 0.5 * dt0)
+            probe("K1")
+            BlockAMR.fill_ghosts!(hier, 0; θ = 0.0f0, buf = :R)
+            probe("ghosts")
+            BlockAMR.ctu_level!(hier, 0, λv)
+            hDo = Array(lev0d.Do); hTo = Array(lev0d.Tauo)
+            @printf("DISSECT[ctu-O]: Do-nonfinite=%d Tauo-nonfinite=%d\n",
+                    count(x -> !isfinite(Float32(x)), hDo),
+                    count(x -> !isfinite(Float32(x)), hTo)); flush(stdout)
+            BlockAMR.capture_coarse!(hier, 1, :R, 1.0f0; λ = λv)
+            BlockAMR.swap_buffers!(lev0d)
+            probe("ctu+swap")
+            BlockAMR.grav_kick_level_pool!(hier, 0, 0.5 * dt0)
+            probe("K2")
+            BlockAMR.chem_level!(hier, 0, dt0; ch...)
+            probe("chem")
+            BlockAMR.restrict_level!(hier, 1)
+            probe("restrict")
+            BlockAMR.reflux_apply!(hier, 1, λv)
+            probe("reflux")
+            hier.nstep[1] += 1
+            error("DISSECT complete at step $(nstep + 1)")
+        end
         BlockAMR.advance_level_w!(hier, 0, hier.λ;
             selfgrav = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
                         rho_mean = 1.0, use_dm = true),
@@ -189,10 +298,40 @@ function main()
         # RB pass a no-op refinement of the FFT solution)
 
         # ── particles: KDK from the finest covering level's φ ──
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            for l in 0:length(hier.levels)-1
+                isempty(hier.levels[l+1].live) && continue
+                sm2 = BlockAMR.max_signal(hier.levels[l+1], hier.gamma)
+                isfinite(sm2) ||
+                    (@printf("PHUNT step %d: GAS nonfinite at level %d POST-advance (smax=%s)\n",
+                             nstep, l, string(sm2)); flush(stdout); error("gas post-advance"))
+            end
+        end
         gather_accel_particles!(hier, parts, pax, pay, paz)
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            ma = maximum(abs, Array(pax)); mb = maximum(abs, Array(pay))
+            mc2 = maximum(abs, Array(paz))
+            if !(isfinite(ma) && isfinite(mb) && isfinite(mc2))
+                @printf("PHUNT step %d: gather accel nonfinite  |ax|=%.3e |ay|=%.3e |az|=%.3e\n",
+                        nstep, ma, mb, mc2); flush(stdout)
+                # locate: which level's phi is poisoned?
+                for l in 0:length(hier.levels)-1
+                    lv = hier.levels[l+1]; isempty(lv.live) && continue
+                    nb2 = count(!isfinite, Array(lv.phi))
+                    nb2 > 0 && @printf("PHUNT   level %d phi nonfinite=%d (of %d)\n",
+                                       l, nb2, length(lv.phi))
+                end
+                error("nonfinite gather at step $nstep")
+            end
+        end
         particles_kick!(hier, parts, pax, pay, paz, 0.5 * dτ)
         particles_drift!(hier, parts, dτ)
         particles_kick!(hier, parts, pax, pay, paz, 0.5 * dτ)
+        if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            mv2 = maximum(abs, Array(parts.vx))
+            isfinite(mv2) || (@printf("PHUNT step %d: vx nonfinite AFTER kicks\n", nstep);
+                              flush(stdout); error("nonfinite vx at step $nstep"))
+        end
 
         # ── Compton momentum drag (frame-agnostic, exp(−Γ/H·Δln a)) ──
         if DODRAG

@@ -109,8 +109,17 @@ end
     U1 = ρ + dU[1]
     U2 = ρ * Wf[2] + dU[2]; U3 = ρ * Wf[3] + dU[3]; U4 = ρ * Wf[4] + dU[4]
     U5 = ρ * Wf[5] + dU[5]
-    ρn = max(U1, 1.0f-30); inv = 1.0f0 / ρn
-    return (ρn, U2 * inv, U3 * inv, U4 * inv, max(U5, 1.0f-30) * inv)
+    # predictor fallback: the transverse half-step is UNLIMITED — at strong
+    # shocks it can drive ρ/ρe near or through zero, and an absolute floor
+    # then manufactures ~1e30 velocities that NaN the Riemann solve (the
+    # bamr256L10 level-2 seed, 482 cells in one substep).  If the half-step
+    # removes >90% of density or internal energy, use the un-evolved face
+    # state instead (locally first-order in time — the Enzo/Athena cure).
+    if !(U1 > 0.1f0 * ρ) || !(U5 > 0.1f0 * ρ * Wf[5])
+        return Wf
+    end
+    inv = 1.0f0 / U1
+    return (U1, U2 * inv, U3 * inv, U4 * inv, U5 * inv)
 end
 
 "corrector face flux: HLLC on the predicted prims + the ge lane on the mass flux."
@@ -280,6 +289,15 @@ end
         nG  = U0[6] - λ * (a6 + P_c * divv)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
         (nT - KE) > η * nT && (nG = nT - KE)
+        # extreme-frontier safety: a degenerate Riemann state can still emit a
+        # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
+        # the OLD state for that cell/substep instead of poisoning the level.
+        ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) & isfinite(nS3) &
+             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2)
+        if !ok
+            nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
+            nT = U0[5]; nG = U0[6]
+        end
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
@@ -288,11 +306,13 @@ end
         Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
-            spout[1][idx] = encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD)
+            spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
+                                 spin[1][idx]
         end
         if NS >= 2
             Xc = decode_log2sp(Float32, spin[2][idx])
-            spout[2][idx] = encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD)
+            spout[2][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD) :
+                                 spin[2][idx]
         end
     end
 end
@@ -485,6 +505,15 @@ end
         nG  = U0[6] - λ * (a6 + P_c * divv)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
         (nT - KE) > η * nT && (nG = nT - KE)
+        # extreme-frontier safety: a degenerate Riemann state can still emit a
+        # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
+        # the OLD state for that cell/substep instead of poisoning the level.
+        ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) & isfinite(nS3) &
+             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2)
+        if !ok
+            nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
+            nT = U0[5]; nG = U0[6]
+        end
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
@@ -493,11 +522,13 @@ end
         Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
-            spout[1][idx] = encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD)
+            spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
+                                 spin[1][idx]
         end
         if NS >= 2
             Xc = decode_log2sp(Float32, spin[2][idx])
-            spout[2][idx] = encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD)
+            spout[2][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD) :
+                                 spin[2][idx]
         end
     end
 end

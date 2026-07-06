@@ -25,7 +25,12 @@ import ChemistryKernels
         idx = base + _lidx(i, j, k, nd)
         ρ = Float32(D[idx]) * Dsc[slot]
         rho32[Int32(t)] = ρ
-        e32[Int32(t)]   = Float32(Ge[idx]) * Esc[slot] / max(ρ, 1.0f-30)
+        # f16-vacuumed cells (D underflows to EXACT stored zero, or NaN) must
+        # enter chem as COLD vacuum — dividing Ge by the 1e-30 floor fabricates
+        # e ~ 1e23 (T~1e30 K NaNs the rate fits — the bamr256L10 2-cell seed).
+        # Unit-agnostic predicate: ρ > 0 (false for 0 AND NaN); tiny-but-real
+        # densities divide honestly and the gas_temperature cap bounds them.
+        e32[Int32(t)]   = ρ > 0.0f0 ? Float32(Ge[idx]) * Esc[slot] / ρ : 0.0f0
         h16[Int32(t)]   = sp1[idx]
         m16[Int32(t)]   = sp2[idx]
     end

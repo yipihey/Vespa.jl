@@ -349,6 +349,13 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
         for (sd, sR) in zip(lev.sp, plev.sp)
             _run_prolong!(lev.be, tab, sd, sR, sR, 0.0f0, lev.nd, lev.stride)
         end
+        # φ seed: recycled slots carry a DEAD block's stale potential — a
+        # garbage warm start the RB sweeps cannot recover from regionally
+        # (the bamr256L10 Tau runaway ~10 steps after heavy de-refinement:
+        # wrong φ → runaway kicks → f16 Tau rot, invisible to max_signal).
+        # Prolong the parent's converged φ instead; Dirichlet+sweeps refine it.
+        _run_prolong!(lev.be, tab, lev.phi, plev.phi, plev.phi, 0.0f0,
+                      lev.nd, lev.stride)
         for s in news
             lev.meta[s].flags &= ~FLAG_NEW
         end
