@@ -43,6 +43,12 @@ Base.@kwdef struct BlockRefinementPolicy
     lfac    :: Float64 = 1.0   # threshold scales ×lfac per level (Enzo-style
                                # Lagrangian refinement: lfac=8 ⇒ ~constant
                                # cell mass triggers; 1.0 = flat threshold)
+    # zoom: for levels ≥ zoom_lmin, keep only blocks whose center lies within
+    # zoom_r (box units, periodic) of zoom_center — targeted deep refinement
+    # of one object without paying box-wide breadth at every level.
+    zoom_center :: NTuple{3,Float64} = (0.0, 0.0, 0.0)
+    zoom_r      :: Float64 = 0.0     # 0 = zoom disabled
+    zoom_lmin   :: Int = 3
 end
 
 @kernel function _flag_k!(flags, count, @Const(D), @Const(live_d), @Const(Dsc),
@@ -293,6 +299,22 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
                     off = ntuple(d -> Int16(Int(τ[d] - porg[d])), 3)
                     want[child_origin(porg, off, Pc)] = (s, off)
                 end
+            end
+        end
+        if pol.zoom_r > 0 && lc >= pol.zoom_lmin
+            # drop wants outside the zoom sphere; their descendants drop
+            # automatically next level (parent vanished → byorigin miss).
+            r2 = pol.zoom_r^2
+            filter!(want) do kv
+                org = kv.first
+                d2 = 0.0
+                for d in 1:3
+                    x = (Float64(org[d]) + hier.B / 2) / Float64(Pc[d])
+                    δx = abs(x - pol.zoom_center[d])
+                    δx = min(δx, 1.0 - δx)         # periodic
+                    d2 += δx * δx
+                end
+                d2 <= r2
             end
         end
         changed[lc + 1] = _rebuild_level!(hier, lc, want) > 0

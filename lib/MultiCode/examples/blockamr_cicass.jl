@@ -129,8 +129,15 @@ function main()
             c.fb, Tg0, xHII0, Np); flush(stdout)
     end                                          # if RESTART
 
+    # BAM_ZOOM="x,y,z,r[,lmin]" (box units): confine levels ≥ lmin (default 3)
+    # to a sphere around one target — deep refinement without box-wide breadth.
+    zoomspec = split(get(ENV, "BAM_ZOOM", ""), ",")
+    zr = length(zoomspec) >= 4 ? parse(Float64, zoomspec[4]) : 0.0
+    zc = zr > 0 ? ntuple(d -> parse(Float64, zoomspec[d]), 3) : (0.0, 0.0, 0.0)
+    zl = length(zoomspec) >= 5 ? parse(Int, zoomspec[5]) : 3
     pol = BlockRefinementPolicy(; dthresh = DTHRESH * c.fb, nbuf = 2,
-                                every = REGRIDN, lmax = LMAX, lfac = LFAC)
+                                every = REGRIDN, lmax = LMAX, lfac = LFAC,
+                                zoom_center = zc, zoom_r = zr, zoom_lmin = zl)
     ρg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     φg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     pax = BlockAMR.device_zeros(hier.be, Float32, (Np,))
