@@ -13,6 +13,7 @@ using CUDA
 function __init__()
     if CUDA.functional()
         BlockAMR.register_backend!(:cuda, CUDABackend())
+        BlockAMR.enable_tiling!(:cuda)     # ~42 KB shared mem fits NVIDIA (48+ KB)
     end
 end
 

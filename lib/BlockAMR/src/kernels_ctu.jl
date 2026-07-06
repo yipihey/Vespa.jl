@@ -576,8 +576,13 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     isempty(lev.live) && return nothing
     B = lev.B; NS = lev.nsp
     @assert NS <= 2 "the CTU kernels carry ≤ 2 species lanes (got $NS)"
-    can_tile = hier.besym != :cpu && B % _TBX == 0 && B % _TBY == 0 && B % _TBZ == 0
-    usetile = tiled === nothing ? can_tile : (tiled && can_tile)
+    # the tiled kernel needs ~42 KB threadgroup memory at NS=2 — fine on CUDA,
+    # but over Metal's usual 32 KB limit, so it must be OPTED IN per backend
+    # (`_TILING`, populated by each GPU extension once validated).  The per-cell
+    # oracle runs on every backend; `tiled=true`/`false` force either path.
+    tilecap = hier.besym != :cpu && B % _TBX == 0 && B % _TBY == 0 && B % _TBZ == 0
+    prefer  = hier.besym in _TILING
+    usetile = (tiled === nothing ? prefer : tiled) && tilecap
     sin_  = ntuple(q -> lev.sp[q], NS)
     sout_ = ntuple(q -> lev.spo[q], NS)
     if usetile

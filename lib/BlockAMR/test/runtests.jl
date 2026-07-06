@@ -1,14 +1,18 @@
 # BlockAMR test suite.  Run directly against the test project (NOT via Pkg.test):
 #   <julia> --project=lib/BlockAMR/test lib/BlockAMR/test/runtests.jl
 #
-# CPU always runs; the CUDA layers light up when `using CUDA` succeeds AND a
-# functional device is present (BACKENDS below then includes :cuda).
+# CPU always runs; a GPU layer lights up when its package loads AND a functional
+# device is present — `using CUDA` adds :cuda (NVIDIA), `using Metal` adds :metal
+# (Apple).  BACKENDS below picks up whichever registered.
 using BlockAMR
 using Test
 
 try; @eval using CUDA; catch; end
+try; @eval using Metal; catch; end
 
-const BACKENDS = has_backend(:cuda) ? (:cpu, :cuda) : (:cpu,)
+const BACKENDS = (:cpu,
+                  (has_backend(:cuda) ? (:cuda,) : ())...,
+                  (has_backend(:metal) ? (:metal,) : ())...)
 @info "BlockAMR tests" backends = BACKENDS
 
 @testset "BlockAMR" begin

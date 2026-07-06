@@ -60,8 +60,19 @@ export save_checkpoint, load_checkpoint
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
 
-"Register a KernelAbstractions backend under `name` (used by the CUDA extension)."
+# Backends on which the tiled single-pass CTU kernel (`_ctu_step_k!`, ~42 KB
+# threadgroup memory at NS=2) is the validated default.  A GPU extension adds
+# its symbol here ONLY after confirming the launch fits the device's shared-
+# memory limit (CUDA: yes; Metal: pending threadgroup-size validation on the
+# target Apple GPU — until then the per-cell CTU oracle runs, correct but
+# slower, and `ctu_level!(...; tiled=true)` force-enables tiling for testing).
+const _TILING = Set{Symbol}()
+
+"Register a KernelAbstractions backend under `name` (used by the GPU extensions)."
 register_backend!(name::Symbol, be) = (_BACKENDS[name] = be)
+
+"Mark backend `name` as validated for the tiled CTU kernel (see `_TILING`)."
+enable_tiling!(name::Symbol) = (push!(_TILING, name); name)
 
 "True when backend `name` is available (`:cuda` needs `using CUDA` first)."
 has_backend(name::Symbol) = haskey(_BACKENDS, name)
