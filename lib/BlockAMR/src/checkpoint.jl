@@ -85,7 +85,12 @@ registers rebuilt.  `Lcap` may EXCEED the checkpoint's (deepen-later restarts).
 """
 function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
                          Lcap = nothing)
+    dbg = get(ENV, "BAM_LOADDBG", "0") == "1"
+    _t() = time()
+    dbg && (@info "load: deserialize start"; flush(stderr))
+    t0 = _t()
     ck = Serialization.deserialize(path)
+    dbg && (@printf("load: deserialized in %.1fs\n", _t()-t0); flush(stdout))
     hier = AMRHierarchy(; nbase = ck.nbase, B = ck.B, ng = ck.ng, box = ck.box,
                         backend, T = ck.T, nsp = ck.nsp,
                         Lcap = Lcap === nothing ? ck.Lcap : Lcap,
@@ -93,9 +98,11 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
     init_base_level!(hier)
     slotmaps = Vector{Vector{Int32}}()
     push!(slotmaps, Int32[hier.levels[1].byorigin[org] for org in ck.levels[1].origins])
+    tg = _t()
     for l in 1:length(ck.levels)-1
         ensure_level!(hier, l)                 # checkpoints may carry EMPTY levels
         ckl = ck.levels[l + 1]
+        reserve!(hier.levels[l + 1], length(ckl.origins) + 8)  # one alloc, no grow cascade
         sm = Int32[]
         for (i, org) in enumerate(ckl.origins)
             s = add_block!(hier, l, slotmaps[l][ckl.parents[i]], Int.(ckl.offsets[i]))
@@ -103,6 +110,8 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             push!(sm, s)
         end
         push!(slotmaps, sm)
+        dbg && (@printf("load: grew L%d to %d blocks in %.1fs\n", l, length(sm), _t()-tg);
+                flush(stdout); tg = _t())
     end
     for l in 0:length(ck.levels)-1
         lev = hier.levels[l + 1]; ckl = ck.levels[l + 1]
@@ -131,6 +140,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             end
             lev.meta[s].flags &= ~FLAG_NEW
         end
+        tc = _t()
         for (dev, hh) in zip(gasfields(lev), hosts)
             copyto!(dev, hh)
         end
@@ -139,11 +149,14 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         end
         copyto!(lev.phi, hphi)
         copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc)
+        dbg && (@printf("load: uploaded L%d fields in %.1fs\n", l, _t()-tc); flush(stdout))
     end
     copyto!(hier.nstep, ck.nstep)
+    tb = _t()
     for l in 0:length(hier.levels)-1
         build_level_tables!(hier, l)
         l >= 1 && build_cf_register!(hier, l)
+        dbg && (@printf("load: built tables L%d in %.1fs\n", l, _t()-tb); flush(stdout); tb = _t())
     end
     return hier, ck.extra
 end

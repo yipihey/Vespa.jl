@@ -121,6 +121,17 @@ function _grow!(lev::Level, newcap::Int)
     return nothing
 end
 
+"""
+    reserve!(lev, cap)
+
+Pre-grow a level's pools to `cap` slots in ONE allocation. Restoring a large
+checkpoint otherwise triggers ~log₁.₂₅(N) incremental `_grow!`s, each copying
+the growing pool — and under managed oversubscription those unified→unified
+copies thrash the pager to a standstill. Pre-sizing to the known final count
+makes the restore a single clean allocation per level.
+"""
+reserve!(lev::Level, cap::Int) = (cap > lev.cap && _grow!(lev, cap); lev)
+
 function alloc_slot!(lev::Level)::Int32
     isempty(lev.freelist) || return pop!(lev.freelist)
     s = Int32(length(lev.live) + length(lev.freelist) + 1)
