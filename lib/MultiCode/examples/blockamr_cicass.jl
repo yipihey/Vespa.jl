@@ -147,6 +147,14 @@ function main()
     paz = BlockAMR.device_zeros(hier.be, Float32, (Np,))
 
     nstep = Int(hier.nstep[1]); t0 = time(); xe_mean = xHII0
+    # out-of-core: block pools default to host RAM; the small hot topgrid/particle
+    # arrays stay device-resident (touched every step by the FFT + CIC).
+    if MEMMODE === :managed
+        BlockAMR.advise_all_host!(hier)
+        for a_ in (ρg, φg, parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz)
+            BlockAMR.prefetch_device!(a_)
+        end
+    end
     while a < a_end
         # ── timestep: hydro CFL (global λ), particle CFL, expansion cap,
         #    and the free-fall limiter — a collapsing peak's t_dyn ∝ 1/√(Gρ)
@@ -425,7 +433,10 @@ function main()
         for l in 0:length(hier.levels)-1
             update_scales!(hier, l)
         end
-        nstep % REGRIDN == 0 && regrid!(hier, pol; compact = COMPACT)
+        if nstep % REGRIDN == 0
+            regrid!(hier, pol; compact = COMPACT)
+            MEMMODE === :managed && BlockAMR.advise_all_host!(hier)  # new blocks → host home
+        end
         ckextra() = (a = a, mass_code = mass_code, xe_mean = xe_mean,
                      px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
                      vx = Array(parts.vx), vy = Array(parts.vy), vz = Array(parts.vz))

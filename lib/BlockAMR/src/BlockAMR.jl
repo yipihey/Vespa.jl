@@ -58,6 +58,7 @@ export deposit_particles_level!, gather_accel_particles!, particles_kick!, parti
 export global_from_level0!, compton_drag!
 export save_checkpoint, load_checkpoint
 export memory_mode, set_memory_mode!, memory_report
+export prefetch_level!, advise_level_host!, advise_all_host!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())

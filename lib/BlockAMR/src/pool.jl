@@ -76,7 +76,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
     zed() = device_zeros(be, T, (cap0 * stride,))
     zu()  = device_zeros(be, UInt16, (cap0 * stride,))
     ones32(n) = to_device(be, ones(Float32, n), Float32)
-    Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
+    lev = Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
         l, B, ng, nd, stride, P, th, cap0, nsp, be,
         [BlockMeta() for _ in 1:cap0], Int32[], Int32[],
         Dict{Origin,Vector{Int32}}(), Dict{Origin,Int32}(),
@@ -88,6 +88,11 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
         to_device(be, Int32[], Int32), Dict{Symbol,Any}())
+    # out-of-core: pools are born host-preferred so allocation + checkpoint
+    # restore land in host RAM (not device) — prefetch_level! pulls the working
+    # set to the GPU per advance.  No-op unless memory_mode() === :managed.
+    advise_level_host!(lev)
+    return lev
 end
 
 # ── slot management ───────────────────────────────────────────────────────────
@@ -112,6 +117,7 @@ function _grow!(lev::Level, newcap::Int)
     length(lev.dm) > 0 && (lev.dm = grow(lev.dm))      # dm is lazy (deposit levels only)
     append!(lev.meta, [BlockMeta() for _ in 1:(newcap - lev.cap)])
     lev.cap = newcap
+    advise_level_host!(lev)          # out-of-core: grown pools stay host-preferred
     return nothing
 end
 
@@ -436,3 +442,33 @@ function memory_report(hier::AMRHierarchy; io = stdout)
     flush(io)
     return tot.total
 end
+
+# ── managed-memory staging (out-of-core Phase 0.5) ────────────────────────────
+# All field pools of a level, in one tuple (dm/sp/spo may be empty).
+_field_pools(lev::Level) = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge,
+                            lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo,
+                            lev.phi, lev.rhs, lev.dm, lev.sp..., lev.spo...)
+
+"Prefetch a level's field pools + device tables onto the GPU (managed mode only)."
+function prefetch_level!(lev::Level)
+    memory_mode() === :managed || return lev
+    for a in _field_pools(lev); prefetch_device!(a); end
+    for t in values(lev.tabs)
+        t isa RectJobTable || continue
+        prefetch_device!(t.jobs); prefetch_device!(t.cellstart)
+    end
+    prefetch_device!(lev.live_d)
+    prefetch_device!(lev.Dsc); prefetch_device!(lev.Ssc); prefetch_device!(lev.Esc)
+    return lev
+end
+
+"Mark a level's field pools as host-resident by default (managed mode only)."
+function advise_level_host!(lev::Level)
+    memory_mode() === :managed || return lev
+    for a in _field_pools(lev); advise_host!(a); end
+    return lev
+end
+
+"Advise every level's pools host-resident — the default home under oversubscription."
+advise_all_host!(hier::AMRHierarchy) =
+    (foreach(advise_level_host!, hier.levels); hier)

@@ -76,6 +76,11 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
         advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
     end
+    # out-of-core: pull THIS level's pools onto the GPU right before its kernels
+    # (children ran first and may have evicted it).  Cold levels stay host-
+    # preferred; the working set is resident at ~1.2× vs fully-resident. No-op
+    # unless memory_mode() === :managed.
+    prefetch_level!(lev)
     dt_l = Float64(λ) * level_dx(hier, l)
     # KDK K1.  Native self-gravity (selfgrav = (coef=…, nsweep=…, rho_ext=…)):
     # levels ≥ 1 SOLVE their own Poisson (warm-started red-black on the block
