@@ -355,3 +355,41 @@ function check_nesting(hier::AMRHierarchy; verbose::Bool = false)
     end
     return true
 end
+
+# ── recycled-slot hygiene ─────────────────────────────────────────────────────
+@kernel function _zero_slots_k!(A, @Const(slots), stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b = t0 ÷ stride; c = t0 % stride
+    @inbounds A[(slots[b + Int32(1)] - Int32(1)) * stride + c + Int32(1)] =
+        zero(eltype(A))
+end
+
+"""
+    zero_slots!(lev, slots)
+
+Zero the FULL slot storage (ghosts included) of `slots` in every pool of `lev`.
+A recycled freelist slot carries a DEAD block's f16 data; between block creation
+and the deferred table rebuild there are readers that see it raw — the news
+prolongation stencil reads one cell into the PARENT's ghost ring (a new parent's
+ring is recycled garbage when parent and child levels rebuild in the same
+regrid), and the children's Dirichlet φ refill reads parent φ ghosts likewise.
+"""
+function zero_slots!(lev::Level, slots::Vector{Int32})
+    isempty(slots) && return nothing
+    sd = to_device(lev.be, slots, Int32)
+    n = length(slots) * lev.stride
+    for A in (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge,
+              lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo,
+              lev.phi, lev.rhs, lev.dm)
+        length(A) == 0 && continue
+        _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
+    end
+    for A in lev.sp
+        _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
+    end
+    for A in lev.spo
+        _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
+    end
+    return nothing
+end

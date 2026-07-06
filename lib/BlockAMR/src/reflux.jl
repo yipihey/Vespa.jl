@@ -274,7 +274,7 @@ end
 @kernel function _reflux_apply_k!(D, S1, S2, S3, Tau, Ge,
                                   @Const(Dsc), @Const(Ssc), @Const(Esc),
                                   @Const(ent), @Const(reg), @Const(perm), @Const(gs),
-                                  λc::Float32, nd::Int32, stride::Int32)
+                                  λc::Float32, γ::Float32, nd::Int32, stride::Int32)
     g = @index(Global)
     @inbounds begin
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
@@ -298,12 +298,16 @@ end
         nS3 = Float32(S3[idx])  + a4 / ssc
         nT  = Float32(Tau[idx]) + a5 / esc
         nG  = Float32(Ge[idx])  + a6 / esc
-        # keep-old-state safety (the hydro-epilogue twin): a nonfinite or
-        # positivity-violating correction must never overwrite a finite
-        # coarse cell.
+        # keep-old-state safety (the hydro-epilogue twin): a nonfinite,
+        # positivity-violating, or CFL-inconsistent correction must never
+        # overwrite a finite coarse cell (see the CTU epilogue cap).
         ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) &
              isfinite(nS3) & isfinite(nT) & isfinite(nG) &
              (nD > 0.0f0) & (nT > 0.0f0)
+        invD = 1.0f0 / max(nD, 1.0f-30)
+        vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
+        cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
+        ok &= (vm + cn) * λc < 1.0f0
         D[idx]   = ok ? _narrow(eltype(D),   nD)  : D[idx]
         S1[idx]  = ok ? _narrow(eltype(S1),  nS1) : S1[idx]
         S2[idx]  = ok ? _narrow(eltype(S2),  nS2) : S2[idx]
@@ -388,6 +392,7 @@ function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
     _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc,
                              _tabi(lev, :cf), _tabf(lev, :cfreg),
                              _tabi(lev, :cfperm), _tabi(lev, :cfgs), λc,
+                             Float32(hier.gamma),
                              Int32(plev.nd), Int32(plev.stride); ndrange = ng_)
     fill!(_tabf(lev, :cfreg), 0.0f0)
     return nothing

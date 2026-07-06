@@ -5,6 +5,7 @@ using Serialization, Printf
 
 ck = deserialize(ARGS[1])
 γ = Float32(ck.gamma)
+thr = length(ARGS) >= 2 ? parse(Float32, ARGS[2]) : 1.0f6
 @printf("checkpoint: T=%s nsp=%d nstep=%s scheme=%s\n",
         string(ck.T), ck.nsp, string(ck.nstep[1:6]), string(ck.scheme))
 
@@ -20,14 +21,16 @@ for (lidx, ckl) in enumerate(ck.levels)
     for i in 1:nb
         dsc = ckl.Dsc[i]; ssc = ckl.Ssc[i]; esc = ckl.Esc[i]
         for q in 1:B3
-            ρ = max(Float32(ckl.D[q, i]) * dsc, 1.0f-30); inv = 1.0f0 / ρ
+            ρraw = Float32(ckl.D[q, i]) * dsc
+            # replicate the GATED _max_signal_k! (vacuum cells carry no signal)
+            inv = ifelse(ρraw > 0.0f0, 1.0f0 / max(ρraw, 1.0f-30), 0.0f0)
             vx = Float32(ckl.S1[q, i]) * ssc * inv
             vy = Float32(ckl.S2[q, i]) * ssc * inv
             vz = Float32(ckl.S3[q, i]) * ssc * inv
             cs = sqrt(γ * (γ - 1.0f0) * max(Float32(ckl.Ge[q, i]) * esc, 1.0f-30) * inv)
             sm = max(abs(vx), max(abs(vy), abs(vz))) + cs
             smax_lvl = max(smax_lvl, sm)
-            if sm > 1.0f6
+            if sm > thr
                 nhuge += 1
                 if length(worst) < 8
                     push!(worst, sm); push!(wloc, (i, q))

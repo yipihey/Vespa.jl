@@ -42,6 +42,7 @@ const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac
 # DM through their Dirichlet boundaries, the correct treatment for particles far
 # below their native resolution (gas dominates collapsed cores anyway).
 const LDM     = parse(Int, get(ENV, "BAM_LDM", "1"))
+const DTFF    = parse(Float64, get(ENV, "BAM_DTFF", "0.25"))   # free-fall dτ cap
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -138,15 +139,40 @@ function main()
 
     nstep = Int(hier.nstep[1]); t0 = time(); xe_mean = xHII0
     while a < a_end
-        # ── timestep: hydro CFL (global λ), particle CFL, expansion cap ──
+        # ── timestep: hydro CFL (global λ), particle CFL, expansion cap,
+        #    and the free-fall limiter — a collapsing peak's t_dyn ∝ 1/√(Gρ)
+        #    undercuts the quiet-gas CFL; without this cap the gravity kicks
+        #    overshoot at the peak (kicks bypass the hydro epilogue) ──
         λ = compute_lambda!(hier)
         vp = max(maximum(x -> abs(Float64(x)), parts.vx),
                  maximum(x -> abs(Float64(x)), parts.vy),
                  maximum(x -> abs(Float64(x)), parts.vz))
         dx0 = BlockAMR.level_dx(hier, 0)
+        # per level: subcycling gives level l a 2^-l shorter kick dt, so the
+        # root-step bound from a peak living at level l relaxes by 2^l
+        dτ_ff = Inf
+        for l in 0:length(hier.levels)-1
+            lv = hier.levels[l + 1]
+            isempty(lv.live) && continue
+            hd = Array(lv.Dsc)
+            ρl = 1.0
+            for s in lv.live
+                ρl = max(ρl, 2.0 * Float64(hd[s]))       # window top = 2·Dsc
+            end
+            dτ_ff = min(dτ_ff, exp2(l) * DTFF / sqrt(1.5 * c.Om * a * ρl))
+        end
         dτ = min(Float64(λ) * dx0, 0.3 * dx0 / max(vp, 1e-30),
-                 MultiCode.dtau_for_dlna(c, a, MAXEXP))
+                 MultiCode.dtau_for_dlna(c, a, MAXEXP), dτ_ff)
         hier.λ = Float32(dτ / dx0)
+        if get(ENV, "BAM_TRACE", "0") == "1"
+            @printf("TRACE step %d PRE : dτ=%.3e ff=%.3e", nstep + 1, dτ, dτ_ff)
+            for l in 0:length(hier.levels)-1
+                lv = hier.levels[l + 1]
+                isempty(lv.live) && continue
+                @printf("  L%d=%.3e", l, Float64(BlockAMR.max_signal(lv, hier.gamma)))
+            end
+            println(); flush(stdout)
+        end
 
         # ── gravity: composite topgrid FFT (gas from level 0 + DM CIC), then
         #    the native level solves via the selfgrav slot ──
@@ -213,9 +239,8 @@ function main()
                     sm = BlockAMR.max_signal(lvp, hier.gamma)
                     nT = count(x -> !isfinite(Float32(x)), Array(lvp.Tau))
                     nD = count(x -> !isfinite(Float32(x)), Array(lvp.D))
-                    (isfinite(sm) && nT == 0 && nD == 0) ||
-                        @printf("DISSECT[%s]: L%d smax=%s Tau-bad=%d D-bad=%d\n",
-                                tag, lp, string(sm), nT, nD)
+                    @printf("DISSECT[%s]: L%d smax=%.4e Tau-bad=%d D-bad=%d\n",
+                            tag, lp, Float64(sm), nT, nD)
                 end
                 @printf("DISSECT[%s]: done\n", tag); flush(stdout)
             end
@@ -320,6 +345,15 @@ function main()
                     fh = c.XH))
         # level 0 uses the FFT φ pool directly (nsweep0=0 keeps its Dirichlet-free
         # RB pass a no-op refinement of the FFT solution)
+        if get(ENV, "BAM_TRACE", "0") == "1"
+            @printf("TRACE step %d POST:", nstep + 1)
+            for l in 0:length(hier.levels)-1
+                lv = hier.levels[l + 1]
+                isempty(lv.live) && continue
+                @printf("  L%d=%.3e", l, Float64(BlockAMR.max_signal(lv, hier.gamma)))
+            end
+            println(); flush(stdout)
+        end
 
         # ── particles: KDK from the finest covering level's φ ──
         if get(ENV, "BAM_CHECKNAN", "0") == "1"

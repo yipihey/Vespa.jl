@@ -311,6 +311,11 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             l >= 1 && build_cf_register!(hier, l)
         end
     end
+    # φ ring maintenance, coarse→fine (children prolong from refreshed parent
+    # rings) — see refresh_phi_ghosts! for why this cannot wait for the solves.
+    for l in 0:length(hier.levels)-1
+        (changed[l + 1] || (l >= 1 && changed[l])) && refresh_phi_ghosts!(hier, l)
+    end
     return nothing
 end
 
@@ -331,6 +336,11 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
         nchg += 1
     end
     if !isempty(news)
+        # recycled slots first: kill the dead block's data in EVERY pool —
+        # readers before the next ghost fill (the news prolongation stencil
+        # one cell into a NEW parent's ghost ring; the children's Dirichlet
+        # φ refill) must never see it.
+        zero_slots!(lev, news)
         # new blocks inherit their parent's class scales (power-of-two, so the
         # prolongation ratio is exact); update_scales! re-windows them later.
         hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc); hEsc = Array(lev.Esc)

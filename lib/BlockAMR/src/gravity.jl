@@ -438,3 +438,32 @@ function compton_drag!(hier::AMRHierarchy, f::Real; scratch)
     end
     return nothing
 end
+
+"""
+    refresh_phi_ghosts!(hier, l)
+
+One Dirichlet prolong + full sibling exchange on level `l`'s φ ghost shell —
+the same ring maintenance `solve_gravity_level!` performs, without sweeps.
+Called coarse→fine at the END of `regrid!`: the fine-first W-cycle makes a
+child level's FIRST solve read the parent φ ring before the parent's own
+solve ever exchanges, and a parent created in the same regrid carries a
+recycled (dead-block) ring — trilinear Dirichlet has no limiter, so that
+garbage became ~250× accelerations at the fresh skins (the bamr256L10
+step-213 K1 detonation).
+"""
+function refresh_phi_ghosts!(hier::AMRHierarchy, l::Int)
+    lev = hier.levels[l + 1]
+    isempty(lev.live) && return nothing
+    if l >= 1
+        plev = hier.levels[l]
+        pro = _tabt(lev, :pro)
+        if pro.total > 0
+            _rect_prolong_tl_k!(lev.be)(lev.phi, plev.phi, pro.jobs, pro.cellstart,
+                                        Int32(pro.njobs), Int32(lev.nd),
+                                        Int32(lev.stride); ndrange = pro.total)
+        end
+    end
+    sib = _tabt(lev, :sib)
+    _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+    return nothing
+end

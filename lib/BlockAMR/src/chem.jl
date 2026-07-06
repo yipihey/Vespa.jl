@@ -23,14 +23,17 @@ import ChemistryKernels
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        ρ = Float32(D[idx]) * Dsc[slot]
+        d16 = Float32(D[idx])
+        ρ = d16 * Dsc[slot]
         rho32[Int32(t)] = ρ
-        # f16-vacuumed cells (D underflows to EXACT stored zero, or NaN) must
-        # enter chem as COLD vacuum — dividing Ge by the 1e-30 floor fabricates
-        # e ~ 1e23 (T~1e30 K NaNs the rate fits — the bamr256L10 2-cell seed).
-        # Unit-agnostic predicate: ρ > 0 (false for 0 AND NaN); tiny-but-real
-        # densities divide honestly and the gas_temperature cap bounds them.
-        e32[Int32(t)]   = ρ > 0.0f0 ? Float32(Ge[idx]) * Esc[slot] / ρ : 0.0f0
+        # Representability gate: a cell whose STORED density is below the f16
+        # normal range (2^-14; 0, subnormal, or NaN) has ≤10 mantissa bits —
+        # its Ge/D ratio is quantization garbage, and the gas_temperature cap
+        # then "bounds" it at 1e9 K ⇒ cs ~ 3000× the real signal, re-seeded
+        # every step (the bamr256L10 chem-powered blast).  Such cells enter
+        # chem as COLD vacuum (e=0 → solver evolves from its tiny floor).
+        e32[Int32(t)]   = d16 > 6.103515625f-5 ?
+                          Float32(Ge[idx]) * Esc[slot] / ρ : 0.0f0
         h16[Int32(t)]   = sp1[idx]
         m16[Int32(t)]   = sp2[idx]
     end

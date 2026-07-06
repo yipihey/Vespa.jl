@@ -300,6 +300,14 @@ end
              isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2) &
              (nD > 0.0f0) & (nT > 0.0f0)   # positivity: huge-but-FINITE fluxes
                                            # must not drive ρ/E through zero
+        # CFL self-consistency cap: λ was chosen so (|v|+cs)·λ ≤ cfl·safety
+        # (~0.12) for every real cell.  An update whose NEW signal speed
+        # exceeds 1/λ (8× headroom) broke the assumption it was built on —
+        # a degenerate flux wrote garbage-but-finite v or e.  Keep old state.
+        invD = 1.0f0 / max(nD, 1.0f-30)
+        vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
+        cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
+        ok &= (vm + cn) * λ < 1.0f0
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
@@ -523,6 +531,14 @@ end
              isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2) &
              (nD > 0.0f0) & (nT > 0.0f0)   # positivity: huge-but-FINITE fluxes
                                            # must not drive ρ/E through zero
+        # CFL self-consistency cap: λ was chosen so (|v|+cs)·λ ≤ cfl·safety
+        # (~0.12) for every real cell.  An update whose NEW signal speed
+        # exceeds 1/λ (8× headroom) broke the assumption it was built on —
+        # a degenerate flux wrote garbage-but-finite v or e.  Keep old state.
+        invD = 1.0f0 / max(nD, 1.0f-30)
+        vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
+        cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
+        ok &= (vm + cn) * λ < 1.0f0
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
