@@ -102,7 +102,9 @@ function _grow!(lev::Level, newcap::Int)
     # finalize the old array NOW: at production scale (20+ GB of pools) waiting
     # for GC to reclaim each superseded field is what turns a 1 GB grow into an
     # OOM (stream-ordered, so the pending copy completes first).
-    grow(a) = (b = device_zeros(lev.be, eltype(a), (n_new,));
+    # managed: advise the new pool host-resident BEFORE the copy so a grow while
+    # oversubscribed never piles the fresh array onto the device (no-op in :device)
+    grow(a) = (b = device_zeros(lev.be, eltype(a), (n_new,)); advise_host!(b);
                copyto!(view(b, 1:n_old), view(a, 1:n_old)); finalize(a); b)
     lev.D  = grow(lev.D);  lev.S1 = grow(lev.S1); lev.S2 = grow(lev.S2)
     lev.S3 = grow(lev.S3); lev.Tau = grow(lev.Tau); lev.Ge = grow(lev.Ge)
