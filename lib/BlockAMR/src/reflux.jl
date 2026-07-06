@@ -138,9 +138,18 @@ end
         j = cj + (ax == Int32(2) ? sh : Int32(0))
         k = ck + (ax == Int32(3) ? sh : Int32(0))
         F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc)
+        # a degenerate Riemann solve (f16-vacuum extremes) yields a nonfinite
+        # flux; the hydro epilogue kept the old state there, so the matching
+        # register contribution is ZERO — never let NaN into the register.
+        ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
+             isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
         r = (Int32(e) - Int32(1)) * Int32(6)
-        reg[r+1] -= wc * F[1]; reg[r+2] -= wc * F[2]; reg[r+3] -= wc * F[3]
-        reg[r+4] -= wc * F[4]; reg[r+5] -= wc * F[5]; reg[r+6] -= wc * gf
+        reg[r+1] -= wc * ifelse(ok, F[1], 0.0f0)
+        reg[r+2] -= wc * ifelse(ok, F[2], 0.0f0)
+        reg[r+3] -= wc * ifelse(ok, F[3], 0.0f0)
+        reg[r+4] -= wc * ifelse(ok, F[4], 0.0f0)
+        reg[r+5] -= wc * ifelse(ok, F[5], 0.0f0)
+        reg[r+6] -= wc * ifelse(ok, gf,   0.0f0)
     end
 end
 
@@ -166,9 +175,15 @@ end
         k = ck + (ax == Int32(3) ? sh : Int32(0))
         F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
                            dsc, ssc, esc)
+        ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
+             isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
         r = (Int32(e) - Int32(1)) * Int32(6)
-        reg[r+1] -= wc * F[1]; reg[r+2] -= wc * F[2]; reg[r+3] -= wc * F[3]
-        reg[r+4] -= wc * F[4]; reg[r+5] -= wc * F[5]; reg[r+6] -= wc * gf
+        reg[r+1] -= wc * ifelse(ok, F[1], 0.0f0)
+        reg[r+2] -= wc * ifelse(ok, F[2], 0.0f0)
+        reg[r+3] -= wc * ifelse(ok, F[3], 0.0f0)
+        reg[r+4] -= wc * ifelse(ok, F[4], 0.0f0)
+        reg[r+5] -= wc * ifelse(ok, F[5], 0.0f0)
+        reg[r+6] -= wc * ifelse(ok, gf,   0.0f0)
     end
 end
 
@@ -199,7 +214,11 @@ end
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
             F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
                                dsc, ssc, esc)
-            a1 += F[1]; a2 += F[2]; a3 += F[3]; a4 += F[4]; a5 += F[5]; a6 += gf
+            ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
+                 isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
+            a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
+            a3 += ifelse(ok, F[3], 0.0f0); a4 += ifelse(ok, F[4], 0.0f0)
+            a5 += ifelse(ok, F[5], 0.0f0); a6 += ifelse(ok, gf,   0.0f0)
         end
         r = (Int32(e) - Int32(1)) * Int32(6)
         q = 0.25f0 * wf
@@ -236,7 +255,11 @@ end
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
             F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc)
-            a1 += F[1]; a2 += F[2]; a3 += F[3]; a4 += F[4]; a5 += F[5]; a6 += gf
+            ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
+                 isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
+            a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
+            a3 += ifelse(ok, F[3], 0.0f0); a4 += ifelse(ok, F[4], 0.0f0)
+            a5 += ifelse(ok, F[5], 0.0f0); a6 += ifelse(ok, gf,   0.0f0)
         end
         r = (Int32(e) - Int32(1)) * Int32(6)
         q = 0.25f0 * wf
@@ -269,12 +292,24 @@ end
         base = (slot - Int32(1)) * stride
         idx  = base + _lidx(ent[b+2], ent[b+3], ent[b+4], nd)
         dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
-        D[idx]   = _narrow(eltype(D),   Float32(D[idx])   + a1 / dsc)
-        S1[idx]  = _narrow(eltype(S1),  Float32(S1[idx])  + a2 / ssc)
-        S2[idx]  = _narrow(eltype(S2),  Float32(S2[idx])  + a3 / ssc)
-        S3[idx]  = _narrow(eltype(S3),  Float32(S3[idx])  + a4 / ssc)
-        Tau[idx] = _narrow(eltype(Tau), Float32(Tau[idx]) + a5 / esc)
-        Ge[idx]  = _narrow(eltype(Ge),  Float32(Ge[idx])  + a6 / esc)
+        nD  = Float32(D[idx])   + a1 / dsc
+        nS1 = Float32(S1[idx])  + a2 / ssc
+        nS2 = Float32(S2[idx])  + a3 / ssc
+        nS3 = Float32(S3[idx])  + a4 / ssc
+        nT  = Float32(Tau[idx]) + a5 / esc
+        nG  = Float32(Ge[idx])  + a6 / esc
+        # keep-old-state safety (the hydro-epilogue twin): a nonfinite or
+        # positivity-violating correction must never overwrite a finite
+        # coarse cell.
+        ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) &
+             isfinite(nS3) & isfinite(nT) & isfinite(nG) &
+             (nD > 0.0f0) & (nT > 0.0f0)
+        D[idx]   = ok ? _narrow(eltype(D),   nD)  : D[idx]
+        S1[idx]  = ok ? _narrow(eltype(S1),  nS1) : S1[idx]
+        S2[idx]  = ok ? _narrow(eltype(S2),  nS2) : S2[idx]
+        S3[idx]  = ok ? _narrow(eltype(S3),  nS3) : S3[idx]
+        Tau[idx] = ok ? _narrow(eltype(Tau), nT)  : Tau[idx]
+        Ge[idx]  = ok ? _narrow(eltype(Ge),  nG)  : Ge[idx]
     end
 end
 

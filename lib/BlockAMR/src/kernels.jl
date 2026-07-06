@@ -31,8 +31,13 @@ import ChemistryKernels: encode_log2sp, decode_log2sp
 end
 
 # primitives (ρ,u,v,w,P) with DUAL-ENERGY pressure P = (γ−1)·Ge, floored.
+# VACUUM GATE: a cell whose stored density is ≤0 (f16 underflow under an extreme
+# per-block scale window) carries no mass; dividing its (quantization-noise)
+# momentum by the 1e-30 floor manufactures ~1e30 velocities that overflow kin to
+# Inf and detonate the Riemann solve (the bamr256L10 λ-collapse).  Vacuum cells
+# get v=0 — the hydro twin of the chem gather's ρ>0 predicate.
 @inline function _prim_de(U::NTuple{6,Float32}, γ::Float32)
-    ρ = max(U[1], 1.0f-30); inv = 1.0f0 / ρ
+    ρ = max(U[1], 1.0f-30); inv = ifelse(U[1] > 0.0f0, 1.0f0 / ρ, 0.0f0)
     vx = U[2] * inv; vy = U[3] * inv; vz = U[4] * inv
     kin = 0.5f0 * ρ * (vx * vx + vy * vy + vz * vz)
     P = (γ - 1.0f0) * max(U[6], 1.0f-30)
@@ -239,7 +244,10 @@ end
         dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        ρ = max(Float32(D[idx]) * dsc, 1.0f-30); inv = 1.0f0 / ρ
+        ρraw = Float32(D[idx]) * dsc
+        # vacuum gate (see _prim_de): a stored-ρ≤0 cell carries no signal —
+        # v = S/1e-30 garbage must never set the global λ.
+        inv = ifelse(ρraw > 0.0f0, 1.0f0 / max(ρraw, 1.0f-30), 0.0f0)
         vx = Float32(S1[idx]) * ssc * inv; vy = Float32(S2[idx]) * ssc * inv
         vz = Float32(S3[idx]) * ssc * inv
         cs = sqrt(γ * (γ - 1.0f0) * max(Float32(Ge[idx]) * esc, 1.0f-30) * inv)

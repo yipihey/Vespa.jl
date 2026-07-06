@@ -256,7 +256,31 @@ function main()
             BlockAMR.chem_level!(hier, 1, dt1; ch...)
             probe("L1-K2chem")
             BlockAMR.restrict_level!(hier, 2)
+            probe("L2-restrict")
+            reg2 = Array(BlockAMR._tabf(hier.levels[3], :cfreg))
+            @printf("DISSECT[reg(1,2)]: n=%d nonfinite=%d max|reg|=%.3e\n",
+                    length(reg2), count(!isfinite, reg2),
+                    isempty(reg2) ? 0.0 : maximum(x -> isfinite(x) ? abs(x) : 0.0f0, reg2))
+            flush(stdout)
             BlockAMR.reflux_apply!(hier, 2, λv)
+            probe("L2-reflux")
+            # locate the bad L1 cells: which live blocks, and are they C/F targets?
+            let lv1 = hier.levels[2]
+                hD1 = Array(lv1.D); hT1 = Array(lv1.Tau)
+                badslots = Dict{Int,Int}()
+                for s_ in lv1.live
+                    b_ = (Int(s_) - 1) * lv1.stride
+                    nb = 0
+                    for cix in 1:lv1.nd^3
+                        (isfinite(Float32(hD1[b_ + cix])) &&
+                         isfinite(Float32(hT1[b_ + cix]))) || (nb += 1)
+                    end
+                    nb > 0 && (badslots[Int(s_)] = nb)
+                end
+                @printf("DISSECT[badmap]: %d live L1 blocks w/ nonfinite: %s\n",
+                        length(badslots), string(sort(collect(badslots))))
+                flush(stdout)
+            end
             hier.nstep[2] += 1
             probe("child-pass-1")
             BlockAMR.advance_level_w!(hier, 1, λv; φ = nothing, chem = ch, selfgrav = sg)

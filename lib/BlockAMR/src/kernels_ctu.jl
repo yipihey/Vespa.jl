@@ -145,11 +145,15 @@ end
 @inline function _ctu_prims_pool(D, S1, S2, S3, Tau, Ge, idx::Int32,
                                  dsc::Float32, ssc::Float32, esc::Float32)
     U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
-    ρ = max(U[1], 1.0f-30); inv = 1.0f0 / ρ
+    # vacuum gate — must mirror the tiled kernel's phase-0 load bit-exactly.
+    ρ = max(U[1], 1.0f-30)
+    inv = ifelse(U[1] > 0.0f0, 1.0f0 / ρ, 0.0f0)
     ρ̂ = Float32(Float16(U[1] / dsc))
     u = Float32(Float16(U[2] * inv)); v = Float32(Float16(U[3] * inv))
     w = Float32(Float16(U[4] * inv))
-    ê = Float32(Float16(max(U[6], 1.0f-30) / esc / max(U[1] / dsc, 1.0f-30)))
+    ê = Float32(Float16(ifelse(U[1] > 0.0f0,
+                               max(U[6], 1.0f-30) / esc /
+                               max(U[1] / dsc, 1.0f-30), 0.0f0)))
     return (max(ρ̂ * dsc, 1.0f-30), u, v, w, ê * (esc / dsc))
 end
 
@@ -293,7 +297,9 @@ end
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
         # the OLD state for that cell/substep instead of poisoning the level.
         ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) & isfinite(nS3) &
-             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2)
+             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2) &
+             (nD > 0.0f0) & (nT > 0.0f0)   # positivity: huge-but-FINITE fluxes
+                                           # must not drive ρ/E through zero
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
@@ -372,14 +378,19 @@ end
             idx = base + _lidx(tx0 + lx + ng - Int32(2), ty0 + ly + ng - Int32(2),
                                tz0 + lz + ng - Int32(2), nd)
             U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
-            ρ = max(U[1], 1.0f-30); inv = 1.0f0 / ρ
+            # vacuum gate (see _prim_de): stored ρ ≤ 0 ⇒ v = 0, ê = 0 — never
+            # divide quantization-noise momenta by the density floor.
+            ρ = max(U[1], 1.0f-30)
+            inv = ifelse(U[1] > 0.0f0, 1.0f0 / ρ, 0.0f0)
             q = t * Int32(5)
             @inbounds begin
                 Wt[q+1] = Float16(U[1] / dsc)
                 Wt[q+2] = Float16(U[2] * inv)
                 Wt[q+3] = Float16(U[3] * inv)
                 Wt[q+4] = Float16(U[4] * inv)
-                Wt[q+5] = Float16(max(U[6], 1.0f-30) / esc / max(U[1] / dsc, 1.0f-30))
+                Wt[q+5] = Float16(ifelse(U[1] > 0.0f0,
+                                         max(U[6], 1.0f-30) / esc /
+                                         max(U[1] / dsc, 1.0f-30), 0.0f0))
                 for s in 1:NS
                     Xt[t*Int32(NS)+Int32(s)] = spin[s][idx]
                 end
@@ -509,7 +520,9 @@ end
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
         # the OLD state for that cell/substep instead of poisoning the level.
         ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) & isfinite(nS3) &
-             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2)
+             isfinite(nT) & isfinite(nG) & isfinite(aX1) & isfinite(aX2) &
+             (nD > 0.0f0) & (nT > 0.0f0)   # positivity: huge-but-FINITE fluxes
+                                           # must not drive ρ/E through zero
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
