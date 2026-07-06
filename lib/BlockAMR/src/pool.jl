@@ -393,3 +393,46 @@ function zero_slots!(lev::Level, slots::Vector{Int32})
     end
     return nothing
 end
+
+# ── memory accounting (out-of-core Phase 0 instrumentation) ───────────────────
+"Resident bytes of one level's field pools, broken out by class."
+function level_bytes(lev::Level)
+    b(a) = length(a) * sizeof(eltype(a))
+    gas  = sum(b, gasfields(lev)) + sum(b, gasfields_o(lev))     # 12 f16 pools
+    spb  = sum(b, lev.sp; init = 0) + sum(b, lev.spo; init = 0)  # 2·nsp u16 pools
+    grav = b(lev.phi) + b(lev.rhs) + b(lev.dm)                   # f32 phi/rhs/dm
+    sc   = b(lev.Dsc) + b(lev.Ssc) + b(lev.Esc) + b(lev.live_d)  # per-block, tiny
+    tabs = sum((t isa RectJobTable ? b(t.jobs) + b(t.cellstart) : 0
+                for t in values(lev.tabs)); init = 0)
+    return (gas = gas, species = spb, gravity = grav, scales = sc, tables = tabs,
+            total = gas + spb + grav + sc + tabs)
+end
+
+"""
+    memory_report(hier; io = stdout)
+
+Print resident pool bytes per level (gas / species / gravity / tables) and the
+grand total — the Phase-0 lens on where the GPU's memory goes at each redshift.
+Returns the grand total in bytes.
+"""
+function memory_report(hier::AMRHierarchy; io = stdout)
+    GB = 1 / 2^30
+    tot = (gas = 0, species = 0, gravity = 0, scales = 0, tables = 0, total = 0)
+    println(io, "── BlockAMR memory report (mode=$(memory_mode())) ──")
+    @printf(io, "%3s %8s %8s | %8s %8s %8s %8s | %9s\n",
+            "L", "blocks", "cap", "gas", "species", "gravity", "tables", "total GB")
+    for l in 0:length(hier.levels)-1
+        lev = hier.levels[l + 1]
+        isempty(lev.live) && lev.cap <= 8 && continue
+        m = level_bytes(lev)
+        tot = map(+, tot, m)
+        @printf(io, "%3d %8d %8d | %7.2fG %7.2fG %7.2fG %7.2fG | %9.3f\n",
+                l, length(lev.live), lev.cap, m.gas * GB, m.species * GB,
+                m.gravity * GB, m.tables * GB, m.total * GB)
+    end
+    @printf(io, "%3s %8s %8s | %7.2fG %7.2fG %7.2fG %7.2fG | %9.3f\n",
+            "Σ", "", "", tot.gas * GB, tot.species * GB, tot.gravity * GB,
+            tot.tables * GB, tot.total * GB)
+    flush(io)
+    return tot.total
+end

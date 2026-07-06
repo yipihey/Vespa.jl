@@ -43,6 +43,7 @@ const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac
 # below their native resolution (gas dominates collapsed cores anyway).
 const LDM     = parse(Int, get(ENV, "BAM_LDM", "1"))
 const DTFF    = parse(Float64, get(ENV, "BAM_DTFF", "0.25"))   # free-fall dτ cap
+const MEMMODE = Symbol(get(ENV, "BAM_MEM", "device"))          # device | managed (out-of-core)
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -61,8 +62,9 @@ function main()
                         Ob = OMEGAB, Or = 4.15e-5 / (HCONST/100)^2)
     a  = MultiCode.z_to_a(ZSTART); a_end = MultiCode.z_to_a(ZEND)
     u0 = MultiCode.cosmo_units(c, a)
-    @printf("BlockAMR CICASS: %d³ (B=%d, lmax=%d) box=%.4f Mpc/h  z=%.0f→%.0f  [%s]\n",
-            NGRID, BBLK, LMAX, BOXMPCH, ZSTART, ZEND, BE); flush(stdout)
+    @printf("BlockAMR CICASS: %d³ (B=%d, lmax=%d) box=%.4f Mpc/h  z=%.0f→%.0f  [%s mem=%s]\n",
+            NGRID, BBLK, LMAX, BOXMPCH, ZSTART, ZEND, BE, MEMMODE); flush(stdout)
+    BlockAMR.set_memory_mode!(MEMMODE)   # before ANY pool allocation (out-of-core)
 
     # ── ICs: CICASS realization, or restart from a checkpoint ──
     μ = 1.22
@@ -433,6 +435,8 @@ function main()
             BlockAMR.save_checkpoint(ckf, hier; extra = ckextra())
             @printf("ckpt @ step %d z=%.3f → %s\n", nstep, 1/a - 1, ckf); flush(stdout)
         end
+        get(ENV, "BAM_MEMREPORT", "0") == "1" && nstep % REGRIDN == 0 &&
+            BlockAMR.memory_report(hier)
         if STOPL < 99 && length(hier.levels) > STOPL &&
            !isempty(hier.levels[STOPL + 1].live)
             @printf("LEVEL %d POPULATED at z=%.4f (blocks=%s) — stopping\n", STOPL,

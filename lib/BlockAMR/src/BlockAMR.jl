@@ -37,6 +37,7 @@ module BlockAMR
 
 using KernelAbstractions
 const KA = KernelAbstractions
+using Printf: @printf
 import ChemistryKernels
 
 export backend, has_backend, device_zeros, to_device, to_host
@@ -56,6 +57,7 @@ export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
 export global_from_level0!, compton_drag!
 export save_checkpoint, load_checkpoint
+export memory_mode, set_memory_mode!, memory_report
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -90,6 +92,25 @@ function backend(name::Symbol = :cpu)
                "Known backends: $(collect(keys(_BACKENDS)))."))
     end
 end
+
+# ── memory backing mode (out-of-core Phase 0) ─────────────────────────────────
+# `:device`  — pools in ordinary GPU memory (default; the fully-resident path).
+# `:managed` — pools in CUDA Unified memory: the driver pages block data over
+#              PCIe on demand, so the host's RAM backs a working set far larger
+#              than the GPU. Set before building a hierarchy; the CUDA extension
+#              reads it in `device_zeros`. No effect on the CPU backend.
+const _MEMMODE = Ref(:device)
+memory_mode() = _MEMMODE[]
+set_memory_mode!(m::Symbol) =
+    (m in (:device, :managed) || error("memory mode must be :device or :managed");
+     _MEMMODE[] = m)
+
+# Migration hints for unified pools — no-ops unless a GPU extension overrides
+# them (CPU arrays and plain device arrays ignore them).  `advise_host!` marks a
+# cold pool as host-preferred + device-accessible (paged in on touch);
+# `prefetch_device!` pulls a hot pool to the GPU up front.
+advise_host!(a) = a
+prefetch_device!(a) = a
 
 "A zero-filled array of element type `T` and shape `dims` on backend `be`."
 device_zeros(::CPU, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)
