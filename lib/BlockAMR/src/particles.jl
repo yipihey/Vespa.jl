@@ -91,6 +91,37 @@ end
     end
 end
 
+# per-particle-MASS variant (multi-mass DM, e.g. a MUSIC/CAMB zoom IC): pm[p] is
+# the particle's mass in code units, scaled to a density by invdx3 = 1/dx_l³.
+# Identical CIC registration to _pdeposit_k! otherwise.
+@kernel function _pdeposit_mm_k!(dm, @Const(px), @Const(py), @Const(pz), @Const(pm),
+                                 @Const(pkey), @Const(pslot), nkey::Int32,
+                                 invdx3::Float32, N::Float32, B::Int32, ng::Int32,
+                                 nd::Int32, stride::Int32)
+    p = @index(Global)
+    @inbounds begin
+        gx = px[p] * N; gy = py[p] * N; gz = pz[p] * N
+        cx = unsafe_trunc(Int32, gx); cy = unsafe_trunc(Int32, gy); cz = unsafe_trunc(Int32, gz)
+        key = Int64(cx ÷ B) | (Int64(cy ÷ B) << 21) | (Int64(cz ÷ B) << 42)
+        slot = _lookup_slot(pkey, pslot, nkey, key)
+        if slot != Int32(0)
+            m = pm[p] * invdx3
+            base = (slot - Int32(1)) * stride
+            hx = gx - 0.5f0; hy = gy - 0.5f0; hz = gz - 0.5f0
+            i0 = unsafe_trunc(Int32, floor(hx)); fx = hx - Float32(i0)
+            j0 = unsafe_trunc(Int32, floor(hy)); fy = hy - Float32(j0)
+            k0 = unsafe_trunc(Int32, floor(hz)); fz = hz - Float32(k0)
+            li = i0 - (cx ÷ B) * B + ng; lj = j0 - (cy ÷ B) * B + ng; lk = k0 - (cz ÷ B) * B + ng
+            for c3 in Int32(0):Int32(1), c2 in Int32(0):Int32(1), c1 in Int32(0):Int32(1)
+                w = (c1 == 0 ? 1.0f0 - fx : fx) * (c2 == 0 ? 1.0f0 - fy : fy) *
+                    (c3 == 0 ? 1.0f0 - fz : fz)
+                idx = base + _lidx(li + c1, lj + c2, lk + c3, nd)
+                KA.@atomic dm[idx] += m * w
+            end
+        end
+    end
+end
+
 # fold ghost-ring deposits into the sibling owners (REVERSE of the ghost fill:
 # read my ghost cells, atomically add into the neighbour's active cells)
 @kernel function _rect_accum_rev_k!(F, @Const(jobs), @Const(cellstart),
@@ -112,11 +143,12 @@ end
     deposit_particles_level!(hier, l, parts; mass_code) -> nothing
 
 CIC-deposit the global particle SoA into level `l`'s `dm` pool at level-l
-resolution (`mass_code` = particle mass in code density·volume units — the
-deposited field is a DENSITY: mass_code/dx_l³ per unit CIC weight).  Ghost-ring
-deposits are folded into sibling owners; the pool is zeroed first.
+resolution.  `mass_code` = particle mass in code density·volume units — the
+deposited field is a DENSITY: mass_code/dx_l³ per unit CIC weight.  Pass a scalar
+`Real` for equal-mass DM, or a per-particle device `AbstractVector` for MULTI-MASS
+DM (a zoom IC).  Ghost-ring deposits are folded into sibling owners; pool zeroed first.
 """
-function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code::Real)
+function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)
@@ -126,12 +158,21 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code::
         (lev.dm = device_zeros(lev.be, Float32, (lev.cap * lev.stride,)))
     fill!(lev.dm, 0.0f0)
     N = Float32(hier.nbase[1] * exp2(l))
-    ρ1 = Float32(mass_code / level_dx(hier, l)^3)
-    _pdeposit_k!(lev.be)(lev.dm, parts.px, parts.py, parts.pz,
-                         lev.tabs[:pkey], lev.tabs[:pslot],
-                         Int32(length(lev.live)), ρ1, N, Int32(hier.B),
-                         Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                         ndrange = length(parts.px))
+    if mass_code isa AbstractVector                     # multi-mass DM (per particle)
+        invdx3 = Float32(1.0 / level_dx(hier, l)^3)
+        _pdeposit_mm_k!(lev.be)(lev.dm, parts.px, parts.py, parts.pz, mass_code,
+                                lev.tabs[:pkey], lev.tabs[:pslot],
+                                Int32(length(lev.live)), invdx3, N, Int32(hier.B),
+                                Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
+                                ndrange = length(parts.px))
+    else
+        ρ1 = Float32(mass_code / level_dx(hier, l)^3)
+        _pdeposit_k!(lev.be)(lev.dm, parts.px, parts.py, parts.pz,
+                             lev.tabs[:pkey], lev.tabs[:pslot],
+                             Int32(length(lev.live)), ρ1, N, Int32(hier.B),
+                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
+                             ndrange = length(parts.px))
+    end
     sib = _tabt(lev, :sib)
     if sib.total > 0
         _rect_accum_rev_k!(lev.be)(lev.dm, sib.jobs, sib.cellstart,

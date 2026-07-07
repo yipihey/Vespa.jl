@@ -124,7 +124,7 @@ end
 
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
 function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
-                          parts = nothing, mass_code::Real = 0.0)
+                          parts = nothing, mass_code = 0.0)
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
@@ -228,7 +228,7 @@ conservatively prolonged from their parents; vanished blocks are freed.  All
 tables and C/F registers are rebuilt.
 """
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
-                 parts = nothing, mass_code::Real = 0.0)
+                 parts = nothing, mass_code = 0.0)
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
