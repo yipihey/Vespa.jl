@@ -49,10 +49,15 @@ Base.@kwdef struct BlockRefinementPolicy
     zoom_center :: NTuple{3,Float64} = (0.0, 0.0, 0.0)
     zoom_r      :: Float64 = 0.0     # 0 = zoom disabled
     zoom_lmin   :: Int = 3
+    # dm_criterion: refine on the TOTAL matter density (gas + CIC-deposited DM)
+    # instead of gas alone, so DM-dominated minihalos refine on their own
+    # overdensity (dthresh must then be in total-matter units).  Needs `parts`
+    # + `mass_code` passed to regrid!.
+    dm_criterion :: Bool = false
 end
 
-@kernel function _flag_k!(flags, count, @Const(D), @Const(live_d), @Const(Dsc),
-                          thresh::Float32,
+@kernel function _flag_k!(flags, count, @Const(D), @Const(dm), @Const(live_d), @Const(Dsc),
+                          thresh::Float32, dmmul::Float32,
                           B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -63,7 +68,10 @@ end
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        f = Float32(D[idx]) * Dsc[slot] > thresh
+        # dmmul=0 ⇒ gas-only (dm is a dummy array); dmmul=1 ⇒ TOTAL matter
+        # (gas + CIC-deposited DM), the physical collapse criterion.
+        dens = Float32(D[idx]) * Dsc[slot] + dmmul * Float32(dm[idx])
+        f = dens > thresh
         flags[idx] = UInt8(f)
         f && (KA.@atomic count[slot] += Int32(1))
     end
@@ -113,12 +121,24 @@ end
 end
 
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
-function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy)
+function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
+                          parts = nothing, mass_code::Real = 0.0)
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
-    _flag_k!(lev.be)(flags, count, lev.D, lev.live_d, lev.Dsc,
-                     Float32(pol.dthresh * pol.lfac^l),
+    # DM-driven refinement: deposit DM onto THIS level (criterion-only — the block
+    # dm pool; shot noise is fine for FLAGGING, unlike gravity) and flag on the
+    # TOTAL matter density.  Lets DM-dominated minihalos refine on their own
+    # overdensity, not only where gas has traced them.
+    usedm = pol.dm_criterion && parts !== nothing
+    if usedm
+        deposit_particles_level!(hier, l, parts; mass_code)          # fills lev.dm
+        dmarr = lev.dm; dmmul = 1.0f0
+    else
+        dmarr = lev.D; dmmul = 0.0f0                                  # gas-only (dummy)
+    end
+    _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc,
+                     Float32(pol.dthresh * pol.lfac^l), dmmul,
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = length(lev.live) * lev.B^3)
     return flags, Array(count)
@@ -192,7 +212,8 @@ projection + dilation).  Persistent blocks keep their slots and data untouched
 conservatively prolonged from their parents; vanished blocks are freed.  All
 tables and C/F registers are rebuilt.
 """
-function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true)
+function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
+                 parts = nothing, mass_code::Real = 0.0)
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
@@ -206,7 +227,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     for l in 0:ltop
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
-        Fd[l], cnt[l] = _criterion_flags(hier, l, pol)
+        Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code)
     end
     # 2) tile cascade fine→coarse: T[lf] = forced level-lf child footprints as
     #    level-(lf−1)-cell tile origins (multiples of Bh; every block spans

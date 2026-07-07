@@ -97,13 +97,16 @@ function run_pancake_refined(; N=32, mode=1, ac=0.10, ai=0.01, af=0.092, nstep=4
     B=16; while N%B!=0; B÷=2; end
     hier=AMRHierarchy(; nbase=(N,N,N),B=B,backend=be,T=Float16,nsp=0,gamma=5/3,cfl=0.3,Lcap=lmax,scheme=:ctu)
     init_base_level!(hier); build_level_tables!(hier,0)
-    pol=BlockRefinementPolicy(; dthresh=dthresh, nbuf=2, every=4, lmax=lmax, lfac=4.0)
+    # DM-based refinement: pure-DM pancake refines on its OWN overdensity (total
+    # matter = DM here, so dthresh is in total-matter units).
+    pol=BlockRefinementPolicy(; dthresh=dthresh, nbuf=2, every=4, lmax=lmax, lfac=4.0,
+                              dm_criterion=true)
     ρg=BlockAMR.device_zeros(hier.be,Float32,(N^3,)); φg=BlockAMR.device_zeros(hier.be,Float32,(N^3,))
     pax=BlockAMR.device_zeros(hier.be,Float32,(Np,)); pay=similar(pax); paz=similar(pax)
     a=ai; dlna=(log(af)-log(ai))/nstep; nstepdone=0
     for s in 1:nstep
         dτ=dtau_for_dlna(a,dlna)
-        s%4==0 && regrid!(hier, pol; compact=true)
+        s%4==0 && regrid!(hier, pol; compact=true, parts, mass_code)
         # level-0 topgrid FFT (gas=0 + DM CIC)
         fill!(ρg,0.0f0)
         PoissonKernels.cic_deposit!(ρg,parts.px,parts.py,parts.pz,parts.vx,parts.vy,parts.vz,
