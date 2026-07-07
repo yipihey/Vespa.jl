@@ -51,8 +51,10 @@ Base.@kwdef struct BlockRefinementPolicy
     zoom_lmin   :: Int = 3
     # dm_criterion: refine on the TOTAL matter density (gas + CIC-deposited DM)
     # instead of gas alone, so DM-dominated minihalos refine on their own
-    # overdensity (dthresh must then be in total-matter units).  Needs `parts`
-    # + `mass_code` passed to regrid!.
+    # overdensity.  The DM path uses a QUASI-LAGRANGIAN per-level threshold
+    # (×RefineBy^ndim=8 per level, NOT `lfac`): `dthresh` is the particle-per-
+    # base-cell count that triggers (RAMSES m_refine, ~8), robust to CIC shot
+    # noise at depth.  Needs `parts` + `mass_code` passed to regrid!.
     dm_criterion :: Bool = false
 end
 
@@ -126,19 +128,32 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
-    # DM-driven refinement: deposit DM onto THIS level (criterion-only — the block
-    # dm pool; shot noise is fine for FLAGGING, unlike gravity) and flag on the
-    # TOTAL matter density.  Lets DM-dominated minihalos refine on their own
-    # overdensity, not only where gas has traced them.
+    # DM-driven refinement: deposit DM onto THIS level and flag on the TOTAL
+    # matter density (gas + CIC-DM), so DM-dominated minihalos refine on their
+    # own overdensity, not only where gas has traced them.
+    #
+    # QUASI-LAGRANGIAN per-level threshold (RAMSES poisson_flag `nref ≥ m_refine`,
+    # Enzo Grid_FlagCellsToBeRefinedByMass): `dm` is the CIC density over the
+    # LOCAL level-l cell volume (deposit_particles_level! uses mass_code/dx_l³),
+    # so the mean occupancy per cell drops ×RefineBy^ndim=8 each level and a
+    # single stray particle already reads ≈8^l × mean.  A FLAT overdensity
+    # threshold would therefore flag shot noise everywhere at depth (the z≈59,
+    # 7191-L3-block pathology).  Scaling the threshold ×8 per level makes it a
+    # CONSTANT-cell-mass / constant-particle-count test — `dthresh` is the
+    # particle-per-(base-)cell count that triggers, unchanged across levels,
+    # exactly RAMSES's mass criterion relative to the (level) mean density.  The
+    # gas-only path keeps its own `lfac` (gas density is smooth, not shot-noisy).
     usedm = pol.dm_criterion && parts !== nothing
     if usedm
         deposit_particles_level!(hier, l, parts; mass_code)          # fills lev.dm
         dmarr = lev.dm; dmmul = 1.0f0
+        thr = Float32(pol.dthresh * 8.0^l)                           # 8 = RefineBy^ndim
     else
-        dmarr = lev.D; dmmul = 0.0f0                                  # gas-only (dummy)
+        dmarr = lev.D; dmmul = 0.0f0                                 # gas-only (dummy)
+        thr = Float32(pol.dthresh * pol.lfac^l)
     end
     _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc,
-                     Float32(pol.dthresh * pol.lfac^l), dmmul,
+                     thr, dmmul,
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = length(lev.live) * lev.B^3)
     return flags, Array(count)
