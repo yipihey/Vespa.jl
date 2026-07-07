@@ -39,13 +39,16 @@ function read_music_grafic(dir::AbstractString)
     # grafic arrays are A[i,j,k] with i fastest; particle p = (i,j,k)
     dm_pos = Array{Float32}(undef, N, 3); dm_vel = similar(dm_pos); gas_vel = similar(dm_pos)
     dxfrac = 1.0f0 / n                          # cell size in box fraction
+    # grafic ic_posc* displacements are in Mpc/h (NOT Mpc — verified by the v/Ψ
+    # growing-mode cross-check v_raw/Ψ_raw = a·f·H/h, and P(k) recovery vs CAMB).
+    # box fraction = displacement[Mpc/h]/box[Mpc/h] = disp/box.  (The earlier
+    # disp/(n·dx) divided by box in Mpc = box/h → under-displaced everything by h.)
+    boxf = Float32(box)
     @inbounds for k in 1:n, j in 1:n, i in 1:n
         p = i + (j-1)*n + (k-1)*n^2
-        # displacement in Mpc → box fraction: disp/box_mpc; box_mpc = n*dx
-        boxmpc = Float32(n * H.dx)
-        dm_pos[p,1] = mod((i-0.5f0)*dxfrac + pcx[i,j,k]/boxmpc, 1.0f0)
-        dm_pos[p,2] = mod((j-0.5f0)*dxfrac + pcy[i,j,k]/boxmpc, 1.0f0)
-        dm_pos[p,3] = mod((k-0.5f0)*dxfrac + pcz[i,j,k]/boxmpc, 1.0f0)
+        dm_pos[p,1] = mod((i-0.5f0)*dxfrac + pcx[i,j,k]/boxf, 1.0f0)
+        dm_pos[p,2] = mod((j-0.5f0)*dxfrac + pcy[i,j,k]/boxf, 1.0f0)
+        dm_pos[p,3] = mod((k-0.5f0)*dxfrac + pcz[i,j,k]/boxf, 1.0f0)
         dm_vel[p,1] = vcx[i,j,k]; dm_vel[p,2] = vcy[i,j,k]; dm_vel[p,3] = vcz[i,j,k]
         gas_vel[p,1] = vbx[i,j,k]; gas_vel[p,2] = vby[i,j,k]; gas_vel[p,3] = vbz[i,j,k]
     end
