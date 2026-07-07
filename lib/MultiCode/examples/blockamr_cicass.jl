@@ -45,6 +45,7 @@ const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac
 const LDM     = parse(Int, get(ENV, "BAM_LDM", "1"))
 const DTFF    = parse(Float64, get(ENV, "BAM_DTFF", "0.25"))   # free-fall dτ cap
 const MEMMODE = Symbol(get(ENV, "BAM_MEM", "device"))          # device | managed (out-of-core)
+const DMCRIT  = get(ENV, "BAM_DMCRIT", "0") == "1"             # refine on TOTAL matter (gas+DM)
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -149,9 +150,12 @@ function main()
     zr = length(zoomspec) >= 4 ? parse(Float64, zoomspec[4]) : 0.0
     zc = zr > 0 ? ntuple(d -> parse(Float64, zoomspec[d]), 3) : (0.0, 0.0, 0.0)
     zl = length(zoomspec) >= 5 ? parse(Int, zoomspec[5]) : 3
-    pol = BlockRefinementPolicy(; dthresh = DTHRESH * c.fb, nbuf = 2,
-                                every = REGRIDN, lmax = LMAX, lfac = LFAC,
-                                zoom_center = zc, zoom_r = zr, zoom_lmin = zl)
+    # DM criterion flags on TOTAL matter (mean 1) so dthresh is unscaled; the
+    # gas-only criterion flags on gas density (mean fb) so it's ×fb.
+    pol = BlockRefinementPolicy(; dthresh = DMCRIT ? DTHRESH : DTHRESH * c.fb,
+                                nbuf = 2, every = REGRIDN, lmax = LMAX, lfac = LFAC,
+                                zoom_center = zc, zoom_r = zr, zoom_lmin = zl,
+                                dm_criterion = DMCRIT)
     ρg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     φg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     pax = BlockAMR.device_zeros(hier.be, Float32, (Np,))
@@ -446,7 +450,7 @@ function main()
             update_scales!(hier, l)
         end
         if nstep % REGRIDN == 0
-            regrid!(hier, pol; compact = COMPACT)
+            regrid!(hier, pol; compact = COMPACT, parts, mass_code)
             MEMMODE === :managed && BlockAMR.advise_all_host!(hier)  # new blocks → host home
         end
         ckextra() = (a = a, mass_code = mass_code, xe_mean = xe_mean,
