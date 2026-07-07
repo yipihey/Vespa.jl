@@ -22,6 +22,7 @@
 using MultiCode, BlockAMR, CICASSLib, Printf
 import PoissonKernels, ChemistryKernels
 try; @eval using CUDA; catch; end
+include(joinpath(@__DIR__, "music_ic.jl"))   # BAM_IC=music: Planck18 grafic ICs
 
 const BE      = Symbol(get(ENV, "BACKEND", "cpu"))
 const NGRID   = parse(Int, get(ENV, "BAM_NGRID", "32"))
@@ -81,9 +82,20 @@ function main()
             string([length(hier.levels[l+1].live) for l in 0:length(hier.levels)-1]))
     flush(stdout)
     else
-    r = MultiCode.run_cicass_streaming(; vbc = VBC, boxlength = BOXMPCH,
-                                       zstart = ZSTART, ngrid = NGRID)
-    snap = CICASSLib.read_snapshot(r.output)
+    # ── ICs: CICASS streaming (default) OR MUSIC grafic (BAM_IC=music, Planck18
+    #    z=1000 two-fluid: DM kicked, baryons Silk-damped + at rest) ──
+    if get(ENV, "BAM_IC", "cicass") == "music"
+        mdir = ENV["BAM_MUSIC_DIR"]                 # a grafic level_XXX directory
+        snap = MusicIC.read_music_grafic(mdir)
+        getδb = s -> reshape(s.gas_delta, s.n, s.n, s.n)
+        @printf("MUSIC ICs from %s: box=%.3f Mpc/h z=%.0f Np=%d\n",
+                mdir, snap.box, snap.zinit, snap.Np); flush(stdout)
+    else
+        r = MultiCode.run_cicass_streaming(; vbc = VBC, boxlength = BOXMPCH,
+                                           zstart = ZSTART, ngrid = NGRID)
+        snap = CICASSLib.read_snapshot(r.output)
+        getδb = s -> CICASSLib.grid3d(s, s.gas_delta)
+    end
     ts = CICASSLib.thermal_state(ZSTART)
     xHII0 = ts.x_e; Tg0 = ts.T_gas
     eint0 = Tg0 / ((GAMMA - 1) * μ * u0.T2)
@@ -96,7 +108,7 @@ function main()
     lev0 = init_base_level!(hier); build_level_tables!(hier, 0)
 
     # gas → level-0 pools (host stage in the pool layout, then encode)
-    δb = CICASSLib.grid3d(snap, snap.gas_delta); gv = snap.gas_vel
+    δb = getδb(snap); gv = snap.gas_vel
     n = lev0.cap * lev0.stride
     hD = zeros(n); hS1 = zeros(n); hS2 = zeros(n); hS3 = zeros(n)
     hT = zeros(n); hG = zeros(n)
