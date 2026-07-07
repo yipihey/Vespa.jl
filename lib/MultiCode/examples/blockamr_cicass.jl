@@ -23,6 +23,7 @@ using MultiCode, BlockAMR, CICASSLib, Printf
 import PoissonKernels, ChemistryKernels
 try; @eval using CUDA; catch; end
 include(joinpath(@__DIR__, "music_ic.jl"))   # BAM_IC=music: Planck18 grafic ICs
+include(joinpath(@__DIR__, "camb_ic.jl"))     # BAM_IC=camb:  sub-percent CAMB-normalized ICs
 
 const BE      = Symbol(get(ENV, "BACKEND", "cpu"))
 const NGRID   = parse(Int, get(ENV, "BAM_NGRID", "32"))
@@ -88,7 +89,12 @@ function main()
     else
     # ── ICs: CICASS streaming (default) OR MUSIC grafic (BAM_IC=music, Planck18
     #    z=1000 two-fluid: DM kicked, baryons Silk-damped + at rest) ──
-    if get(ENV, "BAM_IC", "cicass") == "music"
+    if get(ENV, "BAM_IC", "cicass") == "camb"
+        snap = CambIC.read_camb_ic(ENV["BAM_CAMB_IC"])   # sub-percent CAMB-normalized
+        getδb = s -> reshape(s.gas_delta, s.n, s.n, s.n)
+        @printf("CAMB ICs from %s: box=%.3f Mpc/h z=%.0f Np=%d (sub-percent P(k))\n",
+                ENV["BAM_CAMB_IC"], snap.box, snap.zinit, snap.Np); flush(stdout)
+    elseif get(ENV, "BAM_IC", "cicass") == "music"
         mdir = ENV["BAM_MUSIC_DIR"]                 # a grafic level_XXX directory
         snap = MusicIC.read_music_grafic(mdir)
         getδb = s -> reshape(s.gas_delta, s.n, s.n, s.n)
