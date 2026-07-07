@@ -142,6 +142,24 @@ end
 @info "DM pancake test" backend=BE
 l1, gr = run_pancake()
 @printf("[level-0]  growth=%.3f  L1(pos)=%.4f  %s\n", gr, l1, l1<0.05 ? "PASS" : "FAIL")
+
+# ── convergence with RESOLUTION (level-0 PM): L1 vs N, expect ~2nd order (dx^2) ──
+if get(ENV, "PANCAKE_CONV", "0") == "1"
+    println("── spatial convergence (nstep=800 so timestep error is subdominant) ──")
+    Ns=[16,32,64,128]; L=Float64[]
+    for N in Ns
+        e,_=run_pancake(; N=N, nstep=800)
+        push!(L,e); @printf("  N=%4d  L1(pos)=%.5f\n", N, e)
+    end
+    for i in 2:length(Ns)
+        rate=log(L[i-1]/L[i])/log(Ns[i]/Ns[i-1])
+        @printf("  rate N=%d→%d : %.2f\n", Ns[i-1], Ns[i], rate)
+    end
+    println("── temporal convergence (N=32, vary nstep) ──")
+    for ns in [100,200,400,800]
+        e,_=run_pancake(; N=32, nstep=ns); @printf("  nstep=%4d  L1=%.5f\n", ns, e)
+    end
+end
 # The refined variant exercises regrid + block-CIC + native gravity ONLY if the
 # region actually refines.  NOTE: BlockAMR's refinement criterion keys on the GAS
 # density; a pure-DM pancake (gas=0) never triggers it -> DM refinement is INDIRECT
