@@ -149,10 +149,16 @@ l1, gr = run_pancake()
 # pancake (gas tracing DM) or a DM-based refinement criterion.
 l1r, mlev = run_pancake_refined()
 if mlev == 0
-    @printf("[refined]  deepest level=0 — refinement did NOT trigger (gas-based criterion, pure-DM test)\n")
-    @printf("           => block-CIC/native-DM path UNTESTED here; needs a gas tracer or DM criterion\n")
+    @printf("[refined]  deepest level=0 — refinement did NOT trigger\n")
 else
     @printf("[refined]  deepest level=%d  L1(pos)=%.4f  %s\n", mlev, l1r, l1r<0.08 ? "PASS" : "FAIL")
+end
+# LDM sensitivity: block-DM gravity (ldm=1) vs DM-via-Dirichlet-only (ldm=0)
+if get(ENV, "PANCAKE_LDM_SWEEP", "1") == "1"
+    for ldm in (0, 1)
+        l1s, ml = run_pancake_refined(; ldm=ldm, lmax=2)
+        @printf("[LDM=%d, lmax=2]  deepest=%d  L1(pos)=%.4f\n", ldm, ml, l1s)
+    end
 end
 println(l1<0.05 ? "DM DYNAMICS: level-0 (topgrid) reproduces Zel'dovich to <5% ✓" :
                   "DM DYNAMICS: level-0 FAILED")
