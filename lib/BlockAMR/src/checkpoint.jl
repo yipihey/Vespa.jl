@@ -53,7 +53,7 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
                        D = gf[1], S1 = gf[2], S2 = gf[3], S3 = gf[4],
                        Tau = gf[5], Ge = gf[6], sp = fsp, phi = fphi,
                        Dsc = Array(lev.Dsc)[li], Ssc = Array(lev.Ssc)[li],
-                       Esc = Array(lev.Esc)[li]))
+                       Esc = Array(lev.Esc)[li], Gsc = Array(lev.Gsc)[li]))
     end
     return (; nbase = hier.nbase, B = hier.B, ng = hier.ng, box = hier.box,
             Lcap = hier.Lcap, gamma = hier.gamma, cfl = hier.cfl,
@@ -121,11 +121,14 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         hsp = [zeros(UInt16, n) for _ in 1:lev.nsp]
         hphi = zeros(Float32, n)
         hDsc = ones(Float32, lev.cap); hSsc = ones(Float32, lev.cap)
-        hEsc = ones(Float32, lev.cap)
+        hEsc = ones(Float32, lev.cap); hGsc = ones(Float32, lev.cap)
         ckf = (ckl.D, ckl.S1, ckl.S2, ckl.S3, ckl.Tau, ckl.Ge)
+        # backward-compat: pre-split checkpoints have no Gsc — Ge was encoded on
+        # the shared Esc, so Gsc = Esc reproduces the old physical Ge exactly.
+        ckGsc = hasproperty(ckl, :Gsc) ? ckl.Gsc : ckl.Esc
         for (i, s) in enumerate(slotmaps[l + 1])
             base = (Int(s) - 1) * lev.stride
-            hDsc[s] = ckl.Dsc[i]; hSsc[s] = ckl.Ssc[i]; hEsc[s] = ckl.Esc[i]
+            hDsc[s] = ckl.Dsc[i]; hSsc[s] = ckl.Ssc[i]; hEsc[s] = ckl.Esc[i]; hGsc[s] = ckGsc[i]
             q = 0
             for k in 1:B, j in 1:B, ii in 1:B
                 idx = base + ((ng+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
@@ -148,7 +151,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             copyto!(sp, hsp[t])
         end
         copyto!(lev.phi, hphi)
-        copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc)
+        copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc); copyto!(lev.Gsc, hGsc)
         dbg && (@printf("load: uploaded L%d fields in %.1fs\n", l, _t()-tc); flush(stdout))
     end
     copyto!(hier.nstep, ck.nstep)

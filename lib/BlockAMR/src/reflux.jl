@@ -103,15 +103,15 @@ end
 @inline function _face6(D, S1, S2, S3, Tau, Ge, base::Int32,
                         i::Int32, j::Int32, k::Int32, nd::Int32,
                         γ::Float32, ax::Int32,
-                        dsc::Float32, ssc::Float32, esc::Float32)
+                        dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
     di = ax == Int32(1) ? Int32(1) : Int32(0)
     dj = ax == Int32(2) ? Int32(1) : Int32(0)
     dk = ax == Int32(3) ? Int32(1) : Int32(0)
     idx(m) = base + _lidx(i + m * di, j + m * dj, k + m * dk, nd)
-    U1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-1)), dsc, ssc, esc)
-    U2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(0)), dsc, ssc, esc)
-    U3 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(1)), dsc, ssc, esc)
-    U4 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(2)), dsc, ssc, esc)
+    U1 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(-1)), dsc, ssc, esc, gsc)
+    U2 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(0)), dsc, ssc, esc, gsc)
+    U3 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(1)), dsc, ssc, esc, gsc)
+    U4 = _loadU(D, S1, S2, S3, Tau, Ge, idx(Int32(2)), dsc, ssc, esc, gsc)
     F, _ = _face_flux(_prim_de(U1, γ), _prim_de(U2, γ), _prim_de(U3, γ),
                       _prim_de(U4, γ), γ, ax)
     gf = _geflux(F[1], U2[6], U2[1], U3[6], U3[1])
@@ -122,13 +122,13 @@ end
 @kernel function _capture_coarse_k!(reg, @Const(ent),
                                     @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                     @Const(Tau), @Const(Ge),
-                                    @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                    @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                     wc::Float32, γ::Float32, nd::Int32, stride::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+1] - Int32(1)) * stride
-        dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]
+        dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]; gsc = Gsc[ent[b+1]]
         ci = ent[b+2]; cj = ent[b+3]; ck = ent[b+4]
         ax = ent[b+5]; side = ent[b+6]
         # side=+1 → the coarse cell's LOW face: face between (q−1, q) → window at q−1
@@ -137,7 +137,7 @@ end
         i = ci + (ax == Int32(1) ? sh : Int32(0))
         j = cj + (ax == Int32(2) ? sh : Int32(0))
         k = ck + (ax == Int32(3) ? sh : Int32(0))
-        F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc)
+        F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc, gsc)
         # a degenerate Riemann solve (f16-vacuum extremes) yields a nonfinite
         # flux; the hydro epilogue kept the old state there, so the matching
         # register contribution is ZERO — never let NaN into the register.
@@ -159,14 +159,14 @@ end
 @kernel function _capture_coarse_ctu_k!(reg, @Const(ent),
                                         @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                         @Const(Tau), @Const(Ge),
-                                        @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                        @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                         wc::Float32, λ::Float32, γ::Float32,
                                         nd::Int32, stride::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+1] - Int32(1)) * stride
-        dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]
+        dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]; gsc = Gsc[ent[b+1]]
         ci = ent[b+2]; cj = ent[b+3]; ck = ent[b+4]
         ax = ent[b+5]; side = ent[b+6]
         sh = side == Int32(1) ? Int32(-1) : Int32(0)
@@ -174,7 +174,7 @@ end
         j = cj + (ax == Int32(2) ? sh : Int32(0))
         k = ck + (ax == Int32(3) ? sh : Int32(0))
         F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                           dsc, ssc, esc)
+                           dsc, ssc, esc, gsc)
         ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
              isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
         r = (Int32(e) - Int32(1)) * Int32(6)
@@ -190,14 +190,14 @@ end
 @kernel function _capture_fine_ctu_k!(reg, @Const(ent),
                                       @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                       @Const(Tau), @Const(Ge),
-                                      @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                      @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                       wf::Float32, λ::Float32, γ::Float32,
                                       nd::Int32, stride::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+7] - Int32(1)) * stride
-        dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]
+        dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]; gsc = Gsc[ent[b+7]]
         fi = ent[b+8]; fj = ent[b+9]; fk = ent[b+10]
         ax = ent[b+5]; side = ent[b+6]
         sh = side == Int32(1) ? Int32(0) : Int32(-1)
@@ -213,7 +213,7 @@ end
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
             F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                               dsc, ssc, esc)
+                               dsc, ssc, esc, gsc)
             ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
                  isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
             a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
@@ -231,13 +231,13 @@ end
 @kernel function _capture_fine_k!(reg, @Const(ent),
                                   @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                   @Const(Tau), @Const(Ge),
-                                  @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                  @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                   wf::Float32, γ::Float32, nd::Int32, stride::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+7] - Int32(1)) * stride
-        dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]
+        dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]; gsc = Gsc[ent[b+7]]
         fi = ent[b+8]; fj = ent[b+9]; fk = ent[b+10]
         ax = ent[b+5]; side = ent[b+6]
         # face of the INSIDE fine cell: hi face for side=+1 (window at the cell),
@@ -254,7 +254,7 @@ end
             i = fi + (ax == Int32(1) ? sh : Int32(0)) + s1 * t1i + s2 * t2i
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
-            F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc)
+            F, gf = _face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, ax, dsc, ssc, esc, gsc)
             ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
                  isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
             a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
@@ -272,7 +272,7 @@ end
 # coarse cell sums all its face entries) — atomic-free (f16 has no atomics) and
 # scale-aware (physical correction ÷ the target block's class scale on store).
 @kernel function _reflux_apply_k!(D, S1, S2, S3, Tau, Ge,
-                                  @Const(Dsc), @Const(Ssc), @Const(Esc),
+                                  @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                   @Const(ent), @Const(reg), @Const(perm), @Const(gs),
                                   λc::Float32, γ::Float32, nd::Int32, stride::Int32)
     g = @index(Global)
@@ -291,13 +291,13 @@ end
         slot = ent[b+1]
         base = (slot - Int32(1)) * stride
         idx  = base + _lidx(ent[b+2], ent[b+3], ent[b+4], nd)
-        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
         nD  = Float32(D[idx])   + a1 / dsc
         nS1 = Float32(S1[idx])  + a2 / ssc
         nS2 = Float32(S2[idx])  + a3 / ssc
         nS3 = Float32(S3[idx])  + a4 / ssc
         nT  = Float32(Tau[idx]) + a5 / esc
-        nG  = Float32(Ge[idx])  + a6 / esc
+        nG  = Float32(Ge[idx])  + a6 / gsc
         # keep-old-state safety (the hydro-epilogue twin): a nonfinite,
         # positivity-violating, or CFL-inconsistent correction must never
         # overwrite a finite coarse cell (see the CTU epilogue cap).
@@ -332,12 +332,12 @@ function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     ff = buf === :R ? gasfields(lev) : gasfields_o(lev)
     if hier.scheme === :ctu
         _capture_fine_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
-                                     lev.Dsc, lev.Ssc, lev.Esc, w, λ,
+                                     lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, w, λ,
                                      Float32(hier.gamma), Int32(lev.nd),
                                      Int32(lev.stride); ndrange = n)
     else
         _capture_fine_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
-                                 lev.Dsc, lev.Ssc, lev.Esc, w,
+                                 lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, w,
                                  Float32(hier.gamma), Int32(lev.nd),
                                  Int32(lev.stride); ndrange = n)
     end
@@ -358,12 +358,12 @@ function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     fc = buf === :R ? gasfields(plev) : gasfields_o(plev)
     if hier.scheme === :ctu
         _capture_coarse_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
-                                       plev.Dsc, plev.Ssc, plev.Esc, w, λ,
+                                       plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc, w, λ,
                                        Float32(hier.gamma), Int32(plev.nd),
                                        Int32(plev.stride); ndrange = n)
     else
         _capture_coarse_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
-                                   plev.Dsc, plev.Ssc, plev.Esc, w,
+                                   plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc, w,
                                    Float32(hier.gamma), Int32(plev.nd),
                                    Int32(plev.stride); ndrange = n)
     end
@@ -389,7 +389,7 @@ function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
     n == 0 && return nothing
     ng_ = lev.tabs[:cfng]::Int
     ng_ == 0 && return nothing
-    _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc,
+    _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                              _tabi(lev, :cf), _tabf(lev, :cfreg),
                              _tabi(lev, :cfperm), _tabi(lev, :cfgs), λc,
                              Float32(hier.gamma),

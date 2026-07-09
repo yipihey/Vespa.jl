@@ -121,3 +121,39 @@ end
     end
 end
 end # for BE
+
+# ── Jeans refinement criterion: flag cells where λ_J < N_J·dx.  In code units
+# λ_J² = jeans_coef·(Ge·Esc)/ρ²; with uniform ρ=e=1 and jeans_coef=1 ⇒ λ_J²=1,
+# so with dx0=1/32 the flag flips at N_J=32 (refine ⟺ 1 < (N_J/32)²).
+for BE in BACKENDS
+@testset "Jeans criterion threshold [$BE]" begin
+    function setup(ρval, eval_)
+        hier = AMRHierarchy(; nbase=(32,32,32), B=16, backend=BE, T=Float16, nsp=0,
+                            gamma=5/3, cfl=0.3, Lcap=1, scheme=:ctu)
+        lev = init_base_level!(hier); build_level_tables!(hier,0)
+        n = lev.cap*lev.stride
+        hD=zeros(n); hz=zeros(n); hG=zeros(n)
+        for s in lev.live
+            m=lev.meta[s]; base=(Int(s)-1)*lev.stride
+            for k in 1:16, j in 1:16, i in 1:16
+                idx = base + ((lev.ng+k-1)*lev.nd+(lev.ng+j-1))*lev.nd+(lev.ng+i-1)+1
+                hD[idx]=ρval; hG[idx]=ρval*eval_; # Tau=Ge (v=0)
+            end
+        end
+        BA.encode_from_host!(lev, hD,hz,hz,hz,copy(hG),hG)
+        hier, lev
+    end
+    hier,lev = setup(1.0,1.0); dx0 = BA.level_dx(hier,0)
+    for ncell in (64, 16, 48, 24)
+        pol = BlockRefinementPolicy(; dthresh=1e30, lmax=1, jeans_ncells=ncell)
+        _, cnt = BA._criterion_flags(hier, 0, pol; jeans_coef=1.0)
+        pred = 1.0 < (ncell*dx0)^2
+        @test (sum(cnt) == length(lev.live)*16^3) == pred
+        @test (sum(cnt) == 0) == !pred
+    end
+    # off-switch: jeans_ncells=0 with a huge density threshold ⇒ nothing flags
+    pol0 = BlockRefinementPolicy(; dthresh=1e30, lmax=1, jeans_ncells=0.0)
+    _, cnt0 = BA._criterion_flags(hier, 0, pol0; jeans_coef=1.0)
+    @test sum(cnt0) == 0
+end
+end # for BE

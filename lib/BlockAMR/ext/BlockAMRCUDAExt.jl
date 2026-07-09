@@ -48,4 +48,12 @@ function BlockAMR.prefetch_device!(a::CuArray)
     return a
 end
 
+# push the whole pool BACK to host RAM now (explicit eviction) — frees device
+# memory for the working level.  Deterministic movement, not a driver-paging hint.
+function BlockAMR.prefetch_host!(a::CuArray)
+    um = _unified(a)
+    um !== nothing && length(a) > 0 && CUDA.prefetch(um; device = CUDA.DEVICE_CPU)
+    return a
+end
+
 end # module

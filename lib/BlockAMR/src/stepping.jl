@@ -73,6 +73,9 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     isempty(lev.live) && return nothing
     haskids = l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
     if haskids                                    # fine first (frozen parent state)
+        # out-of-core: keep THIS (parent) level resident while its children run —
+        # they read its φ/gas for C/F ghost prolongation + Dirichlet gravity BCs.
+        prefetch_level!(lev)
         advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
         advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
     end
@@ -130,6 +133,10 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     if haskids
         restrict_level!(hier, l + 1)
         reflux_apply!(hier, l + 1, λ)
+        # out-of-core: the child level is now fully advanced AND consumed by this
+        # level's restrict/reflux — MOVE it back to host RAM, freeing the device
+        # for the working set.  (No-op unless memory_mode() === :managed.)
+        evict_level!(hier.levels[l + 2])
     end
     hier.nstep[l + 1] += 1
     return nothing

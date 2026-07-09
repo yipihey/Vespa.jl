@@ -56,10 +56,35 @@ Base.@kwdef struct BlockRefinementPolicy
     # base-cell count that triggers (RAMSES m_refine, ~8), robust to CIC shot
     # noise at depth.  Needs `parts` + `mass_code` passed to regrid!.
     dm_criterion :: Bool = false
+    # ZOOM STATIC MESH (Enzo MustRefineParticles / RAMSES mass_cut_refine):
+    # for levels l < must_refine_lmax, flag cells by PRESENCE of the (fine, zoom-
+    # region) particles — density > must_refine_thr·(mean) — NOT by overdensity.
+    # This keeps the whole IC/zoom region refined to must_refine_lmax (the IC
+    # finest level), following the particles as they collapse and NEVER de-
+    # refining where they are.  Adaptive `dthresh·8^l` refinement then applies
+    # only at l ≥ must_refine_lmax (in the finest box).  0 = disabled (all-adaptive).
+    must_refine_lmax :: Int = 0
+    must_refine_thr  :: Float64 = 0.5     # fraction of mean fine-region density
+    # JEANS REFINEMENT (Truelove): resolve the local Jeans length by ≥ jeans_ncells
+    # cells — flag cell if λ_J < jeans_ncells·dx_l.  In the code's super-comoving
+    # units (∇²φ = 1.5Ωm·a·δ ⇒ G_sc = 3Ωm·a/8π), c_s² = γ(γ-1)·Ge·Esc/ρ gives
+    # λ_J² = [8π²γ(γ-1)/(3Ωm a)]·Ge·Esc/ρ².  The a-dependent coefficient is passed
+    # to regrid! each step as `jeans_coef` (the driver knows a); this holds only the
+    # cell target.  OR'd with the density/DM criterion, so halos still form on
+    # overdensity while cooling cores go deep on Jeans.  0 = disabled.
+    jeans_ncells :: Float64 = 0.0
+    # Jeans DENSITY FLOOR (gas code density): apply the Jeans test ONLY where
+    # ρ_gas > jeans_rho_floor.  In super-comoving units the smooth high-z IGM is
+    # itself Jeans-"under-resolved" at 256 cells (cold gas, small c_s in these
+    # units), so an ungated Jeans criterion refines the whole box.  Gating by
+    # overdensity confines deep Jeans refinement to the COLLAPSING core (a cooling
+    # halo), the physical target.  0 = no floor.
+    jeans_rho_floor :: Float64 = 0.0
 end
 
 @kernel function _flag_k!(flags, count, @Const(D), @Const(dm), @Const(live_d), @Const(Dsc),
-                          thresh::Float32, dmmul::Float32,
+                          @Const(Ge), @Const(Gsc), thresh::Float32, dmmul::Float32,
+                          jcoef::Float32, jdx2::Float32, jfloor::Float32,
                           B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -74,6 +99,13 @@ end
         # (gas + CIC-deposited DM), the physical collapse criterion.
         dens = Float32(D[idx]) * Dsc[slot] + dmmul * Float32(dm[idx])
         f = dens > thresh
+        # Jeans (jcoef>0): refine if λ_J < N_J·dx, i.e. λ_J² < (N_J·dx)².
+        # λ_J² = jcoef·(Ge·Esc)/ρ²  ⇒  jcoef·Ge·Esc < jdx2·ρ² (ρ = gas density).
+        if jcoef > 0.0f0
+            ρg = Float32(D[idx]) * Dsc[slot]
+            # gate by the density floor: only refine on Jeans in dense/collapsing gas
+            f |= (ρg > jfloor) && ((jcoef * Float32(Ge[idx]) * Gsc[slot]) < (jdx2 * ρg * ρg))
+        end
         flags[idx] = UInt8(f)
         f && (KA.@atomic count[slot] += Int32(1))
     end
@@ -124,7 +156,7 @@ end
 
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
 function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
-                          parts = nothing, mass_code = 0.0)
+                          parts = nothing, mass_code = 0.0, jeans_coef = 0.0)
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
@@ -147,13 +179,26 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     if usedm
         deposit_particles_level!(hier, l, parts; mass_code)          # fills lev.dm
         dmarr = lev.dm; dmmul = 1.0f0
-        thr = Float32(pol.dthresh * 8.0^l)                           # 8 = RefineBy^ndim
+        # Static zoom mesh: below the IC finest level, flag by PRESENCE (fine-
+        # region density > must_refine_thr·mean) so the whole zoom region is
+        # kept refined to must_refine_lmax and never de-refines (Enzo/RAMSES
+        # must-refine).  At/above it, the adaptive overdensity threshold.
+        thr = (pol.must_refine_lmax > 0 && l < pol.must_refine_lmax) ?
+              Float32(pol.must_refine_thr) : Float32(pol.dthresh * 8.0^l)  # 8 = RefineBy^ndim
     else
         dmarr = lev.D; dmmul = 0.0f0                                 # gas-only (dummy)
         thr = Float32(pol.dthresh * pol.lfac^l)
     end
-    _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc,
-                     thr, dmmul,
+    # Jeans: enabled only for a gas run (Ge allocated) with a positive coefficient
+    # and cell target.  jdx2 = (N_J·dx_l)²; the a-dependent physics is in jeans_coef.
+    usejeans = pol.jeans_ncells > 0 && jeans_coef > 0 && !isempty(lev.Ge)
+    gearr  = usejeans ? lev.Ge  : lev.D
+    escarr = usejeans ? lev.Gsc : lev.Dsc     # Ge decodes on its own scale Gsc
+    jcoef  = usejeans ? Float32(jeans_coef) : 0.0f0
+    jdx2   = usejeans ? Float32((pol.jeans_ncells * level_dx(hier, l))^2) : 0.0f0
+    jfloor = Float32(pol.jeans_rho_floor)
+    _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc, gearr, escarr,
+                     thr, dmmul, jcoef, jdx2, jfloor,
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = length(lev.live) * lev.B^3)
     return flags, Array(count)
@@ -178,13 +223,18 @@ function compact_level!(hier::AMRHierarchy, l::Int)
     order = sort(lev.live; by = s -> _morton(lev.meta[s], lev.B))
     order == Int32.(1:n) && return false           # already dense + Morton
     perm_d = to_device(lev.be, order, Int32)
-    for (r, o) in zip(gasfields(lev), gasfields_o(lev))
-        _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+    # gravity_only (no O-twins): skip the gas/species permute entirely — D is 0 in
+    # every slot (no hydro), so its slot order is irrelevant; φ/dm/scales below still
+    # compact.  Otherwise permute the gas + species R fields through their O-twins.
+    if !isempty(lev.Do)
+        for (r, o) in zip(gasfields(lev), gasfields_o(lev))
+            _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+        end
+        for (r, o) in zip(lev.sp, lev.spo)
+            _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+        end
+        swap_buffers!(lev)                         # permuted O twins become R
     end
-    for (r, o) in zip(lev.sp, lev.spo)
-        _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
-    end
-    swap_buffers!(lev)                             # permuted O twins become R
     _permute_slots!(lev.be, lev.rhs, lev.phi, perm_d, n, lev.stride)
     lev.phi, lev.rhs = lev.rhs, lev.phi
     if !isempty(lev.dm)                            # dm is lazy (deposit levels only)
@@ -192,7 +242,7 @@ function compact_level!(hier::AMRHierarchy, l::Int)
         lev.dm, lev.rhs = lev.rhs, lev.dm          # rhs ends as scratch garbage
     end
     # per-block scales (host-side; power-of-two, so the move is exact)
-    for f in (:Dsc, :Ssc, :Esc)
+    for f in (:Dsc, :Ssc, :Esc, :Gsc)
         h = Array(getfield(lev, f))
         hn = ones(Float32, lev.cap); hn[1:n] .= h[order]
         copyto!(getfield(lev, f), hn)
@@ -228,13 +278,14 @@ conservatively prolonged from their parents; vanished blocks are freed.  All
 tables and C/F registers are rebuilt.
 """
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
-                 parts = nothing, mass_code = 0.0)
+                 parts = nothing, mass_code = 0.0, jeans_coef = 0.0)
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
     R  = 2 + cld(nbuf, 2)                  # projection rim (nesting margin)
     Bh = hier.B ÷ 2
     ltop = min(Ltarget - 1, length(hier.levels) - 1)   # deepest level that clusters
+    _t0 = time()
     # 1) criterion flags on device, levels 0..Ltarget−1 (the deepest level's
     #    flags have no children to force and are never consumed)
     Fd  = Dict{Int,Any}()
@@ -242,7 +293,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     for l in 0:ltop
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
-        Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code)
+        Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code, jeans_coef)
     end
     # 2) tile cascade fine→coarse: T[lf] = forced level-lf child footprints as
     #    level-(lf−1)-cell tile origins (multiples of Bh; every block spans
@@ -303,6 +354,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     # :pro/:res/:cf also depend on its PARENT, so a change at l dirties l and
     # l+1; level 0 never changes here — its sibling table, the largest,
     # survives every regrid).
+    tFLAG = time() - _t0; _t1 = time()
     changed = falses(Ltarget + 2)          # sized by TARGET (ensure_level! grows hier.levels)
     for lc in 1:Ltarget
         plev = hier.levels[lc]
@@ -340,7 +392,21 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         if pol.zoom_r > 0 && lc >= pol.zoom_lmin
             # drop wants outside the zoom sphere; their descendants drop
             # automatically next level (parent vanished → byorigin miss).
-            r2 = pol.zoom_r^2
+            # NESTING-SAFE radius: shrink the sphere with DEPTH so each level's
+            # blocks + their ghost shell stay strictly inside the parent's sphere.
+            # Otherwise a child near the sphere edge needs a parent NEIGHBOR that
+            # the filter dropped at lc-1 → "prolongation under-covered".  The margin
+            # per level is the parent (B/2 + ng + nbuf) footprint in box units; it
+            # is geometric in depth, so the total shrink is bounded (~2× the coarsest).
+            # A child at the sphere edge needs a WHOLE parent-block neighbor for its
+            # ghost prolongation, so the per-level margin is a full parent block
+            # (B) + ghost (ng) + criterion buffer (nbuf), in box units at lc-1.
+            margin = 0.0
+            for k in (pol.zoom_lmin + 1):lc
+                margin += (hier.B + hier.ng + pol.nbuf) / (hier.nbase[1] * 2.0^(k - 1))
+            end
+            reff = max(pol.zoom_r - margin, 0.0)
+            r2 = reff^2
             filter!(want) do kv
                 org = kv.first
                 d2 = 0.0
@@ -355,15 +421,17 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         end
         changed[lc + 1] = _rebuild_level!(hier, lc, want) > 0
     end
+    tRB = time() - _t1
     # Morton slot compaction of the churned levels, coarse→fine (parent remaps
     # cascade), BEFORE the table rebuild — every table references slot ids, and
     # the changed-flag propagation below already re-dirties both l and l+1.
-    if compact
+    _prof = haskey(ENV, "BAM_RGPROF")
+    tCP = @elapsed if compact
         for lc in 1:Ltarget
             changed[lc + 1] && compact_level!(hier, lc)
         end
     end
-    for l in 0:length(hier.levels)-1
+    tTB = @elapsed for l in 0:length(hier.levels)-1
         if changed[l + 1] || (l >= 1 && changed[l])
             build_level_tables!(hier, l)
             l >= 1 && build_cf_register!(hier, l)
@@ -371,9 +439,10 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     end
     # φ ring maintenance, coarse→fine (children prolong from refreshed parent
     # rings) — see refresh_phi_ghosts! for why this cannot wait for the solves.
-    for l in 0:length(hier.levels)-1
+    tPH = @elapsed for l in 0:length(hier.levels)-1
         (changed[l + 1] || (l >= 1 && changed[l])) && refresh_phi_ghosts!(hier, l)
     end
+    _prof && (println("  regrid phases: flag=$(round(tFLAG,digits=2)) rebuild=$(round(tRB,digits=2)) compact=$(round(tCP,digits=2)) tables=$(round(tTB,digits=2)) phi=$(round(tPH,digits=2)) s"); flush(stdout))
     return nothing
 end
 
@@ -382,17 +451,29 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
                          want::Dict{Origin,Tuple{Int32,NTuple{3,Int16}}})
     plev = hier.levels[lc]
     lev  = ensure_level!(hier, lc)
-    # persistence: free vanished, create missing (data via interior prolongation)
+    # persistence: free vanished, create missing (data via interior prolongation).
+    # BATCHED: per-block sync_live! (device upload of `live`) and the remove-scan
+    # (findall over `live`) are each O(nlive) — doing them per add/remove made a
+    # bulk regrid O(blocks²) (the 15 s L13 build).  Instead defer both: unregister +
+    # free vanished, rebuild `live` in ONE filter!, add with sync=false, sync ONCE.
     nchg = 0
-    for s in copy(lev.live)
-        haskey(want, lev.meta[s].origin) || (remove_block!(hier, lc, s); nchg += 1)
+    nremoved = 0
+    for s in lev.live
+        if !haskey(want, lev.meta[s].origin)
+            remove_block!(hier, lc, s; sync = false, defer_live = true); nremoved += 1
+        end
+    end
+    if nremoved > 0
+        filter!(s -> isalive(lev.meta[s]), lev.live)   # one O(nlive) pass drops the freed slots
+        nchg += nremoved
     end
     news = Int32[]
     for (org, (p, off)) in want
         haskey(lev.byorigin, org) && continue
-        push!(news, add_block!(hier, lc, p, Int.(off)))
+        push!(news, add_block!(hier, lc, p, Int.(off); sync = false))
         nchg += 1
     end
+    (nremoved > 0 || !isempty(news)) && sync_live!(lev)   # single device upload
     if !isempty(news)
         # recycled slots first: kill the dead block's data in EVERY pool —
         # readers before the next ghost fill (the news prolongation stencil
@@ -401,17 +482,18 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
         zero_slots!(lev, news)
         # new blocks inherit their parent's class scales (power-of-two, so the
         # prolongation ratio is exact); update_scales! re-windows them later.
-        hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc); hEsc = Array(lev.Esc)
-        pDsc = Array(plev.Dsc); pSsc = Array(plev.Ssc); pEsc = Array(plev.Esc)
+        hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc); hEsc = Array(lev.Esc); hGsc = Array(lev.Gsc)
+        pDsc = Array(plev.Dsc); pSsc = Array(plev.Ssc); pEsc = Array(plev.Esc); pGsc = Array(plev.Gsc)
         for s in news
             p = lev.meta[s].parent
-            hDsc[s] = pDsc[p]; hSsc[s] = pSsc[p]; hEsc[s] = pEsc[p]
+            hDsc[s] = pDsc[p]; hSsc[s] = pSsc[p]; hEsc[s] = pEsc[p]; hGsc[s] = pGsc[p]
         end
-        copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc)
+        copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc); copyto!(lev.Gsc, hGsc)
         tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true,
                                                          only_slots = news))
         for (fd, fR, scd, scs) in zip(gasfields(lev), gasfields(plev),
                                       classes(lev), classes(plev))
+            isempty(fd) && continue     # gravity_only: unused hydro pool (zero-size) — skip
             _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride, scd, scs)
         end
         for (sd, sR) in zip(lev.sp, plev.sp)

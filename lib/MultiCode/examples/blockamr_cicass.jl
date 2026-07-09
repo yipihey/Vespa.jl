@@ -24,6 +24,7 @@ import PoissonKernels, ChemistryKernels
 try; @eval using CUDA; catch; end
 include(joinpath(@__DIR__, "music_ic.jl"))   # BAM_IC=music: Planck18 grafic ICs
 include(joinpath(@__DIR__, "camb_ic.jl"))     # BAM_IC=camb:  sub-percent CAMB-normalized ICs
+include(joinpath(@__DIR__, "jeans_profile.jl"))   # radial profiles on each new level
 
 const BE      = Symbol(get(ENV, "BACKEND", "cpu"))
 const NGRID   = parse(Int, get(ENV, "BAM_NGRID", "32"))
@@ -50,6 +51,16 @@ const DMCRIT  = get(ENV, "BAM_DMCRIT", "0") == "1"             # refine on TOTAL
 const MREFINE = parse(Float64, get(ENV, "BAM_MREFINE", "8.0")) # DMCRIT: particles/base-cell
                                                               # to refine (quasi-Lagrangian,
                                                               # RAMSES m_refine; threshold ×8/level)
+# JEANS REFINEMENT (Truelove): resolve the local Jeans length by ≥ BAM_JEANS cells
+# — refine cell if λ_J < BAM_JEANS·dx.  256 = capture a cooling halo's collapse to
+# many extra levels.  OR'd with the density/DM criterion; confine deep refinement to
+# the high-res region with BAM_ZOOM (+ BAM_ZOOM_TRACK to retarget the sphere onto the
+# baryon peak each regrid).  BAM_PROFILE_ON_LEVEL dumps a radial profile around the
+# baryon density max each time a new deepest level is triggered (default on if Jeans).
+const JEANS   = parse(Float64, get(ENV, "BAM_JEANS", "0.0"))
+const JEANSRHO = parse(Float64, get(ENV, "BAM_JEANS_RHO", "100.0"))  # gas overdensity floor (×gas mean) for Jeans — confines it to collapsing cores
+const ZTRACK  = get(ENV, "BAM_ZOOM_TRACK", "0") == "1"
+const PROFLV  = get(ENV, "BAM_PROFILE_ON_LEVEL", JEANS > 0 ? "1" : "0") == "1"
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
 const ZEND    = parse(Float64, get(ENV, "CIC_ZEND", "600.0"))
@@ -162,10 +173,17 @@ function main()
     # DM criterion flags on TOTAL matter (mean 1) with a quasi-Lagrangian ×8/level
     # threshold — dthresh = MREFINE is the particles-per-base-cell trigger (RAMSES
     # m_refine); the gas-only criterion flags on gas density (mean fb) so it's ×fb.
-    pol = BlockRefinementPolicy(; dthresh = DMCRIT ? MREFINE : DTHRESH * c.fb,
+    mkpol(center) = BlockRefinementPolicy(; dthresh = DMCRIT ? MREFINE : DTHRESH * c.fb,
                                 nbuf = 2, every = REGRIDN, lmax = LMAX, lfac = LFAC,
-                                zoom_center = zc, zoom_r = zr, zoom_lmin = zl,
-                                dm_criterion = DMCRIT)
+                                zoom_center = center, zoom_r = zr, zoom_lmin = zl,
+                                dm_criterion = DMCRIT, jeans_ncells = JEANS,
+                                jeans_rho_floor = JEANS > 0 ? JEANSRHO * c.fb : 0.0)
+    pol = mkpol(zc)
+    # deepest populated level so far — a NEW level triggers a radial-profile dump
+    curlevel() = maximum(l for l in 0:length(hier.levels)-1 if !isempty(hier.levels[l+1].live))
+    maxlevel_seen = curlevel()
+    JEANS > 0 && @printf("JEANS refinement ON: %.0f cells/λ_J, ρ_floor=%.1f×gas-mean, zoom_r=%.4f track=%s profiles=%s lmax=%d\n",
+                         JEANS, JEANSRHO, zr, ZTRACK, PROFLV, LMAX)
     ρg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     φg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     pax = BlockAMR.device_zeros(hier.be, Float32, (Np,))
@@ -460,8 +478,32 @@ function main()
             update_scales!(hier, l)
         end
         if nstep % REGRIDN == 0
-            regrid!(hier, pol; compact = COMPACT, parts, mass_code)
+            # Jeans coefficient (a-dependent): λ_J² = [8π²γ(γ-1)/(3Ωm a)]·Ge·Esc/ρ²
+            jcoef = JEANS > 0 ? 8π^2 * GAMMA * (GAMMA - 1) / (3 * c.Om * a) : 0.0
+            # retarget the high-res sphere onto the current baryon peak (track the halo)
+            if ZTRACK && zr > 0
+                pk, _, _ = JeansProfile.find_baryon_peak(hier); pol = mkpol(pk)
+            end
+            regrid!(hier, pol; compact = COMPACT, parts, mass_code, jeans_coef = jcoef)
             MEMMODE === :managed && BlockAMR.advise_all_host!(hier)  # new blocks → host home
+            # NEW LEVEL → radial profile around the baryon density maximum
+            if PROFLV
+                Lnow = curlevel()
+                if Lnow > maxlevel_seen
+                    maxlevel_seen = Lnow
+                    pk, ρmax, _ = JeansProfile.find_baryon_peak(hier)
+                    uu = MultiCode.cosmo_units(c, a); zz = 1/a - 1
+                    # profile radius: focus on the collapsing core (a fraction of the
+                    # zoom sphere), not the whole refined region — else deep levels
+                    # bin 10⁸ cells.  BAM_PROFR overrides (box units).
+                    rmax = parse(Float64, get(ENV, "BAM_PROFR", string(zr > 0 ? min(zr, 0.02) : 0.02)))
+                    pth = joinpath(REPORTS, "profile$(TAG)_L$(Lnow)_z$(round(zz, digits=2)).txt")
+                    npts, _ = JeansProfile.dump_radial_profile(pth, hier, c, uu; peak = pk,
+                                  z = zz, level = Lnow, gamma = GAMMA, μ = μ, XH = c.XH, rmax = rmax)
+                    @printf("  ▸ NEW LEVEL %d @ z=%.3f  ρ_b,max=%.3e  → radial profile (%d cells) %s\n",
+                            Lnow, zz, ρmax, npts, basename(pth)); flush(stdout)
+                end
+            end
         end
         ckextra() = (a = a, mass_code = mass_code, xe_mean = xe_mean,
                      px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
@@ -538,7 +580,7 @@ function main()
 
     # ── phase dump (composite level-0 after restriction) for the H2(ρ) pipeline ──
     lev = hier.levels[1]
-    hDf = Array(lev.D); hGf = Array(lev.Ge); hsc = Array(lev.Dsc); hesc = Array(lev.Esc)
+    hDf = Array(lev.D); hGf = Array(lev.Ge); hsc = Array(lev.Dsc); hesc = Array(lev.Gsc)
     h1 = Array(lev.sp[1]); h2 = Array(lev.sp[2])
     u = MultiCode.cosmo_units(c, a)
     NC = NGRID^3
@@ -590,7 +632,7 @@ function main()
             end
             hD = Array(lv.D); hG = Array(lv.Ge)
             hs1 = Array(lv.sp[1]); hs2 = Array(lv.sp[2])
-            hdsc = Array(lv.Dsc); hesc = Array(lv.Esc)
+            hdsc = Array(lv.Dsc); hesc = Array(lv.Gsc)
             Bh = BBLK ÷ 2
             for s in lv.live
                 m = lv.meta[s]

@@ -55,10 +55,12 @@ export grav_kick_level!, sync_block_geometry!
 export chem_level!
 export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
+export set_particle_tile!, particle_tile, ptile_ranges
 export global_from_level0!, compton_drag!
 export save_checkpoint, load_checkpoint
 export memory_mode, set_memory_mode!, memory_report
-export prefetch_level!, advise_level_host!, advise_all_host!
+export prefetch_level!, advise_level_host!, advise_all_host!, evict_level!, evict_gas_pools!,
+       prefetch_grav!, evict_grav!, set_stream_grav!
 
 # ── backend registry (house pattern — PoissonKernels/ChemistryKernels) ────────
 const _BACKENDS = Dict{Symbol,Any}(:cpu => CPU())
@@ -109,9 +111,21 @@ set_memory_mode!(m::Symbol) =
 # Migration hints for unified pools — no-ops unless a GPU extension overrides
 # them (CPU arrays and plain device arrays ignore them).  `advise_host!` marks a
 # cold pool as host-preferred + device-accessible (paged in on touch);
-# `prefetch_device!` pulls a hot pool to the GPU up front.
+# `prefetch_device!` pulls a hot pool to the GPU up front; `prefetch_host!`
+# pushes a cold pool BACK to host RAM now (explicit eviction — the out-of-core
+# "move level off the device" primitive, deterministic vs driver paging).
 advise_host!(a) = a
 prefetch_device!(a) = a
+prefetch_host!(a) = a
+
+# Per-level gravity streaming (prefetch/evict around each level's solve+gather).
+# On drivers where cuMemPrefetchAsync-to-host is a no-op, the explicit eviction does
+# nothing and the bulk per-level prefetch is pure overhead (~4× the gravity time) —
+# `advise`-pressure paging under `gravity_only` keeps the device bounded anyway.  So
+# this is OFF by default; turn on only where explicit prefetch measurably helps.
+const _STREAM_GRAV = Ref(false)
+set_stream_grav!(b::Bool) = (_STREAM_GRAV[] = b)
+stream_grav() = _STREAM_GRAV[]
 
 "A zero-filled array of element type `T` and shape `dims` on backend `be`."
 device_zeros(::CPU, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)

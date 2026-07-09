@@ -22,6 +22,33 @@
 # their Dirichlet boundaries and rho_ext, which is the physically sensible
 # treatment of topgrid-mass particles far below their native resolution.
 
+# ── particle streaming (out-of-core SoA) ─────────────────────────────────────
+# The global particle SoA (positions/velocities/mass/accel, ~7×4 B/particle) is
+# the last device-resident chunk that caps the run at device memory.  To use the
+# 2 TB host as the limit we keep the SoA host/managed and TILE every
+# particle-length launch: no single kernel touches more than `particle_tile()`
+# particles, so its working set fits; the managed driver auto-evicts cold tiles
+# under pressure → device residency is bounded to ~one tile, not the full count.
+# Tiling is per-particle-independent for kick/drift/gather (bit-identical) and
+# accumulates identically (to fp round-off) for the atomic CIC deposit.
+const _PTILE = Ref(0)                       # 0 ⇒ streaming off (one whole-array launch)
+"Set the particle streaming tile size (0 disables tiling — one whole-array launch)."
+set_particle_tile!(n::Integer) = (_PTILE[] = Int(n); nothing)
+particle_tile() = _PTILE[]
+
+"""
+    ptile_ranges(np) -> iterable of contiguous UnitRanges
+
+Particle tiles of the current `particle_tile()` size covering `1:np`
+(0 or ≥ np ⇒ a single whole-array range).  Every particle-length launch — here
+and in the driver's topgrid deposit — iterates these to bound its working set.
+"""
+function ptile_ranges(np::Integer)
+    t = _PTILE[]; np = Int(np)
+    (t <= 0 || t >= np) && return (1:np,)
+    return (i:min(i + t - 1, np) for i in 1:t:np)
+end
+
 "Build the per-level device block-lookup (sorted packed lattice keys + slots)."
 function build_block_lookup!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
@@ -158,20 +185,23 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code)
         (lev.dm = device_zeros(lev.be, Float32, (lev.cap * lev.stride,)))
     fill!(lev.dm, 0.0f0)
     N = Float32(hier.nbase[1] * exp2(l))
-    if mass_code isa AbstractVector                     # multi-mass DM (per particle)
-        invdx3 = Float32(1.0 / level_dx(hier, l)^3)
-        _pdeposit_mm_k!(lev.be)(lev.dm, parts.px, parts.py, parts.pz, mass_code,
-                                lev.tabs[:pkey], lev.tabs[:pslot],
-                                Int32(length(lev.live)), invdx3, N, Int32(hier.B),
-                                Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                                ndrange = length(parts.px))
-    else
-        ρ1 = Float32(mass_code / level_dx(hier, l)^3)
-        _pdeposit_k!(lev.be)(lev.dm, parts.px, parts.py, parts.pz,
-                             lev.tabs[:pkey], lev.tabs[:pslot],
-                             Int32(length(lev.live)), ρ1, N, Int32(hier.B),
-                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                             ndrange = length(parts.px))
+    nkey = Int32(length(lev.live))
+    for r in ptile_ranges(length(parts.px))               # stream: tile the deposit
+        cnt = length(r)
+        pxr = view(parts.px, r); pyr = view(parts.py, r); pzr = view(parts.pz, r)
+        if mass_code isa AbstractVector                   # multi-mass DM (per particle)
+            invdx3 = Float32(1.0 / level_dx(hier, l)^3)
+            _pdeposit_mm_k!(lev.be)(lev.dm, pxr, pyr, pzr, view(mass_code, r),
+                                    lev.tabs[:pkey], lev.tabs[:pslot], nkey, invdx3, N,
+                                    Int32(hier.B), Int32(lev.ng), Int32(lev.nd),
+                                    Int32(lev.stride); ndrange = cnt)
+        else
+            ρ1 = Float32(mass_code / level_dx(hier, l)^3)
+            _pdeposit_k!(lev.be)(lev.dm, pxr, pyr, pzr,
+                                 lev.tabs[:pkey], lev.tabs[:pslot], nkey, ρ1, N,
+                                 Int32(hier.B), Int32(lev.ng), Int32(lev.nd),
+                                 Int32(lev.stride); ndrange = cnt)
+        end
     end
     sib = _tabt(lev, :sib)
     if sib.total > 0
@@ -230,18 +260,26 @@ solved and ghost-consistent.
 function gather_accel_particles!(hier::AMRHierarchy, parts, ax, ay, az;
                                  lmax_dm::Int = length(hier.levels) - 1)
     np = length(parts.px)
-    done = device_zeros(hier.be, UInt8, (np,))
+    done = device_zeros(hier.be, UInt8, (np,))            # np bytes — cheap, stays resident
     for l in min(lmax_dm, length(hier.levels) - 1):-1:0
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
         haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)
+        stream_grav() && prefetch_grav!(lev)   # optional: bulk-pull this level's φ (else driver faults it in)
         N = Float32(hier.nbase[1] * exp2(l))
         inv2h = Float32(1.0 / (2.0 * level_dx(hier, l)))
-        _pgather_k!(lev.be)(ax, ay, az, done, parts.px, parts.py, parts.pz,
-                            lev.phi, lev.tabs[:pkey], lev.tabs[:pslot],
-                            Int32(length(lev.live)), N, inv2h, Int32(hier.B),
-                            Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                            ndrange = np)
+        nkey = Int32(length(lev.live))
+        # level-outer / tile-inner: this level's φ stays resident while every
+        # particle tile gathers from it, then evicts — good φ locality under
+        # streaming; the particle SoA + accel stream a tile at a time.
+        for r in ptile_ranges(np)
+            _pgather_k!(lev.be)(view(ax, r), view(ay, r), view(az, r), view(done, r),
+                                view(parts.px, r), view(parts.py, r), view(parts.pz, r),
+                                lev.phi, lev.tabs[:pkey], lev.tabs[:pslot], nkey, N, inv2h,
+                                Int32(hier.B), Int32(lev.ng), Int32(lev.nd),
+                                Int32(lev.stride); ndrange = length(r))
+        end
+        stream_grav() && evict_grav!(lev)
     end
     return nothing
 end
@@ -264,12 +302,23 @@ end
     end
 end
 
-"v += a·dt (device particle SoA + accel arrays)."
-particles_kick!(hier, parts, ax, ay, az, dt) =
-    (_pkick_k!(hier.be)(parts.vx, parts.vy, parts.vz, ax, ay, az, Float32(dt);
-               ndrange = length(parts.px)); nothing)
+"v += a·dt (device particle SoA + accel arrays); streamed a tile at a time."
+function particles_kick!(hier, parts, ax, ay, az, dt)
+    dtf = Float32(dt)
+    for r in ptile_ranges(length(parts.px))
+        _pkick_k!(hier.be)(view(parts.vx, r), view(parts.vy, r), view(parts.vz, r),
+                           view(ax, r), view(ay, r), view(az, r), dtf; ndrange = length(r))
+    end
+    return nothing
+end
 
-"x += v·dt/box (positions box-normalized, periodic)."
-particles_drift!(hier, parts, dt) =
-    (_pdrift_k!(hier.be)(parts.px, parts.py, parts.pz, parts.vx, parts.vy, parts.vz,
-                Float32(dt / hier.box); ndrange = length(parts.px)); nothing)
+"x += v·dt/box (positions box-normalized, periodic); streamed a tile at a time."
+function particles_drift!(hier, parts, dt)
+    c = Float32(dt / hier.box)
+    for r in ptile_ranges(length(parts.px))
+        _pdrift_k!(hier.be)(view(parts.px, r), view(parts.py, r), view(parts.pz, r),
+                            view(parts.vx, r), view(parts.vy, r), view(parts.vz, r),
+                            c; ndrange = length(r))
+    end
+    return nothing
+end

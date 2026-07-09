@@ -12,7 +12,7 @@ import ChemistryKernels
 
 @kernel function _chem_gather_k!(rho32, e32, h16, m16,
                                  @Const(D), @Const(Ge), @Const(sp1), @Const(sp2),
-                                 @Const(live_d), @Const(Dsc), @Const(Esc),
+                                 @Const(live_d), @Const(Dsc), @Const(Gsc),
                                  B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -33,7 +33,7 @@ import ChemistryKernels
         # every step (the bamr256L10 chem-powered blast).  Such cells enter
         # chem as COLD vacuum (e=0 → solver evolves from its tiny floor).
         e32[Int32(t)]   = d16 > 6.103515625f-5 ?
-                          Float32(Ge[idx]) * Esc[slot] / ρ : 0.0f0
+                          Float32(Ge[idx]) * Gsc[slot] / ρ : 0.0f0
         h16[Int32(t)]   = sp1[idx]
         m16[Int32(t)]   = sp2[idx]
     end
@@ -41,7 +41,7 @@ end
 
 @kernel function _chem_scatter_k!(Ge, Tau, sp1, sp2,
                                   @Const(rho32), @Const(e32), @Const(h16), @Const(m16),
-                                  @Const(live_d), @Const(Esc),
+                                  @Const(live_d), @Const(Esc), @Const(Gsc),
                                   B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -52,10 +52,10 @@ end
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        esc = Esc[slot]
-        ge_old = Float32(Ge[idx]) * esc
+        esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
+        ge_old = Float32(Ge[idx]) * gsc
         ge_new = e32[Int32(t)] * rho32[Int32(t)]
-        Ge[idx]  = _narrow(eltype(Ge), ge_new / esc)
+        Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
         Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
         sp1[idx] = h16[Int32(t)]
         sp2[idx] = m16[Int32(t)]
@@ -100,7 +100,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     h16   = view(bufs[3], 1:n)
     m16   = view(bufs[4], 1:n)
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
-                            lev.live_d, lev.Dsc, lev.Esc, Int32(lev.B), Int32(lev.ng),
+                            lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
                             Int32(lev.nd), Int32(lev.stride); ndrange = n)
     dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
     local rin, ein, hin, min_
@@ -132,7 +132,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
         end
     end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
-                             rho32, e32, h16, m16, lev.live_d, lev.Esc,
+                             rho32, e32, h16, m16, lev.live_d, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride); ndrange = n)
     return nothing

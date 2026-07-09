@@ -38,7 +38,11 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     sp       :: Vector{U}
     spo      :: Vector{U}
     # ── per-block power-of-two f32 scales (identity until the f16 phase) ──
-    Dsc::F; Ssc::F; Esc::F
+    # Dsc=D, Ssc=S1..S3, Esc=Tau (TOTAL energy), Gsc=Ge (internal energy).  Ge has
+    # its OWN scale (not shared with Tau): in a cold kinetic-dominated core Tau≫Ge,
+    # so a shared scale windows to Tau and crushes Ge into the f16 sub-normal floor
+    # (garbage temperature).  A separate Gsc keeps Ge on its own [1,2) window.
+    Dsc::F; Ssc::F; Esc::F; Gsc::F
     # ── gravity: level potential + rhs + particle-deposit pools (f32, ghosts inline) ──
     phi::F; rhs::F; dm::F
     live_d   :: I                        # device copy of `live`
@@ -56,10 +60,11 @@ end
 gasfields(lev::Level)   = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge)
 gasfields_o(lev::Level) = (lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo)
 "Per-field scale-class vectors, field order (D,S1,S2,S3,Tau,Ge)."
-classes(lev::Level)     = (lev.Dsc, lev.Ssc, lev.Ssc, lev.Ssc, lev.Esc, lev.Esc)
+classes(lev::Level)     = (lev.Dsc, lev.Ssc, lev.Ssc, lev.Ssc, lev.Esc, lev.Gsc)
 
 "Swap the R and O gas/species buffers (after a level substep)."
 function swap_buffers!(lev::Level)
+    isempty(lev.Do) && return nothing        # gravity_only: no O-twins → nothing to swap
     lev.D, lev.Do = lev.Do, lev.D;   lev.S1, lev.S1o = lev.S1o, lev.S1
     lev.S2, lev.S2o = lev.S2o, lev.S2; lev.S3, lev.S3o = lev.S3o, lev.S3
     lev.Tau, lev.Tauo = lev.Tauo, lev.Tau; lev.Ge, lev.Geo = lev.Geo, lev.Ge
@@ -68,22 +73,28 @@ function swap_buffers!(lev::Level)
 end
 
 function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
-                 T::Type = Float32, nsp::Int = 0, cap0::Int = 8)
+                 T::Type = Float32, nsp::Int = 0, cap0::Int = 8,
+                 gravity_only::Bool = false)
     @assert B % 2 == 0 && B >= 2ng "B must be even and ≥ 2ng"
     @assert all(nbase .% B .== 0) "nbase must be divisible by B"
     nd = B + 2ng; stride = _slot_stride(nd)
     P  = level_period(nbase, l); th = B ÷ 2
     zed() = device_zeros(be, T, (cap0 * stride,))
-    zu()  = device_zeros(be, UInt16, (cap0 * stride,))
+    # gravity_only (DM/gravity runs): the 5 momentum/energy R fields + all 6 O-twins
+    # are NEVER touched (no hydro advance) — allocate them ZERO-SIZE so they never
+    # cost device RAM.  D is kept (the Poisson rhs reads it, =0 with no gas).  The
+    # regrid/compact/prolong paths skip zero-length gas fields (isempty guards).
+    gz() = gravity_only ? device_zeros(be, T, (0,)) : zed()
+    zu()  = (gravity_only ? device_zeros(be, UInt16, (0,)) : device_zeros(be, UInt16, (cap0 * stride,)))
     ones32(n) = to_device(be, ones(Float32, n), Float32)
     lev = Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
         l, B, ng, nd, stride, P, th, cap0, nsp, be,
         [BlockMeta() for _ in 1:cap0], Int32[], Int32[],
         Dict{Origin,Vector{Int32}}(), Dict{Origin,Int32}(),
-        zed(), zed(), zed(), zed(), zed(), zed(),
-        zed(), zed(), zed(), zed(), zed(), zed(),
+        zed(), gz(), gz(), gz(), gz(), gz(),
+        gz(), gz(), gz(), gz(), gz(), gz(),
         [zu() for _ in 1:nsp], [zu() for _ in 1:nsp],
-        ones32(cap0), ones32(cap0), ones32(cap0),
+        ones32(cap0), ones32(cap0), ones32(cap0), ones32(cap0),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
@@ -104,7 +115,9 @@ function _grow!(lev::Level, newcap::Int)
     # OOM (stream-ordered, so the pending copy completes first).
     # managed: advise the new pool host-resident BEFORE the copy so a grow while
     # oversubscribed never piles the fresh array onto the device (no-op in :device)
-    grow(a) = (b = device_zeros(lev.be, eltype(a), (n_new,)); advise_host!(b);
+    # gravity_only zero-size pools stay zero-size through grows (never allocated)
+    grow(a) = length(a) == 0 ? a :
+              (b = device_zeros(lev.be, eltype(a), (n_new,)); advise_host!(b);
                copyto!(view(b, 1:n_old), view(a, 1:n_old)); finalize(a); b)
     lev.D  = grow(lev.D);  lev.S1 = grow(lev.S1); lev.S2 = grow(lev.S2)
     lev.S3 = grow(lev.S3); lev.Tau = grow(lev.Tau); lev.Ge = grow(lev.Ge)
@@ -114,7 +127,7 @@ function _grow!(lev::Level, newcap::Int)
     lev.spo = [grow(a) for a in lev.spo]
     growsc(a) = (b = to_device(lev.be, ones(Float32, newcap), Float32);
                  copyto!(view(b, 1:lev.cap), view(a, 1:lev.cap)); b)
-    lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc)
+    lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc); lev.Gsc = growsc(lev.Gsc)
     lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs)
     length(lev.dm) > 0 && (lev.dm = grow(lev.dm))      # dm is lazy (deposit levels only)
     append!(lev.meta, [BlockMeta() for _ in 1:(newcap - lev.cap)])
@@ -190,8 +203,13 @@ origins are lattice-aligned — the clusterer guarantee — so neighbour lookup 
 26 O(1) `byorigin` hits instead of a tilemap walk).  Includes the block itself
 in the periodic self-wrap sense the sibling builder expects (caller filters).
 """
-function lattice_neighbors(lev::Level, origin::Origin, B::Int)
-    out = Int32[]
+lattice_neighbors(lev::Level, origin::Origin, B::Int) =
+    lattice_neighbors!(Int32[], lev, origin, B)
+
+"""In-place `lattice_neighbors`: fills a caller-owned `out` (reused across the
+sibling builders' per-block loop to avoid a Vector alloc per block)."""
+function lattice_neighbors!(out::Vector{Int32}, lev::Level, origin::Origin, B::Int)
+    empty!(out)
     for dk in -1:1, dj in -1:1, di in -1:1
         o = (wrapc(Int128(origin[1]) + di * B, lev.P[1]),
              wrapc(Int128(origin[2]) + dj * B, lev.P[2]),
@@ -213,22 +231,30 @@ Live slots whose ACTIVE region [origin, origin+B) overlaps the (wrapped) query
 box `[lo, lo+len)` given in level-`lev.l` cells (`lo` signed Int128, may be
 negative or beyond the period).  Exact; periodic.
 """
-function overlapping_blocks(lev::Level, lo::NTuple{3,Int128}, len::NTuple{3,Int})
+overlapping_blocks(lev::Level, lo::NTuple{3,Int128}, len::NTuple{3,Int}) =
+    overlapping_blocks!(Int32[], lev, lo, len)
+
+# In-place twin: fills a caller-owned `out` (dedup is a linear `s in out` scan —
+# overlap result sets are tiny, so a reusable Vector beats a per-call `Set`).
+# Lets the table builders reuse one buffer across their (hundreds of thousands
+# of) queries instead of allocating a Vector+Set each time.
+function overlapping_blocks!(out::Vector{Int32}, lev::Level,
+                             lo::NTuple{3,Int128}, len::NTuple{3,Int})
+    empty!(out)
     nt  = ntuple(d -> Int(lev.P[d] ÷ lev.th), 3)
-    out = Int32[]; seen = Set{Int32}()
     rng = ntuple(d -> fld(lo[d], lev.th):fld(lo[d] + len[d] - 1, lev.th), 3)
     low = ntuple(d -> wrapc(lo[d], lev.P[d]), 3)
     for tk in rng[3], tj in rng[2], ti in rng[1]
         key = (wrapc(Int128(ti), UInt128(nt[1])), wrapc(Int128(tj), UInt128(nt[2])),
                wrapc(Int128(tk), UInt128(nt[3])))
         for s in get(lev.tilemap, key, Int32[])
-            s in seen && continue
+            s in out && continue
             m = lev.meta[s]
             ok = true
             for d in 1:3
                 overlap1(low[d], len[d], m.origin[d], lev.B, lev.P[d]) || (ok = false; break)
             end
-            ok && (push!(out, s); push!(seen, s))
+            ok && push!(out, s)
         end
     end
     return out
@@ -257,10 +283,11 @@ lmax(hier::AMRHierarchy) = findlast(lv -> !isempty(lv.live), hier.levels) - 1
 function AMRHierarchy(; nbase::NTuple{3,Int}, box::Real = 1.0, B::Int = 16,
                         ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
                         nsp::Int = 0, Lcap::Int = 60, gamma::Real = 5/3,
-                        cfl::Real = 0.4, cap0::Int = 8, scheme::Symbol = :rk2)
+                        cfl::Real = 0.4, cap0::Int = 8, scheme::Symbol = :rk2,
+                        gravity_only::Bool = false)
     @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
     be = BlockAMR.backend(backend)
-    lev0 = Level(; l = 0, B, ng, nbase, be, T, nsp, cap0)
+    lev0 = Level(; l = 0, B, ng, nbase, be, T, nsp, cap0, gravity_only)
     AMRHierarchy{typeof(lev0)}([lev0], B, ng, nbase, Float64(box), Lcap, be, backend,
                                Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme)
 end
@@ -273,7 +300,8 @@ function ensure_level!(hier::AMRHierarchy, l::Int)
         push!(hier.levels, Level(; l = ln, B = hier.B, ng = hier.ng,
                                    nbase = hier.nbase, be = hier.be,
                                    T = eltype(hier.levels[1].D),
-                                   nsp = hier.levels[1].nsp, cap0 = 8))
+                                   nsp = hier.levels[1].nsp, cap0 = 8,
+                                   gravity_only = isempty(hier.levels[1].Do)))  # inherit from base
         push!(hier.nstep, 0)
     end
     return hier.levels[l + 1]
@@ -301,7 +329,7 @@ cells, each component in `0:B−B÷2`) inside parent block `parent_slot` of leve
 `l−1`.  The child covers B÷2 parent cells and B³ own cells.
 """
 function add_block!(hier::AMRHierarchy, l::Int, parent_slot::Integer,
-                    offset::NTuple{3,<:Integer})
+                    offset::NTuple{3,<:Integer}; sync::Bool = true)
     @assert l >= 1 "level-0 blocks come from init_base_level!/the topgrid shadow"
     lev  = ensure_level!(hier, l)
     plev = hier.levels[l]
@@ -314,18 +342,23 @@ function add_block!(hier::AMRHierarchy, l::Int, parent_slot::Integer,
     haskey(lev.byorigin, org) && error("block at origin $org already exists on level $l")
     s = alloc_slot!(lev)
     lev.meta[s] = BlockMeta(org, Int32(parent_slot), off, FLAG_ALIVE | FLAG_NEW)
-    push!(lev.live, s); _register!(lev, s); sync_live!(lev)
+    push!(lev.live, s); _register!(lev, s); sync && sync_live!(lev)
     return s
 end
 
-function remove_block!(hier::AMRHierarchy, l::Int, slot::Integer)
+# `sync=false` defers the (O(nlive)) device upload of `live` — the caller batches
+# many add/remove and calls sync_live! ONCE.  `defer_live=true` additionally skips
+# the O(nlive) `findall`+`deleteat!` scan (caller rebuilds `live` in one filter!),
+# turning a bulk regrid from O(blocks²) to O(blocks).
+function remove_block!(hier::AMRHierarchy, l::Int, slot::Integer;
+                       sync::Bool = true, defer_live::Bool = false)
     lev = hier.levels[l + 1]
     s = Int32(slot)
     @assert isalive(lev.meta[s])
     _unregister!(lev, s)
     lev.meta[s].flags = 0x00
-    deleteat!(lev.live, findall(==(s), lev.live))
-    push!(lev.freelist, s); sync_live!(lev)
+    defer_live || deleteat!(lev.live, findall(==(s), lev.live))
+    push!(lev.freelist, s); sync && sync_live!(lev)
     return nothing
 end
 
@@ -420,7 +453,7 @@ function level_bytes(lev::Level)
     gas  = sum(b, gasfields(lev)) + sum(b, gasfields_o(lev))     # 12 f16 pools
     spb  = sum(b, lev.sp; init = 0) + sum(b, lev.spo; init = 0)  # 2·nsp u16 pools
     grav = b(lev.phi) + b(lev.rhs) + b(lev.dm)                   # f32 phi/rhs/dm
-    sc   = b(lev.Dsc) + b(lev.Ssc) + b(lev.Esc) + b(lev.live_d)  # per-block, tiny
+    sc   = b(lev.Dsc) + b(lev.Ssc) + b(lev.Esc) + b(lev.Gsc) + b(lev.live_d)  # per-block, tiny
     tabs = sum((t isa RectJobTable ? b(t.jobs) + b(t.cellstart) : 0
                 for t in values(lev.tabs)); init = 0)
     return (gas = gas, species = spb, gravity = grav, scales = sc, tables = tabs,
@@ -471,7 +504,7 @@ function prefetch_level!(lev::Level)
         prefetch_device!(t.jobs); prefetch_device!(t.cellstart)
     end
     prefetch_device!(lev.live_d)
-    prefetch_device!(lev.Dsc); prefetch_device!(lev.Ssc); prefetch_device!(lev.Esc)
+    prefetch_device!(lev.Dsc); prefetch_device!(lev.Ssc); prefetch_device!(lev.Esc); prefetch_device!(lev.Gsc)
     return lev
 end
 
@@ -485,3 +518,71 @@ end
 "Advise every level's pools host-resident — the default home under oversubscription."
 advise_all_host!(hier::AMRHierarchy) =
     (foreach(advise_level_host!, hier.levels); hier)
+
+"""
+    evict_level!(lev)
+
+Explicitly MOVE a level's field pools + device tables OFF the GPU, back to host
+RAM (managed mode only) — the out-of-core dual of [`prefetch_level!`].  Once a
+level has finished its advance and been consumed by its parent's restrict/reflux,
+evicting it frees device memory for the working level.  Making this movement
+explicit (vs leaving it to the driver's pager) is what keeps the device bounded
+so the 2 TB host holds the full hierarchy.
+"""
+function evict_level!(lev::Level)
+    memory_mode() === :managed || return lev
+    for a in _field_pools(lev); prefetch_host!(a); end
+    for t in values(lev.tabs)
+        t isa RectJobTable || continue
+        prefetch_host!(t.jobs); prefetch_host!(t.cellstart)
+    end
+    prefetch_host!(lev.live_d)
+    prefetch_host!(lev.Dsc); prefetch_host!(lev.Ssc); prefetch_host!(lev.Esc); prefetch_host!(lev.Gsc)
+    return lev
+end
+
+"""
+    evict_gas_pools!(hier)
+
+Move every level's gas (hydro) field pools + O-twins + species OFF the GPU to host
+RAM (managed mode only).  For DM-only / gravity-only runs these ~12 f16 pools per
+block are allocated but NEVER touched — explicitly evicting them keeps ~2/3 of the
+block-pool footprint off the device (only the gravity φ/rhs/dm working set + scales
+stay resident).  Call after the hierarchy is built AND after every regrid (which
+allocates fresh gas pools for the new blocks).
+"""
+function evict_gas_pools!(hier::AMRHierarchy)
+    memory_mode() === :managed || return hier
+    for lev in hier.levels
+        for a in gasfields(lev);   prefetch_host!(a); end
+        for a in gasfields_o(lev); prefetch_host!(a); end
+        for a in lev.sp;  prefetch_host!(a); end
+        for a in lev.spo; prefetch_host!(a); end
+    end
+    return hier
+end
+
+# ── streaming gravity: bring/evict ONE level's gravity working set ────────────
+# The Poisson solve (`_grav_rhs_k!` + red-black), the DM deposit, and the accel
+# gather read+write exactly {D, φ, rhs, dm, Dsc} + live_d + lookup tables — NEVER
+# the hydro S1..Ge / O-twins.  Prefetching just these per level (and evicting after)
+# keeps only ~2 levels of gravity resident, so the block count is bounded by HOST
+# RAM (2 TB) rather than the device gravity working set (~290k blocks on 45 GB).
+
+"Pull a level's GRAVITY working set (φ/rhs/dm/D/Dsc + tables + live_d) onto the GPU."
+function prefetch_grav!(lev::Level)
+    memory_mode() === :managed || return lev
+    for a in (lev.phi, lev.rhs, lev.dm, lev.D, lev.Dsc); prefetch_device!(a); end
+    prefetch_device!(lev.live_d)
+    for t in values(lev.tabs)
+        t isa RectJobTable && (prefetch_device!(t.jobs); prefetch_device!(t.cellstart))
+    end
+    return lev
+end
+
+"Push a level's gravity working set BACK to host RAM (after its solve/gather is done)."
+function evict_grav!(lev::Level)
+    memory_mode() === :managed || return lev
+    for a in (lev.phi, lev.rhs, lev.dm, lev.D); prefetch_host!(a); end
+    return lev
+end

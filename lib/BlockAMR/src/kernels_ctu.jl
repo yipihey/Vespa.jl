@@ -143,18 +143,20 @@ end
 # ── pool gather with the f16 hat-tile rounding (oracle + capture path) ────────
 "tile-rounded physical (ρ,u,v,w,e): the EXACT value the f16 hat tile yields."
 @inline function _ctu_prims_pool(D, S1, S2, S3, Tau, Ge, idx::Int32,
-                                 dsc::Float32, ssc::Float32, esc::Float32)
-    U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
+                                 dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
+    U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
     # vacuum gate — must mirror the tiled kernel's phase-0 load bit-exactly.
     ρ = max(U[1], 1.0f-30)
     inv = ifelse(U[1] > 0.0f0, 1.0f0 / ρ, 0.0f0)
     ρ̂ = Float32(Float16(U[1] / dsc))
     u = Float32(Float16(U[2] * inv)); v = Float32(Float16(U[3] * inv))
     w = Float32(Float16(U[4] * inv))
+    # internal energy rides ITS OWN scale gsc (U[6]=Ge·gsc) — the tile lift factor
+    # is gsc/dsc so the f16 tile windows the true internal energy, not Tau's.
     ê = Float32(Float16(ifelse(U[1] > 0.0f0,
-                               max(U[6], 1.0f-30) / esc /
+                               max(U[6], 1.0f-30) / gsc /
                                max(U[1] / dsc, 1.0f-30), 0.0f0)))
-    return (max(ρ̂ * dsc, 1.0f-30), u, v, w, ê * (esc / dsc))
+    return (max(ρ̂ * dsc, 1.0f-30), u, v, w, ê * (gsc / dsc))
 end
 
 # corrector flux (5 lanes + ge) between local cell (i,j,k) and its +ax neighbour,
@@ -162,12 +164,12 @@ end
 @inline function _ctu_face6(D, S1, S2, S3, Tau, Ge, base::Int32,
                             i::Int32, j::Int32, k::Int32, nd::Int32,
                             λ::Float32, γ::Float32, ax::Int32,
-                            dsc::Float32, ssc::Float32, esc::Float32)
+                            dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
     di = ax == Int32(1) ? Int32(1) : Int32(0)
     dj = ax == Int32(2) ? Int32(1) : Int32(0)
     dk = ax == Int32(3) ? Int32(1) : Int32(0)
     P(ii, jj, kk) = _ctu_prims_pool(D, S1, S2, S3, Tau, Ge,
-                                    base + _lidx(ii, jj, kk, nd), dsc, ssc, esc)
+                                    base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc)
     cL = P(i, j, k); cR = P(i + di, j + dj, k + dk)
     dUL = _ctu_dU5(P(i - Int32(1), j, k), cL, P(i + Int32(1), j, k),
                    P(i, j - Int32(1), k), P(i, j + Int32(1), k),
@@ -188,7 +190,7 @@ end
 @kernel function _ctu_cell_k!(Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
                               @Const(Tau), @Const(Ge), spin,
-                              @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc),
+                              @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                               λ::Float32, γ::Float32, η::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
                               ::Val{NS}) where {NS}
@@ -199,11 +201,11 @@ end
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
         P(ii, jj, kk) = _ctu_prims_pool(D, S1, S2, S3, Tau, Ge,
-                                        base + _lidx(ii, jj, kk, nd), dsc, ssc, esc)
+                                        base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc)
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
         aX1 = 0.0f0; aX2 = 0.0f0
         for ax in Int32(1):Int32(3)
@@ -279,7 +281,7 @@ end
             end
         end
         # epilogue (shared with the tiled kernel by construction)
-        U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
+        U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
         Wc = P(i, j, k)
         divv = 0.5f0 * ((P(i + Int32(1), j, k)[2] - P(i - Int32(1), j, k)[2]) +
                         (P(i, j + Int32(1), k)[3] - P(i, j - Int32(1), k)[3]) +
@@ -317,7 +319,7 @@ end
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
+        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
             spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
@@ -348,10 +350,11 @@ const _FSMX = max((_TBX + 1) * _TBY * _TBZ, _TBX * (_TBY + 1) * _TBZ,
 
 # physical 5-lane state of W-tile cell (lx,ly,lz) from the f16 hat tile
 @inline function _tld(Wt, lx::Int32, ly::Int32, lz::Int32,
-                      dsc::Float32, esc::Float32)
+                      dsc::Float32, gsc::Float32)
     q = _wsi(lx, ly, lz) * Int32(5)
+    # lane 5 is the internal energy hat, lifted by gsc/dsc (its OWN scale)
     @inbounds (max(Float32(Wt[q+1]) * dsc, 1.0f-30), Float32(Wt[q+2]),
-               Float32(Wt[q+3]), Float32(Wt[q+4]), Float32(Wt[q+5]) * (esc / dsc))
+               Float32(Wt[q+3]), Float32(Wt[q+4]), Float32(Wt[q+5]) * (gsc / dsc))
 end
 
 @inline _xld(Xt, w0::Int32, s::Int, NS::Int) =
@@ -360,7 +363,7 @@ end
 @kernel cpu=false function _ctu_step_k!(
         Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
         @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), @Const(Ge), spin,
-        @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc),
+        @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
         λ::Float32, γ::Float32, η::Float32, tpb::Int32,
         B::Int32, ng::Int32, nd::Int32, stride::Int32, ::Val{NS}) where {NS}
     Wt  = @localmem Float16 (_WS3 * 5)
@@ -376,7 +379,7 @@ end
     tz0 = (tile ÷ (ntx * nty)) * Int32(_TBZ)
     slot = @inbounds live_d[bi + Int32(1)]
     base = (slot - Int32(1)) * stride
-    dsc = @inbounds Dsc[slot]; ssc = @inbounds Ssc[slot]; esc = @inbounds Esc[slot]
+    dsc = @inbounds Dsc[slot]; ssc = @inbounds Ssc[slot]; esc = @inbounds Esc[slot]; gsc = @inbounds Gsc[slot]
     NL = Int32(5 + NS)
     # ── phase 0: pool U → physical prims → f16 hat tile (+ u16 species) ──────
     let t = tid
@@ -385,7 +388,7 @@ end
             lz = t ÷ Int32(_WSX * _WSY)
             idx = base + _lidx(tx0 + lx + ng - Int32(2), ty0 + ly + ng - Int32(2),
                                tz0 + lz + ng - Int32(2), nd)
-            U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
+            U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
             # vacuum gate (see _prim_de): stored ρ ≤ 0 ⇒ v = 0, ê = 0 — never
             # divide quantization-noise momenta by the density floor.
             ρ = max(U[1], 1.0f-30)
@@ -396,8 +399,9 @@ end
                 Wt[q+2] = Float16(U[2] * inv)
                 Wt[q+3] = Float16(U[3] * inv)
                 Wt[q+4] = Float16(U[4] * inv)
+                # internal energy hat on gsc (U[6]=Ge·gsc) → full f16 tile precision
                 Wt[q+5] = Float16(ifelse(U[1] > 0.0f0,
-                                         max(U[6], 1.0f-30) / esc /
+                                         max(U[6], 1.0f-30) / gsc /
                                          max(U[1] / dsc, 1.0f-30), 0.0f0))
                 for s in 1:NS
                     Xt[t*Int32(NS)+Int32(s)] = spin[s][idx]
@@ -413,13 +417,13 @@ end
             dx = t % Int32(_DSX); dy = (t ÷ Int32(_DSX)) % Int32(_DSY)
             dz = t ÷ Int32(_DSX * _DSY)
             lx = dx + Int32(1); ly = dy + Int32(1); lz = dz + Int32(1)  # W coords
-            xc = _tld(Wt, lx, ly, lz, dsc, esc)
-            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, esc)
-            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, esc)
-            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, esc)
-            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, esc)
-            zm = _tld(Wt, lx, ly, lz - Int32(1), dsc, esc)
-            zp = _tld(Wt, lx, ly, lz + Int32(1), dsc, esc)
+            xc = _tld(Wt, lx, ly, lz, dsc, gsc)
+            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, gsc)
+            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, gsc)
+            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, gsc)
+            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, gsc)
+            zm = _tld(Wt, lx, ly, lz - Int32(1), dsc, gsc)
+            zp = _tld(Wt, lx, ly, lz + Int32(1), dsc, gsc)
             dU = _ctu_dU5(xm, xc, xp, ym, yp, zm, zp, λ, γ)
             q = t * NL
             @inbounds begin
@@ -463,10 +467,10 @@ end
                     dUL = (dUs[dL+1], dUs[dL+2], dUs[dL+3], dUs[dL+4], dUs[dL+5])
                     dUR = (dUs[dR+1], dUs[dR+2], dUs[dR+3], dUs[dR+4], dUs[dR+5])
                 end
-                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, esc)
-                cL = _tld(Wt, lx, ly, lz, dsc, esc)
-                cR = _tld(Wt, mx, my, mz, dsc, esc)
-                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, esc)
+                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, gsc)
+                cL = _tld(Wt, lx, ly, lz, dsc, gsc)
+                cR = _tld(Wt, mx, my, mz, dsc, gsc)
+                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, gsc)
                 L = _ctu_predicted(cm, cL, cR, dUL, 1.0f0)
                 R = _ctu_predicted(cL, cR, cp, dUR, -1.0f0)
                 F, Fge, Fm = _ctu_face(L, R, γ, dir)
@@ -506,15 +510,15 @@ end
     i = tx0 + tx + ng; j = ty0 + ty + ng; k = tz0 + tz + ng
     idx = base + _lidx(i, j, k, nd)
     @inbounds begin
-        U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc)
+        U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
         wx = tx + Int32(2); wy = ty + Int32(2); wz = tz + Int32(2)
-        Wc = _tld(Wt, wx, wy, wz, dsc, esc)
-        divv = 0.5f0 * ((_tld(Wt, wx + Int32(1), wy, wz, dsc, esc)[2] -
-                         _tld(Wt, wx - Int32(1), wy, wz, dsc, esc)[2]) +
-                        (_tld(Wt, wx, wy + Int32(1), wz, dsc, esc)[3] -
-                         _tld(Wt, wx, wy - Int32(1), wz, dsc, esc)[3]) +
-                        (_tld(Wt, wx, wy, wz + Int32(1), dsc, esc)[4] -
-                         _tld(Wt, wx, wy, wz - Int32(1), dsc, esc)[4]))
+        Wc = _tld(Wt, wx, wy, wz, dsc, gsc)
+        divv = 0.5f0 * ((_tld(Wt, wx + Int32(1), wy, wz, dsc, gsc)[2] -
+                         _tld(Wt, wx - Int32(1), wy, wz, dsc, gsc)[2]) +
+                        (_tld(Wt, wx, wy + Int32(1), wz, dsc, gsc)[3] -
+                         _tld(Wt, wx, wy - Int32(1), wz, dsc, gsc)[3]) +
+                        (_tld(Wt, wx, wy, wz + Int32(1), dsc, gsc)[4] -
+                         _tld(Wt, wx, wy, wz - Int32(1), dsc, gsc)[4]))
         P_c = (γ - 1.0f0) * max(Wc[1] * Wc[5], 1.0f-30)
         nD  = max(U0[1] - λ * a1, 1.0f-30)
         nS1 = U0[2] - λ * a2
@@ -548,7 +552,7 @@ end
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / esc)
+        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
             spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
@@ -589,14 +593,14 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
         tpb = (B ÷ _TBX) * (B ÷ _TBY) * (B ÷ _TBZ)
         n = length(lev.live) * tpb * _NT
         _ctu_step_k!(lev.be, _NT)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
-                                  lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
+                                  lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
                                   λ, Float32(hier.gamma), η, Int32(tpb),
                                   Int32(B), Int32(lev.ng), Int32(lev.nd),
                                   Int32(lev.stride), Val(NS); ndrange = n)
     else
         n = length(lev.live) * B^3
         _ctu_cell_k!(lev.be)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
-                             lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
+                             lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
                              λ, Float32(hier.gamma), η,
                              Int32(B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), Val(NS); ndrange = n)

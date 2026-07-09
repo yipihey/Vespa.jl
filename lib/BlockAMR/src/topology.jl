@@ -81,6 +81,28 @@ function axis_images(a0::Int128, alen::Integer, b0::Int128, blen::Integer, P::In
     return out
 end
 
+# Allocation-free twin of `axis_images` for the table builders' hot loops: packs
+# the ≤3 non-empty images into a homogeneous 3-tuple + count `(n, e1, e2, e3)`
+# (stack-allocated).  `img_get(r, k)` returns image k (1..n) type-stably.  Same
+# images in the same order as `axis_images` — the builders' output is identical.
+const _AxImg = Tuple{Int128,Int,Int128}
+@inline function axis_images3(a0::Int128, alen::Integer, b0::Int128, blen::Integer, P::Int128)
+    z = (Int128(0), 0, Int128(0))
+    n = 0; e1 = z; e2 = z; e3 = z
+    for s in (-P, Int128(0), P)
+        lo = max(a0, b0 + s)
+        hi = min(a0 + Int128(alen), b0 + Int128(blen) + s)
+        if hi > lo
+            e = (lo, Int(hi - lo), s)
+            n += 1
+            n == 1 ? (e1 = e) : (n == 2 ? (e2 = e) : (e3 = e))
+        end
+    end
+    return (n, e1, e2, e3)
+end
+@inline img_get(r::Tuple{Int,_AxImg,_AxImg,_AxImg}, k::Int) =
+    k == 1 ? r[2] : (k == 2 ? r[3] : r[4])
+
 # ── box subtraction (nesting validator support) ───────────────────────────────
 # Boxes are (lo::NTuple{3,Int128}, hi::NTuple{3,Int128}) half-open, in an
 # UNWRAPPED local frame.  subtract_box returns A ∖ B as ≤6 disjoint boxes.
