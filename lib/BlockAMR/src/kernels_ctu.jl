@@ -314,12 +314,17 @@ end
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
         end
+        # reconstruct total energy Tau ≡ KE + Ge (FVGK fv_run_ctus_de, both branches) —
+        # keeps Tau consistent with the evolved internal energy in the kinetic-dominated
+        # core so the conservative Tau flux carries the shock heat into Ge on deceleration.
+        nG = max(nG, 1.0f-30)
+        nT = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30) + nG
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / gsc)
+        Geo_[idx]  = _narrow(eltype(Geo_), nG / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
             spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
@@ -547,12 +552,17 @@ end
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
         end
+        # reconstruct total energy Tau ≡ KE + Ge (FVGK fv_run_ctus_de, both branches) —
+        # keeps Tau consistent with the evolved internal energy in the kinetic-dominated
+        # core so the conservative Tau flux carries the shock heat into Ge on deceleration.
+        nG = max(nG, 1.0f-30)
+        nT = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30) + nG
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / gsc)
+        Geo_[idx]  = _narrow(eltype(Geo_), nG / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
             spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :

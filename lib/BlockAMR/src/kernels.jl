@@ -195,16 +195,22 @@ end
         nS3 = wo * Float32(OldS3[idx])  * ssc + wi * nS3
         nT  = wo * Float32(OldTau[idx]) * esc + wi * nT
         nG  = wo * Float32(OldGe[idx])  * gsc + wi * nG
-        # dual-energy selection: trust Tau−KE where it is well-resolved
+        # dual-energy selection: trust Tau−KE where it is well-resolved, else keep the
+        # advected Ge; then ALWAYS reconstruct Tau = KE + Ge (FVGK fv_run_ctus_de).  Without
+        # this rebuild, in a kinetic-dominated (supersonic) core the f16 Tau drifts to KE>Tau,
+        # so the shock heating carried by the conservative Tau flux is corrupted and never
+        # reaches Ge when the gas decelerates — the deep-core T→CMB-floor collapse.
         nD = max(nD, 1.0f-30)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
         (nT - KE) > η * nT && (nG = nT - KE)
+        nG = max(nG, 1.0f-30)
+        nT = KE + nG                                # reconstruct total energy (Tau ≡ KE + Ge)
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
         S3o_[idx]  = _narrow(eltype(S3o_), nS3 / ssc)
         Tauo_[idx] = _narrow(eltype(Tauo_), nT / esc)
-        Geo_[idx]  = _narrow(eltype(Geo_), max(nG, 1.0f-30) / gsc)
+        Geo_[idx]  = _narrow(eltype(Geo_), nG / gsc)
         # ── species CMA: X rides the six HLLC mass fluxes, upwinded per face; the
         # conserved quantity is ρX (fractions decode from the absolute u16 codec) ──
         if NS > 0
