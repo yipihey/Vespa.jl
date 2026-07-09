@@ -26,6 +26,21 @@ include(joinpath(@__DIR__, "music_ic.jl"))   # BAM_IC=music: Planck18 grafic ICs
 include(joinpath(@__DIR__, "camb_ic.jl"))     # BAM_IC=camb:  sub-percent CAMB-normalized ICs
 include(joinpath(@__DIR__, "jeans_profile.jl"))   # radial profiles on each new level
 
+# read a MULTI-MASS DM particle binary (read_music_zoom.py format): Int64 Np,
+# Float64 box, zstart, then Float32[pos 3Np (xyz-interleaved) | vel 3Np | mass Np].
+# Used by BAM_IC=zoom: the 5-level zoom's fine halo-region DM (from all grafic
+# levels), so the target halo is resolved as a proper zoom, not a uniform base.
+function read_multimass_dm(path)
+    io = open(path, "r"); Np = Int(read(io, Int64))
+    box = read(io, Float64); zstart = read(io, Float64)
+    raw = read!(io, Vector{Float32}(undef, 7Np)); close(io)
+    posv = @view raw[1:3Np]; velv = @view raw[3Np+1:6Np]
+    px = mod.(@view(posv[1:3:end]), 1f0); py = mod.(@view(posv[2:3:end]), 1f0); pz = mod.(@view(posv[3:3:end]), 1f0)
+    vx = collect(@view velv[1:3:end]); vy = collect(@view velv[2:3:end]); vz = collect(@view velv[3:3:end])
+    pmass = collect(@view raw[6Np+1:7Np])
+    return (; Np, box, zstart, px, py, pz, vx, vy, vz, pmass)
+end
+
 const BE      = Symbol(get(ENV, "BACKEND", "cpu"))
 const NGRID   = parse(Int, get(ENV, "BAM_NGRID", "32"))
 const BBLK    = parse(Int, get(ENV, "BAM_B", "16"))
@@ -60,6 +75,8 @@ const MREFINE = parse(Float64, get(ENV, "BAM_MREFINE", "8.0")) # DMCRIT: particl
 const JEANS   = parse(Float64, get(ENV, "BAM_JEANS", "0.0"))
 const JEANSRHO = parse(Float64, get(ENV, "BAM_JEANS_RHO", "100.0"))  # gas overdensity floor (×gas mean) for Jeans — confines it to collapsing cores
 const ZTRACK  = get(ENV, "BAM_ZOOM_TRACK", "0") == "1"
+const ZOOMDM  = get(ENV, "BAM_ZOOM_DM", "")   # multi-mass DM binary → 5-level zoom (fine halo DM); gas still from BAM_MUSIC_DIR base level
+const MRLMAX  = parse(Int, get(ENV, "BAM_MRLMAX", "0"))  # keep the IC zoom mesh static-refined to L(MRLMAX) (must-refine; 0=adaptive)
 const PROFLV  = get(ENV, "BAM_PROFILE_ON_LEVEL", JEANS > 0 ? "1" : "0") == "1"
 const BOXMPCH = parse(Float64, get(ENV, "CIC_BOX", "0.128"))
 const ZSTART  = parse(Float64, get(ENV, "CIC_ZSTART", "1000.0"))
@@ -150,19 +167,34 @@ function main()
     copyto!(lev0.sp[1], fill(ChemistryKernels.encode_log2sp(Float32(xHII0 * c.XH)), n))
     copyto!(lev0.sp[2], fill(ChemistryKernels.encode_log2sp(Float32(2e-6 * c.XH)), n))
 
-    # DM particle SoA (device, f32) — mass (1−fb)/Np ⇒ mean DM density 1−fb
-    pos = snap.dm_pos; vel = snap.dm_vel; Np = size(pos, 1)
+    # DM particle SoA (device, f32).  BAM_ZOOM_DM: MULTI-MASS particles from the
+    # 5-level zoom (fine halo DM); else uniform mass (1−fb)/Np from the base grid.
     dev(v) = BlockAMR.to_device(hier.be, v, Float32)
-    parts = (px = dev(Float32[mod(pos[p,1], 1.0) for p in 1:Np]),
-             py = dev(Float32[mod(pos[p,2], 1.0) for p in 1:Np]),
-             pz = dev(Float32[mod(pos[p,3], 1.0) for p in 1:Np]),
-             vx = dev(Float32[vel[p,1] * vconv for p in 1:Np]),
-             vy = dev(Float32[vel[p,2] * vconv for p in 1:Np]),
-             vz = dev(Float32[vel[p,3] * vconv for p in 1:Np]))
-    mass_code = (1 - c.fb) / Np
+    if ZOOMDM != ""
+        zdm = read_multimass_dm(ZOOMDM); Np = zdm.Np
+        parts = (px = dev(zdm.px), py = dev(zdm.py), pz = dev(zdm.pz),
+                 vx = dev(zdm.vx .* Float32(vconv)), vy = dev(zdm.vy .* Float32(vconv)),
+                 vz = dev(zdm.vz .* Float32(vconv)))
+        # DM mean density = (1−fb); per-particle code mass ⇒ Σ = (1−fb) over the box
+        mcode = (1 - c.fb) .* Float64.(zdm.pmass) ./ sum(Float64.(zdm.pmass))
+        mass_code = dev(Float32.(mcode))
+        @printf("ZOOM DM: %d multi-mass particles (masses=%s Msun/h)\n", Np,
+                string(sort(unique(round.(zdm.pmass, digits=0))))); flush(stdout)
+    else
+        pos = snap.dm_pos; vel = snap.dm_vel; Np = size(pos, 1)
+        parts = (px = dev(Float32[mod(pos[p,1], 1.0) for p in 1:Np]),
+                 py = dev(Float32[mod(pos[p,2], 1.0) for p in 1:Np]),
+                 pz = dev(Float32[mod(pos[p,3], 1.0) for p in 1:Np]),
+                 vx = dev(Float32[vel[p,1] * vconv for p in 1:Np]),
+                 vy = dev(Float32[vel[p,2] * vconv for p in 1:Np]),
+                 vz = dev(Float32[vel[p,3] * vconv for p in 1:Np]))
+        mass_code = (1 - c.fb) / Np
+    end
     @printf("gas IC: f_b=%.4f T=%.1fK x_HII=%.3e;  DM: %d particles\n",
             c.fb, Tg0, xHII0, Np); flush(stdout)
     end                                          # if RESTART
+    # topgrid CIC deposit weight: per-particle vector for multi-mass DM, else scalar
+    marg = mass_code isa AbstractVector ? (mass_code .* Float32(NGRID^3)) : nothing
 
     # BAM_ZOOM="x,y,z,r[,lmin]" (box units): confine levels ≥ lmin (default 3)
     # to a sphere around one target — deep refinement without box-wide breadth.
@@ -177,7 +209,8 @@ function main()
                                 nbuf = 2, every = REGRIDN, lmax = LMAX, lfac = LFAC,
                                 zoom_center = center, zoom_r = zr, zoom_lmin = zl,
                                 dm_criterion = DMCRIT, jeans_ncells = JEANS,
-                                jeans_rho_floor = JEANS > 0 ? JEANSRHO * c.fb : 0.0)
+                                jeans_rho_floor = JEANS > 0 ? JEANSRHO * c.fb : 0.0,
+                                must_refine_lmax = MRLMAX)
     pol = mkpol(zc)
     # deepest populated level so far — a NEW level triggers a radial-profile dump
     curlevel() = maximum(l for l in 0:length(hier.levels)-1 if !isempty(hier.levels[l+1].live))
@@ -241,7 +274,7 @@ function main()
         global_from_level0!(hier, ρg)
         PoissonKernels.cic_deposit!(ρg, parts.px, parts.py, parts.pz,
                                     parts.vx, parts.vy, parts.vz,
-                                    Float32(mass_code * NGRID^3);
+                                    marg === nothing ? Float32(mass_code * NGRID^3) : marg;
                                     N = NGRID, disp = 0.0f0, shift = -0.5f0)
         ρg .-= 1.0f0                                     # δ (total mean = 1)
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
