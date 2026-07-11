@@ -52,6 +52,7 @@ export BlockRefinementPolicy, regrid!, compact_level!
 export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
 export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
+export enable_timers!, reset_timers!, timer_report
 export chem_level!
 export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!

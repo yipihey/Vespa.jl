@@ -224,6 +224,20 @@ end
     end
 end
 
+# gather |rhs| over interior cells into a compact (n,) buffer for ‖rhs‖∞
+@kernel function _absrhs_k!(out, @Const(rhs), @Const(live_d),
+                            B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        out[Int32(t)] = abs(rhs[(slot - Int32(1)) * stride + _lidx(i, j, k, nd)])
+    end
+end
+
 """
     solve_gravity_level!(hier, l; source_coef, nsweep = 60, rho_ext = nothing,
                          rho_mean = 0, init = :warm) -> residual∞
@@ -235,11 +249,21 @@ tiling covers the box, so the sibling exchange IS the periodic BC) — pass the
 mean density in `rho_mean` so the source is solvable.  `init = :parent` seeds
 the interior from the parent; `:warm` keeps the existing φ.  Returns the final
 ∞-norm residual (h²-scaled units).
+
+`restol > 0` enables residual-based early exit: the loop breaks once the ∞-norm
+residual drops below `restol·‖rhs‖∞` (the source norm — the standard Enzo/RAMSES
+convergence test, NOT relative to the initial residual, which an already-converged
+warm φ cannot reduce further).  Checked before the first sweep and every
+`check_every` sweeps thereafter; `nsweep` is the hard cap.  This is the deep-
+subcycled fast path — a warm-started φ under 2:1 subcycling is usually already
+near-converged (`res/‖rhs‖ < restol` on entry ⇒ zero sweeps), so a fixed sweep
+budget is wasted work.
 """
 function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
                               nsweep::Int = 60, rho_ext = nothing,
                               rho_mean::Real = 0, init::Symbol = :warm,
-                              use_dm::Bool = false, residual::Bool = true)
+                              use_dm::Bool = false, residual::Bool = true,
+                              restol::Real = 0.0, check_every::Int = 4)
     lev = hier.levels[l + 1]
     plev = l >= 1 ? hier.levels[l] : lev
     isempty(lev.live) && return 0.0f0
@@ -276,7 +300,23 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     # time at 128³) — one full-shell exchange after the loop restores the
     # corners for trilinear consumers (particle gather).
     sibf = _tabt(lev, :sibf)
-    for _ in 1:nsweep
+    # residual-based early exit (subcycled deep levels warm-start nearly
+    # converged — a warm φ that already meets restol skips the whole sweep
+    # budget).  resbuf doubles as the final-diagnostic scratch.
+    resbuf = (restol > 0 || residual) ? device_zeros(lev.be, Float32, (n,)) : nothing
+    rtarget = 0.0f0
+    if restol > 0 && nsweep > 0
+        _absrhs_k!(lev.be)(resbuf, lev.rhs, lev.live_d, Int32(lev.B),
+                           Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
+        rtarget = Float32(restol) * maximum(resbuf)      # restol·‖rhs‖∞
+    end
+    for s in 1:nsweep
+        # convergence test BEFORE sweeping: an already-converged warm φ exits at 0
+        if rtarget > 0 && (s == 1 || (s - 1) % check_every == 0)
+            _residual_k!(lev.be)(resbuf, lev.phi, lev.rhs, lev.live_d, Int32(lev.B),
+                                 Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
+            maximum(resbuf) <= rtarget && break
+        end
         _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(0), Int32(lev.B),
                              Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
         _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(1), Int32(lev.B),
@@ -285,7 +325,7 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     end
     nsweep > 0 && _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
     residual || return 0.0f0                     # skip the diagnostic reduce +
-    res = device_zeros(lev.be, Float32, (n,))    # D→H sync on the hot path
+    res = resbuf                                  # D→H sync on the hot path
     _residual_k!(lev.be)(res, lev.phi, lev.rhs, lev.live_d, Int32(lev.B),
                          Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
     return maximum(res)

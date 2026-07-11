@@ -8,6 +8,52 @@
 # overwrites the covered ones.  λ_l = dt/dx_l per level here; the strict-2:1
 # W-cycle (Phase 3) collapses them into the single global λ.
 
+# ── phase timers (ENV-gated, sync-accurate) ──────────────────────────────────
+# Attribute per-root-step wall time to (phase, level).  OFF by default (zero
+# overhead — the _tic guard returns before any sync).  enable_timers!() turns it
+# on; each _tic/_toc pair synchronizes the backend so async GPU kernels are
+# actually attributed to their phase (perturbs overlap, but that's the point of
+# a cost breakdown).  Report with timer_report().
+const _TIMERS = Dict{Tuple{Symbol,Int},Float64}()
+const _TCOUNT = Dict{Tuple{Symbol,Int},Int}()
+const _TON    = Ref(false)
+enable_timers!(on::Bool = true) = (_TON[] = on; on)
+reset_timers!() = (empty!(_TIMERS); empty!(_TCOUNT); nothing)
+
+@inline function _tic(be)
+    _TON[] || return 0.0
+    KA.synchronize(be)
+    return time()
+end
+@inline function _toc(be, phase::Symbol, l::Int, t0)
+    _TON[] || return nothing
+    KA.synchronize(be)
+    k = (phase, l)
+    _TIMERS[k] = get(_TIMERS, k, 0.0) + (time() - t0)
+    _TCOUNT[k] = get(_TCOUNT, k, 0) + 1
+    return nothing
+end
+
+"Formatted per-(phase,level) timing breakdown since the last reset_timers!()."
+function timer_report(; io = stdout)
+    isempty(_TIMERS) && (println(io, "[timers] (none)"); return nothing)
+    tot = sum(values(_TIMERS))
+    println(io, "── phase timers ── total ", round(tot, digits = 3), " s")
+    # by phase (summed over levels)
+    byphase = Dict{Symbol,Float64}()
+    for ((p, _), v) in _TIMERS; byphase[p] = get(byphase, p, 0.0) + v; end
+    for (p, v) in sort(collect(byphase); by = x -> -x[2])
+        @printf(io, "  %-16s %8.3f s  %5.1f%%\n", p, v, 100v / tot)
+    end
+    println(io, "  ── by (phase, level) ──")
+    for ((p, l), v) in sort(collect(_TIMERS); by = x -> -x[2])
+        v / tot < 0.01 && continue
+        @printf(io, "  %-16s L%-2d %8.3f s  %5.1f%%  (%d calls)\n",
+                p, l, v, 100v / tot, _TCOUNT[(p, l)])
+    end
+    return nothing
+end
+
 """
     hierarchy_rk2_step!(hier, dt) -> nothing
 
@@ -93,6 +139,7 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         # cosmological convention: the source is coef·(ρ_tot − rho_mean) = coef·δ
         # at EVERY level (matching the mean-subtracted topgrid FFT that feeds the
         # level-1 Dirichlet BCs); use_dm adds the per-level particle deposit.
+        _t = _tic(lev.be)
         solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
                              nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :
                                                get(selfgrav, :nsweep, 30),
@@ -100,20 +147,23 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                              rho_mean = get(selfgrav, :rho_mean, 0),
                              use_dm = get(selfgrav, :use_dm, false),
                              residual = false)         # no diagnostic sync per substep
-        grav_kick_level_pool!(hier, l, 0.5 * dt_l)
+        _toc(lev.be, :grav_solve, l, _t)
+        _t = _tic(lev.be); grav_kick_level_pool!(hier, l, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     elseif φ !== nothing
-        grav_kick_level!(hier, l, φ, 0.5 * dt_l)
+        _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     end
     if hier.scheme === :ctu
         # single-pass CTU: one ghost fill, one fused launch (R→O), captures from
         # the intact R, then swap.  Single-stage weights: fine ½/substep (time
         # average over the 2:1 pair), coarse 1 — same per-coarse-step totals as
         # the RK2 path's (¼,½)×2.
-        fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
-        ctu_level!(hier, l, λ)
+        _t = _tic(lev.be); fill_ghosts!(hier, l; θ = 0.0f0, buf = :R); _toc(lev.be, :ghost, l, _t)
+        _t = _tic(lev.be); ctu_level!(hier, l, λ); _toc(lev.be, :hydro, l, _t)
+        _t = _tic(lev.be)
         l >= 1   && capture_fine!(hier, l, :R, 0.5f0; λ)
         haskids  && capture_coarse!(hier, l + 1, :R, 1.0f0; λ)
         swap_buffers!(lev)
+        _toc(lev.be, :capture, l, _t)
     else
         fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
         stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
@@ -125,14 +175,18 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
     end
     if selfgrav !== nothing && (l >= 1 || φ === nothing)           # KDK: K2
-        grav_kick_level_pool!(hier, l, 0.5 * dt_l)
+        _t = _tic(lev.be); grav_kick_level_pool!(hier, l, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     elseif φ !== nothing
-        grav_kick_level!(hier, l, φ, 0.5 * dt_l)
+        _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     end
-    chem === nothing || chem_level!(hier, l, dt_l; chem...)        # analytic H+H₂
+    if chem !== nothing                                           # analytic H+H₂
+        _t = _tic(lev.be); chem_level!(hier, l, dt_l; chem...); _toc(lev.be, :chem, l, _t)
+    end
     if haskids
+        _t = _tic(lev.be)
         restrict_level!(hier, l + 1)
         reflux_apply!(hier, l + 1, λ)
+        _toc(lev.be, :restrict_reflux, l, _t)
         # out-of-core: the child level is now fully advanced AND consumed by this
         # level's restrict/reflux — MOVE it back to host RAM, freeing the device
         # for the working set.  (No-op unless memory_mode() === :managed.)

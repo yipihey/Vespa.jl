@@ -28,6 +28,12 @@
 # Criterion: overdensity threshold on D (×lfac per level).  The policy carries
 # plain numbers (device-evaluable), not closures.
 
+# One-time warnings when the nesting-safe zoom margin has eaten the effective
+# radius below a block (refinement geometrically impossible at that level — a
+# SILENT collapse-killer otherwise; cost hours on the BB collapse).  Keyed by
+# level so a long run warns once per depth, not every regrid.
+const _ZOOM_WARNED = Set{Int}()
+
 """
     BlockRefinementPolicy(; dthresh, nbuf = 2, every = 4, lmax = 1)
 
@@ -407,6 +413,20 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             end
             reff = max(pol.zoom_r - margin, 0.0)
             r2 = reff^2
+            # guard: the depth-shrinking margin can drive reff below one block
+            # half-width, so this level is dropped purely by geometry even where
+            # the physics flags refinement — warn (once/level) with the zoom_r
+            # that would keep this depth alive, so it never silently stalls.
+            blk_hw = (hier.B / 2) / (hier.nbase[1] * 2.0^lc)   # box units at lc
+            if !isempty(want) && reff < blk_hw && !(lc in _ZOOM_WARNED)
+                push!(_ZOOM_WARNED, lc)
+                @warn "BlockAMR zoom margin killed refinement at level $lc: " *
+                      "effective radius reff=$(round(reff, sigdigits=3)) box < block " *
+                      "half-width $(round(blk_hw, sigdigits=3)) (zoom_r=$(pol.zoom_r), " *
+                      "margin=$(round(margin, sigdigits=3))). Increase zoom_r to " *
+                      "≳ $(round(margin + blk_hw, sigdigits=3)) or set zoom_r=0 and " *
+                      "confine by the Jeans/density criterion instead." maxlog = 1
+            end
             filter!(want) do kv
                 org = kv.first
                 d2 = 0.0

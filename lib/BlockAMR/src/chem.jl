@@ -96,7 +96,8 @@ end
 function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      a_value::Real, density_units::Real, length_units::Real,
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
-                     OL::Real = 0.73, fh::Real = 0.76)
+                     OL::Real = 0.73, fh::Real = 0.76,
+                     dtfrac::Real = 0.1, itcap::Int = 5000)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     @assert lev.nsp >= 2 "chem_level! needs nsp ≥ 2 (HII, H2I)"
@@ -116,7 +117,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     end
     ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
         a_value, dt, density_units, length_units, time_units,
-        hubble, Om, OL, fh, backend = hier.besym, precision = Float32)
+        hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
     if dbg
         nb = mapreduce(x -> !isfinite(x), +, e32)
         if nb > 0
