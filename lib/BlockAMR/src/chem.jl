@@ -97,7 +97,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      a_value::Real, density_units::Real, length_units::Real,
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
                      OL::Real = 0.73, fh::Real = 0.76,
-                     dtfrac::Real = 0.1, itcap::Int = 5000)
+                     dtfrac::Real = 0.1, itcap::Int = 5000, rho_switch::Real = 0.0)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     @assert lev.nsp >= 2 "chem_level! needs nsp ≥ 2 (HII, H2I)"
@@ -115,9 +115,19 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     if dbg
         rin = Array(rho32); ein = Array(e32); hin = Array(h16); min_ = Array(m16)
     end
-    ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
-        a_value, dt, density_units, length_units, time_units,
-        hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
+    # rho_switch > 0 (CGS g/cm³): per-cell handoff — cells denser than rho_switch
+    # run the FULL primordial network (3-body H₂ + dissociation), the rest the
+    # cheap analytic path.  The analytic path is our IC generator; the dense
+    # collapsing core continues on the full network.  0 ⇒ analytic everywhere.
+    if rho_switch > 0
+        ChemistryKernels.solve_chem_hybrid_device_u16!(rho32, e32, h16, m16;
+            rho_switch, a_value, dt, density_units, length_units, time_units,
+            hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
+    else
+        ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
+            a_value, dt, density_units, length_units, time_units,
+            hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
+    end
     if dbg
         nb = mapreduce(x -> !isfinite(x), +, e32)
         if nb > 0

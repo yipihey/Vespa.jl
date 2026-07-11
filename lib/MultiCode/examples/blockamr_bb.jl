@@ -48,6 +48,7 @@ const SLICEN  = parse(Int,   get(ENV, "BAM_SLICE", "20"))    # midplane density 
 const TIMERN  = parse(Int,   get(ENV, "BAM_TIMERS", "0"))    # phase-timing breakdown every N steps (0=off)
 const CHEM_ITCAP  = parse(Int,     get(ENV, "BAM_CHEM_ITCAP", "5000"))   # chem subcycle cap/cell/call
 const CHEM_DTFRAC = parse(Float64, get(ENV, "BAM_CHEM_DTFRAC", "0.1"))   # chem substep target (frac change)
+const CHEM_NHSW   = parse(Float64, get(ENV, "BAM_CHEM_NHSWITCH", "0.0")) # n_H [cm⁻³] above which cells use the FULL network (0=off, analytic everywhere)
 const TAG     = get(ENV, "CIC_TAG", "_bb")
 const PREC    = get(ENV, "BAM_PREC", "f16") == "f32" ? Float32 : Float16  # gas field precision
 const REPORTS = MultiCode.run_dir("bbamr")
@@ -208,7 +209,8 @@ function run!(hier, pol)
     t = 0.0; nstep = 0; maxseen = maximum(l -> isempty(hier.levels[l+1].live) ? -1 : l, 0:length(hier.levels)-1)
     ch = (a_value = 1.0, density_units = U_D, length_units = U_L, time_units = U_T,
           hubble = 67.4, Om = 0.315, OL = 0.685, fh = XH,
-          dtfrac = CHEM_DTFRAC, itcap = CHEM_ITCAP)
+          dtfrac = CHEM_DTFRAC, itcap = CHEM_ITCAP,
+          rho_switch = CHEM_NHSW > 0 ? CHEM_NHSW * mH / XH : 0.0)   # n_H [cm⁻³] → CGS g/cm³
     TIMERN > 0 && (enable_timers!(true); reset_timers!())
     while nstep < NROOT && t < TEND_FF * (t_ff / t_u)
         # timestep: hydro CFL + free-fall limiter (per level, 2^l relaxed)
