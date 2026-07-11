@@ -50,6 +50,7 @@ const REGRIDN = parse(Int, get(ENV, "BAM_REGRID", "4"))
 const COMPACT = get(ENV, "BAM_COMPACT", "1") == "1"   # Morton slot compaction at regrid
 const CKPTN   = parse(Int, get(ENV, "BAM_CKPT", "0"))     # checkpoint every N root steps (0=off)
 const RESTART = get(ENV, "BAM_RESTART", "")               # checkpoint path to resume from
+const PREC    = get(ENV, "BAM_PREC", "f16") == "f32" ? Float32 : Float16  # gas field storage precision
 const STOPL   = parse(Int, get(ENV, "BAM_STOPLEVEL", "99"))  # stop once this level populates
 const NSWEEP  = parse(Int, get(ENV, "BAM_NSWEEP", "30"))
 const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac per level
@@ -104,11 +105,14 @@ function main()
     μ = 1.22
     local hier, parts, mass_code, xHII0, Np
     if RESTART != ""
-    hier, ex = BlockAMR.load_checkpoint(RESTART; backend = BE, Lcap = LMAX)
+    hier, ex = BlockAMR.load_checkpoint(RESTART; backend = BE, Lcap = LMAX, T = PREC)
     devr = v -> BlockAMR.to_device(hier.be, v, Float32)
     parts = (px = devr(ex.px), py = devr(ex.py), pz = devr(ex.pz),
              vx = devr(ex.vx), vy = devr(ex.vy), vz = devr(ex.vz))
-    Np = length(ex.px); mass_code = ex.mass_code
+    # mass_code: multi-mass zoom saves a host Vector (backend-portable checkpoint,
+    # no CUDA needed to deserialize) → move to device; uniform mass is a scalar.
+    Np = length(ex.px)
+    mass_code = ex.mass_code isa AbstractVector ? devr(ex.mass_code) : ex.mass_code
     a = ex.a; xHII0 = ex.xe_mean
     @printf("RESTART %s: z=%.3f  nstep=%d  blocks=%s\n", RESTART, 1/a - 1,
             Int(hier.nstep[1]),
@@ -140,7 +144,7 @@ function main()
     vconv = 1.0e5 / u0.v
 
     hier = AMRHierarchy(; nbase = (NGRID, NGRID, NGRID), B = BBLK, backend = BE,
-                        T = Float16, nsp = 2, gamma = GAMMA, cfl = 0.3,
+                        T = PREC, nsp = 2, gamma = GAMMA, cfl = 0.3,
                         Lcap = LMAX,
                         scheme = Symbol(get(ENV, "BAM_SCHEME", "rk2")))
     lev0 = init_base_level!(hier); build_level_tables!(hier, 0)
@@ -538,7 +542,10 @@ function main()
                 end
             end
         end
-        ckextra() = (a = a, mass_code = mass_code, xe_mean = xe_mean,
+        # save mass_code host-side (portable: load needs no CUDA) — vector for
+        # multi-mass zoom, scalar for uniform mass.
+        ckextra() = (a = a, xe_mean = xe_mean,
+                     mass_code = mass_code isa AbstractVector ? Array(mass_code) : mass_code,
                      px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
                      vx = Array(parts.vx), vy = Array(parts.vy), vz = Array(parts.vz))
         if CKPTN > 0 && nstep % CKPTN == 0

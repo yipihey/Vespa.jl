@@ -33,19 +33,23 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
         hostf = map(Array, gasfields(lev))
         hsp = map(Array, lev.sp)
         hphi = Array(lev.phi)
-        for (i, s) in enumerate(lev.live)
+        live = lev.live
+        # per-block gather into compacted [B³,nl] columns — disjoint output columns
+        # per block ⇒ parallel over blocks (bounded by -t auto; serial otherwise).
+        Threads.@threads for i in eachindex(live)
+            s = live[i]
             base = (Int(s) - 1) * lev.stride
             q = 0
             for k in 1:B, j in 1:B, ii in 1:B
                 idx = base + ((ng+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
                 for f in 1:6
-                    gf[f][q, i] = hostf[f][idx]
+                    @inbounds gf[f][q, i] = hostf[f][idx]
                 end
                 for t in 1:lev.nsp
-                    fsp[t][q, i] = hsp[t][idx]
+                    @inbounds fsp[t][q, i] = hsp[t][idx]
                 end
-                fphi[q, i] = hphi[idx]
+                @inbounds fphi[q, i] = hphi[idx]
             end
         end
         li = Int.(lev.live)
@@ -84,15 +88,18 @@ species, φ and scales restored to the ACTIVE cells, all tables and C/F
 registers rebuilt.  `Lcap` may EXCEED the checkpoint's (deepen-later restarts).
 """
 function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
-                         Lcap = nothing)
+                         Lcap = nothing, T = nothing)
     dbg = get(ENV, "BAM_LOADDBG", "0") == "1"
     _t() = time()
     dbg && (@info "load: deserialize start"; flush(stderr))
     t0 = _t()
     ck = Serialization.deserialize(path)
     dbg && (@printf("load: deserialized in %.1fs\n", _t()-t0); flush(stdout))
+    # T override: widen an f16 checkpoint into an f32 hierarchy (the per-cell host
+    # scatter converts on assignment).  Restored scales stay valid (stored=phys/scale).
+    Tp = T === nothing ? ck.T : T
     hier = AMRHierarchy(; nbase = ck.nbase, B = ck.B, ng = ck.ng, box = ck.box,
-                        backend, T = ck.T, nsp = ck.nsp,
+                        backend, T = Tp, nsp = ck.nsp,
                         Lcap = Lcap === nothing ? ck.Lcap : Lcap,
                         gamma = ck.gamma, cfl = ck.cfl, scheme = ck.scheme)
     init_base_level!(hier)
@@ -126,7 +133,13 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         # backward-compat: pre-split checkpoints have no Gsc — Ge was encoded on
         # the shared Esc, so Gsc = Esc reproduces the old physical Ge exactly.
         ckGsc = hasproperty(ckl, :Gsc) ? ckl.Gsc : ckl.Esc
-        for (i, s) in enumerate(slotmaps[l + 1])
+        ts = _t()
+        cksp = ckl.sp; ckphi = ckl.phi; smap = slotmaps[l + 1]
+        # per-block interior scatter — each block owns a disjoint `base` region of
+        # every host pool, so this is embarrassingly parallel (bounded by -t auto;
+        # serial when single-threaded).  The dominant single-thread restore cost.
+        Threads.@threads for i in eachindex(smap)
+            s = smap[i]
             base = (Int(s) - 1) * lev.stride
             hDsc[s] = ckl.Dsc[i]; hSsc[s] = ckl.Ssc[i]; hEsc[s] = ckl.Esc[i]; hGsc[s] = ckGsc[i]
             q = 0
@@ -134,15 +147,16 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
                 idx = base + ((ng+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
                 for f in 1:6
-                    hosts[f][idx] = ckf[f][q, i]
+                    @inbounds hosts[f][idx] = ckf[f][q, i]
                 end
                 for t in 1:lev.nsp
-                    hsp[t][idx] = ckl.sp[t][q, i]
+                    @inbounds hsp[t][idx] = cksp[t][q, i]
                 end
-                hphi[idx] = ckl.phi[q, i]
+                @inbounds hphi[idx] = ckphi[q, i]
             end
             lev.meta[s].flags &= ~FLAG_NEW
         end
+        dbg && (@printf("load: scattered L%d (%d blocks) in %.1fs\n", l, length(smap), _t()-ts); flush(stdout))
         tc = _t()
         for (dev, hh) in zip(gasfields(lev), hosts)
             copyto!(dev, hh)

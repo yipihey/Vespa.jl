@@ -42,7 +42,8 @@ end
 @kernel function _chem_scatter_k!(Ge, Tau, sp1, sp2,
                                   @Const(rho32), @Const(e32), @Const(h16), @Const(m16),
                                   @Const(live_d), @Const(Esc), @Const(Gsc),
-                                  B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                                  B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                  efloor::Float32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = B * B * B
@@ -54,7 +55,13 @@ end
         idx = base + _lidx(i, j, k, nd)
         esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
         ge_old = Float32(Ge[idx]) * gsc
-        ge_new = e32[Int32(t)] * rho32[Int32(t)]
+        # CMB temperature floor on the specific internal energy: in a hypersonic
+        # f16 collapse the deep core's Ge decays to the chem MIN_TEMPERATURE (1 K,
+        # sub-CMB) — unphysical (gas can't Compton-cool below the CMB).  efloor is
+        # the code specific-energy at T_CMB(z); 0 disables (library default).
+        en = e32[Int32(t)]
+        en < efloor && (en = efloor)
+        ge_new = en * rho32[Int32(t)]
         Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
         Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
         sp1[idx] = h16[Int32(t)]
@@ -131,9 +138,19 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
             error("chem NaN: $nb cells at level $l")
         end
     end
+    # CMB specific-energy floor (code units) at the current redshift, μ=1.22
+    # (neutral primordial).  T_CMB = 2.725·(1+z) = 2.725/a; T2 = (l/t)²·mH/kB.
+    # Gated by BAM_TCMB_FLOOR (multiple of T_CMB; unset/0 ⇒ disabled).
+    tcmb_mult = parse(Float64, get(ENV, "BAM_TCMB_FLOOR", "0"))
+    efloor = 0.0f0
+    if tcmb_mult > 0
+        T_cmb = tcmb_mult * 2.725 / a_value
+        T2 = (length_units / time_units)^2 * 1.21148e-8   # K per code specific-energy
+        efloor = Float32(T_cmb / ((hier.gamma - 1) * 1.22 * T2))
+    end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
                              rho32, e32, h16, m16, lev.live_d, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                             Int32(lev.stride); ndrange = n)
+                             Int32(lev.stride), efloor; ndrange = n)
     return nothing
 end
