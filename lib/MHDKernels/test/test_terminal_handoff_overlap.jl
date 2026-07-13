@@ -50,4 +50,25 @@ end
     @test _limit_source_dt(0.5, 1.0, 1.0) == (dt=0.5, limited=false)
 end
 
+@testset "hybrid aware cadence retains explicit MHD subcycles" begin
+    @test _limit_hybrid_aware_dt(16.0, 1.0, 4.0) ==
+          (dt=4.0, nsub=4, limited=true)
+    @test _limit_hybrid_aware_dt(4.0, 1.0, 16.0) ==
+          (dt=4.0, nsub=4, limited=false)
+end
+
+@testset "cosmological and hydro clocks preserve drag impulse" begin
+    gamma = 3.2e-11
+    dtphys = 4.5e9
+    dtau = 0.03
+    vunit = 8.0e5
+    lbox = 6.0 * _PMF_KPC_CM
+    amid = 2.5e-4
+    dth = _hydro_code_dt(dtphys, dtau, vunit, lbox, amid)
+    gamma_h = _terminal_gamma_code(gamma, dtphys, dtau, vunit, lbox, amid)
+    @test gamma_h * dth ≈ gamma * dtphys rtol=2e-15
+    @test _hydro_code_dt(dtphys, dtau, vunit, NaN, amid) == dtau
+    @test _hydro_subinterval(dth, dtau, 0.25dtau) ≈ 0.25dth rtol=2e-15
+end
+
 end

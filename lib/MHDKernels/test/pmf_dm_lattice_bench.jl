@@ -1411,6 +1411,12 @@ function _limit_source_dt(dt::Real, dt_explicit::Real, max_factor::Real)
     return (dt=Float64(dt), limited=false)
 end
 
+function _limit_hybrid_aware_dt(dt::Real, dt_explicit::Real, max_factor::Real)
+    limited_dt = min(Float64(dt), Float64(max_factor * dt_explicit))
+    nsub = max(1, ceil(Int, limited_dt / max(Float64(dt_explicit), eps(Float64))))
+    return (dt=limited_dt, nsub=nsub, limited=limited_dt < dt)
+end
+
 function _terminal_implicit_diffuse_B!(s, coeff_cells2::Real)
     coeff = Float64(coeff_cells2)
     if !(isfinite(coeff) && coeff > 0)
@@ -1979,8 +1985,28 @@ function _terminal_gamma_code(gamma_drag, dtphys, dtcode, vunit, lbox_comoving_c
         return gamma_drag * dtphys / max(dtcode, eps(Float64))
     end
     lphys = lbox_comoving_cm * amid
-    coeff = dtphys * vunit^2 / max(gamma_drag * lphys^2, eps(Float64))
-    return dtcode / max(coeff, eps(Float64))
+    return gamma_drag * lphys / max(vunit, eps(Float64))
+end
+
+function _hydro_time_per_tau(a, h, vunit, lbox_comoving_cm)
+    if !(isfinite(lbox_comoving_cm) && lbox_comoving_cm > 0)
+        return 1.0
+    end
+    H0 = 100.0 * h * 1.0e5 / 3.0857e24
+    return a * vunit / (H0 * lbox_comoving_cm)
+end
+
+function _hydro_code_dt(dtphys, dtau, vunit, lbox_comoving_cm, amid)
+    if !(isfinite(lbox_comoving_cm) && lbox_comoving_cm > 0)
+        return Float64(dtau)
+    end
+    lphys = lbox_comoving_cm * amid
+    return Float64(dtphys) * vunit / lphys
+end
+
+@inline function _hydro_subinterval(dt_hydro, dtau, sub_dtau)
+    return Float64(dt_hydro) * Float64(sub_dtau) /
+           max(Float64(dtau), eps(Float64))
 end
 
 @inline function _drag_impulse(gamma_drag, dtphys, dtcode, rate_code)
@@ -2164,7 +2190,9 @@ function main()
     Ok = 1.0 - Om - OL - Or
     Ob = parse(Float64, get(ENV, "MHD_OB", string(0.17037 * Om)))
     maxexp = parse(Float64, get(ENV, "MHD_MAXEXP", "0.01"))
-    source_max_dt_factor = parse(Float64, get(ENV, "MHD_SOURCE_MAX_DT_FACTOR", "Inf"))
+    # Source factor 1 is the corrected-clock science reference.  Larger factors
+    # are explicit performance experiments and must pass the cadence gate.
+    source_max_dt_factor = parse(Float64, get(ENV, "MHD_SOURCE_MAX_DT_FACTOR", "1.0"))
     source_max_dt_factor >= 1 || error("MHD_SOURCE_MAX_DT_FACTOR must be >= 1")
     maxcycles = parse(Int, get(ENV, "MHD_MAX_CYCLES", "100000000"))
     print_every = parse(Int, get(ENV, "MHD_PRINT_EVERY", "100"))
@@ -2270,7 +2298,7 @@ function main()
     hybrid_reenter_terminal = get(ENV, "MHD_HYBRID_REENTER_TERMINAL", "0") in
                               ("1", "true", "TRUE", "yes", "on")
     hybrid_aware_dt_factor = parse(Float64, get(ENV, "MHD_HYBRID_AWARE_DT_FACTOR", "1.0"))
-    0 < hybrid_aware_dt_factor <= 1 || error("MHD_HYBRID_AWARE_DT_FACTOR must be in (0,1]")
+    hybrid_aware_dt_factor > 0 || error("MHD_HYBRID_AWARE_DT_FACTOR must be positive")
     brms = parse(Float64, get(ENV, "MHD_PMF_BRMS", "1e-3"))
     pmf_b0_ng_env = get(ENV, "MHD_PMF_B0_NG", "")
     pmf_init = Symbol(lowercase(get(ENV, "MHD_PMF_INIT", "batchelor")))
@@ -2652,8 +2680,11 @@ function main()
         dt0 = dt0_ref[]
         smax = smax_ref[]
         ch = T(glm_ch_fac) * T(smax)
-        dt = Float64(dt0) * Float64(smax) / Float64(max(T(smax), ch))
-        dt_explicit = dt
+        dt_hydro_explicit = Float64(dt0) * Float64(smax) / Float64(max(T(smax), ch))
+        hydro_per_tau = zrun ? _hydro_time_per_tau(a, hub, chem_vunit,
+                                                   terminal_lbox_cm) : 1.0
+        dt_explicit = dt_hydro_explicit / hydro_per_tau
+        dt = dt_explicit
         if drag_enabled && drag_dt_mode in (:boost, :subcycle, :semiimplicit, :aware, :terminal, :hybrid) && drag_dt_boost > 1
             dt *= drag_dt_boost
             boosted_steps += 1
@@ -2695,6 +2726,9 @@ function main()
         zsource = zrun ? a_to_z(0.5 * (a_before + a_after_step)) : 0.0
         dtphys_source = zrun ? _cosmic_dt_seconds(a_before, a_after_step, hub, Om, OL, Or) :
                         dt * chem_time_unit
+        dt_hydro = zrun ? _hydro_code_dt(dtphys_source, dt, chem_vunit,
+                                         terminal_lbox_cm,
+                                         0.5 * (a_before + a_after_step)) : dt
         tdrag = 0.0
         tm = 0.0
         tgp = 0.0
@@ -2739,15 +2773,22 @@ function main()
             if use_terminal
                 nsub = 1
                 last_nsub = nsub
-            elseif dt > dt_explicit * hybrid_aware_dt_factor
-                dt = dt_explicit * hybrid_aware_dt_factor
-                last_dt = dt
-                nsub = 1
+            else
+                aware_step = _limit_hybrid_aware_dt(dt, dt_explicit,
+                                                     hybrid_aware_dt_factor)
+                nsub = aware_step.nsub
                 last_nsub = nsub
+            end
+            if !use_terminal && aware_step.limited
+                dt = aware_step.dt
+                last_dt = dt
                 a_after_step = zrun ? _advance_a_rk2(Om, OL, Ok, Or, a, dt, a_end) : 1.0
                 zsource = zrun ? a_to_z(0.5 * (a_before + a_after_step)) : 0.0
                 dtphys_source = zrun ? _cosmic_dt_seconds(a_before, a_after_step, hub, Om, OL, Or) :
                                 dt * chem_time_unit
+                dt_hydro = zrun ? _hydro_code_dt(dtphys_source, dt, chem_vunit,
+                                                 terminal_lbox_cm,
+                                                 0.5 * (a_before + a_after_step)) : dt
                 if drag_enabled
                     drag_xe = isfinite(drag_xe_fixed) ? drag_xe_fixed :
                               _drag_electron_fraction(evolving_xe_mean, zsource, hub, Ob,
@@ -2816,10 +2857,11 @@ function main()
                              (4 * terminal_accuracy_pressure * max(kacc * kacc, eps(Float64)))
                     dt_terminal_limit = min(dt_terminal_limit, dt_acc)
                 end
-                if dt <= dt_terminal_limit * (1 + 1e-6)
+                if dt_hydro <= dt_terminal_limit * (1 + 1e-6)
                     break
                 end
-                dt = max(dt_terminal_limit, 8eps(Float64) * max(1.0, abs(dt)))
+                dt *= dt_terminal_limit / dt_hydro
+                dt = max(dt, 8eps(Float64) * max(1.0, abs(dt)))
                 last_dt = dt
                 nsub = 1
                 last_nsub = nsub
@@ -2827,6 +2869,9 @@ function main()
                 zsource = zrun ? a_to_z(0.5 * (a_before + a_after_step)) : 0.0
                 dtphys_source = zrun ? _cosmic_dt_seconds(a_before, a_after_step, hub, Om, OL, Or) :
                                 dt * chem_time_unit
+                dt_hydro = zrun ? _hydro_code_dt(dtphys_source, dt, chem_vunit,
+                                                 terminal_lbox_cm,
+                                                 0.5 * (a_before + a_after_step)) : dt
                 if drag_enabled
                     drag_xe = isfinite(drag_xe_fixed) ? drag_xe_fixed :
                               _drag_electron_fraction(evolving_xe_mean, zsource, hub, Ob,
@@ -2856,7 +2901,7 @@ function main()
             vcap_step = terminal_vcap
             tm += _time_phase(be_mhd, be_p) do
                 if terminal_pressure_implicit
-                    result = _terminal_pressure_implicit_step!(be_mhd, s, dt, gamma_code,
+                    result = _terminal_pressure_implicit_step!(be_mhd, s, dt_hydro, gamma_code,
                                                                vcap_step, terminal_pressure_coeff,
                                                                terminal_rho_rel_limit,
                                                                terminal_b_rel_limit;
@@ -2875,16 +2920,16 @@ function main()
                     tvy = terminal_dedicated_scratch ? terminal_tvy : ρtot
                     tvz = terminal_dedicated_scratch ? terminal_tvz :
                           (φ === ρtot && eint !== nothing) ? eint : φ
-                    _terminal_velocity_step_cached!(be_mhd, s, dt, gamma_code, vcap_step,
+                    _terminal_velocity_step_cached!(be_mhd, s, dt_hydro, gamma_code, vcap_step,
                                                     tvx, tvy, tvz, terminal_vsmooth)
                 else
-                    _terminal_velocity_step!(be_mhd, s, dt, gamma_code, vcap_step)
+                    _terminal_velocity_step!(be_mhd, s, dt_hydro, gamma_code, vcap_step)
                 end
             end
             if terminal_implicit_diffuse
                 tm += _time_phase(be_mhd, be_p) do
                     br_step = _device_brms!(be_mhd, s, s.scratch[1])
-                    coeff = terminal_implicit_diffuse_fac * dt * br_step^2 /
+                    coeff = terminal_implicit_diffuse_fac * dt_hydro * br_step^2 /
                             max(gamma_code, eps(Float64)) / max(Float64(s.dx)^2, eps(Float64))
                     last_terminal_diffuse_coeff = coeff
                     _terminal_implicit_diffuse_B!(s, coeff)
@@ -2907,7 +2952,7 @@ function main()
                 end
             end
             for _ in 1:nsub
-                dtsub = dt / nsub
+                dtsub = dt_hydro / nsub
                 exponential_drag = drag_enabled &&
                                    drag_dt_mode in (:aware, :semiimplicit, :hybrid)
                 if drag_enabled && !exponential_drag
@@ -2953,7 +2998,7 @@ function main()
                 last_handoff_terminal_v_rms = overlap.terminal_v_rms
                 last_handoff_full_v_rms = overlap.full_v_rms
                 handoff_index = handoff_steps_done + 1
-                raw_handoff_displacement = overlap.delta_v_rms * dt / Float64(s.dx)
+                raw_handoff_displacement = overlap.delta_v_rms * dt_hydro / Float64(s.dx)
                 last_handoff_displacement = handoff_alpha_step * raw_handoff_displacement
                 max_handoff_displacement = max(max_handoff_displacement,
                                                last_handoff_displacement)
@@ -3079,7 +3124,7 @@ function main()
             if grav_dm_weight == 0
                 ta += _time_phase(be_p, be_mhd) do
                     if gravity_midpoint_source
-                        MHDKernels.predict_density_backward!(ρtot, s, 0.5 * dt)
+                        MHDKernels.predict_density_backward!(ρtot, s, 0.5 * dt_hydro)
                         _assemble_total_delta_k!(be_p)(ρtot, ρtot, ρdm,
                                                        grav_gas_weight, grav_dm_weight, Int(N);
                                                        ndrange=ncells)
@@ -3148,7 +3193,8 @@ function main()
                     ta += _time_phase(be_p, be_mhd) do
                         if gravity_midpoint_source && grav_gas_weight != 0
                             dt_back = dt - (ig - 0.5) * dtdm
-                            MHDKernels.predict_density_backward!(ρtot, s, dt_back)
+                            dt_back_hydro = _hydro_subinterval(dt_hydro, dt, dt_back)
+                            MHDKernels.predict_density_backward!(ρtot, s, dt_back_hydro)
                             _assemble_total_delta_k!(be_p)(ρtot, ρtot, ρdm,
                                                            grav_gas_weight, grav_dm_weight, Int(N);
                                                            ndrange=ncells)
@@ -3384,6 +3430,7 @@ function main()
                                   "hubble_h","omega_m","omega_l","omega_r",
                                   "pmf_kcut","pmf_kmax","pmf_hard_cutoff",
                                   "pmf_mode_lock_n","pmf_seed","pmf_min_cells_per_wavelength",
+                                  "boxsize","pk_nbins",
                                   "glm_project_every","glm_projection_steps",
                                   "drag","drag_dt_mode","drag_dt_boost","drag_boosted_steps",
                                   "drag_subcycles_total","drag_last_nsub","drag_last_f","drag_last_gamma_over_H","drag_xe",
@@ -3436,6 +3483,7 @@ function main()
                               kcut, pmf_kmax === nothing ? "" : pmf_kmax, pmf_kmax !== nothing,
                               pmf_mode_lock_n === nothing ? 0 : pmf_mode_lock_n, seed,
                               pmf_min_cells_per_wavelength,
+                              boxsize, pk_nbins,
                               glm_project_every, glm_projection_steps,
                               drag_enabled, String(drag_dt_mode),
                               drag_dt_boost, boosted_steps, subcycles_total, last_nsub,
