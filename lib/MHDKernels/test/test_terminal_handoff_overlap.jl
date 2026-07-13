@@ -44,4 +44,10 @@ end
     @test 0.45 < alpha[32] < 0.55
 end
 
+@testset "source cadence limits the outer MHD step" begin
+    @test _limit_source_dt(8.0, 1.0, Inf) == (dt=8.0, limited=false)
+    @test _limit_source_dt(8.0, 1.0, 4.0) == (dt=4.0, limited=true)
+    @test _limit_source_dt(0.5, 1.0, 1.0) == (dt=0.5, limited=false)
+end
+
 end

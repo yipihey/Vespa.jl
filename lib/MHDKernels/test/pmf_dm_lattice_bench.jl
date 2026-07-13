@@ -1404,6 +1404,13 @@ function _hybrid_handoff_alpha(alpha_max::Real, remaining::Int, total::Int)
     return Float64(alpha_max) * 0.5 * (1.0 + cos(pi * progress))
 end
 
+function _limit_source_dt(dt::Real, dt_explicit::Real, max_factor::Real)
+    if isfinite(max_factor) && dt > max_factor * dt_explicit
+        return (dt=Float64(max_factor * dt_explicit), limited=true)
+    end
+    return (dt=Float64(dt), limited=false)
+end
+
 function _terminal_implicit_diffuse_B!(s, coeff_cells2::Real)
     coeff = Float64(coeff_cells2)
     if !(isfinite(coeff) && coeff > 0)
@@ -2157,6 +2164,8 @@ function main()
     Ok = 1.0 - Om - OL - Or
     Ob = parse(Float64, get(ENV, "MHD_OB", string(0.17037 * Om)))
     maxexp = parse(Float64, get(ENV, "MHD_MAXEXP", "0.01"))
+    source_max_dt_factor = parse(Float64, get(ENV, "MHD_SOURCE_MAX_DT_FACTOR", "Inf"))
+    source_max_dt_factor >= 1 || error("MHD_SOURCE_MAX_DT_FACTOR must be >= 1")
     maxcycles = parse(Int, get(ENV, "MHD_MAX_CYCLES", "100000000"))
     print_every = parse(Int, get(ENV, "MHD_PRINT_EVERY", "100"))
     cycle_print_every = parse(Int, get(ENV, "MHD_CYCLE_PRINT_EVERY", "1"))
@@ -2535,6 +2544,7 @@ function main()
     last_handoff_displacement = NaN
     max_handoff_displacement = 0.0
     cumulative_handoff_displacement = 0.0
+    source_limited_steps = 0
     last_terminal_diffuse_coeff = 0.0
     last_terminal_vmax = NaN
     last_induction_nsub = 0
@@ -2578,9 +2588,9 @@ function main()
                 pmf_b0_ng, brms, zrun ? zstart : parse(Float64, get(ENV, "MHD_PMF_B0_ZREF", "3000")), chem_vunit)
         flush(stdout)
     end
-    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s gas_kick=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha_max=%.3f hybrid_handoff_ramp=cosine hybrid_handoff_error_tol=%.3e hybrid_handoff_displacement_tol=%.3e hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
+    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s source_max_dt_factor=%.3g recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s gas_kick=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha_max=%.3f hybrid_handoff_ramp=cosine hybrid_handoff_error_tol=%.3e hybrid_handoff_displacement_tol=%.3e hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
             String(BACKEND_NAME), N, steps, warmup, tfinal === nothing ? "cycle-count" : string(tfinal),
-            zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
+            zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off", source_max_dt_factor,
             String(recon), String(riemann), glm_ch_fac, glm_cr, String(pmf_init), pmf_kmode, brms, p0, pfloor,
             va_rms / max(cs_floor, eps(Float64)), kcut,
             pmf_kmax === nothing ? "none" : @sprintf("%.6g", pmf_kmax),
@@ -2667,6 +2677,9 @@ function main()
         if tfinal !== nothing && cyc > warmup && elapsed_time + dt > tfinal
             dt = tfinal - elapsed_time
         end
+        source_dt = _limit_source_dt(dt, dt_explicit, source_max_dt_factor)
+        dt = source_dt.dt
+        source_limited_steps += source_dt.limited
         _assert_finite_step(s, "pre-step", cyc, zrun ? a : NaN, dt, smax)
         last_dt = dt
         last_dt_explicit = dt_explicit
@@ -3323,6 +3336,8 @@ function main()
             100*phase[:gas_gravity]/total, 100*phase[:push]/total)
     @printf("GLM: ch_fac=%.6g cr=%.6g project_every=%d projections=%d\n",
             glm_ch_fac, glm_cr, glm_project_every, glm_projection_steps)
+    @printf("SOURCE_CADENCE: max_dt_factor=%.6g limited_steps=%d\n",
+            source_max_dt_factor, source_limited_steps)
     terminal_denom = max(terminal_measured, 1)
     @printf("TERMINAL measured_cycles=%d s/terminal-cycle: force %.6f | pressure_fft %.6f | finalize %.6f | induction %.6f | projection %.6f\n",
             terminal_measured, terminal_phase[:force]/terminal_denom,
@@ -3365,6 +3380,7 @@ function main()
             if !exists
                 println(io, join(("timestamp","backend","N","recon","riemann","glm_ch_fac","glm_cr",
                                   "chem","chem_rate_tables","chem_itcap","chem_dtfrac",
+                                  "source_max_dt_factor","source_limited_steps",
                                   "hubble_h","omega_m","omega_l","omega_r",
                                   "pmf_kcut","pmf_kmax","pmf_hard_cutoff",
                                   "pmf_mode_lock_n","pmf_seed","pmf_min_cells_per_wavelength",
@@ -3415,7 +3431,8 @@ function main()
             println(io, join((Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS"),
                               String(BACKEND_NAME), N, String(recon), String(riemann),
                               glm_ch_fac, glm_cr, String(chem_mode), chem_rate_tables_enabled,
-                              chem_itcap, chem_dtfrac, hub, Om, OL, Or,
+                              chem_itcap, chem_dtfrac, source_max_dt_factor,
+                              source_limited_steps, hub, Om, OL, Or,
                               kcut, pmf_kmax === nothing ? "" : pmf_kmax, pmf_kmax !== nothing,
                               pmf_mode_lock_n === nothing ? 0 : pmf_mode_lock_n, seed,
                               pmf_min_cells_per_wavelength,
