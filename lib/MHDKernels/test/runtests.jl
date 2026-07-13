@@ -168,6 +168,7 @@ end
 end
 
 include("test_terminal_ct.jl")
+include("test_terminal_handoff_overlap.jl")
 
 @testset "magnetic field-loop advection" begin
     N = 64

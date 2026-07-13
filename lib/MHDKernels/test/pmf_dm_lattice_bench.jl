@@ -629,6 +629,27 @@ end
     end
 end
 
+@kernel function _terminal_velocity_overlap_diag_k!(delta2, terminal2, full2,
+                                                    @Const(rho), @Const(mx), @Const(my), @Const(mz),
+                                                    @Const(tvx), @Const(tvy), @Const(tvz), smallr)
+    c = @index(Global)
+    @inbounds begin
+        r = max(rho[c], smallr)
+        vx = mx[c] / r
+        vy = my[c] / r
+        vz = mz[c] / r
+        tx = tvx[c]
+        ty = tvy[c]
+        tz = tvz[c]
+        dx = vx - tx
+        dy = vy - ty
+        dz = vz - tz
+        delta2[c] = r * (dx * dx + dy * dy + dz * dz)
+        terminal2[c] = r * (tx * tx + ty * ty + tz * tz)
+        full2[c] = r * (vx * vx + vy * vy + vz * vz)
+    end
+end
+
 @kernel function _terminal_velocity_update_cached_k!(orho, omx, omy, omz, oE, oBx, oBy, oBz, opsi,
                                                      @Const(rho), @Const(mx), @Const(my), @Const(mz), @Const(E),
                                                      @Const(Bx), @Const(By), @Const(Bz), @Const(psi),
@@ -1336,7 +1357,8 @@ end
     end
 end
 
-function _terminal_handoff_momenta!(be, s, gamma_code::Real, vcap::Real, alpha::Real)
+function _terminal_handoff_momenta!(be, s, gamma_code::Real, vcap::Real, alpha::Real;
+                                    measure::Bool=false)
     tvx = s.scratch[2]
     tvy = s.scratch[3]
     tvz = s.scratch[4]
@@ -1346,13 +1368,40 @@ function _terminal_handoff_momenta!(be, s, gamma_code::Real, vcap::Real, alpha::
                                     T(gamma_code), T(s.γ), T(s.smallr), T(1e-30), T(vcap);
                                     ndrange=length(s.U[1]))
     KA.synchronize(be)
+    overlap = (relative=NaN, delta_v_rms=NaN, terminal_v_rms=NaN, full_v_rms=NaN)
+    if measure
+        delta2 = s.scratch[1]
+        terminal2 = s.scratch[5]
+        full2 = s.scratch[9]
+        _terminal_velocity_overlap_diag_k!(be)(delta2, terminal2, full2,
+                                               s.U[1], s.U[2], s.U[3], s.U[4],
+                                               tvx, tvy, tvz, T(s.smallr);
+                                               ndrange=length(s.U[1]))
+        KA.synchronize(be)
+        n = Float64(length(s.U[1]))
+        d2 = max(Float64(sum(delta2)), 0.0)
+        t2 = max(Float64(sum(terminal2)), 0.0)
+        f2 = max(Float64(sum(full2)), 0.0)
+        scale2 = 0.5 * (t2 + f2)
+        relative = scale2 > eps(Float64) ? sqrt(d2 / scale2) : 0.0
+        overlap = (relative=relative,
+                   delta_v_rms=sqrt(d2 / n),
+                   terminal_v_rms=sqrt(t2 / n),
+                   full_v_rms=sqrt(f2 / n))
+    end
     _terminal_handoff_momenta_cached_k!(be)(s.U[2], s.U[3], s.U[4], s.U[5],
                                             s.U[1], s.U[6], s.U[7], s.U[8],
                                             tvx, tvy, tvz,
                                             T(s.smallr), T(1e-30), T(alpha);
                                             ndrange=length(s.U[1]))
     KA.synchronize(be)
-    return nothing
+    return overlap
+end
+
+function _hybrid_handoff_alpha(alpha_max::Real, remaining::Int, total::Int)
+    total <= 1 && return Float64(alpha_max)
+    progress = clamp(Float64(total - remaining) / Float64(total - 1), 0.0, 1.0)
+    return Float64(alpha_max) * 0.5 * (1.0 + cos(pi * progress))
 end
 
 function _terminal_implicit_diffuse_B!(s, coeff_cells2::Real)
@@ -2201,6 +2250,14 @@ function main()
     hybrid_handoff_steps >= 0 || error("MHD_HYBRID_HANDOFF_STEPS must be non-negative")
     hybrid_handoff_alpha = parse(Float64, get(ENV, "MHD_HYBRID_HANDOFF_ALPHA", "0.0"))
     0 <= hybrid_handoff_alpha <= 1 || error("MHD_HYBRID_HANDOFF_ALPHA must be in [0,1]")
+    hybrid_handoff_error_tol = parse(Float64, get(ENV, "MHD_HYBRID_HANDOFF_ERROR_TOL", "Inf"))
+    hybrid_handoff_error_tol > 0 || error("MHD_HYBRID_HANDOFF_ERROR_TOL must be positive")
+    hybrid_handoff_displacement_tol = parse(Float64,
+        get(ENV, "MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL", "0.02"))
+    hybrid_handoff_displacement_tol > 0 ||
+        error("MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL must be positive")
+    hybrid_handoff_diag_every = parse(Int, get(ENV, "MHD_HYBRID_HANDOFF_DIAG_EVERY", "8"))
+    hybrid_handoff_diag_every >= 1 || error("MHD_HYBRID_HANDOFF_DIAG_EVERY must be positive")
     hybrid_reenter_terminal = get(ENV, "MHD_HYBRID_REENTER_TERMINAL", "0") in
                               ("1", "true", "TRUE", "yes", "on")
     hybrid_aware_dt_factor = parse(Float64, get(ENV, "MHD_HYBRID_AWARE_DT_FACTOR", "1.0"))
@@ -2469,6 +2526,15 @@ function main()
     handoff_steps_done = 0
     last_handoff_remaining = 0
     last_handoff_alpha = 0.0
+    last_handoff_error = NaN
+    max_handoff_error = NaN
+    max_handoff_settled_error = NaN
+    last_handoff_delta_v_rms = NaN
+    last_handoff_terminal_v_rms = NaN
+    last_handoff_full_v_rms = NaN
+    last_handoff_displacement = NaN
+    max_handoff_displacement = 0.0
+    cumulative_handoff_displacement = 0.0
     last_terminal_diffuse_coeff = 0.0
     last_terminal_vmax = NaN
     last_induction_nsub = 0
@@ -2512,7 +2578,7 @@ function main()
                 pmf_b0_ng, brms, zrun ? zstart : parse(Float64, get(ENV, "MHD_PMF_B0_ZREF", "3000")), chem_vunit)
         flush(stdout)
     end
-    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s gas_kick=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha=%.3f hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
+    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s gas_kick=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha_max=%.3f hybrid_handoff_ramp=cosine hybrid_handoff_error_tol=%.3e hybrid_handoff_displacement_tol=%.3e hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
             String(BACKEND_NAME), N, steps, warmup, tfinal === nothing ? "cycle-count" : string(tfinal),
             zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
             String(recon), String(riemann), glm_ch_fac, glm_cr, String(pmf_init), pmf_kmode, brms, p0, pfloor,
@@ -2532,7 +2598,9 @@ function main()
             string(terminal_implicit_diffuse), terminal_implicit_diffuse_fac,
             string(terminal_pressure_implicit), terminal_pressure_coeff,
             terminal_rho_rel_limit, terminal_b_rel_limit,
-            hybrid_handoff_steps, hybrid_handoff_alpha, string(hybrid_reenter_terminal),
+            hybrid_handoff_steps, hybrid_handoff_alpha, hybrid_handoff_error_tol,
+            hybrid_handoff_displacement_tol,
+            string(hybrid_reenter_terminal),
             hybrid_aware_dt_factor)
     @printf("  terminal induction=%s cfl=%.3f dissipation=%.3f/order%d project_b=%s max_subcycles=%d\n",
             string(terminal_induction), terminal_induction_cfl, terminal_induction_dissipation,
@@ -2695,9 +2763,11 @@ function main()
         end
         if drag_dt_mode === :hybrid && was_terminal && !use_terminal
             handoff_events += 1
-            @printf("  hybrid handoff start cycle=%d z=%.6f G/omA=%.3e va/cs=%.3e steps=%d alpha=%.3f\n",
+            cumulative_handoff_displacement = 0.0
+            @printf("  hybrid handoff start cycle=%d z=%.6f G/omA=%.3e va/cs=%.3e steps=%d alpha_max=%.3f ramp=cosine error_tol=%.3e displacement_tol=%.3e\n",
                     cyc, zrun ? a_to_z(a_before) : NaN, last_hybrid_drag_omega,
-                    last_hybrid_va_cs, hybrid_handoff_steps, hybrid_handoff_alpha)
+                    last_hybrid_va_cs, hybrid_handoff_steps, hybrid_handoff_alpha,
+                    hybrid_handoff_error_tol, hybrid_handoff_displacement_tol)
             flush(stdout)
             if hybrid_handoff_steps > 0
                 handoff_remaining = max(handoff_remaining, hybrid_handoff_steps)
@@ -2767,7 +2837,7 @@ function main()
         end
         was_terminal = use_terminal
         last_handoff_remaining = handoff_remaining
-        last_handoff_alpha = handoff_remaining > 0 ? hybrid_handoff_alpha : 0.0
+        last_handoff_alpha = 0.0
         subcycles_total += nsub
         if use_terminal
             vcap_step = terminal_vcap
@@ -2810,13 +2880,18 @@ function main()
                 last_terminal_diffuse_coeff = 0.0
             end
         else
+            handoff_active_this_step = handoff_remaining > 0
+            handoff_alpha_step = 0.0
             if handoff_remaining > 0
                 vcap_step = terminal_vcap
+                handoff_alpha_step = _hybrid_handoff_alpha(hybrid_handoff_alpha,
+                                                           handoff_remaining,
+                                                           hybrid_handoff_steps)
+                last_handoff_alpha = handoff_alpha_step
                 tdrag += _time_phase(be_mhd, be_p) do
-                    _terminal_handoff_momenta!(be_mhd, s, gamma_code, vcap_step, hybrid_handoff_alpha)
+                    _terminal_handoff_momenta!(be_mhd, s, gamma_code, vcap_step,
+                                               handoff_alpha_step)
                 end
-                handoff_remaining -= 1
-                handoff_steps_done += 1
             end
             for _ in 1:nsub
                 dtsub = dt / nsub
@@ -2849,6 +2924,46 @@ function main()
                     _project_mhd_b!(be_mhd, s)
                 end
                 glm_projection_steps += 1
+            end
+            if handoff_active_this_step
+                overlap = nothing
+                tdrag += _time_phase(be_mhd, be_p) do
+                    overlap = _terminal_handoff_momenta!(be_mhd, s, gamma_code, terminal_vcap,
+                                                         0.0; measure=true)
+                end
+                last_handoff_error = overlap.relative
+                max_handoff_error = isnan(max_handoff_error) ? overlap.relative :
+                                    max(max_handoff_error, overlap.relative)
+                max_handoff_settled_error = isnan(max_handoff_settled_error) ? overlap.relative :
+                                            max(max_handoff_settled_error, overlap.relative)
+                last_handoff_delta_v_rms = overlap.delta_v_rms
+                last_handoff_terminal_v_rms = overlap.terminal_v_rms
+                last_handoff_full_v_rms = overlap.full_v_rms
+                handoff_index = handoff_steps_done + 1
+                raw_handoff_displacement = overlap.delta_v_rms * dt / Float64(s.dx)
+                last_handoff_displacement = handoff_alpha_step * raw_handoff_displacement
+                max_handoff_displacement = max(max_handoff_displacement,
+                                               last_handoff_displacement)
+                cumulative_handoff_displacement += last_handoff_displacement
+                if handoff_index == 1 || handoff_remaining == 1 ||
+                   handoff_index % hybrid_handoff_diag_every == 0
+                    @printf("  hybrid overlap step=%d remaining=%d alpha=%.6f rel=%.6e dv_rms=%.6e vt_rms=%.6e vf_rms=%.6e raw_dcell=%.6e correction_dcell=%.6e sum_correction_dcell=%.6e\n",
+                            handoff_index, handoff_remaining, handoff_alpha_step, overlap.relative,
+                            overlap.delta_v_rms, overlap.terminal_v_rms, overlap.full_v_rms,
+                            raw_handoff_displacement, last_handoff_displacement,
+                            cumulative_handoff_displacement)
+                    flush(stdout)
+                end
+                overlap.relative <= hybrid_handoff_error_tol ||
+                    error("hybrid handoff velocity mismatch $(overlap.relative) exceeds " *
+                          "MHD_HYBRID_HANDOFF_ERROR_TOL=$(hybrid_handoff_error_tol)")
+                cumulative_handoff_displacement <= hybrid_handoff_displacement_tol ||
+                    error("hybrid handoff accumulated correction displacement " *
+                          "$(cumulative_handoff_displacement) cells exceeds " *
+                          "MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL=" *
+                          "$(hybrid_handoff_displacement_tol)")
+                handoff_remaining -= 1
+                handoff_steps_done += 1
             end
         end
         _debug_div("after_mhd", cyc, zrun ? a_before : 1.0)
@@ -3088,10 +3203,11 @@ function main()
             end
         end
         if cycle_print_every > 0 && (cyc <= warmup || cyc % cycle_print_every == 0)
-            @printf("cycle %3d%s dt=%.3e expdt=%.3e nsub=%d gsub=%d pvmax=%.3e pgmax=%.3e regime=%s handoff=%d va/cs=%.3e G/omA=%.3e idiff=%.3e drag %.4f f=%.6f G/H=%.3e  cfl %.4f mhd %.4f chem %.4f dep %.4f asm %.4f fft %.4f ggas %.4f push %.4f\n",
+            @printf("cycle %3d%s dt=%.3e expdt=%.3e nsub=%d gsub=%d pvmax=%.3e pgmax=%.3e regime=%s handoff=%d herr=%.3e va/cs=%.3e G/omA=%.3e idiff=%.3e drag %.4f f=%.6f G/H=%.3e  cfl %.4f mhd %.4f chem %.4f dep %.4f asm %.4f fft %.4f ggas %.4f push %.4f\n",
                     cyc, measuring ? "" : " warm", dt, dt_explicit, nsub, last_gravity_nsub,
                     last_particle_vmax, last_particle_gmax, last_hybrid_regime,
-                    last_handoff_remaining, last_hybrid_va_cs, last_hybrid_drag_omega,
+                    last_handoff_remaining, last_handoff_error,
+                    last_hybrid_va_cs, last_hybrid_drag_omega,
                     last_terminal_diffuse_coeff, tdrag, last_drag_f, last_drag_gammaH,
                     tcfl, tm, tc, td, ta, tf, tg, tp)
             flush(stdout)
@@ -3217,14 +3333,21 @@ function main()
     @printf("DIAG: Brms %.3e -> %.3e | divB*dx/Brms %.3e | delta_b_rms %.3e | delta_dm_rms %.3e\n",
             st.brms_measured, br, divn, δb, δdm)
     pmf_init === :magpressure && @printf("MODE: delta2k_amp %.8e\n", delta2k_final)
-    drag_enabled && @printf("DRAG: mode=%s regime=%s boost=%.3f boosted_steps=%d subcycles_total=%d last_nsub=%d last_explicit_dt=%.3e last_dt=%.3e last_f=%.8f last_Gamma_over_H=%.6e rate_code=%.6e xe_mode=%s last_xe=%.6e terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_vmax=%.3e induction_subcycles=%d last_induction_nsub=%d terminal_idiff_coeff=%.3e hybrid_va_cs=%.3e hybrid_drag_over_omega=%.3e handoff_events=%d handoff_steps=%d handoff_remaining=%d handoff_alpha=%.3f\n",
+    drag_enabled && @printf("DRAG: mode=%s regime=%s boost=%.3f boosted_steps=%d subcycles_total=%d last_nsub=%d last_explicit_dt=%.3e last_dt=%.3e last_f=%.8f last_Gamma_over_H=%.6e rate_code=%.6e xe_mode=%s last_xe=%.6e terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_vmax=%.3e induction_subcycles=%d last_induction_nsub=%d terminal_idiff_coeff=%.3e hybrid_va_cs=%.3e hybrid_drag_over_omega=%.3e handoff_events=%d handoff_steps=%d handoff_remaining=%d handoff_alpha_max=%.3f handoff_ramp=cosine handoff_alpha_last=%.3f handoff_error_last=%.6e handoff_error_max=%.6e handoff_error_settled_max=%.6e handoff_dv_rms=%.6e handoff_vt_rms=%.6e handoff_vf_rms=%.6e handoff_error_tol=%.6e handoff_correction_dcell_last=%.6e handoff_correction_dcell_max=%.6e handoff_correction_dcell_sum=%.6e handoff_correction_dcell_tol=%.6e\n",
                             String(drag_dt_mode), last_hybrid_regime, drag_dt_boost, boosted_steps, subcycles_total, last_nsub,
                             last_dt_explicit, last_dt, last_drag_f, last_drag_gammaH, drag_rate_code,
                             drag_xe_env, last_drag_xe,
                             terminal_gamma_scale, terminal_vcap, last_terminal_vmax,
                             induction_subcycles_total, last_induction_nsub, last_terminal_diffuse_coeff,
                             last_hybrid_va_cs, last_hybrid_drag_omega,
-                            handoff_events, handoff_steps_done, handoff_remaining, last_handoff_alpha)
+                            handoff_events, handoff_steps_done, handoff_remaining,
+                            hybrid_handoff_alpha, last_handoff_alpha,
+                            last_handoff_error, max_handoff_error, max_handoff_settled_error,
+                            last_handoff_delta_v_rms,
+                            last_handoff_terminal_v_rms, last_handoff_full_v_rms,
+                            hybrid_handoff_error_tol, last_handoff_displacement,
+                            max_handoff_displacement, cumulative_handoff_displacement,
+                            hybrid_handoff_displacement_tol)
     gravity && @printf("GRAVITY: source=%s gas_kick=%s weights=(gas %.6g, dm %.6g) midpoint_source=%s lattice_displacements=%s fixed_subcycles=%d dt_boost=%.3f particle_max_disp=%.6g last_particle_vmax=%.6e last_particle_gmax=%.6e subcycles_total=%d last_nsub=%d\n",
                        String(gravity_source), string(gravity_gas_kick),
                        Float64(grav_gas_weight), Float64(grav_dm_weight),
@@ -3268,7 +3391,14 @@ function main()
                                   "hybrid_regime","hybrid_va_cs","hybrid_drag_over_omega",
                                   "hybrid_exit_drag_over_omega","hybrid_enter_drag_over_omega",
                                   "hybrid_check_every","hybrid_confirm_checks","hybrid_reenter_terminal",
-                                  "hybrid_handoff_events","hybrid_handoff_steps_done","hybrid_handoff_remaining","hybrid_handoff_alpha",
+                                  "hybrid_handoff_events","hybrid_handoff_steps_done","hybrid_handoff_remaining",
+                                  "hybrid_handoff_alpha_max","hybrid_handoff_ramp","hybrid_handoff_alpha_last",
+                                  "hybrid_handoff_error_last","hybrid_handoff_error_max",
+                                  "hybrid_handoff_error_settled_max",
+                                  "hybrid_handoff_delta_v_rms","hybrid_handoff_terminal_v_rms",
+                                  "hybrid_handoff_full_v_rms","hybrid_handoff_error_tol",
+                                  "hybrid_handoff_correction_dcell_last","hybrid_handoff_correction_dcell_max",
+                                  "hybrid_handoff_correction_dcell_sum","hybrid_handoff_correction_dcell_tol",
                                   "brms0","brms","divBdx_over_brms","delta_b_rms","delta_dm_rms","delta2k_amp",
                                   "xHII_mean","xHII_min","xHII_max","fH2_mean","fH2_min","fH2_max",
                                   "cycles","measured_subcycles","measured_time","zstart","zend","final_z","total_s",
@@ -3312,7 +3442,14 @@ function main()
                               last_hybrid_regime, last_hybrid_va_cs, last_hybrid_drag_omega,
                               hybrid_exit_drag_omega, hybrid_enter_drag_omega,
                               hybrid_check_every, hybrid_confirm_checks, hybrid_reenter_terminal,
-                              handoff_events, handoff_steps_done, handoff_remaining, last_handoff_alpha,
+                              handoff_events, handoff_steps_done, handoff_remaining,
+                              hybrid_handoff_alpha, "cosine", last_handoff_alpha,
+                              last_handoff_error, max_handoff_error, max_handoff_settled_error,
+                              last_handoff_delta_v_rms,
+                              last_handoff_terminal_v_rms, last_handoff_full_v_rms,
+                              hybrid_handoff_error_tol, last_handoff_displacement,
+                              max_handoff_displacement, cumulative_handoff_displacement,
+                              hybrid_handoff_displacement_tol,
                               st.brms_measured, br, divn, δb, δdm, delta2k_final,
                               chemstats...,
                               measured, measured_subcycles, elapsed_time, zstart, zend, zrun ? a_to_z(a) : NaN,
