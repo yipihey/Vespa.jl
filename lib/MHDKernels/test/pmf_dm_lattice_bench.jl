@@ -2046,7 +2046,7 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
     br = _device_brms!(be_p, s, scratch)
     divn = _device_divb_norm!(be_p, s, scratch, br)
     δb = _device_delta_rms!(be_p, scratch, s.U[1], one(T))
-    δdm = gravity ? _device_delta_rms!(be_p, scratch, ρdm, one(T)) : 0.0
+    δdm = gravity ? _device_delta_rms!(be_p, scratch, ρdm, one(T)) : NaN
     chemstats = _device_species_stats!(be_p, scratch, s.U[1], HII, H2I, fh)
     thermalstats = _device_thermal_stats!(be_p, s, scratch)
     btrans = _device_component_rms!(be_p, scratch, s.U[7])
@@ -2232,6 +2232,8 @@ function main()
     fb = T(parse(Float64, get(ENV, "MHD_FB", "0.17037")))
     fdm = one(T) - fb
     gravity = parse(Bool, get(ENV, "MHD_GRAVITY", "true"))
+    gravity_gas_kick = get(ENV, "MHD_GRAVITY_GAS_KICK", "1") in
+                           ("1", "true", "TRUE", "yes", "on")
     gravity_subcycles_fixed = parse(Int, get(ENV, "MHD_GRAVITY_SUBCYCLES", "1"))
     gravity_subcycles_fixed >= 1 || error("MHD_GRAVITY_SUBCYCLES must be >= 1")
     gravity_dt_boost = parse(Float64, get(ENV, "MHD_GRAVITY_DT_BOOST", "0.0"))
@@ -2339,11 +2341,11 @@ function main()
     pdf_counts = isempty(pdf_path) ? nothing : PoissonKernels.device_zeros(be_p, Int32, (pdf_nbins,))
     mhd_integrator = BACKEND_NAME === :cpu ? :ref : :cube
     ncells = N^3
-    _log_line(@sprintf("CONFIG backend=%s N=%d ncells=%.3fM zrun=%s cosmology=(h=%.6g Om=%.6g OL=%.6g Or=%.6g) chem=%s rate_tables=%s gravity=%s source=%s phi_interp=%s midpoint_source=%s grav1buf=%s fft=%s particle_wrap=%s lattice_displacements=%s",
+    _log_line(@sprintf("CONFIG backend=%s N=%d ncells=%.3fM zrun=%s cosmology=(h=%.6g Om=%.6g OL=%.6g Or=%.6g) chem=%s rate_tables=%s gravity=%s gas_kick=%s source=%s phi_interp=%s midpoint_source=%s grav1buf=%s fft=%s particle_wrap=%s lattice_displacements=%s",
                        String(BACKEND_NAME), N, ncells/1e6,
                        zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
                        hub, Om, OL, Or, String(chem_mode), string(chem_rate_tables_enabled),
-                       string(gravity), String(gravity_source),
+                       string(gravity), string(gravity_gas_kick), String(gravity_source),
                        string(gravity_phi_interp), string(gravity_midpoint_source),
                        string(gravity_1buf), String(fft_mode),
                        string(particle_wrap), string(lattice_displacements)))
@@ -2438,7 +2440,7 @@ function main()
 
     phase = Dict(:cfl => 0.0, :mhd => 0.0, :glm_projection => 0.0,
                  :drag => 0.0, :deposit => 0.0, :assemble => 0.0,
-                 :fft => 0.0, :push => 0.0, :chem => 0.0)
+                 :fft => 0.0, :gas_gravity => 0.0, :push => 0.0, :chem => 0.0)
     glm_projection_steps = 0
     terminal_phase = Dict(:force => 0.0, :pressure_fft => 0.0, :finalize => 0.0,
                           :induction => 0.0, :projection => 0.0)
@@ -2510,14 +2512,14 @@ function main()
                 pmf_b0_ng, brms, zrun ? zstart : parse(Float64, get(ENV, "MHD_PMF_B0_ZREF", "3000")), chem_vunit)
         flush(stdout)
     end
-    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha=%.3f hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
+    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s gas_kick=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha=%.3f hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
             String(BACKEND_NAME), N, steps, warmup, tfinal === nothing ? "cycle-count" : string(tfinal),
             zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
             String(recon), String(riemann), glm_ch_fac, glm_cr, String(pmf_init), pmf_kmode, brms, p0, pfloor,
             va_rms / max(cs_floor, eps(Float64)), kcut,
             pmf_kmax === nothing ? "none" : @sprintf("%.6g", pmf_kmax),
             pmf_mode_lock_n === nothing ? "none" : string(pmf_mode_lock_n),
-            string(gravity), String(gravity_source),
+            string(gravity), string(gravity_gas_kick), String(gravity_source),
             string(gravity_phi_interp), string(gravity_midpoint_source),
             string(gravity_1buf), gravity_subcycles_fixed,
             gravity_dt_boost, particle_max_disp_cells, string(particle_wrap),
@@ -2928,7 +2930,7 @@ function main()
             end
         end
         _debug_div("after_chem", cyc, zrun ? a_before : 1.0)
-        td = ta = tf = tp = 0.0
+        td = ta = tf = tg = tp = 0.0
         if gravity
             ngrav = gravity_subcycles_fixed
             if gravity_dt_boost > 0
@@ -2970,6 +2972,11 @@ function main()
                         PoissonKernels.fft_poisson_rfft_ka!(φ, ρtot; G=gravcoef, a=1, boxsize=1)
                     else
                         PoissonKernels.fft_poisson_root_gpu!(φ, ρtot; G=gravcoef, a=1, boxsize=1)
+                    end
+                end
+                if gravity_gas_kick
+                    tg += _time_phase(be_mhd, be_p) do
+                        MHDKernels.apply_cell_center_gravity!(s, φ, dt)
                     end
                 end
                 if isfinite(particle_max_disp_cells)
@@ -3039,6 +3046,11 @@ function main()
                             PoissonKernels.fft_poisson_root_gpu!(φ, ρtot; G=gravcoef, a=1, boxsize=1)
                         end
                     end
+                    if gravity_gas_kick
+                        tg += _time_phase(be_mhd, be_p) do
+                            MHDKernels.apply_cell_center_gravity!(s, φ, dtdm)
+                        end
+                    end
                     tp += _time_phase(be_p, be_mhd) do
                         _push_particles!(px, py, pz, vx, vy, vz, φ;
                                          dtau=dtdm, N=N, wrap=particle_wrap,
@@ -3063,6 +3075,7 @@ function main()
             phase[:deposit] += td
             phase[:assemble] += ta
             phase[:fft] += tf
+            phase[:gas_gravity] += tg
             phase[:push] += tp
             phase[:chem] += tc
             if terminal_timed
@@ -3075,12 +3088,12 @@ function main()
             end
         end
         if cycle_print_every > 0 && (cyc <= warmup || cyc % cycle_print_every == 0)
-            @printf("cycle %3d%s dt=%.3e expdt=%.3e nsub=%d gsub=%d pvmax=%.3e pgmax=%.3e regime=%s handoff=%d va/cs=%.3e G/omA=%.3e idiff=%.3e drag %.4f f=%.6f G/H=%.3e  cfl %.4f mhd %.4f chem %.4f dep %.4f asm %.4f fft %.4f push %.4f\n",
+            @printf("cycle %3d%s dt=%.3e expdt=%.3e nsub=%d gsub=%d pvmax=%.3e pgmax=%.3e regime=%s handoff=%d va/cs=%.3e G/omA=%.3e idiff=%.3e drag %.4f f=%.6f G/H=%.3e  cfl %.4f mhd %.4f chem %.4f dep %.4f asm %.4f fft %.4f ggas %.4f push %.4f\n",
                     cyc, measuring ? "" : " warm", dt, dt_explicit, nsub, last_gravity_nsub,
                     last_particle_vmax, last_particle_gmax, last_hybrid_regime,
                     last_handoff_remaining, last_hybrid_va_cs, last_hybrid_drag_omega,
                     last_terminal_diffuse_coeff, tdrag, last_drag_f, last_drag_gammaH,
-                    tcfl, tm, tc, td, ta, tf, tp)
+                    tcfl, tm, tc, td, ta, tf, tg, tp)
             flush(stdout)
         end
         if check_every > 0 && (cyc % check_every == 0)
@@ -3174,6 +3187,7 @@ function main()
     br, divn, δb, δdm, chemstats =
         final_diag ? _final_device_stats!(be_p, s, ρdm, ρtot, HII, H2I, fh) :
         (NaN, NaN, NaN, NaN, (NaN, NaN, NaN, NaN, NaN, NaN))
+    gravity || (δdm = NaN)
     delta2k_final = final_diag && pmf_init === :magpressure ?
                     _device_density_cos_mode_amp!(be_p, ρtot, s.U[1], N, pmf_kmode, 2) : NaN
 
@@ -3181,14 +3195,16 @@ function main()
             measured, measured_subcycles, ncells/1e6, total, mcells, substep_mcells, last_dt)
     @printf("EVOLVED measured_time=%.6e\n", elapsed_time)
     zrun && @printf("COSMO final_z=%.6f final_a=%.8e cycles=%d\n", a_to_z(a), a, measured)
-    @printf("PHASE s/cycle: cfl %.4f | mhd %.4f | glm_project %.4f | drag %.4f | chem %.4f | deposit %.4f | assemble %.4f | fft %.4f | push %.4f | total %.4f\n",
+    @printf("PHASE s/cycle: cfl %.4f | mhd %.4f | glm_project %.4f | drag %.4f | chem %.4f | deposit %.4f | assemble %.4f | fft %.4f | gas_gravity %.4f | push %.4f | total %.4f\n",
             phase[:cfl]/measured, phase[:mhd]/measured, phase[:glm_projection]/measured,
             phase[:drag]/measured, phase[:chem]/measured, phase[:deposit]/measured,
-            phase[:assemble]/measured, phase[:fft]/measured, phase[:push]/measured, total/measured)
-    @printf("SHARES: cfl %.0f%% | mhd %.0f%% | glm_project %.0f%% | drag %.0f%% | chem %.0f%% | deposit %.0f%% | assemble %.0f%% | fft %.0f%% | push %.0f%%\n",
+            phase[:assemble]/measured, phase[:fft]/measured, phase[:gas_gravity]/measured,
+            phase[:push]/measured, total/measured)
+    @printf("SHARES: cfl %.0f%% | mhd %.0f%% | glm_project %.0f%% | drag %.0f%% | chem %.0f%% | deposit %.0f%% | assemble %.0f%% | fft %.0f%% | gas_gravity %.0f%% | push %.0f%%\n",
             100*phase[:cfl]/total, 100*phase[:mhd]/total, 100*phase[:glm_projection]/total,
             100*phase[:drag]/total, 100*phase[:chem]/total, 100*phase[:deposit]/total,
-            100*phase[:assemble]/total, 100*phase[:fft]/total, 100*phase[:push]/total)
+            100*phase[:assemble]/total, 100*phase[:fft]/total,
+            100*phase[:gas_gravity]/total, 100*phase[:push]/total)
     @printf("GLM: ch_fac=%.6g cr=%.6g project_every=%d projections=%d\n",
             glm_ch_fac, glm_cr, glm_project_every, glm_projection_steps)
     terminal_denom = max(terminal_measured, 1)
@@ -3209,8 +3225,9 @@ function main()
                             induction_subcycles_total, last_induction_nsub, last_terminal_diffuse_coeff,
                             last_hybrid_va_cs, last_hybrid_drag_omega,
                             handoff_events, handoff_steps_done, handoff_remaining, last_handoff_alpha)
-    gravity && @printf("GRAVITY: source=%s weights=(gas %.6g, dm %.6g) midpoint_source=%s lattice_displacements=%s fixed_subcycles=%d dt_boost=%.3f particle_max_disp=%.6g last_particle_vmax=%.6e last_particle_gmax=%.6e subcycles_total=%d last_nsub=%d\n",
-                       String(gravity_source), Float64(grav_gas_weight), Float64(grav_dm_weight),
+    gravity && @printf("GRAVITY: source=%s gas_kick=%s weights=(gas %.6g, dm %.6g) midpoint_source=%s lattice_displacements=%s fixed_subcycles=%d dt_boost=%.3f particle_max_disp=%.6g last_particle_vmax=%.6e last_particle_gmax=%.6e subcycles_total=%d last_nsub=%d\n",
+                       String(gravity_source), string(gravity_gas_kick),
+                       Float64(grav_gas_weight), Float64(grav_dm_weight),
                        string(gravity_midpoint_source), string(lattice_displacements),
                        gravity_subcycles_fixed, gravity_dt_boost, particle_max_disp_cells,
                        last_particle_vmax, last_particle_gmax, gravity_subcycles_total, last_gravity_nsub)
@@ -3227,12 +3244,13 @@ function main()
                                   "chem","chem_rate_tables","chem_itcap","chem_dtfrac",
                                   "hubble_h","omega_m","omega_l","omega_r",
                                   "pmf_kcut","pmf_kmax","pmf_hard_cutoff",
-                                  "pmf_mode_lock_n","pmf_min_cells_per_wavelength",
+                                  "pmf_mode_lock_n","pmf_seed","pmf_min_cells_per_wavelength",
                                   "glm_project_every","glm_projection_steps",
                                   "drag","drag_dt_mode","drag_dt_boost","drag_boosted_steps",
                                   "drag_subcycles_total","drag_last_nsub","drag_last_f","drag_last_gamma_over_H","drag_xe",
                                   "drag_helium_electrons","drag_last_xe","drag_rate_code",
-                                  "gravity_source","gravity_phi_interp","gravity_midpoint_source",
+                                  "gravity","gravity_gas_kick","gravity_source",
+                                  "gravity_phi_interp","gravity_midpoint_source",
                                   "particle_lattice_displacements",
                                   "gravity_gas_weight","gravity_dm_weight",
                                   "gravity_subcycles_fixed","gravity_dt_boost","particle_max_disp_cells",
@@ -3258,7 +3276,7 @@ function main()
                                   "last_dt","last_explicit_dt",
                                   "cfl_s_cyc","mhd_s_cyc","glm_projection_s_cyc",
                                   "drag_s_cyc","chem_s_cyc","deposit_s_cyc","assemble_s_cyc",
-                                  "fft_s_cyc","push_s_cyc","terminal_measured_cycles",
+                                  "fft_s_cyc","gas_gravity_s_cyc","push_s_cyc","terminal_measured_cycles",
                                   "terminal_force_s_cyc","terminal_pressure_fft_s_cyc","terminal_finalize_s_cyc",
                                   "terminal_induction_s_cyc","terminal_projection_s_cyc",
                                   "device_live_gib","device_allocated_gib","device_freed_gib"),
@@ -3269,14 +3287,14 @@ function main()
                               glm_ch_fac, glm_cr, String(chem_mode), chem_rate_tables_enabled,
                               chem_itcap, chem_dtfrac, hub, Om, OL, Or,
                               kcut, pmf_kmax === nothing ? "" : pmf_kmax, pmf_kmax !== nothing,
-                              pmf_mode_lock_n === nothing ? 0 : pmf_mode_lock_n,
+                              pmf_mode_lock_n === nothing ? 0 : pmf_mode_lock_n, seed,
                               pmf_min_cells_per_wavelength,
                               glm_project_every, glm_projection_steps,
                               drag_enabled, String(drag_dt_mode),
                               drag_dt_boost, boosted_steps, subcycles_total, last_nsub,
                               last_drag_f, last_drag_gammaH, drag_xe_env, drag_helium_electrons,
                               last_drag_xe, drag_rate_code,
-                              String(gravity_source),
+                              gravity, gravity_gas_kick, String(gravity_source),
                               gravity_phi_interp, gravity_midpoint_source, lattice_displacements,
                               grav_gas_weight, grav_dm_weight, gravity_subcycles_fixed,
                               gravity_dt_boost, particle_max_disp_cells, last_particle_vmax,
@@ -3303,7 +3321,7 @@ function main()
                               phase[:cfl]/measured, phase[:mhd]/measured,
                               phase[:glm_projection]/measured, phase[:drag]/measured, phase[:chem]/measured,
                               phase[:deposit]/measured, phase[:assemble]/measured, phase[:fft]/measured,
-                              phase[:push]/measured, terminal_measured,
+                              phase[:gas_gravity]/measured, phase[:push]/measured, terminal_measured,
                               terminal_phase[:force]/terminal_denom,
                               terminal_phase[:pressure_fft]/terminal_denom,
                               terminal_phase[:finalize]/terminal_denom,

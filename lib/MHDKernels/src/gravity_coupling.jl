@@ -1,7 +1,8 @@
 # Time-center a gas density source without retaining the previous full grid.
 # From continuity, rho(t-dt) = rho(t) + dt div(m)(t) + O(dt^2).
 
-export predict_density_backward!, initialize_lattice_displacements!
+export predict_density_backward!, apply_cell_center_gravity!
+export initialize_lattice_displacements!
 export deposit_lattice_displacements!, drift_lattice_displacements!
 
 @kernel function _initialize_lattice_displacements_k!(dxp, dyp, dzp, vx, vy, vz)
@@ -163,4 +164,62 @@ function predict_density_backward!(dst::AbstractArray, s::MHDState,
                                    dt_back::Real)
     predict_density_backward!(dst, s.U[1], s.U[2], s.U[3], s.U[4], s.dims;
                               dx=s.dx, dt_back=dt_back)
+end
+
+@kernel function _apply_cell_center_gravity_k!(rho, mx, my, mz, E,
+                                                @Const(phi), dt, inv2dx,
+                                                nx::Int, ny::Int, nz::Int)
+    c = @index(Global)
+    @inbounds begin
+        i = (c - 1) % nx + 1
+        q = (c - 1) ÷ nx
+        j = q % ny + 1
+        k = q ÷ ny + 1
+        im = i == 1  ? nx : i - 1
+        ip = i == nx ? 1  : i + 1
+        jm = j == 1  ? ny : j - 1
+        jp = j == ny ? 1  : j + 1
+        km = k == 1  ? nz : k - 1
+        kp = k == nz ? 1  : k + 1
+
+        cim = ((k - 1) * ny + (j - 1)) * nx + im
+        cip = ((k - 1) * ny + (j - 1)) * nx + ip
+        cjm = ((k - 1) * ny + (jm - 1)) * nx + i
+        cjp = ((k - 1) * ny + (jp - 1)) * nx + i
+        ckm = ((km - 1) * ny + (j - 1)) * nx + i
+        ckp = ((kp - 1) * ny + (j - 1)) * nx + i
+
+        gx = -(phi[cip] - phi[cim]) * inv2dx
+        gy = -(phi[cjp] - phi[cjm]) * inv2dx
+        gz = -(phi[ckp] - phi[ckm]) * inv2dx
+        r = rho[c]
+        mx0 = mx[c]; my0 = my[c]; mz0 = mz[c]
+        dmx = r * gx * dt
+        dmy = r * gy * dt
+        dmz = r * gz * dt
+        mx[c] = mx0 + dmx
+        my[c] = my0 + dmy
+        mz[c] = mz0 + dmz
+        # Exact kinetic-energy change for a constant acceleration over the kick.
+        E[c] += dt * (mx0 * gx + my0 * gy + mz0 * gz) +
+                (dt * dt * r) * (gx * gx + gy * gy + gz * gz) / oftype(r, 2)
+    end
+end
+
+"""
+    apply_cell_center_gravity!(state, phi, dt)
+
+Apply the periodic cell-centred acceleration `-grad(phi)` to gas momentum and
+total energy. The energy update is the exact kinetic-energy change of the kick,
+so internal and magnetic energy are unchanged. The operation is allocation-free
+on CPU, CUDA, and Metal backends.
+"""
+function apply_cell_center_gravity!(s::MHDState, phi::AbstractArray, dt::Real)
+    length(phi) == prod(s.dims) || throw(DimensionMismatch("phi does not match state dimensions"))
+    be = KA.get_backend(s.U[1])
+    T = eltype(s.U[1])
+    _apply_cell_center_gravity_k!(be)(s.U[1], s.U[2], s.U[3], s.U[4], s.U[5], phi,
+                                      T(dt), T(0.5) / T(s.dx), s.dims...;
+                                      ndrange=length(phi))
+    return s
 end

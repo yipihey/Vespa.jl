@@ -118,6 +118,30 @@ else
             @test maximum(abs, Array(sm.scratch[1]) .- Array(sr.scratch[1])) < 2f-7
         end
 
+        @testset "gas gravity kick CPU/Metal parity" begin
+            dims = (24, 12, 6)
+            sr = allocate_state(becpu, T, dims; dx=1 / dims[1])
+            sm = allocate_state(be, T, dims; dx=1 / dims[1])
+            phi = Vector{T}(undef, prod(dims))
+            for c in eachindex(phi)
+                sr.U[1][c] = 1f0 + 0.02f0 * sin(T(c))
+                sr.U[2][c] = 0.03f0 * cos(T(c)); sr.U[3][c] = -0.02f0
+                sr.U[4][c] = 0.01f0; sr.U[5][c] = 2f0
+                phi[c] = 0.04f0 * sin(T(c) / 7f0)
+            end
+            for field in 1:9
+                copyto!(sm.U[field], sr.U[field])
+            end
+            phim = to_device(be, phi)
+            apply_cell_center_gravity!(sr, phi, 0.003)
+            apply_cell_center_gravity!(sm, phim, 0.003)
+            KA.synchronize(be)
+            hr = fields_to_host(sr); hm = fields_to_host(sm)
+            for field in 2:5
+                @test maximum(abs, hm[field] .- hr[field]) < 3f-7
+            end
+        end
+
         @testset "lattice displacement CIC CPU/Metal parity" begin
             N = 16
             np = N^3

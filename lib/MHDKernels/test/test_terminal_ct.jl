@@ -31,6 +31,49 @@ using MHDKernels, KernelAbstractions, Test
     @test coarse / fine > 3.5
 end
 
+@testset "cell-centred gas gravity kick" begin
+    N = 64
+    s = allocate_state(backend(:cpu), Float32, (N, 1, 1); dx=1 / N)
+    phi = Vector{Float32}(undef, N)
+    fill!(s.U[1], 2f0)
+    fill!(s.U[2], 0.3f0); fill!(s.U[3], -0.2f0); fill!(s.U[4], 0.1f0)
+    fill!(s.U[6], 0.04f0); fill!(s.U[7], -0.03f0); fill!(s.U[8], 0.02f0)
+    kinetic0 = (0.3f0^2 + 0.2f0^2 + 0.1f0^2) / 4f0
+    magnetic = 0.5f0 * (0.04f0^2 + 0.03f0^2 + 0.02f0^2)
+    fill!(s.U[5], 1.7f0 + kinetic0 + magnetic)
+    for i in 1:N
+        phi[i] = 0.07f0 * sinpi(2f0 * (Float32(i) - 0.5f0) / Float32(N))
+    end
+    h0 = fields_to_host(s)
+    dt = 0.013f0
+    apply_cell_center_gravity!(s, phi, dt)
+    h1 = fields_to_host(s)
+    inv2dx = 0.5f0 * N
+    for i in 1:N
+        im = i == 1 ? N : i - 1
+        ip = i == N ? 1 : i + 1
+        gx = -(phi[ip] - phi[im]) * inv2dx
+        @test h1[2][i] ≈ h0[2][i] + 2f0 * gx * dt rtol=3f-6 atol=2f-7
+    end
+    eint0 = h0[5] .- 0.5f0 .* (h0[2].^2 .+ h0[3].^2 .+ h0[4].^2) ./ h0[1] .-
+            0.5f0 .* (h0[6].^2 .+ h0[7].^2 .+ h0[8].^2)
+    eint1 = h1[5] .- 0.5f0 .* (h1[2].^2 .+ h1[3].^2 .+ h1[4].^2) ./ h1[1] .-
+            0.5f0 .* (h1[6].^2 .+ h1[7].^2 .+ h1[8].^2)
+    @test maximum(abs, eint1 .- eint0) < 3f-7
+
+    one_kick = allocate_state(backend(:cpu), Float32, (N, 1, 1); dx=1 / N)
+    two_kicks = allocate_state(backend(:cpu), Float32, (N, 1, 1); dx=1 / N)
+    for v in 1:9
+        copyto!(one_kick.U[v], h0[v]); copyto!(two_kicks.U[v], h0[v])
+    end
+    apply_cell_center_gravity!(one_kick, phi, dt)
+    apply_cell_center_gravity!(two_kicks, phi, dt / 2)
+    apply_cell_center_gravity!(two_kicks, phi, dt / 2)
+    ho = fields_to_host(one_kick); ht = fields_to_host(two_kicks)
+    @test maximum(abs, ht[2] .- ho[2]) < 8f-8
+    @test maximum(abs, ht[5] .- ho[5]) < 3f-7
+end
+
 @testset "lattice displacement particles preserve early-time drifts" begin
     N = 16
     np = N^3
