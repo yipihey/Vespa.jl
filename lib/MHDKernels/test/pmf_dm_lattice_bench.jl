@@ -162,6 +162,90 @@ function _push_particles_fused_global_phi_mix!(px::AbstractVector{T}, py, pz, vx
     return nothing
 end
 
+@kernel function _push_kdk_global_lattice_k!(dxp, dyp, dzp, vx, vy, vz, @Const(phi),
+                                             dcoef, ts, driftcoef, dowrap::Int,
+                                             c05, c1, N::Int, hc)
+    p = @index(Global)
+    @inbounds begin
+        Tv = eltype(vx)
+        q = p - 1
+        i = q % N
+        j = (q ÷ N) % N
+        k = q ÷ (N * N)
+        nT = Tv(N)
+        # Reconstruct directly in cell coordinates. Adding dxp to an absolute
+        # Float32 box position would round away the tiny high-z drift.
+        xpos = mod(Tv(i) + c05 + nT * (Tv(dxp[p]) + dcoef * Tv(vx[p])), nT)
+        ypos = mod(Tv(j) + c05 + nT * (Tv(dyp[p]) + dcoef * Tv(vy[p])), nT)
+        zpos = mod(Tv(k) + c05 + nT * (Tv(dzp[p]) + dcoef * Tv(vz[p])), nT)
+        i1 = unsafe_trunc(Int, xpos + c05)
+        j1 = unsafe_trunc(Int, ypos + c05)
+        k1 = unsafe_trunc(Int, zpos + c05)
+        dxr = Tv(i1) + c05 - xpos
+        dyr = Tv(j1) + c05 - ypos
+        dzr = Tv(k1) + c05 - zpos
+        ex = c1 - dxr; ey = c1 - dyr; ez = c1 - dzr
+        ax, ay, az = PoissonKernels._global_phi_force(phi, i1, j1, k1,
+                                                       dxr, dyr, dzr, ex, ey, ez,
+                                                       N, N, N, hc)
+
+        nvx = Tv(vx[p] + ax * ts)
+        nvy = Tv(vy[p] + ay * ts)
+        nvz = Tv(vz[p] + az * ts)
+        x = Tv(dxp[p]) + driftcoef * nvx
+        y = Tv(dyp[p]) + driftcoef * nvy
+        z = Tv(dzp[p]) + driftcoef * nvz
+        if dowrap == 1
+            x -= floor(x + c05)
+            y -= floor(y + c05)
+            z -= floor(z + c05)
+        end
+        dxp[p] = x; dyp[p] = y; dzp[p] = z
+        vx[p] = Tv(nvx + ax * ts)
+        vy[p] = Tv(nvy + ay * ts)
+        vz[p] = Tv(nvz + az * ts)
+    end
+end
+
+function _push_particles_fused_global_lattice!(dxp::AbstractVector{T}, dyp, dzp,
+                                               vx, vy, vz, phi;
+                                               dtau::Real, N::Int,
+                                               wrap::Bool=true) where {T}
+    be = KA.get_backend(dxp)
+    half = T(0.5) * T(dtau)
+    _push_kdk_global_lattice_k!(be)(dxp, dyp, dzp, vx, vy, vz, phi,
+                                     half, half, T(dtau), wrap ? 1 : 0,
+                                     T(0.5), T(1), N, T(0.5) * T(N);
+                                     ndrange=length(dxp))
+    return nothing
+end
+
+function _deposit_particles!(rho, px, py, pz, vx, vy, vz;
+                             N::Int, disp::Real, lattice_displacements::Bool)
+    if lattice_displacements
+        MHDKernels.deposit_lattice_displacements!(rho, px, py, pz, vx, vy, vz;
+                                                   N=N, disp=disp, shift=-0.5)
+    else
+        PoissonKernels.cic_deposit!(rho, px, py, pz, vx, vy, vz, one(eltype(rho));
+                                    N=N, disp=disp, shift=-0.5)
+    end
+    return rho
+end
+
+function _push_particles!(px, py, pz, vx, vy, vz, phi;
+                          dtau::Real, N::Int, wrap::Bool,
+                          lattice_displacements::Bool)
+    if lattice_displacements
+        _push_particles_fused_global_lattice!(px, py, pz, vx, vy, vz, phi;
+                                               dtau=dtau, N=N, wrap=wrap)
+    else
+        PoissonKernels.push_particles_fused_global!(px, py, pz, vx, vy, vz, phi;
+                                                     dtau=dtau, nc=(N,N,N),
+                                                     wrap=wrap ? 1 : 0)
+    end
+    return nothing
+end
+
 @kernel function _assemble_total_delta_k!(ρtot, @Const(gasρ), @Const(dmρ),
                                           fb, fdm, N::Int)
     c = @index(Global)
@@ -1950,12 +2034,13 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
                             N, ncells, gravity, cycle, measured, a, pk_path,
                             history_path, pdf_path, pdf_counts, pdf_loglo, pdf_loghi,
                             nmu, nbins, boxsize, axis,
+                            lattice_displacements=false,
                             HII=nothing, H2I=nothing, fh=0.76f0,
                             btrans0=NaN, density_kmode=1)
     T = eltype(s.U[1])
     if gravity
-        PoissonKernels.cic_deposit!(ρdm, px, py, pz, vx, vy, vz, one(T);
-                                    N=N, disp=0, shift=-0.5)
+        _deposit_particles!(ρdm, px, py, pz, vx, vy, vz;
+                            N=N, disp=0, lattice_displacements=lattice_displacements)
         KA.synchronize(be_p)
     end
     br = _device_brms!(be_p, s, scratch)
@@ -2132,6 +2217,11 @@ function main()
     pmf_mode_lock_n = isempty(mode_lock_env) ? nothing : parse(Int, mode_lock_env)
     pmf_shortest_k = pmf_kmax === nothing ? kcut : pmf_kmax
     pmf_min_cells_per_wavelength = 2π * N / pmf_shortest_k
+    if pmf_mode_lock_n !== nothing
+        pmf_mode_lock_n <= N || error("MHD_PMF_MODE_LOCK_N cannot exceed MHD_PMF_N")
+        pmf_shortest_k <= π * pmf_mode_lock_n ||
+            error("fixed-band PMF exceeds the mode-lock Nyquist frequency")
+    end
     seed = parse(Int, get(ENV, "MHD_PMF_SEED", "42"))
     recon = Symbol(lowercase(get(ENV, "MHD_RECON", "ppm")))
     riemann = Symbol(lowercase(get(ENV, "MHD_RIEMANN", "hlld")))
@@ -2155,7 +2245,15 @@ function main()
     particle_max_disp_cells = parse(Float64, get(ENV, "MHD_PARTICLE_MAX_DISP_CELLS", "Inf"))
     particle_max_disp_cells > 0 || error("MHD_PARTICLE_MAX_DISP_CELLS must be positive")
     particle_wrap = get(ENV, "MHD_PARTICLE_WRAP", "1") in ("1", "true", "TRUE", "yes", "on")
+    lattice_displacements = get(ENV, "MHD_PARTICLE_LATTICE_DISPLACEMENTS", "1") in
+                                ("1", "true", "TRUE", "yes", "on")
     gravity_phi_interp = get(ENV, "MHD_GRAVITY_PHI_INTERP", "0") in ("1", "true", "TRUE", "yes", "on")
+    gravity_midpoint_source = get(ENV, "MHD_GRAVITY_MIDPOINT_SOURCE", "1") in
+                                 ("1", "true", "TRUE", "yes", "on")
+    gravity_phi_interp && gravity_midpoint_source &&
+        error("choose either MHD_GRAVITY_PHI_INTERP=1 or MHD_GRAVITY_MIDPOINT_SOURCE=1")
+    gravity_phi_interp && lattice_displacements &&
+        error("potential interpolation is not implemented for lattice-displacement particles")
     fft_mode = _fft_mode(BACKEND_NAME, get(ENV, "MHD_FFT", "auto"))
     if BACKEND_NAME === :metal && fft_mode !== :mps &&
        !(get(ENV, "MHD_ALLOW_NON_MPS_FFT", "0") in ("1", "true", "TRUE", "yes", "on"))
@@ -2241,13 +2339,14 @@ function main()
     pdf_counts = isempty(pdf_path) ? nothing : PoissonKernels.device_zeros(be_p, Int32, (pdf_nbins,))
     mhd_integrator = BACKEND_NAME === :cpu ? :ref : :cube
     ncells = N^3
-    _log_line(@sprintf("CONFIG backend=%s N=%d ncells=%.3fM zrun=%s cosmology=(h=%.6g Om=%.6g OL=%.6g Or=%.6g) chem=%s rate_tables=%s gravity=%s source=%s phi_interp=%s grav1buf=%s fft=%s particle_wrap=%s",
+    _log_line(@sprintf("CONFIG backend=%s N=%d ncells=%.3fM zrun=%s cosmology=(h=%.6g Om=%.6g OL=%.6g Or=%.6g) chem=%s rate_tables=%s gravity=%s source=%s phi_interp=%s midpoint_source=%s grav1buf=%s fft=%s particle_wrap=%s lattice_displacements=%s",
                        String(BACKEND_NAME), N, ncells/1e6,
                        zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
                        hub, Om, OL, Or, String(chem_mode), string(chem_rate_tables_enabled),
                        string(gravity), String(gravity_source),
-                       string(gravity_phi_interp), string(gravity_1buf), String(fft_mode),
-                       string(particle_wrap)))
+                       string(gravity_phi_interp), string(gravity_midpoint_source),
+                       string(gravity_1buf), String(fft_mode),
+                       string(particle_wrap), string(lattice_displacements)))
     _log_line(@sprintf("PMF_MODES kcut=%.9g kmax=%s hard_cutoff=%s mode_lock_n=%s minimum_cells_per_wavelength=%.6g",
                        kcut, pmf_kmax === nothing ? "none" : @sprintf("%.9g", pmf_kmax),
                        string(pmf_kmax !== nothing),
@@ -2319,7 +2418,11 @@ function main()
     end
 
     _stage("init_particles_and_chemistry") do
-        _init_lattice_k!(be_p)(px, py, pz, vx, vy, vz, Int(N); ndrange=ncells)
+        if lattice_displacements
+            MHDKernels.initialize_lattice_displacements!(px, py, pz, vx, vy, vz)
+        else
+            _init_lattice_k!(be_p)(px, py, pz, vx, vy, vz, Int(N); ndrange=ncells)
+        end
         if chem_mode !== :off
             _init_reduced_chem_k!(be_p)(HII, H2I, s.U[1], xhii0, xh20, fh, Int(N); ndrange=ncells)
         end
@@ -2407,7 +2510,7 @@ function main()
                 pmf_b0_ng, brms, zrun ? zstart : parse(Float64, get(ENV, "MHD_PMF_B0_ZREF", "3000")), chem_vunit)
         flush(stdout)
     end
-    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s grav_source=%s phi_interp=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha=%.3f hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
+    @printf("PMF+DM lattice bench: backend=%s N=%d steps=%d warmup=%d tfinal=%s zrun=%s recon=%s riemann=%s chfac=%.2f cr=%.2f init=%s kmode=%d brms=%.3e p0=%.3e pfloor=%.3e va_rms/cs_floor=%.3e kcut=%.3f kmax=%s mode_lock_n=%s gravity=%s grav_source=%s phi_interp=%s midpoint_source=%s grav1buf=%s grav_sub=%d grav_dt_boost=%.2f particle_max_disp=%.3g particle_wrap=%s lattice_displacements=%s fft=%s chem=%s smooth=%s falpha=%.3g xHII0=%.3e drag=%s drag_dt=%s boost=%.2f drag_xe=%s terminal_split=%s terminal_vsmooth=%.3f terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_lbox_ckpc=%.3e terminal_diff_cfl=%.3e terminal_accuracy_cfl=%.3e terminal_accuracy_pressure=%.3e terminal_implicit_diffuse=%s terminal_implicit_fac=%.3e terminal_pressure_implicit=%s terminal_pressure_coeff=%.3e terminal_rho_rel_limit=%.3e terminal_b_rel_limit=%.3e hybrid_handoff_steps=%d hybrid_handoff_alpha=%.3f hybrid_reenter=%s hybrid_aware_dt_factor=%.3f\n",
             String(BACKEND_NAME), N, steps, warmup, tfinal === nothing ? "cycle-count" : string(tfinal),
             zrun ? @sprintf("%.1f->%.1f", zstart, zend) : "off",
             String(recon), String(riemann), glm_ch_fac, glm_cr, String(pmf_init), pmf_kmode, brms, p0, pfloor,
@@ -2415,8 +2518,10 @@ function main()
             pmf_kmax === nothing ? "none" : @sprintf("%.6g", pmf_kmax),
             pmf_mode_lock_n === nothing ? "none" : string(pmf_mode_lock_n),
             string(gravity), String(gravity_source),
-            string(gravity_phi_interp), string(gravity_1buf), gravity_subcycles_fixed,
-            gravity_dt_boost, particle_max_disp_cells, string(particle_wrap), String(fft_mode),
+            string(gravity_phi_interp), string(gravity_midpoint_source),
+            string(gravity_1buf), gravity_subcycles_fixed,
+            gravity_dt_boost, particle_max_disp_cells, string(particle_wrap),
+            string(lattice_displacements), String(fft_mode),
             String(chem_mode), String(chem_smooth), chem_falpha, Float64(xhii0), string(drag_enabled),
             String(drag_dt_mode), drag_dt_boost, drag_xe_env, string(terminal_split), terminal_vsmooth,
             terminal_gamma_scale, terminal_vcap,
@@ -2843,11 +2948,20 @@ function main()
             dtdm = dt / last_gravity_nsub
             if grav_dm_weight == 0
                 ta += _time_phase(be_p, be_mhd) do
-                    _assemble_total_delta_k!(be_p)(ρtot, s.U[1], ρdm, grav_gas_weight, grav_dm_weight, Int(N);
-                                                   ndrange=ncells)
+                    if gravity_midpoint_source
+                        MHDKernels.predict_density_backward!(ρtot, s, 0.5 * dt)
+                        _assemble_total_delta_k!(be_p)(ρtot, ρtot, ρdm,
+                                                       grav_gas_weight, grav_dm_weight, Int(N);
+                                                       ndrange=ncells)
+                    else
+                        _assemble_total_delta_k!(be_p)(ρtot, s.U[1], ρdm,
+                                                       grav_gas_weight, grav_dm_weight, Int(N);
+                                                       ndrange=ncells)
+                    end
                 end
                 tf += _time_phase(be_p, be_mhd) do
-                    old_single_step = last_gravity_nsub == 1 && gravity_subcycles_fixed == 1 && gravity_dt_boost == 0
+                    old_single_step = !gravity_midpoint_source && last_gravity_nsub == 1 &&
+                                      gravity_subcycles_fixed == 1 && gravity_dt_boost == 0
                     agrav = old_single_step ? a : (zrun ? 0.5 * (a_before + a_after_step) : 1.0)
                     gravcoef = zrun ? 1.5 * Om * agrav : 1.0
                     if fft_mode === :mps
@@ -2873,9 +2987,9 @@ function main()
                 for ig in 1:last_gravity_nsub
                     tp += _time_phase(be_p, be_mhd) do
                         if φprev === nothing
-                            PoissonKernels.push_particles_fused_global!(px, py, pz, vx, vy, vz, φ;
-                                                                        dtau=dtdm, nc=(N,N,N),
-                                                                        wrap=particle_wrap ? 1 : 0)
+                            _push_particles!(px, py, pz, vx, vy, vz, φ;
+                                             dtau=dtdm, N=N, wrap=particle_wrap,
+                                             lattice_displacements=lattice_displacements)
                         else
                             θ = (ig - 0.5) / last_gravity_nsub
                             _push_particles_fused_global_phi_mix!(px, py, pz, vx, vy, vz, φprev, φ;
@@ -2891,17 +3005,29 @@ function main()
             else
                 for ig in 1:last_gravity_nsub
                     td += _time_phase(be_p, be_mhd) do
-                        PoissonKernels.cic_deposit!(ρdm, px, py, pz, vx, vy, vz, one(T);
-                                                    N=N, disp=0, shift=-0.5)
+                        midpoint_disp = gravity_midpoint_source ? 0.5 * dtdm : 0.0
+                        _deposit_particles!(ρdm, px, py, pz, vx, vy, vz;
+                                            N=N, disp=midpoint_disp,
+                                            lattice_displacements=lattice_displacements)
                     end
                     ta += _time_phase(be_p, be_mhd) do
-                        _assemble_total_delta_k!(be_p)(ρtot, s.U[1], ρdm, grav_gas_weight, grav_dm_weight, Int(N);
-                                                       ndrange=ncells)
+                        if gravity_midpoint_source && grav_gas_weight != 0
+                            dt_back = dt - (ig - 0.5) * dtdm
+                            MHDKernels.predict_density_backward!(ρtot, s, dt_back)
+                            _assemble_total_delta_k!(be_p)(ρtot, ρtot, ρdm,
+                                                           grav_gas_weight, grav_dm_weight, Int(N);
+                                                           ndrange=ncells)
+                        else
+                            _assemble_total_delta_k!(be_p)(ρtot, s.U[1], ρdm,
+                                                           grav_gas_weight, grav_dm_weight, Int(N);
+                                                           ndrange=ncells)
+                        end
                     end
                     tf += _time_phase(be_p, be_mhd) do
                         old_single_step = last_gravity_nsub == 1 &&
                                           gravity_subcycles_fixed == 1 &&
-                                          gravity_dt_boost == 0
+                                          gravity_dt_boost == 0 &&
+                                          !gravity_midpoint_source
                         agrav = old_single_step ? a :
                                 (zrun ? a_before + (a_after_step - a_before) * ((ig - 0.5) / last_gravity_nsub) : 1.0)
                         gravcoef = zrun ? 1.5 * Om * agrav : 1.0
@@ -2914,9 +3040,9 @@ function main()
                         end
                     end
                     tp += _time_phase(be_p, be_mhd) do
-                        PoissonKernels.push_particles_fused_global!(px, py, pz, vx, vy, vz, φ;
-                                                                    dtau=dtdm, nc=(N,N,N),
-                                                                    wrap=particle_wrap ? 1 : 0)
+                        _push_particles!(px, py, pz, vx, vy, vz, φ;
+                                         dtau=dtdm, N=N, wrap=particle_wrap,
+                                         lattice_displacements=lattice_displacements)
                     end
                 end
             end
@@ -2996,7 +3122,8 @@ function main()
                                        pdf_path=full_diag ? pdf_path : "", pdf_counts=pdf_counts,
                                        pdf_loglo=pdf_loglo, pdf_loghi=pdf_loghi,
                                        nmu=pk_nmu, nbins=pk_nbins, boxsize=boxsize,
-                                       axis=pk_axis, HII=HII, H2I=H2I, fh=fh,
+                                       axis=pk_axis, lattice_displacements=lattice_displacements,
+                                       HII=HII, H2I=H2I, fh=fh,
                                        btrans0=Float64(st.btrans0),
                                        density_kmode=pmf_kmode)
                     KA.synchronize(be_mhd)
@@ -3033,8 +3160,9 @@ function main()
     end
 
     if gravity && final_diag
-        PoissonKernels.cic_deposit!(ρdm, px, py, pz, vx, vy, vz, one(T);
-                                    N=N, disp=0, shift=-0.5)
+        _deposit_particles!(ρdm, px, py, pz, vx, vy, vz;
+                            N=N, disp=0,
+                            lattice_displacements=lattice_displacements)
         KA.synchronize(be_p)
     end
     _log_device_memory("final")
@@ -3081,8 +3209,9 @@ function main()
                             induction_subcycles_total, last_induction_nsub, last_terminal_diffuse_coeff,
                             last_hybrid_va_cs, last_hybrid_drag_omega,
                             handoff_events, handoff_steps_done, handoff_remaining, last_handoff_alpha)
-    gravity && @printf("GRAVITY: source=%s weights=(gas %.6g, dm %.6g) fixed_subcycles=%d dt_boost=%.3f particle_max_disp=%.6g last_particle_vmax=%.6e last_particle_gmax=%.6e subcycles_total=%d last_nsub=%d\n",
+    gravity && @printf("GRAVITY: source=%s weights=(gas %.6g, dm %.6g) midpoint_source=%s lattice_displacements=%s fixed_subcycles=%d dt_boost=%.3f particle_max_disp=%.6g last_particle_vmax=%.6e last_particle_gmax=%.6e subcycles_total=%d last_nsub=%d\n",
                        String(gravity_source), Float64(grav_gas_weight), Float64(grav_dm_weight),
+                       string(gravity_midpoint_source), string(lattice_displacements),
                        gravity_subcycles_fixed, gravity_dt_boost, particle_max_disp_cells,
                        last_particle_vmax, last_particle_gmax, gravity_subcycles_total, last_gravity_nsub)
     chem_mode !== :off && @printf("CHEM: xHII mean/min/max %.6e %.6e %.6e | fH2 mean/min/max %.6e %.6e %.6e\n",
@@ -3103,7 +3232,9 @@ function main()
                                   "drag","drag_dt_mode","drag_dt_boost","drag_boosted_steps",
                                   "drag_subcycles_total","drag_last_nsub","drag_last_f","drag_last_gamma_over_H","drag_xe",
                                   "drag_helium_electrons","drag_last_xe","drag_rate_code",
-                                  "gravity_source","gravity_phi_interp","gravity_gas_weight","gravity_dm_weight",
+                                  "gravity_source","gravity_phi_interp","gravity_midpoint_source",
+                                  "particle_lattice_displacements",
+                                  "gravity_gas_weight","gravity_dm_weight",
                                   "gravity_subcycles_fixed","gravity_dt_boost","particle_max_disp_cells",
                                   "particle_last_vmax","particle_last_gmax","gravity_subcycles_total","gravity_last_nsub",
                                   "terminal_gamma_scale","terminal_vcap","terminal_diff_cfl",
@@ -3146,7 +3277,8 @@ function main()
                               last_drag_f, last_drag_gammaH, drag_xe_env, drag_helium_electrons,
                               last_drag_xe, drag_rate_code,
                               String(gravity_source),
-                              gravity_phi_interp, grav_gas_weight, grav_dm_weight, gravity_subcycles_fixed,
+                              gravity_phi_interp, gravity_midpoint_source, lattice_displacements,
+                              grav_gas_weight, grav_dm_weight, gravity_subcycles_fixed,
                               gravity_dt_boost, particle_max_disp_cells, last_particle_vmax,
                               last_particle_gmax, gravity_subcycles_total, last_gravity_nsub,
                               terminal_gamma_scale, terminal_vcap, terminal_diff_cfl,

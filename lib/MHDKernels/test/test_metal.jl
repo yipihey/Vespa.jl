@@ -99,6 +99,49 @@ else
             @test maximum(abs, hm[5] .- hr[5]) == 0
         end
 
+        @testset "midpoint density predictor CPU/Metal parity" begin
+            dims = (32, 8, 4)
+            sr = allocate_state(becpu, T, dims; dx=1 / 32)
+            sm = allocate_state(be, T, dims; dx=1 / 32)
+            for c in eachindex(sr.U[1])
+                sr.U[1][c] = 1f0 + 0.01f0 * sin(T(c))
+                sr.U[2][c] = 0.02f0 * cos(T(c))
+                sr.U[3][c] = -0.01f0 * sin(T(2c))
+                sr.U[4][c] = 0.03f0 * cos(T(3c))
+            end
+            for field in 1:4
+                copyto!(sm.U[field], sr.U[field])
+            end
+            predict_density_backward!(sr.scratch[1], sr, 0.002)
+            predict_density_backward!(sm.scratch[1], sm, 0.002)
+            KA.synchronize(be)
+            @test maximum(abs, Array(sm.scratch[1]) .- Array(sr.scratch[1])) < 2f-7
+        end
+
+        @testset "lattice displacement CIC CPU/Metal parity" begin
+            N = 16
+            np = N^3
+            dxh = Vector{T}(undef, np)
+            for p in 1:np
+                i = (p - 1) % N
+                dxh[p] = 0.05f0 * sinpi(2f0 * (T(i) + 0.5f0) / T(N)) / T(N)
+            end
+            dyh = zeros(T, np); dzh = zeros(T, np)
+            vxh = fill(2f-7, np); vyh = zeros(T, np); vzh = zeros(T, np)
+            rho_cpu = zeros(T, np)
+            deposit_lattice_displacements!(rho_cpu, dxh, dyh, dzh, vxh, vyh, vzh;
+                                            N=N, disp=0.125)
+
+            dxm = to_device(be, dxh); dym = to_device(be, dyh); dzm = to_device(be, dzh)
+            vxm = to_device(be, vxh); vym = to_device(be, vyh); vzm = to_device(be, vzh)
+            rho_metal = device_zeros(be, T, (np,))
+            deposit_lattice_displacements!(rho_metal, dxm, dym, dzm, vxm, vym, vzm;
+                                            N=N, disp=0.125)
+            KA.synchronize(be)
+            @test maximum(abs, Array(rho_metal) .- rho_cpu) < 3f-6
+            @test sum(Array(rho_metal)) ≈ T(np) rtol=3f-6
+        end
+
         @testset "exponential force-drag CPU/Metal parity" begin
             N = 16
             sr = allocate_state(becpu, T, (N,N,N); dx=1/N)

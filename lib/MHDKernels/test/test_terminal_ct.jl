@@ -1,5 +1,68 @@
 using MHDKernels, KernelAbstractions, Test
 
+@testset "continuity midpoint density predictor" begin
+    N = 256
+    dims = (N, 1, 1)
+    s = allocate_state(backend(:cpu), Float32, dims; dx=1 / N)
+    amp = 0.1f0
+    velocity = 0.3f0
+
+    function prediction_error(dt)
+        t1 = 0.2f0
+        rho = Vector{Float32}(undef, N)
+        mx = similar(rho)
+        exact = similar(rho)
+        for i in 1:N
+            x = Float32((i - 0.5) / N)
+            rho[i] = 1f0 + amp * sinpi(2f0 * (x - velocity * t1))
+            mx[i] = velocity * rho[i]
+            exact[i] = 1f0 + amp * sinpi(2f0 * (x - velocity * (t1 - 0.5f0 * dt)))
+        end
+        copyto!(s.U[1], rho)
+        copyto!(s.U[2], mx)
+        fill!(s.U[3], 0f0); fill!(s.U[4], 0f0)
+        predict_density_backward!(s.scratch[1], s, 0.5f0 * dt)
+        return sqrt(sum(abs2, Array(s.scratch[1]) .- exact) / sum(abs2, exact .- 1f0))
+    end
+
+    coarse = prediction_error(0.04f0)
+    fine = prediction_error(0.02f0)
+    @test fine < 3.0f-4
+    @test coarse / fine > 3.5
+end
+
+@testset "lattice displacement particles preserve early-time drifts" begin
+    N = 16
+    np = N^3
+    dxp = zeros(Float32, np); dyp = similar(dxp); dzp = similar(dxp)
+    vx = ones(Float32, np); vy = zeros(Float32, np); vz = zeros(Float32, np)
+    rho = zeros(Float32, np)
+    initialize_lattice_displacements!(dxp, dyp, dzp, vx, vy, vz)
+    fill!(vx, 1f0)
+
+    increment = 5f-10
+    for _ in 1:4096
+        drift_lattice_displacements!(dxp, dyp, dzp, vx, vy, vz;
+                                     coef=increment, wrap=true)
+    end
+    expected = Float32(4096) * increment
+    @test dxp[1] ≈ expected rtol=5f-5 atol=1f-10
+    @test dxp[1] > 10eps(Float32)
+
+    fill!(dxp, 0f0)
+    deposit_lattice_displacements!(rho, dxp, dyp, dzp, vx, vy, vz; N=N)
+    @test rho == ones(Float32, np)
+
+    amp_cells = 0.05f0
+    for p in 1:np
+        i = (p - 1) % N
+        dxp[p] = amp_cells * sinpi(2f0 * (Float32(i) + 0.5f0) / Float32(N)) / Float32(N)
+    end
+    deposit_lattice_displacements!(rho, dxp, dyp, dzp, vx, vy, vz; N=N)
+    @test sum(rho) ≈ Float32(np) rtol=2f-6
+    @test sqrt(sum(abs2, rho .- 1f0) / np) > 0.005f0
+end
+
 function _terminal_ct_seed!(s; amp=0.08f0)
     N = s.dims[1]
     rho = Vector{Float32}(undef, N^3)

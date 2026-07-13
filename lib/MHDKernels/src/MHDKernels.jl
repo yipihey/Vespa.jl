@@ -83,6 +83,7 @@ include("problems.jl")        # initial conditions (smooth waves, Brio-Wu, Orsza
 include("pmf.jl")             # divergence-free primordial magnetic field initializers
 include("terminal_ct.jl")     # divergence-preserving terminal-regime induction
 include("terminal_pressure.jl") # pressure-implicit terminal response + CT coupling
+include("gravity_coupling.jl") # time-centered gas source for particle gravity
 include("driver.jl")          # step! / evolve! (ch + ψ-damping schedule)
 include("drag.jl")            # exact linear drag and Strang-coupled full-MHD step
 
