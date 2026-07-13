@@ -1,5 +1,5 @@
 # ── CFL timestep: max over cells & axes of (|v_d| + c_fast,d) ─────────────────
-export compute_dt, max_wavespeed
+export compute_dt, compute_dt!, max_wavespeed, max_wavespeed!
 
 @kernel function _wavespeed_kernel!(w, @Const(a1),@Const(a2),@Const(a3),@Const(a4),@Const(a5),
         @Const(a6),@Const(a7),@Const(a8),@Const(a9), γ::T, smallr::T, pfl::T) where {T}
@@ -13,13 +13,19 @@ export compute_dt, max_wavespeed
     end
 end
 
-"`max_wavespeed(s)` — the maximum (|v|+c_fast) over the grid (max signal speed)."
-function max_wavespeed(s::MHDState{T}) where {T}
-    w = device_zeros(s.be, T, (ncells(s),))
+"`max_wavespeed!(w, s)` — max (|v|+c_fast), using caller-provided work storage."
+function max_wavespeed!(w, s::MHDState{T}) where {T}
+    length(w) == ncells(s) || error("wavespeed work length $(length(w)) != ncells $(ncells(s))")
     _wavespeed_kernel!(s.be, 256)(w, s.U..., s.γ, s.smallr, s.pfl; ndrange = ncells(s))
     KA.synchronize(s.be)
     smax = maximum(w)
     return smax
+end
+
+"`max_wavespeed(s)` — the maximum (|v|+c_fast) over the grid (max signal speed)."
+function max_wavespeed(s::MHDState{T}) where {T}
+    w = device_zeros(s.be, T, (ncells(s),))
+    return max_wavespeed!(w, s)
 end
 
 """
@@ -28,8 +34,13 @@ end
 CFL timestep `dt = cfl·dx/smax` and the max signal speed `smax` (reused as the GLM
 cleaning speed `ch`).
 """
-function compute_dt(s::MHDState{T}; cfl::Real = 0.4) where {T}
-    smax = max_wavespeed(s)
+function compute_dt!(w, s::MHDState{T}; cfl::Real = 0.4) where {T}
+    smax = max_wavespeed!(w, s)
     dt = T(cfl) * s.dx / max(smax, eps(T))
     return dt, smax
+end
+
+function compute_dt(s::MHDState{T}; cfl::Real = 0.4) where {T}
+    w = device_zeros(s.be, T, (ncells(s),))
+    return compute_dt!(w, s; cfl = cfl)
 end

@@ -22,6 +22,7 @@ mutable struct MHDState{T,A,B}
     llf_dmin::T
     llf_pmin::T
     use_hlld::Bool
+    riemann::Symbol
     bcs::NTuple{3,Symbol}    # per-axis: :periodic / :outflow / :reflecting
     recon::Symbol            # :plm (MonCen) or :ppm (local CW84 parabola)
     be::B
@@ -37,12 +38,15 @@ bc_codes(s::MHDState) = (bc_code(s.bcs[1]), bc_code(s.bcs[2]), bc_code(s.bcs[3])
 "`recon_code_of(s)` → the reconstruction integer code (0=PLM, 1=PPM)."
 recon_code_of(s::MHDState) = recon_code(s.recon)
 
+"`riemann_code_of(s)` → the compile-time Riemann code (:hlld, :hll, :llf)."
+riemann_code_of(s::MHDState) = riemann_code(s.riemann)
+
 "`all_periodic(s)` → true when every axis is periodic (enables the cube's fast load path)."
 all_periodic(s::MHDState) = all(==(:periodic), s.bcs)
 
 """
     allocate_state(be, T, dims; dx, gamma=5/3, smallr=1e-6, pfl=1e-7,
-                   llf_dmin=1e-4, llf_pmin=0, use_hlld=true,
+                   llf_dmin=1e-4, llf_pmin=0, use_hlld=true, riemann=nothing,
                    bc=:periodic, bcs=(bc,bc,bc))
 
 Allocate an `MHDState` of element type `T` and shape `dims=(Nx,Ny,Nz)` on backend
@@ -54,13 +58,14 @@ function allocate_state(be, ::Type{T}, dims::NTuple{3,Int};
                         dx::Real, gamma::Real = 5//3,
                         smallr::Real = 1e-6, pfl::Real = 1e-7,
                         llf_dmin::Real = 1e-4, llf_pmin::Real = 0,
-                        use_hlld::Bool = true, bc::Symbol = :periodic,
+                        use_hlld::Bool = true, riemann = nothing, bc::Symbol = :periodic,
                         bcs::NTuple{3,Symbol} = (bc, bc, bc), recon::Symbol = :plm) where {T}
     nc = prod(dims)
     U  = ntuple(_ -> device_zeros(be, T, (nc,)), NVAR)
     sc = ntuple(_ -> device_zeros(be, T, (nc,)), NVAR)
+    rsym = riemann === nothing ? (use_hlld ? :hlld : :llf) : Symbol(riemann)
     MHDState{T,eltype(U),typeof(be)}(U, sc, dims, T(dx), T(gamma), T(smallr), T(pfl),
-                                     T(llf_dmin), T(llf_pmin), use_hlld, bcs, recon, be)
+                                     T(llf_dmin), T(llf_pmin), use_hlld, rsym, bcs, recon, be)
 end
 
 "`fields_to_host(s)` → an `NTuple{9,Array}` host copy of the conserved fields."

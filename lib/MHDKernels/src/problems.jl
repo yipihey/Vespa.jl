@@ -4,6 +4,7 @@
 # gate; Orszag-Tang (periodic) is the divB-cleaning demo; Brio-Wu needs the
 # (not-yet-wired) outflow BC to be physical at the ends.
 export init_alfven_wave!, init_orszag_tang!, init_brio_wu!, alfven_By_exact, init_turb_field!
+export init_field_loop!
 
 @kernel function _turb_field_kernel!(o1,o2,o3,o4,o5,o6,o7,o8,o9, Nx::Int,Ny::Int,Nz::Int, dx::T, γ::T) where {T}
     c = @index(Global, Linear)
@@ -94,4 +95,60 @@ function init_brio_wu!(s::MHDState{T}) where {T}
     Nx,Ny,Nz = s.dims
     _brio_wu_kernel!(s.be,256)(s.U..., Nx,Ny,Nz, s.γ; ndrange=ncells(s))
     KA.synchronize(s.be); return s
+end
+
+@kernel function _field_loop_A_k!(A, Nx::Int, Ny::Int, Nz::Int, dx, radius, amplitude)
+    c = @index(Global, Linear)
+    @inbounds begin
+        T = eltype(A)
+        i = (c-1) % Nx + 1
+        j = ((c-1) ÷ Nx) % Ny + 1
+        x = (T(i) - T(0.5)) * dx - T(0.5) * T(Nx) * dx
+        y = (T(j) - T(0.5)) * dx - T(0.5) * T(Ny) * dx
+        r = sqrt(x*x + y*y)
+        A[c] = amplitude * max(radius - r, zero(T))
+    end
+end
+
+@kernel function _field_loop_cons_k!(o1,o2,o3,o4,o5,o6,o7,o8,o9, @Const(A),
+                                     Nx::Int, Ny::Int, Nz::Int, dx, gamma,
+                                     rho0, p0, vx0, vy0, vz0)
+    c = @index(Global, Linear)
+    @inbounds begin
+        T = eltype(o1)
+        i = (c-1) % Nx + 1
+        j = ((c-1) ÷ Nx) % Ny + 1
+        k = (c-1) ÷ (Nx*Ny) + 1
+        ip = mod(i, Nx) + 1; im = mod(i-2, Nx) + 1
+        jp = mod(j, Ny) + 1; jm = mod(j-2, Ny) + 1
+        L(ii,jj,kk) = ((kk-1)*Ny + (jj-1))*Nx + ii
+        inv2dx = inv(T(2)*dx)
+        bx = (A[L(i,jp,k)] - A[L(i,jm,k)]) * inv2dx
+        by = -(A[L(ip,j,k)] - A[L(im,j,k)]) * inv2dx
+        U = prim2cons((rho0,vx0,vy0,vz0,p0,bx,by,zero(T),zero(T)), gamma)
+        o1[c]=U[1];o2[c]=U[2];o3[c]=U[3];o4[c]=U[4];o5[c]=U[5]
+        o6[c]=U[6];o7[c]=U[7];o8[c]=U[8];o9[c]=U[9]
+    end
+end
+
+"""
+    init_field_loop!(s; radius=0.3, amplitude=1e-3, rho0=1, p0=1,
+                     velocity=(1, 1, 0))
+
+Initialize the periodic Gardiner-Stone magnetic-field-loop advection problem.
+The in-plane field is formed as a discrete centered curl of `A_z`, making its
+initial centered divergence zero to roundoff.
+"""
+function init_field_loop!(s::MHDState{T}; radius::Real=0.3, amplitude::Real=1e-3,
+                          rho0::Real=1, p0::Real=1,
+                          velocity=(1, 1, 0)) where {T}
+    Nx,Ny,Nz = s.dims
+    vx0,vy0,vz0 = velocity
+    _field_loop_A_k!(s.be,256)(s.scratch[1], Nx,Ny,Nz, s.dx, T(radius), T(amplitude);
+                               ndrange=ncells(s))
+    _field_loop_cons_k!(s.be,256)(s.U..., s.scratch[1], Nx,Ny,Nz, s.dx, s.γ,
+                                  T(rho0), T(p0), T(vx0), T(vy0), T(vz0);
+                                  ndrange=ncells(s))
+    KA.synchronize(s.be)
+    return s
 end

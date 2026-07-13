@@ -24,18 +24,20 @@ const CUBE_GS = 192           # threads per group
 @inline _cfz(fi,fj,fk) = fi + CTB*(fj + CTB*fk)
 # SoA variable-major shared (lin contiguous ⇒ coalesced / bank-conflict-free).
 @inline _sg9(S,NC,lin) = @inbounds ntuple(v -> S[(v-1)*NC+lin+1], 9)
+@inline _sg9_as(::Type{T}, S, NC, lin) where {T} =
+    @inbounds ntuple(v -> T(S[(v-1)*NC+lin+1]), 9)
 @inline function _sp9!(S,NC,lin,q)
     @inbounds for v in 1:9; S[(v-1)*NC+lin+1] = q[v]; end
 end
 
 @kernel function step_cube_kernel!(o1,o2,o3,o4,o5,o6,o7,o8,o9,
         @Const(a1),@Const(a2),@Const(a3),@Const(a4),@Const(a5),@Const(a6),@Const(a7),@Const(a8),@Const(a9),
-        N::Int, nb::Int, cx::Int, cy::Int, cz::Int, rec::Val, per::Val, dtdx::T, γ::T, ch::T, decay::T,
-        smallr::T, pfl::T, llf_dmin::T, llf_pmin::T, use_hlld::Bool) where {T}
-    SP = @localmem T (9*CNCP)
-    LX = @localmem T (9*CNFX); RX = @localmem T (9*CNFX)
-    LY = @localmem T (9*CNFX); RY = @localmem T (9*CNFX)
-    LZ = @localmem T (9*CNFX); RZ = @localmem T (9*CNFX)
+        N::Int, nb::Int, cx::Int, cy::Int, cz::Int, shared::Val{ST}, rec::Val, per::Val, rsol::Val, dtdx::T, γ::T, ch::T, decay::T,
+        smallr::T, pfl::T, llf_dmin::T, llf_pmin::T) where {T,ST}
+    SP = @localmem ST (9*CNCP)
+    LX = @localmem ST (9*CNFX); RX = @localmem ST (9*CNFX)
+    LY = @localmem ST (9*CNFX); RY = @localmem ST (9*CNFX)
+    LZ = @localmem ST (9*CNFX); RZ = @localmem ST (9*CNFX)
     @fastmath @inbounds begin
         u = (a1,a2,a3,a4,a5,a6,a7,a8,a9)
         tid = @index(Local, Linear)
@@ -60,10 +62,10 @@ end
         while t <= (CTB+2)^3
             l=t-1; ci=l%(CTB+2); cj=(l÷(CTB+2))%(CTB+2); ck=l÷((CTB+2)*(CTB+2))
             pi=ci+1; pj=cj+1; pk=ck+1
-            m0=_sg9(SP,CNCP,_ctile(pi,pj,pk))
-            δLx,δRx=recon_offsets(_sg9(SP,CNCP,_ctile(pi-1,pj,pk)),m0,_sg9(SP,CNCP,_ctile(pi+1,pj,pk)),rec)
-            δLy,δRy=recon_offsets(_sg9(SP,CNCP,_ctile(pi,pj-1,pk)),m0,_sg9(SP,CNCP,_ctile(pi,pj+1,pk)),rec)
-            δLz,δRz=recon_offsets(_sg9(SP,CNCP,_ctile(pi,pj,pk-1)),m0,_sg9(SP,CNCP,_ctile(pi,pj,pk+1)),rec)
+            m0=_sg9_as(T,SP,CNCP,_ctile(pi,pj,pk))
+            δLx,δRx=recon_offsets(_sg9_as(T,SP,CNCP,_ctile(pi-1,pj,pk)),m0,_sg9_as(T,SP,CNCP,_ctile(pi+1,pj,pk)),rec)
+            δLy,δRy=recon_offsets(_sg9_as(T,SP,CNCP,_ctile(pi,pj-1,pk)),m0,_sg9_as(T,SP,CNCP,_ctile(pi,pj+1,pk)),rec)
+            δLz,δRz=recon_offsets(_sg9_as(T,SP,CNCP,_ctile(pi,pj,pk-1)),m0,_sg9_as(T,SP,CNCP,_ctile(pi,pj,pk+1)),rec)
             uh=hancock_edges(m0,δLx,δRx,δLy,δRy,δLz,δRz,dtdx,γ); mh=cons2prim(uh,γ,smallr,pfl)
             inxt=(pj>=2&&pj<=CTB+1)&&(pk>=2&&pk<=CTB+1)
             inyt=(pi>=2&&pi<=CTB+1)&&(pk>=2&&pk<=CTB+1)
@@ -88,15 +90,15 @@ end
         while t<=3*nfx
             if t<=nfx
                 l=t-1; fi=l%(CTB+1); fj=(l÷(CTB+1))%CTB; fk=l÷((CTB+1)*CTB); ln=_cfx(fi,fj,fk)
-                F=riemann(_sg9(LX,CNFX,ln),_sg9(RX,CNFX,ln),1,γ,ch,smallr,pfl,llf_dmin,llf_pmin,use_hlld)
+                F=riemann(_sg9_as(T,LX,CNFX,ln),_sg9_as(T,RX,CNFX,ln),1,γ,ch,smallr,pfl,llf_dmin,llf_pmin,rsol)
                 _sp9!(LX,CNFX,ln,F)
             elseif t<=2*nfx
                 l=t-1-nfx; fi=l%CTB; fj=(l÷CTB)%(CTB+1); fk=l÷(CTB*(CTB+1)); ln=_cfy(fi,fj,fk)
-                F=riemann(_sg9(LY,CNFX,ln),_sg9(RY,CNFX,ln),2,γ,ch,smallr,pfl,llf_dmin,llf_pmin,use_hlld)
+                F=riemann(_sg9_as(T,LY,CNFX,ln),_sg9_as(T,RY,CNFX,ln),2,γ,ch,smallr,pfl,llf_dmin,llf_pmin,rsol)
                 _sp9!(LY,CNFX,ln,F)
             else
                 l=t-1-2*nfx; fi=l%CTB; fj=(l÷CTB)%CTB; fk=l÷(CTB*CTB); ln=_cfz(fi,fj,fk)
-                F=riemann(_sg9(LZ,CNFX,ln),_sg9(RZ,CNFX,ln),3,γ,ch,smallr,pfl,llf_dmin,llf_pmin,use_hlld)
+                F=riemann(_sg9_as(T,LZ,CNFX,ln),_sg9_as(T,RZ,CNFX,ln),3,γ,ch,smallr,pfl,llf_dmin,llf_pmin,rsol)
                 _sp9!(LZ,CNFX,ln,F)
             end
             t+=nth
@@ -107,9 +109,9 @@ end
         while t<=CTB*CTB*CTB
             l=t-1; a=l%CTB; b=(l÷CTB)%CTB; c=l÷(CTB*CTB)
             gi=mod(ox+a+1-1,N)+1; gj=mod(oy+b+1-1,N)+1; gk=mod(oz+c+1-1,N)+1; idx=((gk-1)*N+(gj-1))*N+gi
-            Fxl=_sg9(LX,CNFX,_cfx(a,b,c));   Fxh=_sg9(LX,CNFX,_cfx(a+1,b,c))
-            Fyl=_sg9(LY,CNFX,_cfy(a,b,c));   Fyh=_sg9(LY,CNFX,_cfy(a,b+1,c))
-            Fzl=_sg9(LZ,CNFX,_cfz(a,b,c));   Fzh=_sg9(LZ,CNFX,_cfz(a,b,c+1))
+            Fxl=_sg9_as(T,LX,CNFX,_cfx(a,b,c));   Fxh=_sg9_as(T,LX,CNFX,_cfx(a+1,b,c))
+            Fyl=_sg9_as(T,LY,CNFX,_cfy(a,b,c));   Fyh=_sg9_as(T,LY,CNFX,_cfy(a,b+1,c))
+            Fzl=_sg9_as(T,LZ,CNFX,_cfz(a,b,c));   Fzh=_sg9_as(T,LZ,CNFX,_cfz(a,b,c+1))
             U0=(a1[idx],a2[idx],a3[idx],a4[idx],a5[idx],a6[idx],a7[idx],a8[idx],a9[idx])
             r=ntuple(v->U0[v]+dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
             o1[idx]=r[1];o2[idx]=r[2];o3[idx]=r[3];o4[idx]=r[4];o5[idx]=r[5];o6[idx]=r[6];o7[idx]=r[7];o8[idx]=r[8]
@@ -141,8 +143,8 @@ end
 # adds a more-specific method for `Val{:auto}`/`Val{:raw}` on a CUDABackend Float32 state.
 function _cube_launch!(::Val, be, s::MHDState{T}, dt::Real, ch::Real, decay::Real) where {T}
     N = s.dims[1]; nb = N ÷ CTB; dtdx = T(dt)/s.dx; cx,cy,cz = bc_codes(s)
-    rec = Val(recon_code_of(s)); per = Val(all_periodic(s))
-    step_cube_kernel!(be, CUBE_GS)(s.scratch..., s.U..., N, nb, cx,cy,cz, rec, per, dtdx, s.γ, T(ch), T(decay),
-            s.smallr, s.pfl, s.llf_dmin, s.llf_pmin, s.use_hlld; ndrange = nb*nb*nb*CUBE_GS)
+    rec = Val(recon_code_of(s)); per = Val(all_periodic(s)); rsol = Val(riemann_code_of(s))
+    step_cube_kernel!(be, CUBE_GS)(s.scratch..., s.U..., N, nb, cx,cy,cz, Val(Float32), rec, per, rsol, dtdx, s.γ, T(ch), T(decay),
+            s.smallr, s.pfl, s.llf_dmin, s.llf_pmin; ndrange = nb*nb*nb*CUBE_GS)
     KA.synchronize(be)
 end

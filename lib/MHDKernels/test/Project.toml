@@ -3,11 +3,22 @@
 # a device is present) enables the GPU cross-check (ref ≡ cube) + throughput; the core
 # convergence/conservation gate runs CPU-f32 and needs only KernelAbstractions.
 [deps]
-MHDKernels = "1a2b3c4d-0009-4000-8000-000000000009"
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
+MHDKernels = "1a2b3c4d-0015-4000-8000-000000000015"
+PoissonKernels = "1a2b3c4d-0008-4000-8000-000000000008"
+EmissionKernels = "1a2b3c4d-0013-4000-8000-000000000013"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
+ChemistryKernels = {path = "../../../../ChemistryKernels.jl"}
 MHDKernels = {path = ".."}
+PoissonKernels = {path = "../../PoissonKernels"}
+EmissionKernels = {path = "../../../../EmissionKernels.jl"}

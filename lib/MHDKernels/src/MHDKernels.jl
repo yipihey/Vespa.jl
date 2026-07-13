@@ -4,7 +4,9 @@
 A KernelAbstractions.jl ideal-MHD solver with **Dedner mixed-GLM divergence
 cleaning** — MUSCL-Hancock + PLM(MonCen) reconstruction + HLLD (LLF fallback),
 written **once** and run on the CPU (the f64 convergence/conservation oracle) and
-on CUDA / Metal GPUs (f32).
+on CUDA / Metal GPUs (f32). The overdamped PMF path is separate: it advances B
+with a curl-form constrained-transport update and does not require GLM cleaning
+or a projection FFT while terminal mode is active.
 
 Design contract (mirrors `PPMKernels`):
 
@@ -28,7 +30,9 @@ kernel (`step_cube!`, GPU throughput path). Both implement the identical scheme.
 """
 module MHDKernels
 
+using FFTW
 using KernelAbstractions
+using Random
 const KA = KernelAbstractions
 
 export backend, has_backend, device_zeros, to_device, to_host
@@ -76,6 +80,10 @@ include("integrator_cube.jl") # fused shared-memory cube integrator (GPU through
 include("timestep.jl")        # CFL Δt reduction
 include("diagnostics.jl")     # max|∇·B|, conserved totals
 include("problems.jl")        # initial conditions (smooth waves, Brio-Wu, Orszag-Tang)
+include("pmf.jl")             # divergence-free primordial magnetic field initializers
+include("terminal_ct.jl")     # divergence-preserving terminal-regime induction
+include("terminal_pressure.jl") # pressure-implicit terminal response + CT coupling
 include("driver.jl")          # step! / evolve! (ch + ψ-damping schedule)
+include("drag.jl")            # exact linear drag and Strang-coupled full-MHD step
 
 end # module

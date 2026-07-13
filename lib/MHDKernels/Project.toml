@@ -1,5 +1,5 @@
 name = "MHDKernels"
-uuid = "1a2b3c4d-0009-4000-8000-000000000009"
+uuid = "1a2b3c4d-0015-4000-8000-000000000015"
 authors = ["T. Abel and contributors"]
 version = "0.1.0"
 
@@ -15,7 +15,9 @@ version = "0.1.0"
 # used throughout — correctness is certified by smooth-wave convergence + standard
 # MHD test problems, and by ref-kernel ≡ cube-kernel agreement.
 [deps]
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [weakdeps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
@@ -27,6 +29,7 @@ MHDKernelsMetalExt = "Metal"
 
 [compat]
 CUDA = "5"
+FFTW = "1"
 KernelAbstractions = "0.9"
 Metal = "1"
 julia = "1.10"

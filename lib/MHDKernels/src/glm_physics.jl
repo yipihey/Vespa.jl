@@ -119,6 +119,14 @@ end
     f=ntuple(i->T(0.5)*(fL[i]+fR[i])-T(0.5)*smax*(uR[i]-uL[i]), 9)
     (f[1],f[2],f[3],f[4],f[5],fbn,f[7],f[8],fpsi)
 end
+@fastmath @inline function hll_x(L::NTuple{9,T},R::NTuple{9,T},γ::T,ch::T,bn::T,fbn::T,fpsi::T) where {T}
+    cfL=fast_speed(L,γ,bn); cfR=fast_speed(R,γ,bn)
+    SL=min(min(L[2]-cfL, R[2]-cfR), zero(T)); SR=max(max(L[2]+cfL, R[2]+cfR), zero(T))
+    fL=phys_flux_x(L,γ); fR=phys_flux_x(R,γ); uL=prim2cons(L,γ); uR=prim2cons(R,γ)
+    invd=one(T)/(SR-SL)
+    f=ntuple(i->(SR*fL[i] - SL*fR[i] + SL*SR*(uR[i]-uL[i]))*invd, 9)
+    (f[1],f[2],f[3],f[4],f[5],fbn,f[7],f[8],fpsi)
+end
 # Miyoshi-Kusano single-star transverse state (lifted out of hlld_x so it's not a
 # captured closure — closures can inflate GPU register pressure / hurt occupancy).
 @fastmath @inline function _hlld_star(d::T,u::T,v::T,w::T,by::T,bz::T,S::T,bn::T,SM::T) where {T}
@@ -174,15 +182,25 @@ end
     end
     (f[1],f[2],f[3],f[4],f[5],fbn,f[7],f[8],fpsi)
 end
-# Riemann dispatch in direction `dir`: rotate, clean GLM, HLLD (LLF fallback), rotate back.
+
+const RSOLVE_HLLD = 0
+const RSOLVE_HLL = 1
+const RSOLVE_LLF = 2
+riemann_code(s::Symbol) = s === :hlld ? RSOLVE_HLLD : s === :hll ? RSOLVE_HLL :
+                          s === :llf ? RSOLVE_LLF :
+                          error("unknown MHD riemann :$s (have :hlld, :hll, :llf)")
+
+# Riemann dispatch in direction `dir`: rotate, clean GLM, solve selected MHD Riemann, rotate back.
 @fastmath @inline function riemann(Lq::NTuple{9,T},Rq::NTuple{9,T},dir::Int,
-        γ::T,ch::T,smallr::T,pfl::T,llf_dmin::T,llf_pmin::T,use_hlld::Bool) where {T}
+        γ::T,ch::T,smallr::T,pfl::T,llf_dmin::T,llf_pmin::T,rsol::Val{RS}) where {T,RS}
     L0=rot_to(Lq,dir); R0=rot_to(Rq,dir)
     L=(max(L0[1],smallr),L0[2],L0[3],L0[4],max(L0[5],pfl),L0[6],L0[7],L0[8],L0[9])
     R=(max(R0[1],smallr),R0[2],R0[3],R0[4],max(R0[5],pfl),R0[6],R0[7],R0[8],R0[9])
     bns,psis=glm_pair(L[6],R[6],L[9],R[9],ch); fbn=psis; fpsi=ch*ch*bns
     Lc=(L[1],L[2],L[3],L[4],L[5],bns,L[7],L[8],L[9]); Rc=(R[1],R[2],R[3],R[4],R[5],bns,R[7],R[8],R[9])
-    uself=(llf_dmin>zero(T) && min(L[1],R[1])<llf_dmin)||(llf_pmin>zero(T) && min(L[5],R[5])<llf_pmin)||!use_hlld
-    f = uself ? llf_x(Lc,Rc,γ,ch,fbn,fpsi) : hlld_x(Lc,Rc,γ,ch,bns,fbn,fpsi)
+    uself=(llf_dmin>zero(T) && min(L[1],R[1])<llf_dmin)||(llf_pmin>zero(T) && min(L[5],R[5])<llf_pmin)
+    f = RS == RSOLVE_LLF ? llf_x(Lc,Rc,γ,ch,fbn,fpsi) :
+        RS == RSOLVE_HLL ? hll_x(Lc,Rc,γ,ch,bns,fbn,fpsi) :
+        uself ? llf_x(Lc,Rc,γ,ch,fbn,fpsi) : hlld_x(Lc,Rc,γ,ch,bns,fbn,fpsi)
     rot_flux_from(f,dir)
 end
