@@ -2009,6 +2009,11 @@ end
            max(Float64(dtau), eps(Float64))
 end
 
+function _gas_gravity_kick_dt(dtau, a, h, vunit, lbox_comoving_cm)
+    return Float64(dtau) /
+           _hydro_time_per_tau(a, h, vunit, lbox_comoving_cm)
+end
+
 @inline function _drag_impulse(gamma_drag, dtphys, dtcode, rate_code)
     return isfinite(rate_code) ? Float64(rate_code) * Float64(dtcode) :
            Float64(gamma_drag) * Float64(dtphys)
@@ -3134,10 +3139,10 @@ function main()
                                                        ndrange=ncells)
                     end
                 end
+                old_single_step = !gravity_midpoint_source && last_gravity_nsub == 1 &&
+                                  gravity_subcycles_fixed == 1 && gravity_dt_boost == 0
+                agrav = old_single_step ? a : (zrun ? 0.5 * (a_before + a_after_step) : 1.0)
                 tf += _time_phase(be_p, be_mhd) do
-                    old_single_step = !gravity_midpoint_source && last_gravity_nsub == 1 &&
-                                      gravity_subcycles_fixed == 1 && gravity_dt_boost == 0
-                    agrav = old_single_step ? a : (zrun ? 0.5 * (a_before + a_after_step) : 1.0)
                     gravcoef = zrun ? 1.5 * Om * agrav : 1.0
                     if fft_mode === :mps
                         PoissonKernels.fft_poisson_rfft!(φ, ρtot; G=gravcoef, a=1, boxsize=1)
@@ -3148,8 +3153,10 @@ function main()
                     end
                 end
                 if gravity_gas_kick
+                    dtgas = zrun ? _gas_gravity_kick_dt(
+                        dt, agrav, hub, chem_vunit, terminal_lbox_cm) : dt
                     tg += _time_phase(be_mhd, be_p) do
-                        MHDKernels.apply_cell_center_gravity!(s, φ, dt)
+                        MHDKernels.apply_cell_center_gravity!(s, φ, dtgas)
                     end
                 end
                 if isfinite(particle_max_disp_cells)
@@ -3204,13 +3211,13 @@ function main()
                                                            ndrange=ncells)
                         end
                     end
+                    old_single_step = last_gravity_nsub == 1 &&
+                                      gravity_subcycles_fixed == 1 &&
+                                      gravity_dt_boost == 0 &&
+                                      !gravity_midpoint_source
+                    agrav = old_single_step ? a :
+                            (zrun ? a_before + (a_after_step - a_before) * ((ig - 0.5) / last_gravity_nsub) : 1.0)
                     tf += _time_phase(be_p, be_mhd) do
-                        old_single_step = last_gravity_nsub == 1 &&
-                                          gravity_subcycles_fixed == 1 &&
-                                          gravity_dt_boost == 0 &&
-                                          !gravity_midpoint_source
-                        agrav = old_single_step ? a :
-                                (zrun ? a_before + (a_after_step - a_before) * ((ig - 0.5) / last_gravity_nsub) : 1.0)
                         gravcoef = zrun ? 1.5 * Om * agrav : 1.0
                         if fft_mode === :mps
                             PoissonKernels.fft_poisson_rfft!(φ, ρtot; G=gravcoef, a=1, boxsize=1)
@@ -3221,8 +3228,10 @@ function main()
                         end
                     end
                     if gravity_gas_kick
+                        dtgas = zrun ? _gas_gravity_kick_dt(
+                            dtdm, agrav, hub, chem_vunit, terminal_lbox_cm) : dtdm
                         tg += _time_phase(be_mhd, be_p) do
-                            MHDKernels.apply_cell_center_gravity!(s, φ, dtdm)
+                            MHDKernels.apply_cell_center_gravity!(s, φ, dtgas)
                         end
                     end
                     tp += _time_phase(be_p, be_mhd) do

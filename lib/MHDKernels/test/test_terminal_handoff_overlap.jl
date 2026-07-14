@@ -71,4 +71,17 @@ end
     @test _hydro_subinterval(dth, dtau, 0.25dtau) ≈ 0.25dth rtol=2e-15
 end
 
+@testset "cosmological gas-gravity kick uses the MHD velocity clock" begin
+    dtau = 0.017
+    a = 1 / 2501
+    h = 0.674
+    vunit = 8.0e5
+    lbox = 6.0 * _PMF_KPC_CM
+    H0 = 100h * 1.0e5 / 3.0857e24
+    expected = dtau * H0 * lbox / (a * vunit)
+    kick_dt = _gas_gravity_kick_dt(dtau, a, h, vunit, lbox)
+    @test kick_dt ≈ expected rtol=2e-15
+    @test kick_dt * _hydro_time_per_tau(a, h, vunit, lbox) ≈ dtau rtol=2e-15
+end
+
 end
