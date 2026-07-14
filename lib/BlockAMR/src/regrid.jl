@@ -162,10 +162,28 @@ end
 
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
 function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
-                          parts = nothing, mass_code = 0.0, jeans_coef = 0.0)
+                          parts = nothing, mass_code = 0.0, jeans_coef = 0.0,
+                          static_parts = nothing, static_mass_code = 0.0)
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     count = device_zeros(lev.be, Int32, (lev.cap,))
+    # Static (must-refine) levels flag from a FROZEN reference particle set so the
+    # zoom mesh reproduces the IC (MUSIC) grid structure and does NOT drift/grow
+    # with the collapsing particles — L<must_refine_lmax rebuilds identically every
+    # regrid.  Adaptive levels (l ≥ must_refine_lmax) use the LIVE positions so new
+    # refinement follows the collapse inside the frozen zoom region.
+    #
+    # A MULTI-MASS zoom nests by particle mass: MUSIC level (base+l+1) is refined
+    # wherever particles of that mass tier AND finer live, giving progressively
+    # larger rectangles at coarser levels (L10 ⊃ L11 ⊃ L12).  `static_parts` may
+    # therefore be a Function `l -> parts` (per-level mass tier) as well as a fixed
+    # NamedTuple; likewise `static_mass_code`.  Using only the finest tier for every
+    # level collapses L1/L2 toward the L12 footprint — the bug this fixes.
+    is_mustref = pol.dm_criterion && pol.must_refine_lmax > 0 && l < pol.must_refine_lmax
+    sp = static_parts isa Function ? static_parts(l) : static_parts
+    sm = static_mass_code isa Function ? static_mass_code(l) : static_mass_code
+    dparts = (is_mustref && sp !== nothing) ? sp : parts
+    dmcode = (is_mustref && sp !== nothing) ? sm : mass_code
     # DM-driven refinement: deposit DM onto THIS level and flag on the TOTAL
     # matter density (gas + CIC-DM), so DM-dominated minihalos refine on their
     # own overdensity, not only where gas has traced them.
@@ -181,16 +199,16 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     # particle-per-(base-)cell count that triggers, unchanged across levels,
     # exactly RAMSES's mass criterion relative to the (level) mean density.  The
     # gas-only path keeps its own `lfac` (gas density is smooth, not shot-noisy).
-    usedm = pol.dm_criterion && parts !== nothing
+    usedm = pol.dm_criterion && dparts !== nothing
     if usedm
-        deposit_particles_level!(hier, l, parts; mass_code)          # fills lev.dm
+        deposit_particles_level!(hier, l, dparts; mass_code = dmcode)  # fills lev.dm
         dmarr = lev.dm; dmmul = 1.0f0
         # Static zoom mesh: below the IC finest level, flag by PRESENCE (fine-
         # region density > must_refine_thr·mean) so the whole zoom region is
         # kept refined to must_refine_lmax and never de-refines (Enzo/RAMSES
         # must-refine).  At/above it, the adaptive overdensity threshold.
-        thr = (pol.must_refine_lmax > 0 && l < pol.must_refine_lmax) ?
-              Float32(pol.must_refine_thr) : Float32(pol.dthresh * 8.0^l)  # 8 = RefineBy^ndim
+        thr = is_mustref ? Float32(pol.must_refine_thr) :
+                           Float32(pol.dthresh * 8.0^l)  # 8 = RefineBy^ndim
     else
         dmarr = lev.D; dmmul = 0.0f0                                 # gas-only (dummy)
         thr = Float32(pol.dthresh * pol.lfac^l)
@@ -284,7 +302,8 @@ conservatively prolonged from their parents; vanished blocks are freed.  All
 tables and C/F registers are rebuilt.
 """
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
-                 parts = nothing, mass_code = 0.0, jeans_coef = 0.0)
+                 parts = nothing, mass_code = 0.0, jeans_coef = 0.0,
+                 static_parts = nothing, static_mass_code = 0.0)
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
@@ -299,7 +318,8 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     for l in 0:ltop
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
-        Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code, jeans_coef)
+        Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code, jeans_coef,
+                                         static_parts, static_mass_code)
     end
     # 2) tile cascade fine→coarse: T[lf] = forced level-lf child footprints as
     #    level-(lf−1)-cell tile origins (multiples of Bh; every block spans
