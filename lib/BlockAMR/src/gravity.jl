@@ -507,3 +507,184 @@ function refresh_phi_ghosts!(hier::AMRHierarchy, l::Int)
     _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
     return nothing
 end
+
+# ── multigrid level solve: cascadic correction cycle bottoming at the exact FFT ──
+#
+# Plain RB-GS propagates boundary/long-wavelength information only ~√nsweep cells
+# per solve.  On zoom unions 100+ cells across it NEVER converges: the level φ came
+# out 0.44 / 0.05 / 0.006 of truth at L1/L2/L3 (measured against the converged
+# 30000-sweep solution ≡ interpolated topgrid φ, fit 1.0002) — fine particles felt
+# no infall and zoom halos were pushed apart.  The cure every calibrated AMR code
+# uses (RAMSES multigrid_fine, Enzo per-grid MG, repic mg_dirichlet) is multigrid:
+#
+#   cycle: pre-smooth φ_l → defect d = rhs − Lφ → restrict d down the EXISTING
+#   hierarchy (nesting guarantees parents cover the union) to the topgrid, where
+#   the periodic FFT with greens = :discrete7 — the exact inverse of the SAME
+#   7-point stencil the sweeps iterate — solves the correction EXACTLY → cascade
+#   the correction back up (ring + interior prolongation, a few smoothing sweeps
+#   per level) → φ_l += e → post-smooth.
+#
+# Long wavelengths converge exactly regardless of union size; the sweeps only fix
+# the per-level short-wavelength band.  The solved level's own correction ring is
+# held at ZERO (its Dirichlet BC is pinned to the parent φ — one-way interface,
+# RAMSES semantics); intermediate levels' correction rings prolong from the parent
+# correction (the correction field is globally supported through the FFT bottom).
+
+# signed defect d = rhs − Lφ at interior cells, written in POOL layout (dst must be
+# pre-zeroed: ghosts/dead slots stay 0 so the restriction below reads clean data).
+@kernel function _defect_pool_k!(dst, @Const(phi), @Const(rhs), @Const(live_d),
+                                 B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        idx = base + _lidx(i, j, k, nd)
+        dst[idx] = rhs[idx] - (phi[idx - Int32(1)] + phi[idx + Int32(1)] +
+                               phi[idx - nd] + phi[idx + nd] +
+                               phi[idx - nd*nd] + phi[idx + nd*nd] -
+                               6.0f0 * phi[idx])
+    end
+end
+
+"nsweep red-black pairs on explicit (phi, rhs) pool arrays + per-sweep face exchange."
+function _mg_smooth!(lev::Level, phi, rhs, nsweep::Int)
+    sibf = _tabt(lev, :sibf)
+    n = length(lev.live) * lev.B^3
+    for _ in 1:nsweep
+        _rb_relax_k!(lev.be)(phi, rhs, lev.live_d, Int32(0), Int32(lev.B),
+                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
+        _rb_relax_k!(lev.be)(phi, rhs, lev.live_d, Int32(1), Int32(lev.B),
+                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = n)
+        _run_copy!(lev.be, sibf, phi, phi, lev.nd, lev.stride)
+    end
+    return nothing
+end
+
+# lazily sized Float32 pool scratch stashed in tabs (content refreshed every use,
+# so slot remaps after regrid/compaction are harmless; size guards pool growth)
+function _mg_scratch!(lev::Level, key::Symbol)
+    buf = get(lev.tabs, key, nothing)
+    if buf === nothing || length(buf::typeof(lev.phi)) < lev.cap * lev.stride
+        lev.tabs[key] = device_zeros(lev.be, Float32, (lev.cap * lev.stride,))
+    end
+    return lev.tabs[key]::typeof(lev.phi)
+end
+
+# interior-prolongation table (parent → whole active interior), cached; topology-
+# dependent so build_level_tables! invalidates it at every rebuild.
+function _proint_table(lev::Level, plev::Level)
+    t = get(lev.tabs, :proint, nothing)
+    t === nothing || return t::RectJobTable
+    tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true))
+    lev.tabs[:proint] = tab
+    return tab
+end
+
+"""
+    solve_gravity_level_mg!(hier, l; source_coef, rho_mean=0, use_dm=false,
+                            gsrc, gsol, ncycle=2, nu=8, nuc=8) -> defect∞
+
+!!! warning "WIP — not yet convergent, do not use in production"
+    Measured on the zoomA static mesh: the cycle AMPLIFIES (×2.4/6.4/19.5 per
+    level at ncycle=2) because the restricted defect is solved on the UNMASKED
+    periodic bottom — the near-ring boundary-layer defect gets an unpinned
+    global response.  The correct scheme is RAMSES multigrid_fine's MASKED
+    coarse solves (coarse MG levels carry the union's Dirichlet mask, e=0
+    outside the footprint).  Kept as the scaffold for that implementation;
+    unexported.  See project_first_halo_target memory for the full diagnosis.
+
+Multigrid version of [`solve_gravity_level!`](@ref) for `l ≥ 1`: same equation,
+same Dirichlet-from-parent boundary, but each cycle solves the level's defect on
+the coarser hierarchy down to the topgrid FFT (exact, `greens = :discrete7`), so
+the solve CONVERGES on arbitrarily large unions.  `gsrc`/`gsol` are caller-provided
+nbase³ Float32 device scratch arrays for the FFT bottom (the step's topgrid ρ/φ
+buffers are free at this point and are exactly the right size/type).  `bottom!` is
+the caller's exact periodic solver (BlockAMR carries no FFT dep — inject it),
+called as `bottom!(gsol, gsrc)` and expected to solve the 7-point stencil form
+L·e = src, i.e. with PoissonKernels:
+`(sol, src) -> fft_poisson_rfft!(sol, src; G = Float64(N)^2, boxsize = 1.0, greens = :discrete7)`.
+"""
+function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
+                                 rho_mean::Real = 0, use_dm::Bool = false,
+                                 rho_ext = nothing, gsrc = nothing, gsol = nothing,
+                                 bottom! = nothing, init::Symbol = :warm,
+                                 ncycle::Int = 2, nu::Int = 8, nuc::Int = 8)
+    l >= 1 || error("solve_gravity_level_mg!: level 0 is the global FFT — solve it there")
+    lev = hier.levels[l + 1]
+    isempty(lev.live) && return 0.0f0
+    (gsrc === nothing || gsol === nothing || bottom! === nothing) &&
+        error("solve_gravity_level_mg!: pass gsrc/gsol nbase³ device scratch + bottom!")
+    # rhs + Dirichlet ring + pre-smooth (warm start) — the existing single-level path
+    solve_gravity_level!(hier, l; source_coef, rho_mean, use_dm, rho_ext,
+                         nsweep = nu, init = init, residual = false)
+    N  = hier.nbase[1]
+    nB = length(lev.live) * lev.B^3
+    lev0 = hier.levels[1]
+    for cyc in 1:ncycle
+        # defect of THIS level, pool layout
+        d = _mg_scratch!(lev, :mgrhs); fill!(d, 0.0f0)
+        _defect_pool_k!(lev.be)(d, lev.phi, lev.rhs, lev.live_d, Int32(lev.B),
+                                Int32(lev.ng), Int32(lev.nd), Int32(lev.stride); ndrange = nB)
+        # restrict the defect down the parent chain to level 0 (×4 per level: the
+        # h²-scaled stencil form re-scales with the coarser cell)
+        for k in l:-1:1
+            lvf = hier.levels[k + 1]; lvc = hier.levels[k]
+            dc = _mg_scratch!(lvc, :mgrhs); fill!(dc, 0.0f0)
+            _run_restrict!(lvf.be, _tabt(lvf, :res), dc,
+                           _mg_scratch!(lvf, :mgrhs), lvf.nd, lvf.stride)
+            dc .*= 4.0f0
+        end
+        # bottom: exact periodic solve of the coarsened defect on the topgrid.
+        # rhs is h₀²-scaled ⇒ G = 1/h₀² = N² makes L·e = d₀ under :discrete7.
+        haskey(lev0.tabs, :gi0) || sync_block_geometry!(lev0)
+        on0 = get(lev0.tabs, :mgones, nothing)
+        if on0 === nothing || length(on0::typeof(lev0.Dsc)) < lev0.cap
+            o = device_zeros(lev0.be, Float32, (lev0.cap,)); o .= 1.0f0
+            lev0.tabs[:mgones] = o
+        end
+        _global_from_level0_k!(lev0.be)(gsrc, _mg_scratch!(lev0, :mgrhs),
+                                        lev0.tabs[:mgones]::typeof(lev0.Dsc),
+                                        lev0.live_d, _tabi(lev0, :gi0),
+                                        Int32.(hier.nbase)..., Int32(lev0.B),
+                                        Int32(lev0.ng), Int32(lev0.nd),
+                                        Int32(lev0.stride);
+                                        ndrange = length(lev0.live) * lev0.B^3)
+        bottom!(reshape(gsol, N, N, N), reshape(gsrc, N, N, N))
+        e0 = _mg_scratch!(lev0, :mgphi)
+        _phi_from_global_k!(lev0.be)(e0, gsol, lev0.live_d, _tabi(lev0, :gi0),
+                                     Int32.(hier.nbase)..., Int32(lev0.ng),
+                                     Int32(lev0.nd), Int32(lev0.stride);
+                                     ndrange = length(lev0.live) * lev0.nd^3)
+        # cascade the correction back up: ring + interior from the parent correction,
+        # then smooth against the level's coarsened defect.  EVERY level's correction
+        # ring floats with the parent correction (composite two-grid): the fine
+        # defect's long-range response re-adjusts the ring consistently.  A zero-
+        # pinned ring with a PERIODIC bottom is inconsistent — the near-ring
+        # boundary-layer defect then gets an unpinned global response (measured 11×
+        # over-correction).  The fixed point is unchanged (d→0 ⇒ e→0 ⇒ ring→P(φ_parent),
+        # the one-way Dirichlet answer); the floating ring only stabilizes the path.
+        for k in 1:l
+            lvf = hier.levels[k + 1]; lvc = hier.levels[k]
+            e = _mg_scratch!(lvf, :mgphi); fill!(e, 0.0f0)
+            ep = _mg_scratch!(lvc, :mgphi)
+            _run_prolong!(lvf.be, _proint_table(lvf, lvc), e, ep, ep, 0.0f0,
+                          lvf.nd, lvf.stride)
+            pro = _tabt(lvf, :pro)
+            pro.total > 0 && _rect_prolong_tl_k!(lvf.be)(e, ep, pro.jobs,
+                    pro.cellstart, Int32(pro.njobs), Int32(lvf.nd),
+                    Int32(lvf.stride); ndrange = pro.total)
+            _run_copy!(lvf.be, _tabt(lvf, :sib), e, e, lvf.nd, lvf.stride)
+            _mg_smooth!(lvf, e, _mg_scratch!(lvf, :mgrhs), k == l ? nu : nuc)
+        end
+        # apply + post-smooth on the real φ (ring included: it floats with e)
+        lev.phi .+= _mg_scratch!(lev, :mgphi)
+        _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
+        _mg_smooth!(lev, lev.phi, lev.rhs, nu)
+    end
+    _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
+    return 0.0f0
+end
