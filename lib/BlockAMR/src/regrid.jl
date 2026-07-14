@@ -471,10 +471,16 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             changed[lc + 1] && compact_level!(hier, lc)
         end
     end
+    # gravity_only (DMO): the base level's O-twins are zero-size and there is no
+    # hydro flux, so the coarse–fine REFLUX register (build_cf_register! / build_cf_faces)
+    # is never consumed — skip it.  It is an O(N_fine·B²) host build that otherwise
+    # dominates the regrid (~90% of the tables phase at deep DM refinement: ~4 s of
+    # a ~4.4 s tables phase at 100k blocks; regrid ~5-6× faster with it skipped).
+    grav_only = isempty(hier.levels[1].Do)
     tTB = @elapsed for l in 0:length(hier.levels)-1
         if changed[l + 1] || (l >= 1 && changed[l])
             build_level_tables!(hier, l)
-            l >= 1 && build_cf_register!(hier, l)
+            (l >= 1 && !grav_only) && build_cf_register!(hier, l)
         end
     end
     # φ ring maintenance, coarse→fine (children prolong from refreshed parent

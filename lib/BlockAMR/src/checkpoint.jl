@@ -170,9 +170,10 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
     end
     copyto!(hier.nstep, ck.nstep)
     tb = _t()
+    grav_only = isempty(hier.levels[1].Do)   # DMO: no hydro flux → no reflux register
     for l in 0:length(hier.levels)-1
         build_level_tables!(hier, l)
-        l >= 1 && build_cf_register!(hier, l)
+        (l >= 1 && !grav_only) && build_cf_register!(hier, l)
         dbg && (@printf("load: built tables L%d in %.1fs\n", l, _t()-tb); flush(stdout); tb = _t())
     end
     return hier, ck.extra
