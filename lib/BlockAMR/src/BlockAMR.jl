@@ -54,7 +54,7 @@ export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
 export enable_timers!, reset_timers!, timer_report
 export chem_level!
-export solve_gravity_level!, phi_from_global!, grav_kick_level_pool!
+export solve_gravity_level!, solve_gravity_level_mg!, phi_from_global!, grav_kick_level_pool!
 export deposit_particles_level!, gather_accel_particles!, particles_kick!, particles_drift!, build_block_lookup!
 export set_particle_tile!, particle_tile, ptile_ranges
 export global_from_level0!, compton_drag!

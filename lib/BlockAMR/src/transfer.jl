@@ -281,6 +281,7 @@ function build_level_tables!(hier::AMRHierarchy, l::Int)
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
     delete!(lev.tabs, :proint)                            # MG interior-prolong: lazy rebuild
+    delete!(lev.tabs, :mgd)                               # MG dense-pyramid cache: topology-keyed
     if l >= 1
         plev = hier.levels[l]
         lev.tabs[:pro] = to_device_table(lev.be, build_prolong_jobs(lev, plev))
