@@ -322,3 +322,44 @@ function particles_drift!(hier, parts, dt)
     end
     return nothing
 end
+
+# ── particle → finest-covering-level classification (subcycling partition) ────
+@kernel function _plevel_k!(plev, @Const(px), @Const(py), @Const(pz),
+                            @Const(pkey), @Const(pslot), nkey::Int32,
+                            N::Float32, B::Int32, lid::UInt8)
+    p = @index(Global)
+    @inbounds if plev[p] == UInt8(0xff)
+        cx = unsafe_trunc(Int32, px[p] * N); cy = unsafe_trunc(Int32, py[p] * N)
+        cz = unsafe_trunc(Int32, pz[p] * N)
+        key = Int64(cx ÷ B) | (Int64(cy ÷ B) << 21) | (Int64(cz ÷ B) << 42)
+        _lookup_slot(pkey, pslot, nkey, key) != Int32(0) && (plev[p] = lid)
+    end
+end
+
+"""
+    particle_levels!(hier, parts, plev; lmax_dm = …) -> plev
+
+Classify every particle by the FINEST level (≤ `lmax_dm`) whose block union
+covers it, walking fine → coarse (level 0 covers everything in standalone
+hierarchies).  `plev` is a device UInt8 array (particle length); overwritten.
+The per-level index sets drive 2:1 subcycled kick/drift (RAMSES: a particle
+belongs to exactly one level and moves on that level's timestep).
+"""
+function particle_levels!(hier::AMRHierarchy, parts, plev;
+                          lmax_dm::Int = length(hier.levels) - 1)
+    fill!(plev, 0xff)
+    np = length(parts.px)
+    for l in min(lmax_dm, length(hier.levels) - 1):-1:0
+        lev = hier.levels[l + 1]
+        isempty(lev.live) && continue
+        haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)
+        N = Float32(hier.nbase[1] * exp2(l))
+        nkey = Int32(length(lev.live))
+        for r in ptile_ranges(np)
+            _plevel_k!(lev.be)(view(plev, r), view(parts.px, r), view(parts.py, r),
+                               view(parts.pz, r), lev.tabs[:pkey], lev.tabs[:pslot],
+                               nkey, N, Int32(hier.B), UInt8(l); ndrange = length(r))
+        end
+    end
+    return plev
+end

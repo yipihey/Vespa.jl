@@ -263,9 +263,13 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
                               nsweep::Int = 60, rho_ext = nothing,
                               rho_mean::Real = 0, init::Symbol = :warm,
                               use_dm::Bool = false, residual::Bool = true,
-                              restol::Real = 0.0, check_every::Int = 4)
+                              restol::Real = 0.0, check_every::Int = 4,
+                              bc_phi = nothing)
     lev = hier.levels[l + 1]
     plev = l >= 1 ? hier.levels[l] : lev
+    # bc_phi: override the parent φ used for the Dirichlet ring (+ :parent init) —
+    # subcycled children pass the TIME-INTERPOLATED parent state (repic dyadic blend)
+    bcφ = bc_phi === nothing ? plev.phi : bc_phi
     isempty(lev.live) && return 0.0f0
     haskey(lev.tabs, :gi0) || sync_block_geometry!(lev)
     n  = length(lev.live) * lev.B^3
@@ -283,7 +287,7 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     sib = _tabt(lev, :sib)
     pro = l >= 1 ? _tabt(lev, :pro) : RectJobTable()
     if pro.total > 0                                       # Dirichlet BCs (once)
-        _rect_prolong_tl_k!(lev.be)(lev.phi, plev.phi, pro.jobs, pro.cellstart,
+        _rect_prolong_tl_k!(lev.be)(lev.phi, bcφ, pro.jobs, pro.cellstart,
                                     Int32(pro.njobs), Int32(lev.nd),
                                     Int32(lev.stride); ndrange = pro.total)
         # the shell fill also touched sibling-covered ghosts — restore fine data
@@ -292,7 +296,7 @@ function solve_gravity_level!(hier::AMRHierarchy, l::Int; source_coef::Real,
     end
     if init === :parent && l >= 1                          # interior seed
         tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true))
-        _run_prolong!(lev.be, tab, lev.phi, plev.phi, plev.phi, 0.0f0,
+        _run_prolong!(lev.be, tab, lev.phi, bcφ, bcφ, 0.0f0,
                       lev.nd, lev.stride)
     end
     # per-sweep exchange: FACES ONLY (the 7-point stencil never reads
@@ -734,13 +738,13 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
                                  rho_mean::Real = 0, use_dm::Bool = false,
                                  rho_ext = nothing, init::Symbol = :warm,
                                  ncycle::Int = 6, nu1::Int = 3, nu2::Int = 3,
-                                 nub::Int = 80, ω::Real = 0.65)
+                                 nub::Int = 80, ω::Real = 0.65, bc_phi = nothing)
     l >= 1 || error("solve_gravity_level_mg!: level 0 is the global FFT — solve it there")
     lev = hier.levels[l + 1]
     isempty(lev.live) && return 0.0f0
     # rhs + Dirichlet ring (+ optional interior seed), no sweeps — the existing path
     solve_gravity_level!(hier, l; source_coef, rho_mean, use_dm, rho_ext,
-                         nsweep = 0, init, residual = false)
+                         nsweep = 0, init, residual = false, bc_phi)
     # cached union geometry + dense pyramid (topology-keyed: build_level_tables!
     # deletes :mgd at every rebuild, so a static mesh pays the host pass ONCE)
     cache = get(lev.tabs, :mgd, nothing)
