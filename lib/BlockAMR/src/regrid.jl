@@ -425,11 +425,20 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             # per level is the parent (B/2 + ng + nbuf) footprint in box units; it
             # is geometric in depth, so the total shrink is bounded (~2× the coarsest).
             # A child at the sphere edge needs a WHOLE parent-block neighbor for its
-            # ghost prolongation, so the per-level margin is a full parent block
-            # (B) + ghost (ng) + criterion buffer (nbuf), in box units at lc-1.
+            # ghost prolongation.  The filter tests block CENTERS, so the worst case
+            # is the 3D DIAGONAL: a kept child's ghost corner reaches
+            # √3·(B/2+ng)·dx_l past its center, and the parent block containing that
+            # cell has its center up to √3·(B/2)·dx_{l-1} farther — √3·(3B/4+ng/2)
+            # parent cells total (= 22.5 for B=16, ng=2), NOT the linear B+ng.  The
+            # linear margin under-covered exactly at a dense sphere-edge shell
+            # (haloA run 4: ghost at r=0.1245 vs parent keep-radius 0.1207 →
+            # "prolongation under-covered").  √3·(B+ng+nbuf) bounds it with room
+            # for the nbuf flag dilation; still geometric in depth, total ≲ 3.5×
+            # the coarsest term.
             margin = 0.0
             for k in (pol.zoom_lmin + 1):lc
-                margin += (hier.B + hier.ng + pol.nbuf) / (hier.nbase[1] * 2.0^(k - 1))
+                margin += sqrt(3.0) * (hier.B + hier.ng + pol.nbuf) /
+                          (hier.nbase[1] * 2.0^(k - 1))
             end
             reff = max(pol.zoom_r - margin, 0.0)
             r2 = reff^2
