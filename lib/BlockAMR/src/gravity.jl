@@ -745,65 +745,101 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
     # rhs + Dirichlet ring (+ optional interior seed), no sweeps — the existing path
     solve_gravity_level!(hier, l; source_coef, rho_mean, use_dm, rho_ext,
                          nsweep = 0, init, residual = false, bc_phi)
-    # cached union geometry + dense pyramid (topology-keyed: build_level_tables!
-    # deletes :mgd at every rebuild, so a static mesh pays the host pass ONCE)
+    # cached union geometry + dense pyramids (topology-keyed: build_level_tables!
+    # deletes :mgd at every rebuild, so a static mesh pays the host pass ONCE).
+    # The union is split into CONNECTED CLUSTERS (grid-hash union-find, link radius
+    # 2B cells) and each cluster gets its OWN bounding-box pyramid: stray adaptive
+    # blocks far from the main zoom rectangle otherwise blow the single bbox up to
+    # a box-scale dense grid (the 14.8 GiB OOM).  Disjoint clusters are independent
+    # Dirichlet problems — solving them separately IS the one-way scheme.
     cache = get(lev.tabs, :mgd, nothing)
     if cache === nothing
-        # union bounding box in level-l cells (host; periodic-wrap-safe via anchoring)
         P = Int128(lev.P[1])
         anc = lev.meta[lev.live[1]].origin
-        lo = [typemax(Int64), typemax(Int64), typemax(Int64)]
-        hi = [typemin(Int64), typemin(Int64), typemin(Int64)]
-        rel = Matrix{Int64}(undef, 3, length(lev.live))
+        nlive = length(lev.live)
+        rel = Matrix{Int64}(undef, 3, nlive)
         for (n_, s) in enumerate(lev.live)
             m = lev.meta[s]
             for d in 1:3
-                rd = Int64(mod(Int128(m.origin[d]) - Int128(anc[d]) + P ÷ 2, P) - P ÷ 2)
-                rel[d, n_] = rd
-                lo[d] = min(lo[d], rd); hi[d] = max(hi[d], rd + lev.B)
+                rel[d, n_] = Int64(mod(Int128(m.origin[d]) - Int128(anc[d]) + P ÷ 2, P) - P ÷ 2)
             end
         end
-        dims = ntuple(d -> Int(hi[d] - lo[d]) + 2, 3)      # +1-cell halo each side
-        # per-slot dense-relative origins (0-based, halo-exclusive)
+        # union-find over blocks, linked when within 2B cells (grid-hash buckets)
+        parent = collect(1:nlive)
+        find(i) = (while parent[i] != i; parent[i] = parent[parent[i]]; i = parent[i]; end; i)
+        link = 2 * lev.B
+        buck = Dict{NTuple{3,Int64},Vector{Int}}()
+        for n_ in 1:nlive
+            k = ntuple(d -> fld(rel[d, n_], link), 3)
+            push!(get!(buck, k, Int[]), n_)
+        end
+        for n_ in 1:nlive
+            k = ntuple(d -> fld(rel[d, n_], link), 3)
+            for dz in -1:1, dy in -1:1, dx in -1:1
+                nb = get(buck, (k[1]+dx, k[2]+dy, k[3]+dz), nothing)
+                nb === nothing && continue
+                for m_ in nb
+                    if maximum(abs.(rel[:, n_] .- rel[:, m_])) <= link
+                        ra = find(n_); rb = find(m_)
+                        ra != rb && (parent[ra] = rb)
+                    end
+                end
+            end
+        end
+        groups = Dict{Int,Vector{Int}}()
+        for n_ in 1:nlive
+            push!(get!(groups, find(n_), Int[]), n_)
+        end
+        # per-slot dense-relative origins (0-based, halo-exclusive, cluster-local)
         hrel0 = zeros(Int32, 3 * lev.cap)
-        for (n_, s) in enumerate(lev.live), d in 1:3
-            hrel0[3*(Int(s)-1)+d] = Int32(rel[d, n_] - lo[d])
+        clusters = Vector{Tuple{Any,Int,NTuple{3,Int},Vector{Any}}}()
+        for mem in values(groups)
+            lo = ntuple(d -> minimum(rel[d, n_] for n_ in mem), 3)
+            hi = ntuple(d -> maximum(rel[d, n_] for n_ in mem) + lev.B, 3)
+            dims = ntuple(d -> Int(hi[d] - lo[d]) + 2, 3)
+            # budget guard: a single genuinely-huge cluster is a config problem
+            prod(dims) * 4 * 5 > (Int64(12) << 30) &&
+                error("solve_gravity_level_mg!: cluster bbox $(dims) exceeds the memory budget")
+            for n_ in mem, d in 1:3
+                hrel0[3*(Int(lev.live[n_])-1)+d] = Int32(rel[d, n_] - lo[d])
+            end
+            livesub = to_device(lev.be, Int32[lev.live[n_] for n_ in mem], Int32)
+            pyr = Vector{Any}()
+            dd = dims
+            while true
+                push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)), dd))
+                minimum(dd) <= 6 && break
+                dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)   # halve interior, keep halo
+            end
+            push!(clusters, (livesub, length(mem), dims, pyr))
         end
-        rel0 = to_device(lev.be, hrel0, Int32)
-        # dense pyramid: (φ, rhs, mask, resid, dims) per MG level, down to ≤6 cells
-        pyr = Vector{Tuple{Any,Any,Any,Any,NTuple{3,Int}}}()
-        dd = dims
-        while true
-            push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)), dd))
-            minimum(dd) <= 6 && break
-            dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)     # halve interior, keep halo
-        end
-        cache = (dims, rel0, pyr)
+        cache = (to_device(lev.be, hrel0, Int32), clusters)
         lev.tabs[:mgd] = cache
     end
-    dims, rel0, pyr = cache
-    φd, rhsd, maskd, rd, _ = pyr[1]
-    fill!(φd, 0.0f0); fill!(rhsd, 0.0f0); fill!(maskd, 0.0f0)
-    nx, ny, nz = Int32.(dims)
-    nB  = length(lev.live) * lev.B^3
-    ntt = length(lev.live) * lev.nd^3
-    _mgd_gather_int_k!(lev.be)(φd, rhsd, maskd, lev.phi, lev.rhs, lev.live_d, rel0,
-                               nx, ny, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                               Int32(lev.stride); ndrange = nB)
-    _mgd_gather_ring_k!(lev.be)(φd, maskd, lev.phi, lev.live_d, rel0, nx, ny, nz,
+    rel0, clusters = cache
+    defect = 0.0f0
+    for (livesub, nbk, dims, pyr) in clusters
+        φd, rhsd, maskd, rd, _ = pyr[1]
+        fill!(φd, 0.0f0); fill!(rhsd, 0.0f0); fill!(maskd, 0.0f0)
+        nx, ny, nz = Int32.(dims)
+        _mgd_gather_int_k!(lev.be)(φd, rhsd, maskd, lev.phi, lev.rhs, livesub, rel0,
+                                   nx, ny, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                                   Int32(lev.stride); ndrange = nbk * lev.B^3)
+        _mgd_gather_ring_k!(lev.be)(φd, maskd, lev.phi, livesub, rel0, nx, ny, nz,
+                                    Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                                    Int32(lev.stride); ndrange = nbk * lev.nd^3)
+        for _ in 1:ncycle
+            _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
+        end
+        _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
+        defect = max(defect, maximum(abs, rd))
+        _mgd_scatter_k!(lev.be)(lev.phi, φd, livesub, rel0, nx, ny,
                                 Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                                Int32(lev.stride); ndrange = ntt)
-    for _ in 1:ncycle
-        _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
+                                Int32(lev.stride); ndrange = nbk * lev.B^3)
     end
-    _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
-    defect = maximum(abs, rd)
-    _mgd_scatter_k!(lev.be)(lev.phi, φd, lev.live_d, rel0, nx, ny,
-                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                            Int32(lev.stride); ndrange = nB)
     _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
     return defect
 end
