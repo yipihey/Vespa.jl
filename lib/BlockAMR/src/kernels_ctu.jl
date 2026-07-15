@@ -191,7 +191,7 @@ end
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
                               @Const(Tau), @Const(Ge), spin,
                               @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-                              λ::Float32, γ::Float32, η::Float32,
+                              λ::Float32, γ::Float32, η::Float32, scap::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
                               ::Val{NS}) where {NS}
     t = @index(Global)
@@ -310,6 +310,13 @@ end
         vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
         cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
         ok &= (vm + cn) * λ < 1.0f0
+        # ABSOLUTE signal cap (BAM_SMAXCAP; 0 = off): the λ-relative bound above
+        # ESCALATES under pathology — a hot injection shrinks the global λ,
+        # which widens 1/λ for the next substep (observed: a zoom-clipped
+        # secondary knot ratcheting C/F skin cells from 15 km/s to 1e18 K over
+        # ~40 substeps, strangling dτ 470×).  An absolute bound anchored to the
+        # problem's physical signal scale breaks the ratchet.
+        ok &= (scap <= 0.0f0) | (vm + cn < scap)
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
@@ -369,7 +376,7 @@ end
         Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
         @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), @Const(Ge), spin,
         @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-        λ::Float32, γ::Float32, η::Float32, tpb::Int32,
+        λ::Float32, γ::Float32, η::Float32, scap::Float32, tpb::Int32,
         B::Int32, ng::Int32, nd::Int32, stride::Int32, ::Val{NS}) where {NS}
     Wt  = @localmem Float16 (_WS3 * 5)
     Xt  = @localmem UInt16 (_WS3 * max(NS, 1))
@@ -548,6 +555,13 @@ end
         vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
         cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
         ok &= (vm + cn) * λ < 1.0f0
+        # ABSOLUTE signal cap (BAM_SMAXCAP; 0 = off): the λ-relative bound above
+        # ESCALATES under pathology — a hot injection shrinks the global λ,
+        # which widens 1/λ for the next substep (observed: a zoom-clipped
+        # secondary knot ratcheting C/F skin cells from 15 km/s to 1e18 K over
+        # ~40 substeps, strangling dτ 470×).  An absolute bound anchored to the
+        # problem's physical signal scale breaks the ratchet.
+        ok &= (scap <= 0.0f0) | (vm + cn < scap)
         if !ok
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
@@ -588,6 +602,7 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
                     η::Float32 = 1.0f-3, tiled::Union{Nothing,Bool} = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
     B = lev.B; NS = lev.nsp
     @assert NS <= 2 "the CTU kernels carry ≤ 2 species lanes (got $NS)"
     # the tiled kernel needs ~42 KB threadgroup memory at NS=2 — fine on CUDA,
@@ -604,14 +619,14 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
         n = length(lev.live) * tpb * _NT
         _ctu_step_k!(lev.be, _NT)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
                                   lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                                  λ, Float32(hier.gamma), η, Int32(tpb),
+                                  λ, Float32(hier.gamma), η, scap, Int32(tpb),
                                   Int32(B), Int32(lev.ng), Int32(lev.nd),
                                   Int32(lev.stride), Val(NS); ndrange = n)
     else
         n = length(lev.live) * B^3
         _ctu_cell_k!(lev.be)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
                              lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                             λ, Float32(hier.gamma), η,
+                             λ, Float32(hier.gamma), η, scap,
                              Int32(B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), Val(NS); ndrange = n)
     end

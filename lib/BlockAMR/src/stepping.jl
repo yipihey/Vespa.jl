@@ -98,6 +98,12 @@ function compute_lambda!(hier::AMRHierarchy)
         isempty(hier.levels[l+1].live) && continue
         smax = max(smax, max_signal(hier.levels[l+1], hier.gamma))
     end
+    # BAM_SMAXCAP (absolute signal cap, code units; 0 = off): cells beyond the
+    # cap are numerical garbage the epilogue/reflux guards keep frozen — they
+    # must not strangle the global dτ (the observed 470× collapse), or the
+    # λ-relative guards ratchet ever hotter.  Clamp the CFL denominator too.
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
+    scap > 0.0f0 && (smax = min(smax, scap))
     hier.λ = Float32(hier.cfl) / max(smax, 1.0f-30)
     return hier.λ
 end
@@ -113,6 +119,59 @@ in and the (l, l+1) reflux corrects this level's uncovered boundary cells.
 Reflux weights: fine ¼ per fine stage (RK ½ × time-average ½), coarse ½ per
 coarse stage; the apply multiplies the single global λ.
 """
+# NaN-stage hunt (BAM_NANSTAGE=1): reduce the level's decoded signal after each
+# W-cycle stage and abort at the FIRST poisoned one.  A post-advance check only
+# sees the NaN after restriction has smeared it across every level (it reports
+# "level 0" no matter where it started); this pins (level, stage, substep).
+# One device reduction per stage — hunt-mode cost only, off by default.
+@inline function _nanstage!(hier::AMRHierarchy, l::Int, stage::Symbol)
+    get(ENV, "BAM_NANSTAGE", "0") == "1" || return nothing
+    lev = hier.levels[l + 1]
+    s = max_signal(lev, hier.gamma)
+    ok = isfinite(s)
+    if ok
+        # max_signal derives cs from one energy field — a lone NaN in the OTHER
+        # dual-energy field is invisible to it (chem later converts Ge-NaN into
+        # Tau-NaN and only THEN the signal trips, misattributing the stage).
+        # Hunt mode: check both energy pools directly (pool-wide count; ghosts
+        # and dead slots hold finite data in practice).
+        ok = count(x -> !isfinite(Float32(x)), lev.Ge) == 0 &&
+             count(x -> !isfinite(Float32(x)), lev.Tau) == 0
+    end
+    if !ok
+        # which field carries it? (counts cover the whole pool incl. ghosts and
+        # dead slots — a live-interior nonfinite is already established by smax)
+        for (nm, arr) in ((:D, lev.D), (:S1, lev.S1), (:S2, lev.S2), (:S3, lev.S3),
+                          (:Tau, lev.Tau), (:Ge, lev.Ge))
+            nb = count(x -> !isfinite(Float32(x)), arr)
+            nb > 0 && println("NANSTAGE   field $nm: $nb nonfinite (pool-wide)")
+        end
+        # block forensics: which blocks, what scales, what stored cell values
+        hge = Array(lev.Ge); htau = Array(lev.Tau); hd = Array(lev.D)
+        hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc)
+        hEsc = Array(lev.Esc); hGsc = Array(lev.Gsc)
+        seen = Set{Int}()
+        for ii in eachindex(hge)
+            (isfinite(Float32(hge[ii])) && isfinite(Float32(htau[ii]))) && continue
+            slot = (ii - 1) ÷ lev.stride + 1
+            slot in seen && continue
+            push!(seen, slot)
+            length(seen) > 6 && break
+            c = (ii - 1) % lev.stride
+            i_ = c % lev.nd; j_ = (c ÷ lev.nd) % lev.nd; k_ = c ÷ (lev.nd * lev.nd)
+            inint = all(x -> lev.ng <= x < lev.B + lev.ng, (i_, j_, k_))
+            m = lev.meta[slot]
+            println("NANSTAGE   slot $slot origin $(Int128.(m.origin)) ",
+                    inint ? "INTERIOR" : "GHOST", " cell ($i_,$j_,$k_)  scales: ",
+                    "Dsc=$(hDsc[slot]) Ssc=$(hSsc[slot]) Esc=$(hEsc[slot]) Gsc=$(hGsc[slot])",
+                    "  stored: D=$(Float32(hd[ii])) Ge=$(Float32(hge[ii])) Tau=$(Float32(htau[ii]))")
+        end
+        flush(stdout)
+        error("NANSTAGE: level $l nonfinite after :$stage (substep $(hier.nstep[l + 1]))")
+    end
+    return nothing
+end
+
 function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                           φ = nothing, chem = nothing, selfgrav = nothing)
     lev = hier.levels[l + 1]
@@ -166,6 +225,7 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     elseif φ !== nothing
         _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     end
+    _nanstage!(hier, l, :grav_K1)
     if hier.scheme === :ctu
         # single-pass CTU: one ghost fill, one fused launch (R→O), captures from
         # the intact R, then swap.  Single-stage weights: fine ½/substep (time
@@ -188,19 +248,23 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
         haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
     end
+    _nanstage!(hier, l, :hydro)
     if selfgrav !== nothing && (l >= 1 || φ === nothing)           # KDK: K2
         _t = _tic(lev.be); grav_kick_level_pool!(hier, l, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     elseif φ !== nothing
         _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     end
+    _nanstage!(hier, l, :grav_K2)
     if chem !== nothing                                           # analytic H+H₂
         _t = _tic(lev.be); chem_level!(hier, l, dt_l; chem...); _toc(lev.be, :chem, l, _t)
+        _nanstage!(hier, l, :chem)
     end
     if haskids
         _t = _tic(lev.be)
         restrict_level!(hier, l + 1)
         reflux_apply!(hier, l + 1, λ)
         _toc(lev.be, :restrict_reflux, l, _t)
+        _nanstage!(hier, l, :restrict_reflux)
         # out-of-core: the child level is now fully advanced AND consumed by this
         # level's restrict/reflux — MOVE it back to host RAM, freeing the device
         # for the working set.  (No-op unless memory_mode() === :managed.)

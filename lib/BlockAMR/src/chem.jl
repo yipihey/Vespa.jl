@@ -13,7 +13,8 @@ import ChemistryKernels
 @kernel function _chem_gather_k!(rho32, e32, h16, m16,
                                  @Const(D), @Const(Ge), @Const(sp1), @Const(sp2),
                                  @Const(live_d), @Const(Dsc), @Const(Gsc),
-                                 B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                                 B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                 hfloor::UInt16)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = B * B * B
@@ -34,14 +35,20 @@ import ChemistryKernels
         # chem as COLD vacuum (e=0 → solver evolves from its tiny floor).
         e32[Int32(t)]   = d16 > 6.103515625f-5 ?
                           Float32(Ge[idx]) * Gsc[slot] / ρ : 0.0f0
-        h16[Int32(t)]   = sp1[idx]
+        # x_HII floor (codec units): a cell can reach the solver with e = 0 (its
+        # stored-f16 Ge underflows in a block whose Ge window is set by a hot
+        # dense neighbor — the C/F skin geometry) AND its HII at the codec zero;
+        # evolve_cell_analytic's closed-form x_HII then hits a 0/0 corner → NaN.
+        # Flooring x_HII at ~1e-12 (six decades below the relic fraction) kills
+        # the corner for every cell; the codec is monotonic in the u16 code.
+        h16[Int32(t)]   = max(sp1[idx], hfloor)
         m16[Int32(t)]   = sp2[idx]
     end
 end
 
 @kernel function _chem_scatter_k!(Ge, Tau, sp1, sp2,
                                   @Const(rho32), @Const(e32), @Const(h16), @Const(m16),
-                                  @Const(live_d), @Const(Esc), @Const(Gsc),
+                                  @Const(D), @Const(live_d), @Const(Esc), @Const(Gsc),
                                   B::Int32, ng::Int32, nd::Int32, stride::Int32,
                                   efloor::Float32)
     t = @index(Global)
@@ -53,19 +60,27 @@ end
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
-        ge_old = Float32(Ge[idx]) * gsc
-        # CMB temperature floor on the specific internal energy: in a hypersonic
-        # f16 collapse the deep core's Ge decays to the chem MIN_TEMPERATURE (1 K,
-        # sub-CMB) — unphysical (gas can't Compton-cool below the CMB).  efloor is
-        # the code specific-energy at T_CMB(z); 0 disables (library default).
-        en = e32[Int32(t)]
-        en < efloor && (en = efloor)
-        ge_new = en * rho32[Int32(t)]
-        Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
-        Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
-        sp1[idx] = h16[Int32(t)]
-        sp2[idx] = m16[Int32(t)]
+        # Representability gate, same test as the gather: a stored-subnormal
+        # density cell entered chem as e=0 "cold vacuum" — and with its HII
+        # also quantized to the codec floor, evolve_cell_analytic hits a 0/0
+        # x_e corner and returns NaN (haloA L2 blocks holding restricted core
+        # gas next to voids: 1e8 in-block contrast).  Such cells SKIP chem:
+        # write nothing, so solver garbage never leaves the scratch buffers.
+        if Float32(D[idx]) > 6.103515625f-5
+            esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
+            ge_old = Float32(Ge[idx]) * gsc
+            # CMB temperature floor on the specific internal energy: in a hypersonic
+            # f16 collapse the deep core's Ge decays to the chem MIN_TEMPERATURE (1 K,
+            # sub-CMB) — unphysical (gas can't Compton-cool below the CMB).  efloor is
+            # the code specific-energy at T_CMB(z); 0 disables (library default).
+            en = e32[Int32(t)]
+            en < efloor && (en = efloor)
+            ge_new = en * rho32[Int32(t)]
+            Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
+            Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
+            sp1[idx] = h16[Int32(t)]
+            sp2[idx] = m16[Int32(t)]
+        end
     end
 end
 
@@ -107,9 +122,10 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     e32   = view(bufs[2], 1:n)
     h16   = view(bufs[3], 1:n)
     m16   = view(bufs[4], 1:n)
+    hfloor = ChemistryKernels.encode_log2sp(1.0f-12)
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
                             lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
-                            Int32(lev.nd), Int32(lev.stride); ndrange = n)
+                            Int32(lev.nd), Int32(lev.stride), hfloor; ndrange = n)
     dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
     local rin, ein, hin, min_
     if dbg
@@ -129,13 +145,33 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
             hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
     end
     if dbg
-        nb = mapreduce(x -> !isfinite(x), +, e32)
-        if nb > 0
-            eo = Array(e32)
-            shown = 0
+        eo = Array(e32)
+        # Flag EVERY nonfinite output (a NaN input fails `> 0` comparisons, so
+        # gating the check on ein > 0 hid the real culprits), plus finite-but-
+        # EXTREME outputs (≥1e4× input) that overflow the f16 Ge encode at
+        # scatter.  GATED cells (stored D subnormal) never scatter back — their
+        # scratch NaN is benign; print them flagged but only ERROR on non-gated.
+        bad = i -> !isfinite(eo[i]) || (ein[i] > 0 && eo[i] > 1.0f4 * ein[i])
+        if any(bad, eachindex(eo))
+            hd = Array(lev.D); live = Array(lev.live_d)
+            B3 = lev.B^3
+            gated = i -> begin
+                bi = (i - 1) ÷ B3; c = (i - 1) % B3
+                slot = Int(live[bi + 1])
+                ci = c % lev.B + lev.ng; cj = (c ÷ lev.B) % lev.B + lev.ng
+                ck = c ÷ (lev.B^2) + lev.ng
+                idx = (slot - 1) * lev.stride + ((ck * lev.nd) + cj) * lev.nd + ci + 1
+                Float32(hd[idx]) <= 6.103515625f-5
+            end
+            nbad = 0; shown = 0
             for i in eachindex(eo)
-                if !isfinite(eo[i]) && shown < 6
+                bad(i) || continue
+                g = gated(i)
+                g || (nbad += 1)
+                if shown < 12
                     println("CHEMDBG l=", l, " dt=", dt, " a=", a_value,
+                            g ? " GATED" : " LIVE",
+                            " OUT: e=", eo[i],
                             " IN: rho=", rin[i], " e=", ein[i],
                             " hii_code=", hin[i], " h2_code=", min_[i],
                             " xHII=", ChemistryKernels.decode_log2sp(Float64, hin[i]),
@@ -146,7 +182,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                 end
             end
             flush(stdout)
-            error("chem NaN: $nb cells at level $l")
+            nbad > 0 && error("chem NaN: $nbad live cells at level $l")
         end
     end
     # CMB specific-energy floor (code units) at the current redshift, μ=1.22
@@ -160,7 +196,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
         efloor = Float32(T_cmb / ((hier.gamma - 1) * 1.22 * T2))
     end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
-                             rho32, e32, h16, m16, lev.live_d, lev.Esc, lev.Gsc,
+                             rho32, e32, h16, m16, lev.D, lev.live_d, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), efloor; ndrange = n)
     return nothing

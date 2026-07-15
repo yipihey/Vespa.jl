@@ -274,7 +274,8 @@ end
 @kernel function _reflux_apply_k!(D, S1, S2, S3, Tau, Ge,
                                   @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                   @Const(ent), @Const(reg), @Const(perm), @Const(gs),
-                                  λc::Float32, γ::Float32, nd::Int32, stride::Int32)
+                                  λc::Float32, γ::Float32, scap::Float32,
+                                  nd::Int32, stride::Int32)
     g = @index(Global)
     @inbounds begin
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
@@ -308,6 +309,9 @@ end
         vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
         cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
         ok &= (vm + cn) * λc < 1.0f0
+        # absolute signal cap (BAM_SMAXCAP) — see the CTU epilogue twin: the
+        # λ-relative bound alone ratchets under a hot-cell/shrinking-λ feedback
+        ok &= (scap <= 0.0f0) | (vm + cn < scap)
         D[idx]   = ok ? _narrow(eltype(D),   nD)  : D[idx]
         S1[idx]  = ok ? _narrow(eltype(S1),  nS1) : S1[idx]
         S2[idx]  = ok ? _narrow(eltype(S2),  nS2) : S2[idx]
@@ -389,10 +393,11 @@ function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
     n == 0 && return nothing
     ng_ = lev.tabs[:cfng]::Int
     ng_ == 0 && return nothing
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
     _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                              _tabi(lev, :cf), _tabf(lev, :cfreg),
                              _tabi(lev, :cfperm), _tabi(lev, :cfgs), λc,
-                             Float32(hier.gamma),
+                             Float32(hier.gamma), scap,
                              Int32(plev.nd), Int32(plev.stride); ndrange = ng_)
     fill!(_tabf(lev, :cfreg), 0.0f0)
     return nothing
