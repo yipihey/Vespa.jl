@@ -149,8 +149,23 @@ function main()
                         scheme = Symbol(get(ENV, "BAM_SCHEME", "rk2")))
     lev0 = init_base_level!(hier); build_level_tables!(hier, 0)
 
+    # BAM_SHIFT="sx,sy,sz" (INTEGER topgrid cells): periodically roll the gas grids
+    # and shift all particle positions by the same fraction — centers a near-edge
+    # zoom target (validated config), exact for the gas because the shift is whole
+    # cells.  Applied to δb/gas_vel here and to the DM positions below.
+    SHIFTC = Int.(parse.(Float64, split(get(ENV, "BAM_SHIFT", "0,0,0"), ",")))
+    shf = Float32.(SHIFTC ./ NGRID)
     # gas → level-0 pools (host stage in the pool layout, then encode)
     δb = getδb(snap); gv = snap.gas_vel
+    if any(!=(0), SHIFTC)
+        δb = circshift(δb, SHIFTC)
+        gvs = similar(gv)
+        for d in 1:3
+            gvs[:, d] = vec(circshift(reshape(view(gv, :, d), NGRID, NGRID, NGRID), SHIFTC))
+        end
+        gv = gvs
+        @printf("position shift: %s cells (%.4f,%.4f,%.4f box)\n", string(SHIFTC), shf...)
+    end
     n = lev0.cap * lev0.stride
     hD = zeros(n); hS1 = zeros(n); hS2 = zeros(n); hS3 = zeros(n)
     hT = zeros(n); hG = zeros(n)
@@ -176,7 +191,8 @@ function main()
     dev(v) = BlockAMR.to_device(hier.be, v, Float32)
     if ZOOMDM != ""
         zdm = read_multimass_dm(ZOOMDM); Np = zdm.Np
-        parts = (px = dev(zdm.px), py = dev(zdm.py), pz = dev(zdm.pz),
+        parts = (px = dev(mod.(zdm.px .+ shf[1], 1.0f0)), py = dev(mod.(zdm.py .+ shf[2], 1.0f0)),
+                 pz = dev(mod.(zdm.pz .+ shf[3], 1.0f0)),
                  vx = dev(zdm.vx .* Float32(vconv)), vy = dev(zdm.vy .* Float32(vconv)),
                  vz = dev(zdm.vz .* Float32(vconv)))
         # DM mean density = (1−fb); per-particle code mass ⇒ Σ = (1−fb) over the box
@@ -184,6 +200,22 @@ function main()
         mass_code = dev(Float32.(mcode))
         @printf("ZOOM DM: %d multi-mass particles (masses=%s Msun/h)\n", Np,
                 string(sort(unique(round.(zdm.pmass, digits=0))))); flush(stdout)
+        # refinement criterion = FINE (deepest-tier) particles only, so the mesh is
+        # confined to the zoom target; nested-by-mass FROZEN sets pin the coarse
+        # static levels to the MUSIC rectangles (the validated DMO-zoom pattern).
+        zum = sort(unique(zdm.pmass))
+        zfid = BlockAMR.to_device(hier.be, Int32.(findall(zdm.pmass .< 1.5f0 * zum[1])), Int32)
+        zoom_fine_idx = zfid; zoom_fine_mass = mass_code[zfid]
+        zoom_static_sf = Vector{Any}(); zoom_static_sm = Vector{Any}()
+        for lz in 0:max(MRLMAX - 2, -1)
+            thr = 1.5f0 * zum[clamp(MRLMAX - lz, 1, length(zum))]
+            zid = BlockAMR.to_device(hier.be, Int32.(findall(zdm.pmass .< thr)), Int32)
+            push!(zoom_static_sf, (px = copy(parts.px[zid]), py = copy(parts.py[zid]),
+                                   pz = copy(parts.pz[zid])))
+            push!(zoom_static_sm, mass_code[zid])
+            @printf("  static L%d ← %d particles (MUSIC tier ≤ %.0f Msun/h, FROZEN)\n",
+                    lz + 1, length(zid), thr); flush(stdout)
+        end
     else
         pos = snap.dm_pos; vel = snap.dm_vel; Np = size(pos, 1)
         parts = (px = dev(Float32[mod(pos[p,1], 1.0) for p in 1:Np]),
@@ -526,7 +558,20 @@ function main()
             if ZTRACK && zr > 0
                 pk, _, _ = JeansProfile.find_baryon_peak(hier); pol = mkpol(pk)
             end
-            regrid!(hier, pol; compact = COMPACT, parts, mass_code, jeans_coef = jcoef)
+            if ZOOMDM != ""
+                gfz = (px = parts.px[zoom_fine_idx], py = parts.py[zoom_fine_idx],
+                       pz = parts.pz[zoom_fine_idx])
+                # static_parts(l) is consulted while flagging level l (children → l+1):
+                # frozen set j = l+1 covers MUSIC tier (base+1+l); deeper → nothing (live)
+                regrid!(hier, pol; compact = COMPACT, parts = gfz,
+                        mass_code = zoom_fine_mass, jeans_coef = jcoef,
+                        static_parts = lz -> (0 <= lz < length(zoom_static_sf)) ?
+                                             zoom_static_sf[lz + 1] : nothing,
+                        static_mass_code = lz -> (0 <= lz < length(zoom_static_sm)) ?
+                                                 zoom_static_sm[lz + 1] : 0.0f0)
+            else
+                regrid!(hier, pol; compact = COMPACT, parts, mass_code, jeans_coef = jcoef)
+            end
             MEMMODE === :managed && BlockAMR.advise_all_host!(hier)  # new blocks → host home
             # NEW LEVEL → radial profile around the baryon density maximum
             if PROFLV
