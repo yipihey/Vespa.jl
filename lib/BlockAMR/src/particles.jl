@@ -212,6 +212,67 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code)
     return nothing
 end
 
+# PC-inject the parent's dm density into every interior cell of level l
+# (child cell ← the parent cell containing it; density is intensive, so
+# injection conserves the enclosed mass exactly).
+@kernel function _dm_inject_k!(dmc, @Const(dmp), @Const(live_d), @Const(par_d),
+                               @Const(off_d), B::Int32, ng::Int32, nd::Int32,
+                               stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        ps   = par_d[bi + Int32(1)]
+        i = c % B; j = (c ÷ B) % B; k = c ÷ (B * B)
+        pi_ = ng + off_d[3*bi+Int32(1)] + (i >> Int32(1))
+        pj_ = ng + off_d[3*bi+Int32(2)] + (j >> Int32(1))
+        pk_ = ng + off_d[3*bi+Int32(3)] + (k >> Int32(1))
+        dmc[(slot - Int32(1)) * stride + _lidx(i + ng, j + ng, k + ng, nd)] =
+            dmp[(ps - Int32(1)) * stride + _lidx(pi_, pj_, pk_, nd)]
+    end
+end
+
+"""
+    dm_from_parent!(hier, l) -> nothing
+
+Fill level `l`'s `dm` pool by piecewise-constant injection from the parent's
+`dm` (which must already hold this substep's deposit or its own injection).
+This is the deep-level DM source when `l` exceeds the DM sampling scale
+(Enzo `MaximumGravityRefinementLevel`): with fewer than ~1 particle per cell
+a raw CIC deposit is a flickering point-mass comb — ρ_spike = m_p/dx_l³
+grows ×8 per level (haloA: one 10 M⊙ fine particle in an L8 cell deposits
+ρ_code ≈ 6e6, rivaling the gas core) — whose ∇φ two-body kicks bypass every
+hydro guard and ratchet particle+gas velocities.  Injecting the coarser,
+well-sampled field keeps ∇²φ = coef·(gas + DM − ρ̄) complete at every level
+(the vacuum-minus-mean repulsion bug needs the DM SOURCE PRESENT — this
+supplies it at its physically meaningful resolution).
+"""
+function dm_from_parent!(hier::AMRHierarchy, l::Int)
+    @assert l >= 1
+    lev = hier.levels[l + 1]; plev = hier.levels[l]
+    isempty(lev.live) && return nothing
+    @assert length(plev.dm) >= plev.cap * plev.stride "parent dm pool not deposited"
+    length(lev.dm) < lev.cap * lev.stride &&
+        (lev.dm = device_zeros(lev.be, Float32, (lev.cap * lev.stride,)))
+    nlive = length(lev.live)
+    par = Vector{Int32}(undef, nlive); off = Vector{Int32}(undef, 3 * nlive)
+    for (n_, s) in enumerate(lev.live)
+        m = lev.meta[s]
+        par[n_] = m.parent
+        off[3*(n_-1)+1] = Int32(m.offset[1])
+        off[3*(n_-1)+2] = Int32(m.offset[2])
+        off[3*(n_-1)+3] = Int32(m.offset[3])
+    end
+    par_d = to_device(lev.be, par, Int32)
+    off_d = to_device(lev.be, off, Int32)
+    _dm_inject_k!(lev.be)(lev.dm, plev.dm, lev.live_d, par_d, off_d,
+                          Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                          Int32(lev.stride); ndrange = nlive * lev.B^3)
+    return nothing
+end
+
 # gather a = −∇φ at particle positions from ONE level's φ pool; particles whose
 # containing cell has no block here keep `done = 0` for the next (coarser) level.
 @kernel function _pgather_k!(ax, ay, az, done,

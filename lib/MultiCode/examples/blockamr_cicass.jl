@@ -75,6 +75,8 @@ const MREFINE = parse(Float64, get(ENV, "BAM_MREFINE", "8.0")) # DMCRIT: particl
 # baryon density max each time a new deepest level is triggered (default on if Jeans).
 const JEANS   = parse(Float64, get(ENV, "BAM_JEANS", "0.0"))
 const JEANSRHO = parse(Float64, get(ENV, "BAM_JEANS_RHO", "100.0"))  # gas overdensity floor (×gas mean) for Jeans — confines it to collapsing cores
+const LDMAX    = parse(Int, get(ENV, "BAM_LDMAX", "99"))  # deepest raw DM CIC deposit level (Enzo MaximumGravityRefinementLevel); deeper levels PC-inject the parent dm
+const VPCAP    = parse(Float64, get(ENV, "BAM_VPCAP", "0"))  # absolute particle |v| cap per component (code units; 0=off) — the particle twin of BAM_SMAXCAP
 const ZTRACK  = get(ENV, "BAM_ZOOM_TRACK", "0") == "1"
 const ZOOMDM  = get(ENV, "BAM_ZOOM_DM", "")   # multi-mass DM binary → 5-level zoom (fine halo DM); gas still from BAM_MUSIC_DIR base level
 const MRLMAX  = parse(Int, get(ENV, "BAM_MRLMAX", "0"))  # keep the IC zoom mesh static-refined to L(MRLMAX) (must-refine; 0=adaptive)
@@ -358,12 +360,22 @@ function main()
                                     nstep, l, bad); flush(stdout); error("phi pre-advance"))
             end
         end
-        # COMPLETE gravitating density: ALL levels get the full DM deposit
+        # COMPLETE gravitating density: ALL levels get the full DM source
         # (RAMSES rho_fine).  The old ≤LDM cap left deeper levels source-free —
         # ∇²φ = coef·(gas−ρ̄_tot) with the DM missing pushes zoom regions apart.
+        # But a raw CIC deposit is only meaningful while cells hold ≳1 particle:
+        # deeper, it is a flickering point-mass comb (ρ_spike = m_p/dx³ grows
+        # ×8/level) whose two-body ∇φ kicks bypass every hydro guard (the haloA
+        # L8 velocity ratchet).  BAM_LDMAX (Enzo MaximumGravityRefinementLevel):
+        # deposit to LDMAX, deeper levels PC-inject the parent's smooth field —
+        # the DM source stays COMPLETE at every level, at its sampled scale.
         for l in 1:length(hier.levels) - 1
             isempty(hier.levels[l+1].live) && continue
-            deposit_particles_level!(hier, l, parts; mass_code)
+            if l <= LDMAX
+                deposit_particles_level!(hier, l, parts; mass_code)
+            else
+                BlockAMR.dm_from_parent!(hier, l)
+            end
         end
 
         # ── one root step: hydro + native gravity + chem on every level ──
@@ -532,6 +544,18 @@ function main()
         particles_kick!(hier, parts, pax, pay, paz, 0.5 * dτ)
         particles_drift!(hier, parts, dτ)
         particles_kick!(hier, parts, pax, pay, paz, 0.5 * dτ)
+        # BAM_VPCAP (code units, 0=off): particle kicks bypass every hydro
+        # guard — a refinement-saturated knot (zoom-clipped or at LMAX) grows a
+        # near-singular cell whose unsoftened ∇φ slingshots nearby particles
+        # (haloA: vp ratcheted 0.005 → 7.6e4, strangling dτ via the particle
+        # CFL).  Clamp |v| per component at the same absolute garbage bound as
+        # the gas BAM_SMAXCAP; physical speeds here are ≲1e-2.
+        if VPCAP > 0
+            vc = Float32(VPCAP)
+            for vcomp in (parts.vx, parts.vy, parts.vz)
+                vcomp .= clamp.(vcomp, -vc, vc)
+            end
+        end
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
             mv2 = maximum(abs, Array(parts.vx))
             isfinite(mv2) || (@printf("PHUNT step %d: vx nonfinite AFTER kicks\n", nstep);
