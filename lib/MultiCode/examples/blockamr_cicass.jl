@@ -200,22 +200,6 @@ function main()
         mass_code = dev(Float32.(mcode))
         @printf("ZOOM DM: %d multi-mass particles (masses=%s Msun/h)\n", Np,
                 string(sort(unique(round.(zdm.pmass, digits=0))))); flush(stdout)
-        # refinement criterion = FINE (deepest-tier) particles only, so the mesh is
-        # confined to the zoom target; nested-by-mass FROZEN sets pin the coarse
-        # static levels to the MUSIC rectangles (the validated DMO-zoom pattern).
-        zum = sort(unique(zdm.pmass))
-        zfid = BlockAMR.to_device(hier.be, Int32.(findall(zdm.pmass .< 1.5f0 * zum[1])), Int32)
-        zoom_fine_idx = zfid; zoom_fine_mass = mass_code[zfid]
-        zoom_static_sf = Vector{Any}(); zoom_static_sm = Vector{Any}()
-        for lz in 0:max(MRLMAX - 2, -1)
-            thr = 1.5f0 * zum[clamp(MRLMAX - lz, 1, length(zum))]
-            zid = BlockAMR.to_device(hier.be, Int32.(findall(zdm.pmass .< thr)), Int32)
-            push!(zoom_static_sf, (px = copy(parts.px[zid]), py = copy(parts.py[zid]),
-                                   pz = copy(parts.pz[zid])))
-            push!(zoom_static_sm, mass_code[zid])
-            @printf("  static L%d ← %d particles (MUSIC tier ≤ %.0f Msun/h, FROZEN)\n",
-                    lz + 1, length(zid), thr); flush(stdout)
-        end
     else
         pos = snap.dm_pos; vel = snap.dm_vel; Np = size(pos, 1)
         parts = (px = dev(Float32[mod(pos[p,1], 1.0) for p in 1:Np]),
@@ -229,6 +213,34 @@ function main()
     @printf("gas IC: f_b=%.4f T=%.1fK x_HII=%.3e;  DM: %d particles\n",
             c.fb, Tg0, xHII0, Np); flush(stdout)
     end                                          # if RESTART
+    # ── ZOOM refinement sets: fine-criterion subset + FROZEN static levels ──
+    # Derived from the IC FILE (not the evolved particles), so a checkpoint
+    # restart reproduces the identical frozen mesh — build them in BOTH paths.
+    # (Restart bug: these lived only in the IC branch → UndefVarError at the
+    # first regrid after BAM_RESTART.)
+    local zoom_fine_idx, zoom_fine_mass, zoom_static_sf, zoom_static_sm
+    if ZOOMDM != ""
+        zic = @isdefined(zdm) ? zdm : read_multimass_dm(ZOOMDM)   # reuse the IC-branch read
+        zshiftc = Int.(parse.(Float64, split(get(ENV, "BAM_SHIFT", "0,0,0"), ",")))
+        zshf = Float32.(zshiftc ./ NGRID)
+        zmcode = (1 - c.fb) .* Float64.(zic.pmass) ./ sum(Float64.(zic.pmass))
+        zum = sort(unique(zic.pmass))
+        zfh = findall(zic.pmass .< 1.5f0 * zum[1])
+        zoom_fine_idx  = BlockAMR.to_device(hier.be, Int32.(zfh), Int32)
+        zoom_fine_mass = BlockAMR.to_device(hier.be, Float32.(zmcode[zfh]), Float32)
+        zoom_static_sf = Vector{Any}(); zoom_static_sm = Vector{Any}()
+        for lz in 0:max(MRLMAX - 2, -1)
+            thr = 1.5f0 * zum[clamp(MRLMAX - lz, 1, length(zum))]
+            zid = findall(zic.pmass .< thr)
+            push!(zoom_static_sf,
+                  (px = BlockAMR.to_device(hier.be, mod.(zic.px[zid] .+ zshf[1], 1.0f0), Float32),
+                   py = BlockAMR.to_device(hier.be, mod.(zic.py[zid] .+ zshf[2], 1.0f0), Float32),
+                   pz = BlockAMR.to_device(hier.be, mod.(zic.pz[zid] .+ zshf[3], 1.0f0), Float32)))
+            push!(zoom_static_sm, BlockAMR.to_device(hier.be, Float32.(zmcode[zid]), Float32))
+            @printf("  static L%d ← %d particles (MUSIC tier ≤ %.0f Msun/h, FROZEN)\n",
+                    lz + 1, length(zid), thr); flush(stdout)
+        end
+    end
     # topgrid CIC deposit weight: per-particle vector for multi-mass DM, else scalar
     marg = mass_code isa AbstractVector ? (mass_code .* Float32(NGRID^3)) : nothing
 
