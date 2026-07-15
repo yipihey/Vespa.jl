@@ -55,6 +55,7 @@ end
                                @Const(live_d), @Const(gi0), @Const(gfr),
                                @Const(Dsc), @Const(Ssc), @Const(Esc),
                                halfdt::Float32, invh::Float32, hlev::Float32,
+                               scap::Float32,
                                n1::Int32, n2::Int32, n3::Int32,
                                B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
@@ -81,6 +82,18 @@ end
         ρ  = Float32(D[idx]) * dsc
         s1 = Float32(S1[idx]) * ssc; s2 = Float32(S2[idx]) * ssc; s3 = Float32(S3[idx]) * ssc
         d1 = ρ * ax * halfdt; d2 = ρ * ay * halfdt; d3 = ρ * az * halfdt
+        # absolute post-kick velocity cap (the BAM_SMAXCAP twin for kicks):
+        # kicks bypass the hydro epilogue guards — at a refinement-saturated
+        # cell ∇φ is unbounded and ρ·g·dt overflows the f16 momentum window
+        # (stored > 65504 → Inf → smax = Inf).  Clamp the POST-kick velocity
+        # per component; the τ update uses the ACTUAL applied deltas, so the
+        # energy stays consistent with the momentum actually added.
+        if scap > 0.0f0
+            invρc = 1.0f0 / max(ρ, 1f-30)
+            d1 = clamp((s1 + d1) * invρc, -scap, scap) * ρ - s1
+            d2 = clamp((s2 + d2) * invρc, -scap, scap) * ρ - s2
+            d3 = clamp((s3 + d3) * invρc, -scap, scap) * ρ - s3
+        end
         τ  = Float32(Tau[idx]) * esc +
              (s1 * d1 + s2 * d2 + s3 * d3 + 0.5f0 * (d1*d1 + d2*d2 + d3*d3)) / max(ρ, 1f-30)
         S1[idx]  = _narrow(eltype(S1), (s1 + d1) / ssc)
@@ -105,10 +118,11 @@ function grav_kick_level!(hier::AMRHierarchy, l::Int, φ, halfdt::Real)
     hcell = hier.box / hier.nbase[1]              # topgrid cell size, code length
     invh = Float32(1.0 / (2.0 * hcell))
     n = length(lev.live) * lev.B^3
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
     _grav_kick_k!(lev.be)(lev.S1, lev.S2, lev.S3, lev.Tau, lev.D, φ,
                           lev.live_d, _tabi(lev, :gi0), _tabf(lev, :gfr),
                           lev.Dsc, lev.Ssc, lev.Esc,
-                          Float32(halfdt), invh, Float32(exp2(-l)),
+                          Float32(halfdt), invh, Float32(exp2(-l)), scap,
                           n1, n2, n3, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                           Int32(lev.stride); ndrange = n)
     return nothing
@@ -339,6 +353,7 @@ end
 @kernel function _grav_kick_pool_k!(S1, S2, S3, Tau, @Const(D), @Const(phi),
                                     @Const(live_d), @Const(Dsc), @Const(Ssc),
                                     @Const(Esc), halfdt::Float32, inv2h::Float32,
+                                    scap::Float32,
                                     B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -356,6 +371,18 @@ end
         ρ  = Float32(D[idx]) * dsc
         s1 = Float32(S1[idx]) * ssc; s2 = Float32(S2[idx]) * ssc; s3 = Float32(S3[idx]) * ssc
         d1 = ρ * ax * halfdt; d2 = ρ * ay * halfdt; d3 = ρ * az * halfdt
+        # absolute post-kick velocity cap (the BAM_SMAXCAP twin for kicks):
+        # kicks bypass the hydro epilogue guards — at a refinement-saturated
+        # cell ∇φ is unbounded and ρ·g·dt overflows the f16 momentum window
+        # (stored > 65504 → Inf → smax = Inf).  Clamp the POST-kick velocity
+        # per component; the τ update uses the ACTUAL applied deltas, so the
+        # energy stays consistent with the momentum actually added.
+        if scap > 0.0f0
+            invρc = 1.0f0 / max(ρ, 1f-30)
+            d1 = clamp((s1 + d1) * invρc, -scap, scap) * ρ - s1
+            d2 = clamp((s2 + d2) * invρc, -scap, scap) * ρ - s2
+            d3 = clamp((s3 + d3) * invρc, -scap, scap) * ρ - s3
+        end
         τ  = Float32(Tau[idx]) * esc +
              (s1 * d1 + s2 * d2 + s3 * d3 + 0.5f0 * (d1*d1 + d2*d2 + d3*d3)) / max(ρ, 1f-30)
         S1[idx]  = _narrow(eltype(S1), (s1 + d1) / ssc)
@@ -370,10 +397,11 @@ function grav_kick_level_pool!(hier::AMRHierarchy, l::Int, halfdt::Real)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     inv2h = Float32(1.0 / (2.0 * level_dx(hier, l)))
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
     n = length(lev.live) * lev.B^3
     _grav_kick_pool_k!(lev.be)(lev.S1, lev.S2, lev.S3, lev.Tau, lev.D, lev.phi,
                                lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
-                               Float32(halfdt), inv2h, Int32(lev.B), Int32(lev.ng),
+                               Float32(halfdt), inv2h, scap, Int32(lev.B), Int32(lev.ng),
                                Int32(lev.nd), Int32(lev.stride); ndrange = n)
     return nothing
 end
