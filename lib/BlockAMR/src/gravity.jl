@@ -548,10 +548,12 @@ end
         base = (slot - Int32(1)) * stride
         ci = c % B; cj = (c ÷ B) % B; ck = c ÷ (B * B)
         idx = base + _lidx(ci + ng, cj + ng, ck + ng, nd)
-        # dense coords: rel block origin (+1 halo, +1 1-based)
-        di = rel0[3*(slot-Int32(1))+Int32(1)] + ci + Int32(2)
-        dj = rel0[3*(slot-Int32(1))+Int32(2)] + cj + Int32(2)
-        dk = rel0[3*(slot-Int32(1))+Int32(3)] + ck + Int32(2)
+        # dense coords: rel block origin (+1 halo, +1 1-based).  rel0 is indexed
+        # by LIST POSITION (bi), not slot — with Schwarz overlap a slot can be
+        # a member of several sub-clusters, each with its own dense origin.
+        di = rel0[3*bi+Int32(1)] + ci + Int32(2)
+        dj = rel0[3*bi+Int32(2)] + cj + Int32(2)
+        dk = rel0[3*bi+Int32(3)] + ck + Int32(2)
         g = (dk - Int32(1)) * (nx * ny) + (dj - Int32(1)) * nx + di
         φd[g]   = Float32(phi[idx])
         rhsd[g] = Float32(rhs[idx])
@@ -573,9 +575,9 @@ end
         inint = (u >= ng) & (u < B + ng) & (v >= ng) & (v < B + ng) &
                 (w_ >= ng) & (w_ < B + ng)
         if !inint
-            di = rel0[3*(slot-Int32(1))+Int32(1)] + (u - ng) + Int32(2)
-            dj = rel0[3*(slot-Int32(1))+Int32(2)] + (v - ng) + Int32(2)
-            dk = rel0[3*(slot-Int32(1))+Int32(3)] + (w_ - ng) + Int32(2)
+            di = rel0[3*bi+Int32(1)] + (u - ng) + Int32(2)
+            dj = rel0[3*bi+Int32(2)] + (v - ng) + Int32(2)
+            dk = rel0[3*bi+Int32(3)] + (w_ - ng) + Int32(2)
             if di >= Int32(1) && di <= nx && dj >= Int32(1) && dj <= ny &&
                dk >= Int32(1) && dk <= nz
                 g = (dk - Int32(1)) * (nx * ny) + (dj - Int32(1)) * nx + di
@@ -684,9 +686,9 @@ end
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         ci = c % B; cj = (c ÷ B) % B; ck = c ÷ (B * B)
-        di = rel0[3*(slot-Int32(1))+Int32(1)] + ci + Int32(2)
-        dj = rel0[3*(slot-Int32(1))+Int32(2)] + cj + Int32(2)
-        dk = rel0[3*(slot-Int32(1))+Int32(3)] + ck + Int32(2)
+        di = rel0[3*bi+Int32(1)] + ci + Int32(2)
+        dj = rel0[3*bi+Int32(2)] + cj + Int32(2)
+        dk = rel0[3*bi+Int32(3)] + ck + Int32(2)
         g = (dk - Int32(1)) * (nx * ny) + (dj - Int32(1)) * nx + di
         phi[base + _lidx(ci + ng, cj + ng, ck + ng, nd)] = φd[g]
     end
@@ -790,55 +792,106 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
         for n_ in 1:nlive
             push!(get!(groups, find(n_), Int[]), n_)
         end
-        # per-slot dense-relative origins (0-based, halo-exclusive, cluster-local)
-        hrel0 = zeros(Int32, 3 * lev.cap)
-        clusters = Vector{Tuple{Any,Int,NTuple{3,Int},Vector{Any}}}()
-        for mem in values(groups)
-            lo = ntuple(d -> minimum(rel[d, n_] for n_ in mem), 3)
-            hi = ntuple(d -> maximum(rel[d, n_] for n_ in mem) + lev.B, 3)
-            dims = ntuple(d -> Int(hi[d] - lo[d]) + 2, 3)
-            # budget guard: a single genuinely-huge cluster is a config problem
-            prod(dims) * 4 * 5 > (Int64(12) << 30) &&
-                error("solve_gravity_level_mg!: cluster bbox $(dims) exceeds the memory budget")
-            for n_ in mem, d in 1:3
-                hrel0[3*(Int(lev.live[n_])-1)+d] = Int32(rel[d, n_] - lo[d])
-            end
-            livesub = to_device(lev.be, Int32[lev.live[n_] for n_ in mem], Int32)
-            pyr = Vector{Any}()
-            dd = dims
-            while true
-                push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
-                            device_zeros(lev.be, Float32, (prod(dd),)),
-                            device_zeros(lev.be, Float32, (prod(dd),)),
-                            device_zeros(lev.be, Float32, (prod(dd),)), dd))
-                minimum(dd) <= 6 && break
-                dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)   # halve interior, keep halo
-            end
-            push!(clusters, (livesub, length(mem), dims, pyr))
-        end
-        cache = (to_device(lev.be, hrel0, Int32), clusters)
+        # Over-budget connected clusters are RECURSIVELY BISECTED (median block
+        # along the longest bbox axis) into shrink-wrapped sub-clusters — a
+        # union that percolates across the whole zoom sphere (haloA: L2 at
+        # 850×1010×818, 5% fill → 14 GiB dense; L3 would be ~90 GiB) cannot get
+        # one dense pyramid.  Each part is its own Dirichlet solve WITH
+        # OVERLAP: it also gathers (and masks as interior) the component's
+        # blocks within `ovl` cells of its own bbox, but scatters ONLY its own
+        # blocks — overlapping Schwarz.  The 1-cell halo alone converges at
+        # ~0.9/pass (useless); a ~B-cell overlap contracts strongly, and the
+        # per-substep warm start makes the seam lag a small multiple of the
+        # per-substep φ drift.  Ring cells outside the overlap take the
+        # neighbor part's pre-solve φ via the sibling ghost exchange.
+        # Budget: BAM_MGCLUSTER_GIB (default 24, own-bbox) — splitting is a
+        # LAST-RESORT scaling fallback: the seam rings lag the neighbor part's
+        # φ by one substep, which measurably perturbs a fast-deepening
+        # potential (haloA: split-MG shifted L7 formation z=24.75→24.55 and
+        # fed the λ-ratchet); prefer one dense pyramid whenever it fits
+        # (managed memory pages it).  Overlap: BAM_MGOVERLAP cells (default B).
+        # rel origins are PER-CLUSTER, indexed by list position (a slot can be
+        # a member of several parts).
+        clusters = Vector{Tuple{Any,Int,Int,NTuple{3,Int},Any,Vector{Any}}}()
+        budget = Int64(round(parse(Float64, get(ENV, "BAM_MGCLUSTER_GIB", "24.0")) * (Int64(1) << 30)))
+        ovl = clamp(parse(Int, get(ENV, "BAM_MGOVERLAP", string(lev.B))), 0, 4 * lev.B)
+        for g0 in values(groups)
+            stack = Vector{Vector{Int}}([g0])
+            while !isempty(stack)
+                mem = pop!(stack)
+                lo = ntuple(d -> minimum(rel[d, n_] for n_ in mem), 3)
+                hi = ntuple(d -> maximum(rel[d, n_] for n_ in mem) + lev.B, 3)
+                dims = ntuple(d -> Int(hi[d] - lo[d]) + 2, 3)
+                if prod(dims) * 4 * 5 > budget && length(mem) > 1
+                    ax = argmax(dims)
+                    srt = sort(mem; by = n_ -> rel[ax, n_])
+                    h = length(srt) ÷ 2
+                    push!(stack, srt[1:h]); push!(stack, srt[h+1:end])
+                    continue
+                end
+                # overlap borrow: component blocks whose extent intersects the
+                # own bbox grown by ovl (skip when the part IS the component)
+                ext = Int[]
+                if length(mem) < length(g0) && ovl > 0
+                    inmem = BitSet(mem)
+                    for n_ in g0
+                        n_ in inmem && continue
+                        hit = true
+                        for d in 1:3
+                            (rel[d, n_] < hi[d] + ovl && rel[d, n_] + lev.B > lo[d] - ovl) ||
+                                (hit = false; break)
+                        end
+                        hit && push!(ext, n_)
+                    end
+                end
+                all_ = isempty(ext) ? mem : vcat(mem, ext)
+                glo = ntuple(d -> minimum(rel[d, n_] for n_ in all_), 3)
+                ghi = ntuple(d -> maximum(rel[d, n_] for n_ in all_) + lev.B, 3)
+                gdims = ntuple(d -> Int(ghi[d] - glo[d]) + 2, 3)
+                relsub = Vector{Int32}(undef, 3 * length(all_))
+                for (i_, n_) in enumerate(all_), d in 1:3
+                    relsub[3*(i_-1)+d] = Int32(rel[d, n_] - glo[d])
+                end
+                livesub = to_device(lev.be, Int32[lev.live[n_] for n_ in all_], Int32)
+                relsub_d = to_device(lev.be, relsub, Int32)
+                pyr = Vector{Any}()
+                dd = gdims
+                while true
+                    push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
+                                device_zeros(lev.be, Float32, (prod(dd),)),
+                                device_zeros(lev.be, Float32, (prod(dd),)),
+                                device_zeros(lev.be, Float32, (prod(dd),)), dd))
+                    minimum(dd) <= 6 && break
+                    dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)   # halve interior, keep halo
+                end
+                push!(clusters, (livesub, length(all_), length(mem), gdims, relsub_d, pyr))
+            end                                   # while !isempty(stack)
+        end                                       # for g0
+        cache = clusters
         lev.tabs[:mgd] = cache
     end
-    rel0, clusters = cache
+    clusters = cache
     defect = 0.0f0
-    for (livesub, nbk, dims, pyr) in clusters
+    for (livesub, nall, nown, dims, relsub, pyr) in clusters
         φd, rhsd, maskd, rd, _ = pyr[1]
         fill!(φd, 0.0f0); fill!(rhsd, 0.0f0); fill!(maskd, 0.0f0)
         nx, ny, nz = Int32.(dims)
-        _mgd_gather_int_k!(lev.be)(φd, rhsd, maskd, lev.phi, lev.rhs, livesub, rel0,
+        _mgd_gather_int_k!(lev.be)(φd, rhsd, maskd, lev.phi, lev.rhs, livesub, relsub,
                                    nx, ny, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                                   Int32(lev.stride); ndrange = nbk * lev.B^3)
-        _mgd_gather_ring_k!(lev.be)(φd, maskd, lev.phi, livesub, rel0, nx, ny, nz,
+                                   Int32(lev.stride); ndrange = nall * lev.B^3)
+        _mgd_gather_ring_k!(lev.be)(φd, maskd, lev.phi, livesub, relsub, nx, ny, nz,
                                     Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                                    Int32(lev.stride); ndrange = nbk * lev.nd^3)
+                                    Int32(lev.stride); ndrange = nall * lev.nd^3)
         for _ in 1:ncycle
             _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
         end
         _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
         defect = max(defect, maximum(abs, rd))
-        _mgd_scatter_k!(lev.be)(lev.phi, φd, livesub, rel0, nx, ny,
+        # scatter ONLY the part's own blocks (own-first in livesub) — overlap
+        # blocks belong to (and are written by) their own part's solve
+        _mgd_scatter_k!(lev.be)(lev.phi, φd, livesub, relsub, nx, ny,
                                 Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                                Int32(lev.stride); ndrange = nbk * lev.B^3)
+                                Int32(lev.stride); ndrange = nown * lev.B^3)
     end
     _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
     return defect
