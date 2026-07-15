@@ -314,7 +314,10 @@ function main()
                                     nstep, l, bad); flush(stdout); error("phi pre-advance"))
             end
         end
-        for l in 1:min(length(hier.levels) - 1, LDM)
+        # COMPLETE gravitating density: ALL levels get the full DM deposit
+        # (RAMSES rho_fine).  The old ≤LDM cap left deeper levels source-free —
+        # ∇²φ = coef·(gas−ρ̄_tot) with the DM missing pushes zoom regions apart.
+        for l in 1:length(hier.levels) - 1
             isempty(hier.levels[l+1].live) && continue
             deposit_particles_level!(hier, l, parts; mass_code)
         end
@@ -436,7 +439,9 @@ function main()
         end
         BlockAMR.advance_level_w!(hier, 0, hier.λ;
             selfgrav = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
-                        rho_mean = 1.0, use_dm = true),
+                        rho_mean = 1.0, use_dm = true,
+                        mg = get(ENV, "BAM_MG", "1") == "1",     # masked-MG level solves
+                        ncycle = parse(Int, get(ENV, "BAM_MGCYC", "4"))),
             chem = get(ENV, "BAM_NOCHEM", "0") == "1" ? nothing :
                    (a_value = a, density_units = u.d, length_units = u.l,
                     time_units = u.t, hubble = c.h0, Om = c.Om, OL = c.OL,

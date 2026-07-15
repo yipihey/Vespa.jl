@@ -64,6 +64,28 @@ for BE in BACKENDS
         end
         @test worst < tol                                  # |φ*| ≤ 1
     end
+    # masked MULTIGRID reaches the same solution from a COLD start, sourced by
+    # the same GAS density (the level D pools) — the gas-self-gravity MG gate.
+    fill!(hier.levels[2].phi, 0.0f0); fill!(hier.levels[3].phi, 0.0f0)
+    solve_gravity_level_mg!(hier, 1; source_coef = coef, ncycle = 6)
+    solve_gravity_level_mg!(hier, 2; source_coef = coef, ncycle = 6)
+    for (l, tol) in ((1, 0.02), (2, 0.02))
+        lev = hier.levels[l + 1]
+        hp = Array(lev.phi); dx = BA.level_dx(hier, l)
+        worst = 0.0
+        for s in lev.live
+            m = lev.meta[s]; base = (Int(s)-1)*lev.stride
+            for k in 1:lev.B, j in 1:lev.B, i in 1:lev.B
+                x = ntuple(d -> (Float64(m.origin[d]) + (i,j,k)[d] - 0.5) * dx, 3)
+                got = hp[base + ((lev.ng+k-1)*lev.nd + (lev.ng+j-1))*lev.nd + (lev.ng+i-1) + 1]
+                worst = max(worst, abs(got - φex(x)))
+            end
+        end
+        @test worst < tol                              # MG ≡ converged RB, gas source
+    end
+    # re-solve with RB so the warm-restart check below sees its expected state
+    solve_gravity_level!(hier, 1; source_coef = coef, nsweep = 400)
+
     # warm restart: a few sweeps keep the residual small
     rw = solve_gravity_level!(hier, 1; source_coef = coef, nsweep = 5)
     @test rw < 5 * r1b + 1e-6

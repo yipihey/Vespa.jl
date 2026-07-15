@@ -140,13 +140,27 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         # at EVERY level (matching the mean-subtracted topgrid FFT that feeds the
         # level-1 Dirichlet BCs); use_dm adds the per-level particle deposit.
         _t = _tic(lev.be)
-        solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
-                             nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :
-                                               get(selfgrav, :nsweep, 30),
-                             rho_ext = get(selfgrav, :rho_ext, nothing),
-                             rho_mean = get(selfgrav, :rho_mean, 0),
-                             use_dm = get(selfgrav, :use_dm, false),
-                             residual = false)         # no diagnostic sync per substep
+        if l >= 1 && get(selfgrav, :mg, false)
+            # masked multigrid (RAMSES multigrid_fine): CONVERGES the level φ —
+            # gas (the level D pool) + optional DM deposit source — on any union
+            # size; plain RB-GS below only tracks small unions.  The Dirichlet
+            # ring uses the frozen parent φ (fine-first W-cycle convention; the
+            # second substep's ring is lagged dt_parent/2 — a bc_phi extrapolation
+            # from a parent φ_old is the known refinement if it ever matters).
+            solve_gravity_level_mg!(hier, l; source_coef = selfgrav.coef,
+                                    rho_ext = get(selfgrav, :rho_ext, nothing),
+                                    rho_mean = get(selfgrav, :rho_mean, 0),
+                                    use_dm = get(selfgrav, :use_dm, false),
+                                    ncycle = get(selfgrav, :ncycle, 4))
+        else
+            solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
+                                 nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :
+                                                   get(selfgrav, :nsweep, 30),
+                                 rho_ext = get(selfgrav, :rho_ext, nothing),
+                                 rho_mean = get(selfgrav, :rho_mean, 0),
+                                 use_dm = get(selfgrav, :use_dm, false),
+                                 residual = false)     # no diagnostic sync per substep
+        end
         _toc(lev.be, :grav_solve, l, _t)
         _t = _tic(lev.be); grav_kick_level_pool!(hier, l, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     elseif φ !== nothing
