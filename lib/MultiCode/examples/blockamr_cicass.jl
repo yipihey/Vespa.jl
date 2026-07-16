@@ -282,6 +282,9 @@ function main()
             BlockAMR.prefetch_device!(a_)
         end
     end
+    # BAM_TIMERS=1: sync-accurate per-(phase,level) wall-time breakdown, printed
+    # every max(CKPTN,10) steps (answers "where does the time go" exactly)
+    get(ENV, "BAM_TIMERS", "0") == "1" && BlockAMR.enable_timers!()
     while a < a_end
         # ── timestep: hydro CFL (global λ), particle CFL, expansion cap,
         #    and the free-fall limiter — a collapsing peak's t_dyn ∝ 1/√(Gρ)
@@ -553,7 +556,9 @@ function main()
         if VPCAP > 0
             vc = Float32(VPCAP)
             for vcomp in (parts.vx, parts.vy, parts.vz)
-                vcomp .= clamp.(vcomp, -vc, vc)
+                # clamp(NaN) = NaN — a nonfinite kick (NaN accel gather) must
+                # not poison positions through the next drift; zero it.
+                vcomp .= ifelse.(isfinite.(vcomp), clamp.(vcomp, -vc, vc), 0.0f0)
             end
         end
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
@@ -634,6 +639,11 @@ function main()
                      mass_code = mass_code isa AbstractVector ? Array(mass_code) : mass_code,
                      px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
                      vx = Array(parts.vx), vy = Array(parts.vy), vz = Array(parts.vz))
+        if get(ENV, "BAM_TIMERS", "0") == "1" && nstep % max(CKPTN, 10) == 0
+            BlockAMR.timer_report()
+            BlockAMR.reset_timers!()
+            flush(stdout)
+        end
         if CKPTN > 0 && nstep % CKPTN == 0
             ckf = joinpath(REPORTS, "bamr_ckpt$(TAG)_" *
                            (isodd(nstep ÷ CKPTN) ? "A" : "B") * ".jls")

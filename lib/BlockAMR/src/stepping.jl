@@ -138,6 +138,23 @@ coarse stage; the apply multiplies the single global λ.
         ok = count(x -> !isfinite(Float32(x)), lev.Ge) == 0 &&
              count(x -> !isfinite(Float32(x)), lev.Tau) == 0
     end
+    if ok && !isempty(lev.phi)
+        # φ poisoning is invisible to the gas gates once the kicks are
+        # nonfinite-safe (they absorb NaN ∇φ) — the haloA step-99 meltdown
+        # poisoned L2–L9 φ pool-wide while every gas gate stayed green.
+        nphi = count(x -> !isfinite(Float32(x)), lev.phi)
+        if nphi > 0
+            println("NANSTAGE   phi: $nphi nonfinite at level $l after :$stage")
+            for (nm, arr) in ((:rhs, lev.rhs), (:dm, lev.dm))
+                isempty(arr) && continue
+                nb = count(x -> !isfinite(Float32(x)), arr)
+                mx = mapreduce(x -> isfinite(Float32(x)) ? abs(Float32(x)) : 0.0f0,
+                               max, arr; init = 0.0f0)
+                println("NANSTAGE   $nm: nonfinite=$nb  max|finite|=$mx")
+            end
+            ok = false
+        end
+    end
     if !ok
         # which field carries it? (counts cover the whole pool incl. ghosts and
         # dead slots — a live-interior nonfinite is already established by smax)

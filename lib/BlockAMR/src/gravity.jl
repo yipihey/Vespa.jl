@@ -88,11 +88,16 @@ end
         # (stored > 65504 → Inf → smax = Inf).  Clamp the POST-kick velocity
         # per component; the τ update uses the ACTUAL applied deltas, so the
         # energy stays consistent with the momentum actually added.
-        if scap > 0.0f0
+        # NONFINITE-safe: clamp(NaN) = NaN — a NaN ∇φ would sail through a
+        # plain clamp into the pools.  A nonfinite kick keeps the OLD velocity.
+        begin
             invρc = 1.0f0 / max(ρ, 1f-30)
-            d1 = clamp((s1 + d1) * invρc, -scap, scap) * ρ - s1
-            d2 = clamp((s2 + d2) * invρc, -scap, scap) * ρ - s2
-            d3 = clamp((s3 + d3) * invρc, -scap, scap) * ρ - s3
+            v1 = (s1 + d1) * invρc; v2 = (s2 + d2) * invρc; v3 = (s3 + d3) * invρc
+            scap > 0.0f0 && (v1 = clamp(v1, -scap, scap); v2 = clamp(v2, -scap, scap);
+                             v3 = clamp(v3, -scap, scap))
+            d1 = ifelse(isfinite(v1), v1 * ρ - s1, 0.0f0)
+            d2 = ifelse(isfinite(v2), v2 * ρ - s2, 0.0f0)
+            d3 = ifelse(isfinite(v3), v3 * ρ - s3, 0.0f0)
         end
         τ  = Float32(Tau[idx]) * esc +
              (s1 * d1 + s2 * d2 + s3 * d3 + 0.5f0 * (d1*d1 + d2*d2 + d3*d3)) / max(ρ, 1f-30)
@@ -377,11 +382,16 @@ end
         # (stored > 65504 → Inf → smax = Inf).  Clamp the POST-kick velocity
         # per component; the τ update uses the ACTUAL applied deltas, so the
         # energy stays consistent with the momentum actually added.
-        if scap > 0.0f0
+        # NONFINITE-safe: clamp(NaN) = NaN — a NaN ∇φ would sail through a
+        # plain clamp into the pools.  A nonfinite kick keeps the OLD velocity.
+        begin
             invρc = 1.0f0 / max(ρ, 1f-30)
-            d1 = clamp((s1 + d1) * invρc, -scap, scap) * ρ - s1
-            d2 = clamp((s2 + d2) * invρc, -scap, scap) * ρ - s2
-            d3 = clamp((s3 + d3) * invρc, -scap, scap) * ρ - s3
+            v1 = (s1 + d1) * invρc; v2 = (s2 + d2) * invρc; v3 = (s3 + d3) * invρc
+            scap > 0.0f0 && (v1 = clamp(v1, -scap, scap); v2 = clamp(v2, -scap, scap);
+                             v3 = clamp(v3, -scap, scap))
+            d1 = ifelse(isfinite(v1), v1 * ρ - s1, 0.0f0)
+            d2 = ifelse(isfinite(v2), v2 * ρ - s2, 0.0f0)
+            d3 = ifelse(isfinite(v3), v3 * ρ - s3, 0.0f0)
         end
         τ  = Float32(Tau[idx]) * esc +
              (s1 * d1 + s2 * d2 + s3 * d3 + 0.5f0 * (d1*d1 + d2*d2 + d3*d3)) / max(ρ, 1f-30)
@@ -910,16 +920,39 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
         _mgd_gather_ring_k!(lev.be)(φd, maskd, lev.phi, livesub, relsub, nx, ny, nz,
                                     Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                                     Int32(lev.stride); ndrange = nall * lev.nd^3)
+        # MONOTONICITY GUARD: on spongy percolated unions (thousands of
+        # scattered Jeans-driven blocks) the masked V-cycle correction can
+        # AMPLIFY instead of contract — a slow, silent divergence (haloA: φ
+        # grew to ~1e11, 16 decades above physical, over ~15 root steps; the
+        # rhs-implied solution is ~1e4).  Measure the defect before and after
+        # the cycles; if it did not decrease, or φ left the absolute sanity
+        # window, SKIP the scatter — the pool keeps the last bounded φ
+        # (parent-prolonged BCs + previous state).  Contract-or-freeze, never
+        # amplify.  Proper cure (Krylov-wrapped V-cycle / better sponge coarse
+        # masks) is future solver work.
+        _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
+        r0 = maximum(abs, rd)
         for _ in 1:ncycle
             _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
         end
         _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
-        defect = max(defect, maximum(abs, rd))
-        # scatter ONLY the part's own blocks (own-first in livesub) — overlap
-        # blocks belong to (and are written by) their own part's solve
-        _mgd_scatter_k!(lev.be)(lev.phi, φd, livesub, relsub, nx, ny,
-                                Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                                Int32(lev.stride); ndrange = nown * lev.B^3)
+        r1 = maximum(abs, rd)
+        mxφ = mapreduce(x -> isfinite(x) ? abs(x) : 0.0f0, max, φd; init = 0.0f0)
+        okc = isfinite(r1) && r1 <= r0 * 1.001f0 && mxφ < 1.0f8 &&
+              count(x -> !isfinite(x), φd) == 0
+        if okc
+            defect = max(defect, r1)
+            # scatter ONLY the part's own blocks (own-first in livesub) —
+            # overlap blocks belong to (and are written by) their own part
+            _mgd_scatter_k!(lev.be)(lev.phi, φd, livesub, relsub, nx, ny,
+                                    Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                                    Int32(lev.stride); ndrange = nown * lev.B^3)
+        else
+            defect = max(defect, isfinite(r0) ? r0 : 0.0f0)
+            get(ENV, "BAM_NANSTAGE", "0") == "1" &&
+                (println("MGDIAG REVERT l=$l dims=$dims nall=$nall: r0=$r0 r1=$r1 max|φ|=$mxφ");
+                 flush(stdout))
+        end
     end
     _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
     return defect
