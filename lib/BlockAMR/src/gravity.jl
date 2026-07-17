@@ -778,7 +778,8 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
                                  rho_mean::Real = 0, use_dm::Bool = false,
                                  rho_ext = nothing, init::Symbol = :warm,
                                  ncycle::Int = 6, nu1::Int = 3, nu2::Int = 3,
-                                 nub::Int = 80, ω::Real = 0.65, bc_phi = nothing)
+                                 nub::Int = 80, ω::Real = 0.65, bc_phi = nothing,
+                                 mgeps::Real = 0)
     l >= 1 || error("solve_gravity_level_mg!: level 0 is the global FFT — solve it there")
     lev = hier.levels[l + 1]
     isempty(lev.live) && return 0.0f0
@@ -924,22 +925,39 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
         # scattered Jeans-driven blocks) the masked V-cycle correction can
         # AMPLIFY instead of contract — a slow, silent divergence (haloA: φ
         # grew to ~1e11, 16 decades above physical, over ~15 root steps; the
-        # rhs-implied solution is ~1e4).  Measure the defect before and after
-        # the cycles; if it did not decrease, or φ left the absolute sanity
-        # window, SKIP the scatter — the pool keeps the last bounded φ
-        # (parent-prolonged BCs + previous state).  Contract-or-freeze, never
-        # amplify.  Proper cure (Krylov-wrapped V-cycle / better sponge coarse
-        # masks) is future solver work.
+        # rhs-implied solution is ~1e4).  Every 4th solve: measure the defect
+        # before/after and revert non-contracting corrections.  Every solve:
+        # ONE fused reduction (max|φ| with nonfinite→Inf) enforcing the
+        # absolute sanity window — the anti-runaway backstop at ~1/6 the
+        # guard cost (the growth we chased was ~×1.2/root-step, so a 4-solve
+        # cadence catches divergence within a root step).  Contract-or-freeze,
+        # never amplify.  Proper cure (Krylov-wrapped V-cycle / better sponge
+        # coarse masks) is future solver work.
+        # RAMSES-style ε EARLY EXIT (multigrid_fine_commons: iterate until
+        # err < epsilon): with per-substep warm starts and λ_J resolved by
+        # hundreds of cells, φ changes by ~1/N_J per fine substep — the warm
+        # start is already converged on most solves.  Test the residual FIRST
+        # and skip the cycles (and the scatter — the pool already holds this
+        # φd) when r0 ≤ ε·max|rhs|.  mgeps=0 disables (always cycle).
         _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
         r0 = maximum(abs, rd)
+        if mgeps > 0 && isfinite(r0) && r0 <= mgeps * maximum(abs, rhsd)
+            defect = max(defect, r0)
+            continue
+        end
         for _ in 1:ncycle
             _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
         end
-        _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
-        r1 = maximum(abs, rd)
-        mxφ = mapreduce(x -> isfinite(x) ? abs(x) : 0.0f0, max, φd; init = 0.0f0)
-        okc = isfinite(r1) && r1 <= r0 * 1.001f0 && mxφ < 1.0f8 &&
-              count(x -> !isfinite(x), φd) == 0
+        # MONOTONICITY GUARD (contract-or-freeze; see the divergence note
+        # above): with r0 always in hand, check every cycled solve.
+        mxφ = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φd; init = 0.0f0)
+        okc = mxφ < 1.0f8                       # nonfinite folded to Inf → fails
+        r1 = 0.0f0
+        if okc
+            _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
+            r1 = maximum(abs, rd)
+            okc = isfinite(r1) && r1 <= r0 * 1.001f0
+        end
         if okc
             defect = max(defect, r1)
             # scatter ONLY the part's own blocks (own-first in livesub) —
@@ -956,4 +974,195 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
     end
     _run_copy!(lev.be, _tabt(lev, :sib), lev.phi, lev.phi, lev.nd, lev.stride)
     return defect
+end
+
+# ══ MG2: block-topology multigrid (RAMSES-spirit, no big dense pyramids) ══════
+#
+# The dense-bbox MG above gathers the WHOLE union into a dense grid whose
+# volume scales with the bounding box, not the block count — 15-20× waste on
+# sponges, and at high Jeans resolution the per-level pyramids (10+ GB each)
+# exceed the device and page over PCIe on EVERY substep solve.  MG2 keeps all
+# heavy work on the RESIDENT block pools:
+#
+#   smooth (RB on pools)  →  signed residual (pools, compact)  →  restrict to
+#   a SMALL dense coarse grid at ÷cfac (position-based atomic averaging —
+#   alignment-free under free block offsets; L10's 800³ bbox becomes 200³ =
+#   32 MB)  →  existing masked-MG V-cycles solve the correction (Dirichlet-0
+#   halo)  →  trilinear prolong-add back to the pools  →  smooth.
+#
+# Traffic per cycle ≈ (2·nsm+3) passes over the level's own cells at device
+# bandwidth; the only dense object is bbox/cfac³.  The cfac jump (4×) leaves
+# the 2–4Δx error band to the smoother — nsm≈4 RB pairs cover it; long
+# wavelengths ride the coarse solve.  ε early-exit and an absolute correction
+# guard as in the dense path.
+
+# signed residual rhs − Lφ into a compact live-cell buffer (restriction source)
+@kernel function _residual_s_k!(res, @Const(phi), @Const(rhs), @Const(live_d),
+                                B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        idx = base + _lidx(i, j, k, nd)
+        res[Int32(t)] = rhs[idx] - (phi[idx - Int32(1)] + phi[idx + Int32(1)] +
+                                    phi[idx - nd] + phi[idx + nd] +
+                                    phi[idx - nd*nd] + phi[idx + nd*nd] -
+                                    6.0f0 * phi[idx])
+    end
+end
+
+# restrict the compact residual to the ÷cfac dense coarse grid (atomic mean·cfac²:
+# w = cfac²/cfac³ = 1/cfac maps pool-units h²r to coarse-units H²r)
+@kernel function _mg2_restrict_k!(rc, mc, @Const(res), @Const(rel0),
+                                  w::Float32, cfac::Int32,
+                                  nx::Int32, ny::Int32, B::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        i = c % B; j = (c ÷ B) % B; k = c ÷ (B * B)
+        gx = (rel0[3*bi+Int32(1)] + i) ÷ cfac + Int32(2)   # +1 halo, +1 one-based
+        gy = (rel0[3*bi+Int32(2)] + j) ÷ cfac + Int32(2)
+        gz = (rel0[3*bi+Int32(3)] + k) ÷ cfac + Int32(2)
+        g = (gz - Int32(1)) * (nx * ny) + (gy - Int32(1)) * nx + gx
+        KA.@atomic rc[g] += w * res[Int32(t)]
+        mc[g] = 1.0f0                                       # benign write race
+    end
+end
+
+# trilinear prolong-add of the dense coarse correction into the pool φ
+@kernel function _mg2_prolongadd_k!(phi, @Const(ec), @Const(live_d), @Const(rel0),
+                                    cfac::Int32, nx::Int32, ny::Int32, nz::Int32,
+                                    B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B; j = (c ÷ B) % B; k = c ÷ (B * B)
+        # coarse-grid index space: coarse cell cc's center sits at index cc+2
+        x = (Float32(rel0[3*bi+Int32(1)] + i) + 0.5f0) / Float32(cfac) + 1.5f0
+        y = (Float32(rel0[3*bi+Int32(2)] + j) + 0.5f0) / Float32(cfac) + 1.5f0
+        z = (Float32(rel0[3*bi+Int32(3)] + k) + 0.5f0) / Float32(cfac) + 1.5f0
+        ix = unsafe_trunc(Int32, floor(x)); fx = x - Float32(ix)
+        iy = unsafe_trunc(Int32, floor(y)); fy = y - Float32(iy)
+        iz = unsafe_trunc(Int32, floor(z)); fz = z - Float32(iz)
+        ix = clamp(ix, Int32(1), nx - Int32(1)); iy = clamp(iy, Int32(1), ny - Int32(1))
+        iz = clamp(iz, Int32(1), nz - Int32(1))
+        E(a, b, cc) = ec[(cc - Int32(1)) * (nx * ny) + (b - Int32(1)) * nx + a]
+        e = (1-fx)*(1-fy)*(1-fz)*E(ix,   iy,   iz  ) + fx*(1-fy)*(1-fz)*E(ix+Int32(1), iy,   iz  ) +
+            (1-fx)*   fy *(1-fz)*E(ix,   iy+Int32(1), iz  ) + fx*   fy *(1-fz)*E(ix+Int32(1), iy+Int32(1), iz  ) +
+            (1-fx)*(1-fy)*   fz *E(ix,   iy,   iz+Int32(1)) + fx*(1-fy)*   fz *E(ix+Int32(1), iy,   iz+Int32(1)) +
+            (1-fx)*   fy *   fz *E(ix,   iy+Int32(1), iz+Int32(1)) + fx*   fy *   fz *E(ix+Int32(1), iy+Int32(1), iz+Int32(1))
+        idx = base + _lidx(i + ng, j + ng, k + ng, nd)
+        phi[idx] += e
+    end
+end
+
+"""
+    solve_gravity_level_mg2!(hier, l; source_coef, ...) -> defect
+
+Block-topology multigrid level solve: RB smoothing + residual on the RESIDENT
+block pools, one small dense coarse grid (union bbox ÷ `cfac`, masked-MG
+bottom, Dirichlet-0 correction halo), trilinear prolong-add.  Replaces the
+dense-bbox path wherever the pyramid would not fit the device (high Jeans
+resolution) or the union is a sponge (percolated Jeans levels).  `mgeps > 0`
+enables the RAMSES-style relative-residual early exit.
+"""
+function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
+                                  rho_mean::Real = 0, use_dm::Bool = false,
+                                  rho_ext = nothing, ncycle::Int = 2, nsm::Int = 4,
+                                  cfac::Int = 4, nub::Int = 60, mgeps::Real = 0,
+                                  bc_phi = nothing)
+    l >= 1 || error("solve_gravity_level_mg2!: level 0 is the global FFT")
+    lev = hier.levels[l + 1]
+    isempty(lev.live) && return 0.0f0
+    # rhs + Dirichlet ring (+ sibling ghosts), no sweeps — the existing pre-pass
+    solve_gravity_level!(hier, l; source_coef, rho_mean, use_dm, rho_ext,
+                         nsweep = 0, residual = false, bc_phi)
+    n = length(lev.live) * lev.B^3
+    cache = get(lev.tabs, :mg2, nothing)
+    if cache === nothing
+        P = Int128(lev.P[1])
+        anc = lev.meta[lev.live[1]].origin
+        nlive = length(lev.live)
+        rel = Matrix{Int64}(undef, 3, nlive)
+        for (n_, s) in enumerate(lev.live)
+            m = lev.meta[s]
+            for d in 1:3
+                rel[d, n_] = Int64(mod(Int128(m.origin[d]) - Int128(anc[d]) + P ÷ 2, P) - P ÷ 2)
+            end
+        end
+        lo = ntuple(d -> minimum(view(rel, d, :)), 3)
+        hi = ntuple(d -> maximum(view(rel, d, :)) + lev.B, 3)
+        dc = ntuple(d -> Int(cld(hi[d] - lo[d], cfac)) + 2, 3)
+        rel0 = Vector{Int32}(undef, 3 * nlive)
+        for n_ in 1:nlive, d in 1:3
+            rel0[3*(n_-1)+d] = Int32(rel[d, n_] - lo[d])
+        end
+        pyr = Vector{Any}()
+        dd = dc
+        while true
+            push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
+                        device_zeros(lev.be, Float32, (prod(dd),)),
+                        device_zeros(lev.be, Float32, (prod(dd),)),
+                        device_zeros(lev.be, Float32, (prod(dd),)), dd))
+            minimum(dd) <= 6 && break
+            dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)
+        end
+        cache = (to_device(lev.be, rel0, Int32), dc, pyr,
+                 device_zeros(lev.be, Float32, (n,)))
+        lev.tabs[:mg2] = cache
+    end
+    rel0_d, dc, pyr, resb = cache
+    sib = _tabt(lev, :sib); sibf = _tabt(lev, :sibf)
+    nx, ny, nz = Int32.(dc)
+    φc, rc, mc, _, _ = pyr[1]
+    B = Int32(lev.B); ng = Int32(lev.ng); ndv = Int32(lev.nd); st = Int32(lev.stride)
+    smooth! = () -> begin
+        _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(0), B, ng, ndv, st;
+                             ndrange = n)
+        _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(1), B, ng, ndv, st;
+                             ndrange = n)
+        _run_copy!(lev.be, sibf, lev.phi, lev.phi, lev.nd, lev.stride)
+    end
+    defect = 0.0f0
+    for cyc in 1:ncycle
+        if mgeps > 0 && cyc == 1
+            _absrhs_k!(lev.be)(resb, lev.rhs, lev.live_d, B, ng, ndv, st; ndrange = n)
+            rn = maximum(resb)
+            _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
+                                   ndrange = n)
+            defect = maximum(abs, resb)
+            defect <= mgeps * rn && return defect
+        end
+        for _ in 1:nsm; smooth!(); end
+        _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
+                               ndrange = n)
+        fill!(φc, 0.0f0); fill!(rc, 0.0f0); fill!(mc, 0.0f0)
+        _mg2_restrict_k!(lev.be)(rc, mc, resb, rel0_d, Float32(1 / cfac), Int32(cfac),
+                                 nx, ny, B; ndrange = n)
+        _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+        _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+        # absolute correction guard (the anti-runaway backstop; RB smoothing is
+        # non-expansive, so this is the only injection point to bound)
+        mxe = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φc; init = 0.0f0)
+        if mxe < 1.0f8
+            _mg2_prolongadd_k!(lev.be)(lev.phi, φc, lev.live_d, rel0_d, Int32(cfac),
+                                       nx, ny, nz, B, ng, ndv, st; ndrange = n)
+            _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+        end
+        for _ in 1:nsm; smooth!(); end
+    end
+    _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+    _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
+                           ndrange = n)
+    return maximum(abs, resb)
 end

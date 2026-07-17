@@ -14,7 +14,7 @@ import ChemistryKernels
                                  @Const(D), @Const(Ge), @Const(sp1), @Const(sp2),
                                  @Const(live_d), @Const(Dsc), @Const(Gsc),
                                  B::Int32, ng::Int32, nd::Int32, stride::Int32,
-                                 hfloor::UInt16)
+                                 hfloor::UInt16, ecap::Float32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = B * B * B
@@ -26,6 +26,16 @@ import ChemistryKernels
         idx = base + _lidx(i, j, k, nd)
         d16 = Float32(D[idx])
         ρ = d16 * Dsc[slot]
+        # HOT-CELL SKIP (ecap > 0, code specific energy): guard-frozen garbage
+        # cells (velocity/energy caps keep-old at unphysical states, T near the
+        # 1e9 K solver cap) have cooling times of SECONDS — evolve_cell_analytic
+        # grinds its full itcap on them EVERY substep (the j256h "hang": hours
+        # per root step at 100% compute).  Feed them ρ=0, e=0: the solver's
+        # density clamp makes every rate ~0 → one-iteration exit; the scatter
+        # re-derives the same gate and discards the result.
+        ehot = ecap > 0.0f0 &&
+               Float32(Ge[idx]) * Gsc[slot] > ecap * max(ρ, 1.0f-30)
+        ehot && (ρ = 0.0f0)
         rho32[Int32(t)] = ρ
         # Representability gate: a cell whose STORED density is below the f16
         # normal range (2^-14; 0, subnormal, or NaN) has ≤10 mantissa bits —
@@ -48,9 +58,9 @@ end
 
 @kernel function _chem_scatter_k!(Ge, Tau, sp1, sp2,
                                   @Const(rho32), @Const(e32), @Const(h16), @Const(m16),
-                                  @Const(D), @Const(live_d), @Const(Esc), @Const(Gsc),
+                                  @Const(D), @Const(live_d), @Const(Dsc), @Const(Esc), @Const(Gsc),
                                   B::Int32, ng::Int32, nd::Int32, stride::Int32,
-                                  efloor::Float32)
+                                  efloor::Float32, ecap::Float32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = B * B * B
@@ -66,7 +76,10 @@ end
         # x_e corner and returns NaN (haloA L2 blocks holding restricted core
         # gas next to voids: 1e8 in-block contrast).  Such cells SKIP chem:
         # write nothing, so solver garbage never leaves the scratch buffers.
-        if Float32(D[idx]) > 6.103515625f-5
+        d16s = Float32(D[idx])
+        ehot = ecap > 0.0f0 &&
+               Float32(Ge[idx]) * Gsc[slot] > ecap * max(d16s * Dsc[slot], 1.0f-30)
+        if d16s > 6.103515625f-5 && !ehot
             esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
             ge_old = Float32(Ge[idx]) * gsc
             # CMB temperature floor on the specific internal energy: in a hypersonic
@@ -112,7 +125,8 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      a_value::Real, density_units::Real, length_units::Real,
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
                      OL::Real = 0.73, fh::Real = 0.76,
-                     dtfrac::Real = 0.1, itcap::Int = 5000, rho_switch::Real = 0.0)
+                     dtfrac::Real = 0.1, itcap::Int = 5000, rho_switch::Real = 0.0,
+                     tmax::Real = 0.0, rate_tables = nothing, cool_tables = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     @assert lev.nsp >= 2 "chem_level! needs nsp ≥ 2 (HII, H2I)"
@@ -123,9 +137,12 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     h16   = view(bufs[3], 1:n)
     m16   = view(bufs[4], 1:n)
     hfloor = ChemistryKernels.encode_log2sp(1.0f-12)
+    # hot-cell skip threshold: tmax [K] → code specific internal energy
+    T2K  = (length_units / time_units)^2 * 1.21148e-8      # K per code e
+    ecap = tmax > 0 ? Float32(tmax / ((hier.gamma - 1) * 1.22 * T2K)) : 0.0f0
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
                             lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
-                            Int32(lev.nd), Int32(lev.stride), hfloor; ndrange = n)
+                            Int32(lev.nd), Int32(lev.stride), hfloor, ecap; ndrange = n)
     dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
     local rin, ein, hin, min_
     if dbg
@@ -138,11 +155,13 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     if rho_switch > 0
         ChemistryKernels.solve_chem_hybrid_device_u16!(rho32, e32, h16, m16;
             rho_switch, a_value, dt, density_units, length_units, time_units,
-            hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
+            hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
+            backend = hier.besym, precision = Float32)
     else
         ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
             a_value, dt, density_units, length_units, time_units,
-            hubble, Om, OL, fh, dtfrac, itcap, backend = hier.besym, precision = Float32)
+            hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
+            backend = hier.besym, precision = Float32)
     end
     if dbg
         eo = Array(e32)
@@ -196,8 +215,8 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
         efloor = Float32(T_cmb / ((hier.gamma - 1) * 1.22 * T2))
     end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
-                             rho32, e32, h16, m16, lev.D, lev.live_d, lev.Esc, lev.Gsc,
+                             rho32, e32, h16, m16, lev.D, lev.live_d, lev.Dsc, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                             Int32(lev.stride), efloor; ndrange = n)
+                             Int32(lev.stride), efloor, ecap; ndrange = n)
     return nothing
 end

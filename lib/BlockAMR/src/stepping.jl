@@ -211,12 +211,57 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     # levels ≥ 1 SOLVE their own Poisson (warm-started red-black on the block
     # union, Dirichlet from the parent φ pool) and kick from it; level 0 kicks
     # from the external topgrid φ (whose pool copy seeds the level-1 BCs).
+    # gravity solve CADENCE (gravk ≥ 2): at levels ≥ gravk_lmin, run the level
+    # Poisson solve only every gravk-th substep and kick from the existing pool
+    # φ in between.  With λ_J resolved by N_J cells, φ drifts by ~1/N_J per
+    # fine substep — but each solve must TOUCH its dense pyramid (gather +
+    # residual) even when the ε-exit skips the cycles, and once the deep
+    # levels' pyramids exceed the device the per-substep touch pages the
+    # whole thing over PCIe.  Skipping the solve entirely is the only way to
+    # skip the traffic.  Staleness = gravk·dt_l, smallest at the finest levels
+    # (dt_l ∝ 2^-l) — restrict to l ≥ gravk_lmin so coarse φ stays fresh.
+    dosolve = true
+    if selfgrav !== nothing
+        gravk = get(selfgrav, :gravk, 0)
+        if gravk > 1 && l >= get(selfgrav, :gravk_lmin, 6)
+            dosolve = hier.nstep[l + 1] % gravk == 0
+        end
+    end
     if selfgrav !== nothing && (l >= 1 || φ === nothing)
         # cosmological convention: the source is coef·(ρ_tot − rho_mean) = coef·δ
         # at EVERY level (matching the mean-subtracted topgrid FFT that feeds the
         # level-1 Dirichlet BCs); use_dm adds the per-level particle deposit.
+        # The K1 KICK runs every substep (pool φ); only the SOLVE obeys the cadence.
         _t = _tic(lev.be)
-        if l >= 1 && get(selfgrav, :mg, false)
+        if !dosolve
+            # cadence substep: TRACK with warm-started red-black sweeps on the
+            # POOLS (traffic ∝ real cells; no dense pyramid touched).  The
+            # collapse-driven φ changes are LOCAL — RB converges them in a few
+            # sweeps from the last solve; the long wavelengths (which RB cannot
+            # move) evolve on the slow K·dt_l timescale and are corrected by
+            # the full MG solve every gravk-th substep.  NEVER skip outright:
+            # at the free-fall-capped finest level dt ≈ 0.1·t_ff, so a skipped
+            # solve is ~t_ff-stale φ → infall overshoot and central mass
+            # pile-up (the j256g 3.5e10 spike).
+            solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
+                                 nsweep = get(selfgrav, :gravk_nsweep, 8),
+                                 rho_ext = get(selfgrav, :rho_ext, nothing),
+                                 rho_mean = get(selfgrav, :rho_mean, 0),
+                                 use_dm = get(selfgrav, :use_dm, false),
+                                 residual = false)
+        elseif l >= 1 && get(selfgrav, :mg2, false)
+            # block-topology MG (MG2): resident-pool smoothing + one SMALL dense
+            # coarse grid (bbox÷cfac) — no per-substep giant-pyramid traffic
+            solve_gravity_level_mg2!(hier, l; source_coef = selfgrav.coef,
+                                     rho_ext = get(selfgrav, :rho_ext, nothing),
+                                     rho_mean = get(selfgrav, :rho_mean, 0),
+                                     use_dm = get(selfgrav, :use_dm, false),
+                                     ncycle = get(selfgrav, :ncycle, 2),
+                                     nsm = get(selfgrav, :nsm, 4),
+                                     cfac = get(selfgrav, :cfac, 4),
+                                     nub = get(selfgrav, :nub, 60),
+                                     mgeps = get(selfgrav, :mgeps, 0))
+        elseif l >= 1 && get(selfgrav, :mg, false)
             # masked multigrid (RAMSES multigrid_fine): CONVERGES the level φ —
             # gas (the level D pool) + optional DM deposit source — on any union
             # size; plain RB-GS below only tracks small unions.  The Dirichlet
@@ -227,7 +272,11 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                                     rho_ext = get(selfgrav, :rho_ext, nothing),
                                     rho_mean = get(selfgrav, :rho_mean, 0),
                                     use_dm = get(selfgrav, :use_dm, false),
-                                    ncycle = get(selfgrav, :ncycle, 4))
+                                    ncycle = get(selfgrav, :ncycle, 4),
+                                    nu1 = get(selfgrav, :nu1, 3),
+                                    nu2 = get(selfgrav, :nu2, 3),
+                                    nub = get(selfgrav, :nub, 80),
+                                    mgeps = get(selfgrav, :mgeps, 0))
         else
             solve_gravity_level!(hier, l; source_coef = selfgrav.coef,
                                  nsweep = l == 0 ? get(selfgrav, :nsweep0, 120) :

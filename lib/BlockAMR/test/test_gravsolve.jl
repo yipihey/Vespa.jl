@@ -83,6 +83,30 @@ for BE in BACKENDS
         end
         @test worst < tol                              # MG ≡ converged RB, gas source
     end
+    # MG2 (block-topology MG: pool smoothing + small dense coarse at ÷cfac)
+    # reaches the same solution from a cold start — the resident-pool path
+    # that replaces the giant dense pyramids at high Jeans resolution.
+    fill!(hier.levels[2].phi, 0.0f0); fill!(hier.levels[3].phi, 0.0f0)
+    for _ in 1:6
+        solve_gravity_level_mg2!(hier, 1; source_coef = coef, ncycle = 2, nsm = 4)
+    end
+    for _ in 1:6
+        solve_gravity_level_mg2!(hier, 2; source_coef = coef, ncycle = 2, nsm = 4)
+    end
+    for (l, tol) in ((1, 0.03), (2, 0.03))
+        lev = hier.levels[l + 1]
+        hp = Array(lev.phi); dx = BA.level_dx(hier, l)
+        worst = 0.0
+        for s in lev.live
+            m = lev.meta[s]; base = (Int(s)-1)*lev.stride
+            for k in 1:lev.B, j in 1:lev.B, i in 1:lev.B
+                x = ntuple(d -> (Float64(m.origin[d]) + (i,j,k)[d] - 0.5) * dx, 3)
+                got = hp[base + ((lev.ng+k-1)*lev.nd + (lev.ng+j-1))*lev.nd + (lev.ng+i-1) + 1]
+                worst = max(worst, abs(got - φex(x)))
+            end
+        end
+        @test worst < tol                          # MG2 ≡ dense MG ≡ converged RB
+    end
     # SPLIT-CLUSTER (Schwarz) path: a tiny budget forces recursive bisection down
     # to single-block parts — seam rings warm-start from the neighbor part's φ
     # via the sibling exchange, so repeated outer passes must reach the same

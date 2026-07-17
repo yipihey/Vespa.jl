@@ -20,7 +20,7 @@
 # the level-0 species every 10 steps (Compton COOLING lives in the chemistry).
 
 using MultiCode, BlockAMR, CICASSLib, Printf
-import PoissonKernels, ChemistryKernels
+import PoissonKernels, ChemistryKernels, EmissionKernels
 try; @eval using CUDA; catch; end
 include(joinpath(@__DIR__, "music_ic.jl"))   # BAM_IC=music: Planck18 grafic ICs
 include(joinpath(@__DIR__, "camb_ic.jl"))     # BAM_IC=camb:  sub-percent CAMB-normalized ICs
@@ -285,6 +285,16 @@ function main()
     # BAM_TIMERS=1: sync-accurate per-(phase,level) wall-time breakdown, printed
     # every max(CKPTN,10) steps (answers "where does the time go" exactly)
     get(ENV, "BAM_TIMERS", "0") == "1" && BlockAMR.enable_timers!()
+    # BAM_CHEM_TABLES=1: log–log rate + cooling tables for the chem hot path.
+    # The analytic mode was a WASH at few iterations/cell; deep in the H₂-core
+    # collapse the solver runs ~100+ iterations × ~13 transcendental fits per
+    # cell (SFU-bound, 80% of the step) — tables replace the fits with
+    # branchless interpolation.  f32 tables: f64 table values would promote
+    # the kernel math to f64 (1/32 device rate).
+    rtab = get(ENV, "BAM_CHEM_TABLES", "0") == "1" ?
+        ChemistryKernels.build_rate_tables(; precision = Float32, backend = BE) : nothing
+    ctab = get(ENV, "BAM_COOL_TABLES", "0") == "1" ?
+        EmissionKernels.build_cooling_tables(; precision = Float32, backend = BE) : nothing
     while a < a_end
         # ── timestep: hydro CFL (global λ), particle CFL, expansion cap,
         #    and the free-fall limiter — a collapsing peak's t_dyn ∝ 1/√(Gρ)
@@ -500,11 +510,23 @@ function main()
             selfgrav = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
                         rho_mean = 1.0, use_dm = true,
                         mg = get(ENV, "BAM_MG", "1") == "1",     # masked-MG level solves
-                        ncycle = parse(Int, get(ENV, "BAM_MGCYC", "4"))),
+                        mg2 = get(ENV, "BAM_MG2", "0") == "1",   # block-topology MG (resident pools + small dense coarse)
+                        nsm = parse(Int, get(ENV, "BAM_MGSM", "4")),
+                        cfac = parse(Int, get(ENV, "BAM_MGCF", "4")),
+                        ncycle = parse(Int, get(ENV, "BAM_MGCYC", "4")),
+                        nu1 = parse(Int, get(ENV, "BAM_MGNU1", "3")),
+                        nu2 = parse(Int, get(ENV, "BAM_MGNU2", "3")),
+                        nub = parse(Int, get(ENV, "BAM_MGNUB", "80")),
+                        mgeps = parse(Float64, get(ENV, "BAM_MGEPS", "0")),
+                        gravk = parse(Int, get(ENV, "BAM_GRAVK", "0")),
+                        gravk_lmin = parse(Int, get(ENV, "BAM_GRAVKLMIN", "6"))),
             chem = get(ENV, "BAM_NOCHEM", "0") == "1" ? nothing :
                    (a_value = a, density_units = u.d, length_units = u.l,
                     time_units = u.t, hubble = c.h0, Om = c.Om, OL = c.OL,
-                    fh = c.XH))
+                    fh = c.XH,
+                    itcap = parse(Int, get(ENV, "BAM_CHEM_ITCAP", "5000")),
+                    tmax = parse(Float64, get(ENV, "BAM_CHEM_TMAX", "0")),
+                    rate_tables = rtab, cool_tables = ctab))
         # level 0 uses the FFT φ pool directly (nsweep0=0 keeps its Dirichlet-free
         # RB pass a no-op refinement of the FFT solution)
         if get(ENV, "BAM_TRACE", "0") == "1"
@@ -639,7 +661,8 @@ function main()
                      mass_code = mass_code isa AbstractVector ? Array(mass_code) : mass_code,
                      px = Array(parts.px), py = Array(parts.py), pz = Array(parts.pz),
                      vx = Array(parts.vx), vy = Array(parts.vy), vz = Array(parts.vz))
-        if get(ENV, "BAM_TIMERS", "0") == "1" && nstep % max(CKPTN, 10) == 0
+        if get(ENV, "BAM_TIMERS", "0") == "1" &&
+           nstep % parse(Int, get(ENV, "BAM_TIMERS_EVERY", string(max(CKPTN, 10)))) == 0
             BlockAMR.timer_report()
             BlockAMR.reset_timers!()
             flush(stdout)
