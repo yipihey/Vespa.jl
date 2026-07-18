@@ -12,7 +12,7 @@ import ChemistryKernels
 
 @kernel function _chem_gather_k!(rho32, e32, h16, m16,
                                  @Const(D), @Const(Ge), @Const(sp1), @Const(sp2),
-                                 @Const(live_d), @Const(Dsc), @Const(Gsc),
+                                 @Const(cov), @Const(live_d), @Const(Dsc), @Const(Gsc),
                                  B::Int32, ng::Int32, nd::Int32, stride::Int32,
                                  hfloor::UInt16, ecap::Float32)
     t = @index(Global)
@@ -35,7 +35,9 @@ import ChemistryKernels
         # re-derives the same gate and discards the result.
         ehot = ecap > 0.0f0 &&
                Float32(Ge[idx]) * Gsc[slot] > ecap * max(ρ, 1.0f-30)
-        ehot && (ρ = 0.0f0)
+        # covered cells (child-restriction targets) skip chem the same way —
+        # their results are overwritten by restriction (leaf-only chem)
+        (ehot | (cov[idx] != 0x00)) && (ρ = 0.0f0)
         rho32[Int32(t)] = ρ
         # Representability gate: a cell whose STORED density is below the f16
         # normal range (2^-14; 0, subnormal, or NaN) has ≤10 mantissa bits —
@@ -58,7 +60,7 @@ end
 
 @kernel function _chem_scatter_k!(Ge, Tau, sp1, sp2,
                                   @Const(rho32), @Const(e32), @Const(h16), @Const(m16),
-                                  @Const(D), @Const(live_d), @Const(Dsc), @Const(Esc), @Const(Gsc),
+                                  @Const(D), @Const(cov), @Const(live_d), @Const(Dsc), @Const(Esc), @Const(Gsc),
                                   B::Int32, ng::Int32, nd::Int32, stride::Int32,
                                   efloor::Float32, ecap::Float32)
     t = @index(Global)
@@ -79,7 +81,7 @@ end
         d16s = Float32(D[idx])
         ehot = ecap > 0.0f0 &&
                Float32(Ge[idx]) * Gsc[slot] > ecap * max(d16s * Dsc[slot], 1.0f-30)
-        if d16s > 6.103515625f-5 && !ehot
+        if d16s > 6.103515625f-5 && !ehot && cov[idx] == 0x00
             esc = Esc[slot]; gsc = Gsc[slot]     # Ge on its own scale, Tau on Esc
             ge_old = Float32(Ge[idx]) * gsc
             # CMB temperature floor on the specific internal energy: in a hypersonic
@@ -121,6 +123,27 @@ function _chembufs(lev::Level{V,U,F,I}) where {V,U,F,I}
     return cb::Tuple{F,F,U,U}
 end
 
+# LEAF-ONLY chem (RAMSES cooling-on-leaves): cells covered by a child level
+# are overwritten by restriction every substep — chem iterations there are
+# discarded work, and at a stiff collapse core EVERY level except the deepest
+# covers the core, making chem cost grow linearly with depth.  The coverage
+# mask is painted from the CHILD level's :res (restriction-target) table.
+function _cov_mask!(hier::AMRHierarchy, l::Int)
+    lev = hier.levels[l + 1]
+    cm = get(lev.tabs, :covmask, nothing)
+    cm !== nothing && return cm
+    cm = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
+    if l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
+        clev = hier.levels[l + 2]
+        res = _tabt(clev, :res)
+        res.total > 0 &&
+            _rect_paint_k!(lev.be)(cm, res.jobs, res.cellstart, Int32(res.njobs),
+                                   Int32(lev.nd), Int32(lev.stride); ndrange = res.total)
+    end
+    lev.tabs[:covmask] = cm
+    return cm
+end
+
 function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      a_value::Real, density_units::Real, length_units::Real,
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
@@ -140,8 +163,9 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     # hot-cell skip threshold: tmax [K] → code specific internal energy
     T2K  = (length_units / time_units)^2 * 1.21148e-8      # K per code e
     ecap = tmax > 0 ? Float32(tmax / ((hier.gamma - 1) * 1.22 * T2K)) : 0.0f0
+    cov = _cov_mask!(hier, l)
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
-                            lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
+                            cov, lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
                             Int32(lev.nd), Int32(lev.stride), hfloor, ecap; ndrange = n)
     dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
     local rin, ein, hin, min_
@@ -215,7 +239,7 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
         efloor = Float32(T_cmb / ((hier.gamma - 1) * 1.22 * T2))
     end
     _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
-                             rho32, e32, h16, m16, lev.D, lev.live_d, lev.Dsc, lev.Esc, lev.Gsc,
+                             rho32, e32, h16, m16, lev.D, cov, lev.live_d, lev.Dsc, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), efloor, ecap; ndrange = n)
     return nothing

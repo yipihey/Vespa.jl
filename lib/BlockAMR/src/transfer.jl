@@ -100,6 +100,19 @@ end
     end
 end
 
+# paint the DST cells of a job table (e.g. the child :res targets = this
+# level's covered cells) with 1 — the leaf-only-chem coverage mask
+@kernel function _rect_paint_k!(dst, @Const(jobs), @Const(cellstart),
+                                njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        dst[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] = 0x01
+    end
+end
+
 # ── per-block-scaled variants (f16 phase): values cross blocks as PHYSICAL f32,
 #    encoded with the destination block's power-of-two scale (exact rescaling). ──
 @kernel function _rect_copy_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
@@ -283,6 +296,8 @@ function build_level_tables!(hier::AMRHierarchy, l::Int)
     delete!(lev.tabs, :proint)                            # MG interior-prolong: lazy rebuild
     delete!(lev.tabs, :mgd)                               # MG dense-pyramid cache: topology-keyed
     delete!(lev.tabs, :mg2)                               # MG2 block-topology cache: topology-keyed
+    delete!(lev.tabs, :covmask)                           # leaf-chem coverage mask: topology-keyed
+    l >= 1 && delete!(hier.levels[l].tabs, :covmask)      # parent's mask depends on THIS level
     if l >= 1
         plev = hier.levels[l]
         lev.tabs[:pro] = to_device_table(lev.be, build_prolong_jobs(lev, plev))

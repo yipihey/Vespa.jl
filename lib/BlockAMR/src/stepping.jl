@@ -322,8 +322,19 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     end
     _nanstage!(hier, l, :grav_K2)
     if chem !== nothing                                           # analytic H+H₂
-        _t = _tic(lev.be); chem_level!(hier, l, dt_l; chem...); _toc(lev.be, :chem, l, _t)
-        _nanstage!(hier, l, :chem)
+        # chem CADENCE (chemk ≥ 2): run every chemk-th substep with the
+        # ACCUMULATED dt.  Chem is a per-cell ODE with internal subcycling —
+        # non-stiff cells (dt ≪ t_cool by definition) tolerate the coarser
+        # cadence, stiff cells do the same total iterations either way; what
+        # the cadence removes is the fixed per-cell solver overhead (~19 ns ×
+        # cells × 2^l calls — the deepest level's dominant cost at high N_J).
+        ck = get(chem, :chemk, 1)
+        if ck <= 1 || hier.nstep[l + 1] % ck == ck - 1
+            cdt = dt_l * max(ck, 1)
+            chemargs = Base.structdiff(chem, NamedTuple{(:chemk,)})
+            _t = _tic(lev.be); chem_level!(hier, l, cdt; chemargs...); _toc(lev.be, :chem, l, _t)
+            _nanstage!(hier, l, :chem)
+        end
     end
     if haskids
         _t = _tic(lev.be)
