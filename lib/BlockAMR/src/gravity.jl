@@ -1017,7 +1017,7 @@ end
 
 # restrict the compact residual to the ÷cfac dense coarse grid (atomic mean·cfac²:
 # w = cfac²/cfac³ = 1/cfac maps pool-units h²r to coarse-units H²r)
-@kernel function _mg2_restrict_k!(rc, mc, @Const(res), @Const(rel0),
+@kernel function _mg2_restrict_k!(rc, mc, @Const(res), @Const(rel0), @Const(gpos),
                                   w::Float32, cfac::Int32,
                                   nx::Int32, ny::Int32, B::Int32)
     t = @index(Global)
@@ -1030,13 +1030,15 @@ end
         gy = (rel0[3*bi+Int32(2)] + j) ÷ cfac + Int32(2)
         gz = (rel0[3*bi+Int32(3)] + k) ÷ cfac + Int32(2)
         g = (gz - Int32(1)) * (nx * ny) + (gy - Int32(1)) * nx + gx
-        KA.@atomic rc[g] += w * res[Int32(t)]
+        # gpos: cluster-local block position → GLOBAL live-list position (the
+        # compact residual buffer is indexed over the whole level)
+        KA.@atomic rc[g] += w * res[(gpos[bi+Int32(1)] - Int32(1)) * B3 + c + Int32(1)]
         mc[g] = 1.0f0                                       # benign write race
     end
 end
 
 # trilinear prolong-add of the dense coarse correction into the pool φ
-@kernel function _mg2_prolongadd_k!(phi, @Const(ec), @Const(live_d), @Const(rel0),
+@kernel function _mg2_prolongadd_k!(phi, @Const(ec), @Const(livesub), @Const(rel0),
                                     cfac::Int32, nx::Int32, ny::Int32, nz::Int32,
                                     B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
@@ -1044,7 +1046,7 @@ end
     B3 = B * B * B
     bi = t0 ÷ B3; c = t0 % B3
     @inbounds begin
-        slot = live_d[bi + Int32(1)]
+        slot = livesub[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         i = c % B; j = (c ÷ B) % B; k = c ÷ (B * B)
         # coarse-grid index space: coarse cell cc's center sits at index cc+2
@@ -1090,6 +1092,12 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
     n = length(lev.live) * lev.B^3
     cache = get(lev.tabs, :mg2, nothing)
     if cache === nothing
+        # PER-CLUSTER coarse grids (grid-hash union-find, link 2B, as in the
+        # dense path): a deep level's union spans MULTIPLE separate knots —
+        # one union-wide bbox at ÷cfac can still exceed 2³¹ cells (the j256r
+        # L11 illegal-address: UM allocated the oversized virtual pyramid and
+        # the Int32 dense index wrapped).  Each connected component is compact
+        # (~(2N_J/cfac)³) and gets its own small grid.
         P = Int128(lev.P[1])
         anc = lev.meta[lev.live[1]].origin
         nlive = length(lev.live)
@@ -1100,31 +1108,66 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
                 rel[d, n_] = Int64(mod(Int128(m.origin[d]) - Int128(anc[d]) + P ÷ 2, P) - P ÷ 2)
             end
         end
-        lo = ntuple(d -> minimum(view(rel, d, :)), 3)
-        hi = ntuple(d -> maximum(view(rel, d, :)) + lev.B, 3)
-        dc = ntuple(d -> Int(cld(hi[d] - lo[d], cfac)) + 2, 3)
-        rel0 = Vector{Int32}(undef, 3 * nlive)
-        for n_ in 1:nlive, d in 1:3
-            rel0[3*(n_-1)+d] = Int32(rel[d, n_] - lo[d])
+        parent = collect(1:nlive)
+        find(i) = (while parent[i] != i; parent[i] = parent[parent[i]]; i = parent[i]; end; i)
+        link = 2 * lev.B
+        buck = Dict{NTuple{3,Int64},Vector{Int}}()
+        for n_ in 1:nlive
+            push!(get!(buck, ntuple(d -> fld(rel[d, n_], link), 3), Int[]), n_)
         end
-        pyr = Vector{Any}()
-        dd = dc
-        while true
-            push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)),
-                        device_zeros(lev.be, Float32, (prod(dd),)), dd))
-            minimum(dd) <= 6 && break
-            dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)
+        for n_ in 1:nlive
+            k = ntuple(d -> fld(rel[d, n_], link), 3)
+            for dz in -1:1, dy in -1:1, dx in -1:1
+                nb = get(buck, (k[1]+dx, k[2]+dy, k[3]+dz), nothing)
+                nb === nothing && continue
+                for m_ in nb
+                    if maximum(abs.(rel[:, n_] .- rel[:, m_])) <= link
+                        ra = find(n_); rb = find(m_)
+                        ra != rb && (parent[ra] = rb)
+                    end
+                end
+            end
         end
-        cache = (to_device(lev.be, rel0, Int32), dc, pyr,
-                 device_zeros(lev.be, Float32, (n,)))
+        groups = Dict{Int,Vector{Int}}()
+        for n_ in 1:nlive
+            push!(get!(groups, find(n_), Int[]), n_)
+        end
+        clusters = Vector{Any}()
+        for mem in values(groups)
+            lo = ntuple(d -> minimum(rel[d, n_] for n_ in mem), 3)
+            hi = ntuple(d -> maximum(rel[d, n_] for n_ in mem) + lev.B, 3)
+            dc = ntuple(d -> Int(cld(hi[d] - lo[d], cfac)) + 2, 3)
+            prod(dc) < (Int64(1) << 31) ||
+                error("MG2 cluster coarse grid $(dc) exceeds Int32 indexing — raise cfac")
+            m = length(mem)
+            rel0 = Vector{Int32}(undef, 3m); gpos = Vector{Int32}(undef, m)
+            liv = Vector{Int32}(undef, m)
+            for (i_, n_) in enumerate(mem)
+                gpos[i_] = Int32(n_)                    # global live-list position
+                liv[i_]  = lev.live[n_]                 # slot
+                for d in 1:3
+                    rel0[3*(i_-1)+d] = Int32(rel[d, n_] - lo[d])
+                end
+            end
+            pyr = Vector{Any}()
+            dd = dc
+            while true
+                push!(pyr, (device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)),
+                            device_zeros(lev.be, Float32, (prod(dd),)), dd))
+                minimum(dd) <= 6 && break
+                dd = ntuple(d -> cld(dd[d] - 2, 2) + 2, 3)
+            end
+            push!(clusters, (to_device(lev.be, rel0, Int32),
+                             to_device(lev.be, gpos, Int32),
+                             to_device(lev.be, liv, Int32), m, dc, pyr))
+        end
+        cache = (clusters, device_zeros(lev.be, Float32, (n,)))
         lev.tabs[:mg2] = cache
     end
-    rel0_d, dc, pyr, resb = cache
+    clusters, resb = cache
     sib = _tabt(lev, :sib); sibf = _tabt(lev, :sibf)
-    nx, ny, nz = Int32.(dc)
-    φc, rc, mc, _, _ = pyr[1]
     B = Int32(lev.B); ng = Int32(lev.ng); ndv = Int32(lev.nd); st = Int32(lev.stride)
     smooth! = () -> begin
         _rb_relax_k!(lev.be)(lev.phi, lev.rhs, lev.live_d, Int32(0), B, ng, ndv, st;
@@ -1146,19 +1189,27 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
         for _ in 1:nsm; smooth!(); end
         _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
                                ndrange = n)
-        fill!(φc, 0.0f0); fill!(rc, 0.0f0); fill!(mc, 0.0f0)
-        _mg2_restrict_k!(lev.be)(rc, mc, resb, rel0_d, Float32(1 / cfac), Int32(cfac),
-                                 nx, ny, B; ndrange = n)
-        _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
-        _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
-        # absolute correction guard (the anti-runaway backstop; RB smoothing is
-        # non-expansive, so this is the only injection point to bound)
-        mxe = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φc; init = 0.0f0)
-        if mxe < 1.0f8
-            _mg2_prolongadd_k!(lev.be)(lev.phi, φc, lev.live_d, rel0_d, Int32(cfac),
-                                       nx, ny, nz, B, ng, ndv, st; ndrange = n)
-            _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
+        anyadd = false
+        for (rel0_d, gpos_d, liv_d, mblk, dc, pyr) in clusters
+            nx, ny, nz = Int32.(dc)
+            φc, rc, mc, _, _ = pyr[1]
+            fill!(φc, 0.0f0); fill!(rc, 0.0f0); fill!(mc, 0.0f0)
+            _mg2_restrict_k!(lev.be)(rc, mc, resb, rel0_d, gpos_d,
+                                     Float32(1 / cfac), Int32(cfac),
+                                     nx, ny, B; ndrange = mblk * lev.B^3)
+            _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+            _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+            # absolute correction guard (the anti-runaway backstop; RB smoothing
+            # is non-expansive, so this is the only injection point to bound)
+            mxe = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φc; init = 0.0f0)
+            if mxe < 1.0f8
+                _mg2_prolongadd_k!(lev.be)(lev.phi, φc, liv_d, rel0_d, Int32(cfac),
+                                           nx, ny, nz, B, ng, ndv, st;
+                                           ndrange = mblk * lev.B^3)
+                anyadd = true
+            end
         end
+        anyadd && _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
         for _ in 1:nsm; smooth!(); end
     end
     _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
