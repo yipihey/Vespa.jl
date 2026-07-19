@@ -260,6 +260,7 @@ function main()
                                 zoom_center = center, zoom_r = zr, zoom_lmin = zl,
                                 dm_criterion = DMCRIT, jeans_ncells = JEANS,
                                 jeans_rho_floor = JEANS > 0 ? JEANSRHO * c.fb : 0.0,
+                                newlev_delay = parse(Int, get(ENV, "BAM_NEWLEV_DELAY", "0")),
                                 must_refine_lmax = MRLMAX)
     pol = mkpol(zc)
     # deepest populated level so far — a NEW level triggers a radial-profile dump

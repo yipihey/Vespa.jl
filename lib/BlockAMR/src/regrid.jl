@@ -33,6 +33,9 @@
 # SILENT collapse-killer otherwise; cost hours on the BB collapse).  Keyed by
 # level so a long run warns once per depth, not every regrid.
 const _ZOOM_WARNED = Set{Int}()
+# level-birth registry (root step at which each level last became nonempty) —
+# drives the newlev_delay cascade rate-limit; per-process (fresh each run)
+const _LEV_BORN = Dict{Int,Int}()
 
 """
     BlockRefinementPolicy(; dthresh, nbuf = 2, every = 4, lmax = 1)
@@ -86,6 +89,13 @@ Base.@kwdef struct BlockRefinementPolicy
     # overdensity confines deep Jeans refinement to the COLLAPSING core (a cooling
     # halo), the physical target.  0 = no floor.
     jeans_rho_floor :: Float64 = 0.0
+    # cascade rate-limit: a NEW level may only form once its parent has evolved
+    # ≥ newlev_delay ROOT steps since the parent's own creation.  Prolonged
+    # (formerly PC, now limited-linear) fill data must relax under the hydro
+    # before being refined again — at high Jeans resolution the cascade
+    # otherwise nests un-evolved prolongation of coarse data level after level
+    # (the N_J=256 constant-patch pathology).  0 = off.
+    newlev_delay :: Int = 0
 end
 
 @kernel function _flag_k!(flags, count, @Const(D), @Const(dm), @Const(live_d), @Const(Dsc),
@@ -468,7 +478,20 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
                 d2 <= r2
             end
         end
+        # cascade rate-limit (policy newlev_delay): gate the CREATION of a new
+        # level on its parent's age; existing levels are never touched.  At
+        # restart the birth registry is empty → all pre-existing levels count
+        # as old → the first new deeper level forms immediately, as intended.
+        if pol.newlev_delay > 0 && !isempty(want) && isempty(hier.levels[lc + 1].live)
+            born = get(_LEV_BORN, lc - 1, typemin(Int) ÷ 2)
+            Int(hier.nstep[1]) - born < pol.newlev_delay && empty!(want)
+        end
         changed[lc + 1] = _rebuild_level!(hier, lc, want) > 0
+        if !isempty(hier.levels[lc + 1].live)
+            haskey(_LEV_BORN, lc) || (_LEV_BORN[lc] = Int(hier.nstep[1]))
+        else
+            delete!(_LEV_BORN, lc)
+        end
     end
     tRB = time() - _t1
     # Morton slot compaction of the churned levels, coarse→fine (parent remaps

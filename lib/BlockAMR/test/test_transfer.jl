@@ -33,7 +33,20 @@ function expected(lev, s, u, fine, coarse)
         all(d -> mod(Int128(g[d]) - Int128(cm.origin[d]), Int128(lev.P[d])) < lev.B, 1:3) &&
             return fine(g)
     end
-    return coarse(ntuple(d -> BA.wrapc(fld(gu[d], 2), lev.P[d] >> 1), 3))
+    # LIMITED-LINEAR parent reconstruction — exact oracle mirror of
+    # _rect_prolong_llsc_k! (θ=0): minmod slopes from the wrapped parent field,
+    # sampled at the fine-cell parity offset ±¼, f32 ops in the kernel's order.
+    p   = ntuple(d -> fld(gu[d], 2), 3)
+    off = ntuple(d -> mod(gu[d], 2) == 0 ? -0.25f0 : 0.25f0, 3)
+    cw(pv) = Float32(coarse(ntuple(d -> BA.wrapc(pv[d], lev.P[d] >> 1), 3)))
+    mm(a, b) = a * b > 0.0f0 ? (abs(a) < abs(b) ? a : b) : 0.0f0
+    c0 = cw(p)
+    sl = ntuple(3) do d
+        ep = ntuple(e -> e == d ? p[e] + 1 : p[e], 3)
+        em = ntuple(e -> e == d ? p[e] - 1 : p[e], 3)
+        mm(cw(ep) - c0, c0 - cw(em))
+    end
+    return c0 + off[1] * sl[1] + off[2] * sl[2] + off[3] * sl[3]
 end
 
 for BE in BACKENDS
@@ -84,7 +97,7 @@ end
     @test bad == 0
 end
 
-@testset "level-1 ghosts: sibling + PC parent prolongation [$BE]" begin
+@testset "level-1 ghosts: sibling + limited-linear parent prolongation [$BE]" begin
     hier = AMRHierarchy(; nbase = (32, 32, 32), B = 16, backend = BE)
     lev0 = init_base_level!(hier)
     p0 = lev0.byorigin[(UInt128(0), UInt128(0), UInt128(0))]

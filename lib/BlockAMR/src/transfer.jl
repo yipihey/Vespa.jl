@@ -153,6 +153,50 @@ end
     end
 end
 
+# limited-LINEAR scale-aware prolongation (minmod slopes, ±¼-offset samples).
+# Replaces piecewise-constant for gas fields: PC fills leave step functions at
+# every C/F ghost and constant 2^Δl patches in new blocks — invisible when new
+# levels evolve many steps between regrids (N_J=16), but at high Jeans
+# resolution the refinement cascade outruns relaxation and the slices show
+# nested-constant blocks + ~1-dex C/F edge jumps (Jul 2026 diagnosis).
+# Conservative over sibling octets (symmetric ±¼ offsets cancel in the mean),
+# positivity-preserving for positive fields (minmod slope ≤ the smaller
+# one-sided difference), and EXACTLY zero-slope in uniform flow — the
+# uniform-flow C/F bit-cancellation gate is unaffected.  The ±1 slope taps stay
+# inside the parent frame (source rects sit ≥1 cell from the frame edge).
+@inline _mm(a::Float32, b::Float32) =
+    a * b > 0.0f0 ? (abs(a) < abs(b) ? a : b) : 0.0f0
+
+@kernel function _rect_prolong_llsc_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
+                                       @Const(scd), @Const(scs),
+                                       @Const(jobs), @Const(cellstart),
+                                       njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        S(ii, jj, kk) = (1.0f0 - θ) *
+                        Float32(srcR[sbase + (kk * nd + jj) * nd + ii + Int32(1)]) +
+                        θ * Float32(srcO[sbase + (kk * nd + jj) * nd + ii + Int32(1)])
+        c  = S(si, sj, sk)
+        sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
+        sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
+        sz = _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1)))
+        phys = (c + f1 * sx + f2 * sy + f3 * sz) * scs[jobs[b+2]]
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            _narrow(eltype(dst), phys / scd[jobs[b+1]])
+    end
+end
+
 @kernel function _rect_restrict_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
                                       @Const(jobs), @Const(cellstart),
                                       njobs::Int32, nd::Int32, stride::Int32)
@@ -226,9 +270,11 @@ function _run_prolong!(be, tab::RectJobTable, dst, srcR, srcO, θ::Float32,
                                 Int32(tab.njobs), Int32(nd), Int32(stride);
                                 ndrange = tab.total)
     else
-        _rect_prolong_sc_k!(be)(dst, srcR, srcO, θ, scd, scs, tab.jobs,
-                                tab.cellstart, Int32(tab.njobs), Int32(nd),
-                                Int32(stride); ndrange = tab.total)
+        # gas fields: limited-linear (see _rect_prolong_llsc_k!); species/φ
+        # take the scale-free PC path above
+        _rect_prolong_llsc_k!(be)(dst, srcR, srcO, θ, scd, scs, tab.jobs,
+                                  tab.cellstart, Int32(tab.njobs), Int32(nd),
+                                  Int32(stride); ndrange = tab.total)
     end
     return nothing
 end
