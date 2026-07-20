@@ -105,6 +105,8 @@ end
 #              reads it in `device_zeros`. No effect on the CPU backend.
 const _MEMMODE = Ref(:device)
 memory_mode() = _MEMMODE[]
+"CUDA ext overrides this: kill CUDA.jl's per-launch UM prefetch (see the ext docstring)."
+disable_kernel_prefetch!() = nothing
 set_memory_mode!(m::Symbol) =
     (m in (:device, :managed) || error("memory mode must be :device or :managed");
      _MEMMODE[] = m)

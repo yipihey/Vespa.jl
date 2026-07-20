@@ -9,12 +9,37 @@ module BlockAMRCUDAExt
 
 using BlockAMR
 using CUDA
+const Adapt = CUDA.Adapt
 
 function __init__()
     if CUDA.functional()
         BlockAMR.register_backend!(:cuda, CUDABackend())
         BlockAMR.enable_tiling!(:cuda)     # ~42 KB shared mem fits NVIDIA (48+ KB)
     end
+end
+
+"""
+    BlockAMR.disable_kernel_prefetch!() [CUDA]
+
+Overwrite CUDA.jl's `KernelAdaptor` conversion for dense `CuArray`s to SKIP the
+per-launch `cuMemPrefetchAsync` of unified-memory arguments.  CUDA.jl prefetches
+the WHOLE array on EVERY kernel launch (unconditional; upstream "TODO: make
+this configurable?").  Benign while total UM fits the device; once the pools
+exceed it, every launch's multi-GB prefetch triggers real eviction+migration —
+a PCIe storm that stalled one root step for >24 h at 80+ GB of pools (Jul 2026
+N_J=256 ladder; SIGUSR1 profile: main thread ~100% inside cuMemPrefetchAsync
+via adapt_storage).  BlockAMR's managed mode does its OWN deterministic
+residency (advise_host! + per-level prefetch_device!/prefetch_host! in the
+W-cycle), so the per-launch prefetch is pure overhead.  Deliberate method
+overwrite (type piracy) — call once before heavy kernel use; costs a one-time
+recompile of launch wrappers.
+"""
+function BlockAMR.disable_kernel_prefetch!()
+    @eval function Adapt.adapt_storage(::CUDA.KernelAdaptor,
+                                       xs::CUDA.DenseCuArray{T,N}) where {T,N}
+        Base.unsafe_convert(CUDA.CuDeviceArray{T,N,CUDA.AS.Global}, xs)
+    end
+    return nothing
 end
 
 function BlockAMR.device_zeros(::CUDABackend, ::Type{T}, dims::Dims) where {T}

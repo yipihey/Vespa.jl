@@ -286,6 +286,11 @@ function main()
     # BAM_TIMERS=1: sync-accurate per-(phase,level) wall-time breakdown, printed
     # every max(CKPTN,10) steps (answers "where does the time go" exactly)
     get(ENV, "BAM_TIMERS", "0") == "1" && BlockAMR.enable_timers!()
+    # managed mode: kill CUDA.jl's per-launch whole-array UM prefetch — our
+    # W-cycle does deterministic per-level residency; the per-launch prefetch
+    # becomes a PCIe eviction storm once pools exceed the device (>24 h/step)
+    MEMMODE === :managed && get(ENV, "BAM_KERNEL_PREFETCH", "0") == "0" &&
+        BlockAMR.disable_kernel_prefetch!()
     # BAM_CHEM_TABLES=1: log–log rate + cooling tables for the chem hot path.
     # The analytic mode was a WASH at few iterations/cell; deep in the H₂-core
     # collapse the solver runs ~100+ iterations × ~13 transcendental fits per
