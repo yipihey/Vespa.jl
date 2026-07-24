@@ -32,7 +32,8 @@ for BE in BACKENDS
     dt = 1e13
     for l in 0:1
         chem_level!(hier, l, dt; a_value = 1/(1+z), density_units = 1.0,
-                    length_units = 1.0, time_units = 1.0, fh = FH)
+                    length_units = 1.0, time_units = 1.0, fh = FH,
+                    mode = :analytic_u16)     # match the analytic reference below
     end
     # direct reference on ONE identical cell
     r = [Float32(rho)]; e = [Float32(eint)]

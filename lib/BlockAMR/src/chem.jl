@@ -123,6 +123,38 @@ function _chembufs(lev::Level{V,U,F,I}) where {V,U,F,I}
     return cb::Tuple{F,F,U,U}
 end
 
+# f32 species MASS-DENSITY scratch (HII_m = ρ·X, H2I_m = 2·n_H2·mh) for the
+# full-network solve_chem_device! path (mode = :full_f32).
+function _chembufs_f32(lev::Level{V,U,F,I}) where {V,U,F,I}
+    nb = lev.cap * lev.B^3
+    cb = get(lev.tabs, :chembuf32, nothing)
+    if cb === nothing || length((cb::Tuple{F,F})[1]) < nb
+        cb = (device_zeros(lev.be, Float32, (nb,)), device_zeros(lev.be, Float32, (nb,)))
+        lev.tabs[:chembuf32] = cb
+    end
+    return cb::Tuple{F,F}
+end
+
+# u16 FRACTION → f32 MASS DENSITY (ρ·decode) before the f32 full-network solve
+@kernel function _sp_u16_to_massdens_k!(hf, mf, @Const(h16), @Const(m16), @Const(rho))
+    t = @index(Global)
+    @inbounds begin
+        ρ = rho[t]
+        hf[t] = decode_log2sp(Float32, h16[t]) * ρ
+        mf[t] = decode_log2sp(Float32, m16[t]) * ρ
+    end
+end
+
+# f32 MASS DENSITY → u16 FRACTION (encode(HII_m/ρ)) after the solve
+@kernel function _sp_massdens_to_u16_k!(h16, m16, @Const(hf), @Const(mf), @Const(rho))
+    t = @index(Global)
+    @inbounds begin
+        invρ = 1.0f0 / max(rho[t], 1.0f-30)
+        h16[t] = encode_log2sp(max(hf[t] * invρ, 0.0f0))
+        m16[t] = encode_log2sp(max(mf[t] * invρ, 0.0f0))
+    end
+end
+
 # LEAF-ONLY chem (RAMSES cooling-on-leaves): cells covered by a child level
 # are overwritten by restriction every substep — chem iterations there are
 # discarded work, and at a stiff collapse core EVERY level except the deepest
@@ -149,7 +181,8 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
                      time_units::Real, hubble::Real = 71.0, Om::Real = 0.27,
                      OL::Real = 0.73, fh::Real = 0.76,
                      dtfrac::Real = 0.1, itcap::Int = 5000, rho_switch::Real = 0.0,
-                     tmax::Real = 0.0, rate_tables = nothing, cool_tables = nothing)
+                     tmax::Real = 0.0, rate_tables = nothing, cool_tables = nothing,
+                     mode::Symbol = :full_u16)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     @assert lev.nsp >= 2 "chem_level! needs nsp ≥ 2 (HII, H2I)"
@@ -176,16 +209,27 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     # run the FULL primordial network (3-body H₂ + dissociation), the rest the
     # cheap analytic path.  The analytic path is our IC generator; the dense
     # collapsing core continues on the full network.  0 ⇒ analytic everywhere.
-    if rho_switch > 0
+    # solver mode: the FULL primordial network (solve_chem_device*!, evolve_cell)
+    # is now as fast as the reduced analytic path (ChemistryKernels Jul-2026), so
+    # it is the default.  :full_f32 gathers species as f32 MASS DENSITIES and runs
+    # the f32 device solver (the clean-precision validation path); :full_u16 runs
+    # the same network directly on the u16 fraction codes (production storage);
+    # :analytic_u16 keeps the old reduced path; :hybrid the per-cell density switch.
+    ckw = (; a_value, dt, density_units, length_units, time_units,
+           hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
+           backend = hier.besym, precision = Float32)
+    if mode === :full_f32
+        hf, mf = _chembufs_f32(lev); hf = view(hf, 1:n); mf = view(mf, 1:n)
+        _sp_u16_to_massdens_k!(lev.be)(hf, mf, h16, m16, rho32; ndrange = n)
+        ChemistryKernels.solve_chem_device!(rho32, e32, hf, mf; ckw...)
+        _sp_massdens_to_u16_k!(lev.be)(h16, m16, hf, mf, rho32; ndrange = n)
+    elseif mode === :full_u16
+        ChemistryKernels.solve_chem_device_u16!(rho32, e32, h16, m16; ckw...)
+    elseif rho_switch > 0 || mode === :hybrid
         ChemistryKernels.solve_chem_hybrid_device_u16!(rho32, e32, h16, m16;
-            rho_switch, a_value, dt, density_units, length_units, time_units,
-            hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
-            backend = hier.besym, precision = Float32)
-    else
-        ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16;
-            a_value, dt, density_units, length_units, time_units,
-            hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
-            backend = hier.besym, precision = Float32)
+            rho_switch = max(rho_switch, eps(Float64)), ckw...)
+    else   # :analytic_u16
+        ChemistryKernels.solve_chem_analytic_device_u16!(rho32, e32, h16, m16; ckw...)
     end
     if dbg
         eo = Array(e32)

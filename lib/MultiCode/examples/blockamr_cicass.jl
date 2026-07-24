@@ -533,6 +533,7 @@ function main()
                     itcap = parse(Int, get(ENV, "BAM_CHEM_ITCAP", "5000")),
                     tmax = parse(Float64, get(ENV, "BAM_CHEM_TMAX", "0")),
                     chemk = parse(Int, get(ENV, "BAM_CHEMK", "1")),
+                    mode = Symbol(get(ENV, "BAM_CHEM_MODE", "full_u16")),
                     rate_tables = rtab, cool_tables = ctab))
         # level 0 uses the FFT φ pool directly (nsweep0=0 keeps its Dirichlet-free
         # RB pass a no-op refinement of the FFT solution)
