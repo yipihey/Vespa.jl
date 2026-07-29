@@ -482,7 +482,12 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         # level on its parent's age; existing levels are never touched.  At
         # restart the birth registry is empty → all pre-existing levels count
         # as old → the first new deeper level forms immediately, as intended.
-        if pol.newlev_delay > 0 && !isempty(want) && isempty(hier.levels[lc + 1].live)
+        # a not-yet-created level (lc+1 > length) is trivially empty → the
+        # newlev gate applies (it IS a brand-new level).  From ICs only level 0
+        # exists at the first regrid; the from-restart path preloaded L1+ which
+        # masked this out-of-bounds access.
+        newlev = lc + 1 > length(hier.levels) || isempty(hier.levels[lc + 1].live)
+        if pol.newlev_delay > 0 && !isempty(want) && newlev
             born = get(_LEV_BORN, lc - 1, typemin(Int) ÷ 2)
             Int(hier.nstep[1]) - born < pol.newlev_delay && empty!(want)
         end
