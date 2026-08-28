@@ -75,6 +75,7 @@ end
 include("glm_physics.jl")     # precision-generic @fastmath GLM-MHD device functions
 include("boundary.jl")        # per-axis BCs (periodic/outflow/reflecting), ghost-free
 include("state.jl")           # MHDState (9 SoA fields) + cons/prim host helpers
+include("passive_transport.jl") # allocation-free bounded chemistry-species remap
 include("integrator_ref.jl")  # portable per-cell reference integrator (CPU + GPU)
 include("integrator_cube.jl") # fused shared-memory cube integrator (GPU throughput)
 include("timestep.jl")        # CFL Δt reduction
@@ -86,5 +87,8 @@ include("terminal_pressure.jl") # pressure-implicit terminal response + CT coupl
 include("gravity_coupling.jl") # time-centered gas source for particle gravity
 include("driver.jl")          # step! / evolve! (ch + ψ-damping schedule)
 include("drag.jl")            # exact linear drag and Strang-coupled full-MHD step
+include("radiation_coupling.jl") # spectral photon-baryon response inside full MHD
+include("recombination_transport.jl") # nonlocal Lyman-alpha chemistry response
+include("radiation_terminal_ct.jl") # B-only overdamped radiation response + CT
 
 end # module

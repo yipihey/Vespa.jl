@@ -24,7 +24,7 @@ mutable struct MHDState{T,A,B}
     use_hlld::Bool
     riemann::Symbol
     bcs::NTuple{3,Symbol}    # per-axis: :periodic / :outflow / :reflecting
-    recon::Symbol            # :plm (MonCen) or :ppm (local CW84 parabola)
+    recon::Symbol            # :plm (MonCen), :plm_minmod, or :ppm (local CW84)
     be::B
 end
 
@@ -35,7 +35,7 @@ ncells(s::MHDState) = prod(s.dims)
 "`bc_codes(s)` → the per-axis BC integer codes (cx,cy,cz) for the kernels."
 bc_codes(s::MHDState) = (bc_code(s.bcs[1]), bc_code(s.bcs[2]), bc_code(s.bcs[3]))
 
-"`recon_code_of(s)` → the reconstruction integer code (0=PLM, 1=PPM)."
+"`recon_code_of(s)` → reconstruction code (0=MonCen PLM, 1=PPM, 2=minmod PLM)."
 recon_code_of(s::MHDState) = recon_code(s.recon)
 
 "`riemann_code_of(s)` → the compile-time Riemann code (:hlld, :hll, :llf)."

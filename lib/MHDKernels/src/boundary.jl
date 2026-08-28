@@ -31,8 +31,8 @@ bc_code(s::Symbol) = s === :periodic ? BC_PERIODIC :
 end
 
 # Conserved state at logical (i,j,k) under the per-axis BCs (flips normal v & B).
-@inline function _loadU_bc(u::NTuple{9,A}, Nx::Int, Ny::Int, Nz::Int, i::Int, j::Int, k::Int,
-                           cx::Int, cy::Int, cz::Int) where {A}
+@inline function _loadU_bc(u::Tuple,Nx::Int,Ny::Int,Nz::Int,i::Int,j::Int,k::Int,
+                           cx::Int,cy::Int,cz::Int)
     (ii,fx)=_bcidx(i,Nx,cx); (jj,fy)=_bcidx(j,Ny,cy); (kk,fz)=_bcidx(k,Nz,cz)
     idx = ((kk-1)*Ny + (jj-1))*Nx + ii
     @inbounds (u[1][idx], u[2][idx]*fx, u[3][idx]*fy, u[4][idx]*fz, u[5][idx],
@@ -44,8 +44,8 @@ end
 
 # All-periodic fast path: pure `mod` index, NO flip multiplies and NO BC branches — the
 # common case, and what closes the cube's gap to the bare-periodic prototype.
-@inline function _loadP_periodic(u::NTuple{9,A}, Nx::Int, Ny::Int, Nz::Int, i::Int, j::Int, k::Int,
-                                 γ::T, smallr::T, pfl::T) where {T,A}
+@inline function _loadP_periodic(u::Tuple,Nx::Int,Ny::Int,Nz::Int,
+                                 i::Int,j::Int,k::Int,γ::T,smallr::T,pfl::T) where {T}
     ii=mod(i-1,Nx)+1; jj=mod(j-1,Ny)+1; kk=mod(k-1,Nz)+1; idx=((kk-1)*Ny+(jj-1))*Nx+ii
     @inbounds cons2prim((u[1][idx],u[2][idx],u[3][idx],u[4][idx],u[5][idx],u[6][idx],u[7][idx],u[8][idx],u[9][idx]),γ,smallr,pfl)
 end

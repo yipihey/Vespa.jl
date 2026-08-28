@@ -5,7 +5,8 @@
 # matching centered operators, so an initially solenoidal field stays so without
 # a projection FFT.
 
-export terminal_ct_induction!, terminal_magnetic_force!, terminal_velocity_max!
+export terminal_ct_induction!, terminal_magnetic_force!,
+       terminal_magnetic_force_split!, terminal_velocity_max!
 
 @inline _tct_lin3(i, j, k, N) = begin
     ii = mod(i - 1, N) + 1
@@ -49,6 +50,24 @@ end
            (dtzx + dtzy + dtzz) * inv2dx
 end
 
+@inline function _tct_magnetic_force_split_at(Bx, By, Bz, i, j, k, N, inv2dx)
+    T = typeof(inv2dx)
+    fx, fy, fz = _tct_magnetic_force_at(Bx, By, Bz, i, j, k, N, inv2dx)
+    cxp = _tct_lin3(i + 1, j, k, N); cxm = _tct_lin3(i - 1, j, k, N)
+    cyp = _tct_lin3(i, j + 1, k, N); cym = _tct_lin3(i, j - 1, k, N)
+    czp = _tct_lin3(i, j, k + 1, N); czm = _tct_lin3(i, j, k - 1, N)
+    b2xp = Bx[cxp]*Bx[cxp] + By[cxp]*By[cxp] + Bz[cxp]*Bz[cxp]
+    b2xm = Bx[cxm]*Bx[cxm] + By[cxm]*By[cxm] + Bz[cxm]*Bz[cxm]
+    b2yp = Bx[cyp]*Bx[cyp] + By[cyp]*By[cyp] + Bz[cyp]*Bz[cyp]
+    b2ym = Bx[cym]*Bx[cym] + By[cym]*By[cym] + Bz[cym]*Bz[cym]
+    b2zp = Bx[czp]*Bx[czp] + By[czp]*By[czp] + Bz[czp]*Bz[czp]
+    b2zm = Bx[czm]*Bx[czm] + By[czm]*By[czm] + Bz[czm]*Bz[czm]
+    px = -T(0.5) * (b2xp - b2xm) * inv2dx
+    py = -T(0.5) * (b2yp - b2ym) * inv2dx
+    pz = -T(0.5) * (b2zp - b2zm) * inv2dx
+    return px, py, pz, fx - px, fy - py, fz - pz
+end
+
 @kernel function _tct_magnetic_force_k!(fx, fy, fz,
                                         @Const(Bx), @Const(By), @Const(Bz),
                                         N::Int, inv2dx)
@@ -62,6 +81,21 @@ end
     end
 end
 
+@kernel function _tct_magnetic_force_split_k!(px, py, pz, tx, ty, tz,
+                                              @Const(Bx), @Const(By), @Const(Bz),
+                                              N::Int, inv2dx)
+    c = @index(Global)
+    @inbounds begin
+        i = (c - 1) % N + 1
+        j = ((c - 1) ÷ N) % N + 1
+        k = (c - 1) ÷ (N * N) + 1
+        pxi, pyi, pzi, txi, tyi, tzi =
+            _tct_magnetic_force_split_at(Bx, By, Bz, i, j, k, N, inv2dx)
+        px[c] = pxi; py[c] = pyi; pz[c] = pzi
+        tx[c] = txi; ty[c] = tyi; tz[c] = tzi
+    end
+end
+
 function terminal_magnetic_force!(s::MHDState, fx, fy, fz;
                                   B=(s.U[6], s.U[7], s.U[8]))
     N = s.dims[1]
@@ -69,6 +103,25 @@ function terminal_magnetic_force!(s::MHDState, fx, fy, fz;
     _tct_magnetic_force_k!(s.be)(fx, fy, fz, B..., N, inv(typeof(s.dx)(2) * s.dx);
                                      ndrange=ncells(s))
     return fx, fy, fz
+end
+
+"""
+    terminal_magnetic_force_split!(s, px, py, pz, tx, ty, tz; B=...)
+
+Compute the centered conservative Maxwell-stress force as magnetic pressure
+`-grad(B^2/2)` plus the remaining tension contribution. The remainder uses the
+same discrete total-force stencil as [`terminal_magnetic_force!`](@ref), so the
+two terms reconstruct the force used by the solver. For a solenoidal field the
+tension contribution approaches `(B dot grad)B`.
+"""
+function terminal_magnetic_force_split!(s::MHDState, px, py, pz, tx, ty, tz;
+                                        B=(s.U[6], s.U[7], s.U[8]))
+    N = s.dims[1]
+    all(==(N), s.dims) || error("terminal magnetic force requires a cubic grid")
+    _tct_magnetic_force_split_k!(s.be)(px, py, pz, tx, ty, tz, B..., N,
+                                       inv(typeof(s.dx)(2) * s.dx);
+                                       ndrange=ncells(s))
+    return px, py, pz, tx, ty, tz
 end
 
 @inline function _tct_velocity_at(rho, fx, fy, fz, i, j, k, N, inv2dx,

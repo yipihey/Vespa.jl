@@ -1,7 +1,8 @@
 # Time-center a gas density source without retaining the previous full grid.
 # From continuity, rho(t-dt) = rho(t) + dt div(m)(t) + O(dt^2).
 
-export predict_density_backward!, apply_cell_center_gravity!
+export predict_density_backward!, predict_density_perturbation_backward!,
+       apply_cell_center_gravity!
 export initialize_lattice_displacements!
 export deposit_lattice_displacements!, drift_lattice_displacements!
 
@@ -164,6 +165,23 @@ function predict_density_backward!(dst::AbstractArray, s::MHDState,
                                    dt_back::Real)
     predict_density_backward!(dst, s.U[1], s.U[2], s.U[3], s.U[4], s.dims;
                               dx=s.dx, dt_back=dt_back)
+end
+
+"""
+    predict_density_perturbation_backward!(dst, delta_rho, mx, my, mz, dims;
+                                           dx, dt_back)
+
+Time-center an authoritative density perturbation without adding and subtracting
+the homogeneous background in Float32.
+"""
+function predict_density_perturbation_backward!(dst::AbstractArray{T},delta_rho,
+                                                mx,my,mz,dims::NTuple{3,Int};
+                                                dx::Real,dt_back::Real) where {T}
+    length(dst)==prod(dims) || throw(DimensionMismatch("dst does not match dims"))
+    be=KA.get_backend(dst)
+    _predict_density_backward_k!(be)(dst,delta_rho,mx,my,mz,
+        T(dt_back),T(0.5)/T(dx),dims...;ndrange=length(dst))
+    dst
 end
 
 @kernel function _apply_cell_center_gravity_k!(rho, mx, my, mz, E,

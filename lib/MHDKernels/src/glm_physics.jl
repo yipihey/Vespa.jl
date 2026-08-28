@@ -51,8 +51,115 @@ end
 end
 @fastmath @inline prim_slope(L::NTuple{9,T},M::NTuple{9,T},R::NTuple{9,T}) where {T} =
     ntuple(i->T(0.5)*moncen(M[i]-L[i], R[i]-M[i]), 9)
+@fastmath @inline function minmod(dl::T, dr::T) where {T}
+    sgn=ifelse(dl>=zero(T),one(T),-one(T))
+    ifelse(dl*dr<=zero(T),zero(T),sgn*min(abs(dl),abs(dr)))
+end
+@fastmath @inline prim_slope_minmod(L::NTuple{9,T},M::NTuple{9,T},R::NTuple{9,T}) where {T} =
+    ntuple(i->T(0.5)*minmod(M[i]-L[i],R[i]-M[i]),9)
 @inline padd(q::NTuple{9,T}, s::NTuple{9,T}, a::T) where {T} = ntuple(i->q[i]+a*s[i], 9)
 @inline dir_flux(q::NTuple{9,T}, dir::Int, γ::T) where {T} = rot_flux_from(phys_flux_x(rot_to(q,dir),γ), dir)
+
+@inline function _drag_phi1(q::T) where {T}
+    abs(q) < T(1e-4) ? one(T) - q/T(2) + q*q/T(6) : -expm1(-q)/q
+end
+
+# Exact constant-force drag propagation of a no-drag Hancock face prediction.
+# `q0` is the reconstructed face at t^n and `qh` is its no-drag t^(n+1/2)
+# prediction. Only velocity has a direct Compton source; pressure and magnetic
+# components retain their hyperbolic midpoint predictions.
+@inline function drag_predict_face(q0::NTuple{9,T}, qh::NTuple{9,T}, impulse::T,
+                                   vx0::T, vy0::T, vz0::T) where {T}
+    decay = exp(-impulse)
+    phi1 = _drag_phi1(impulse)
+    drag_predict_face(q0, qh, decay, phi1, vx0, vy0, vz0)
+end
+
+@inline function drag_predict_face(q0::NTuple{9,T}, qh::NTuple{9,T}, decay::T,
+                                   phi1::T, vx0::T, vy0::T, vz0::T) where {T}
+    vx = vx0 + decay*(q0[2]-vx0) + phi1*(qh[2]-q0[2])
+    vy = vy0 + decay*(q0[3]-vy0) + phi1*(qh[3]-q0[3])
+    vz = vz0 + decay*(q0[4]-vz0) + phi1*(qh[4]-q0[4])
+    (qh[1],vx,vy,vz,qh[5],qh[6],qh[7],qh[8],qh[9])
+end
+
+# Coefficients of Gamma*integral_0^dt |w(t)|^2 dt for
+# w(t)=exp(-Gamma*t)w0 + phi1(Gamma*t)*t*a. The polynomial branch avoids
+# cancellation in f32 when the drag impulse is small.
+@inline function _drag_work_coefficients(q::T) where {T}
+    if q < T(0.05)
+        q2=q*q; q3=q2*q; q4=q3*q
+        A=q*(one(T)-q+T(2/3)*q2-T(1/3)*q3+T(2/15)*q4)
+        C=q*(one(T)-q+T(7/12)*q2-T(1/4)*q3+T(31/360)*q4)
+        D=q*(T(1/3)-q/T(4)+T(7/60)*q2-q3/T(24)+T(31/2520)*q4)
+        return A,C,D
+    end
+    em1 = -expm1(-q)
+    em2 = -expm1(-T(2)*q)
+    A = T(0.5)*em2
+    C = em1*em1/q
+    D = (q-T(2)*em1+T(0.5)*em2)/(q*q)
+    A,C,D
+end
+
+struct DragCoefficients{T}
+    face_decay::T
+    face_phi1::T
+    decay::T
+    phi1::T
+    A::T
+    C::T
+    D::T
+end
+
+@inline function _drag_coefficients(q::T) where {T}
+    qh=T(0.5)*q
+    A,C,D=_drag_work_coefficients(q)
+    DragCoefficients(exp(-qh),_drag_phi1(qh),exp(-q),_drag_phi1(q),A,C,D)
+end
+
+@inline _no_drag_coefficients(::Type{T}) where {T} =
+    DragCoefficients(one(T),one(T),one(T),one(T),zero(T),zero(T),zero(T))
+
+# Correct the conservative no-drag trial with the same exact constant-force
+# propagator used at faces. Total energy loses the analytically integrated work
+# done by drag; flux exchange remains conservative because the shared HLLD flux
+# already used drag-aware midpoint states.
+@inline function drag_correct_conserved(u0::NTuple{9,T}, trial::NTuple{9,T},
+                                        impulse::T, vx0::T, vy0::T, vz0::T,
+                                        smallr::T, smallE::T) where {T}
+    decay=exp(-impulse); phi1=_drag_phi1(impulse)
+    A,C,D=_drag_work_coefficients(impulse)
+    drag_correct_conserved(u0,trial,decay,phi1,A,C,D,vx0,vy0,vz0,smallr,smallE)
+end
+
+@inline function drag_correct_conserved(u0::NTuple{9,T}, trial::NTuple{9,T},
+                                        decay::T, phi1::T, A::T, C::T, D::T,
+                                        vx0::T, vy0::T, vz0::T,
+                                        smallr::T, smallE::T) where {T}
+    rn=max(trial[1],smallr); ro=max(u0[1],smallr)
+    vox=u0[2]/ro; voy=u0[3]/ro; voz=u0[4]/ro
+    vtx=trial[2]/rn; vty=trial[3]/rn; vtz=trial[4]/rn
+    dvx=vtx-vox; dvy=vty-voy; dvz=vtz-voz
+    wx=vox-vx0; wy=voy-vy0; wz=voz-vz0
+    vnx=vx0+decay*wx+phi1*dvx
+    vny=vy0+decay*wy+phi1*dvy
+    vnz=vz0+decay*wz+phi1*dvz
+    w2=wx*wx+wy*wy+wz*wz
+    wdv=wx*dvx+wy*dvy+wz*dvz
+    dv2=dvx*dvx+dvy*dvy+dvz*dvz
+    # Work on the gas is Gamma*integral v dot (v-v_target) dt. The second
+    # term vanishes in the CMB frame but keeps moving-target semantics exact.
+    iwx=(one(T)-decay)*wx+(one(T)-phi1)*dvx
+    iwy=(one(T)-decay)*wy+(one(T)-phi1)*dvy
+    iwz=(one(T)-decay)*wz+(one(T)-phi1)*dvz
+    qwork=rn*(A*w2+C*wdv+D*dv2+vx0*iwx+vy0*iwy+vz0*iwz)
+    nmx=rn*vnx; nmy=rn*vny; nmz=rn*vnz
+    ek=T(0.5)*(nmx*nmx+nmy*nmy+nmz*nmz)/rn
+    eb=T(0.5)*(trial[6]*trial[6]+trial[7]*trial[7]+trial[8]*trial[8])
+    enew=max(trial[5]-qwork,ek+eb+smallE)
+    (rn,nmx,nmy,nmz,enew,trial[6],trial[7],trial[8],trial[9])
+end
 
 # MUSCL-Hancock half-step predictor: U^{n+1/2} = U^n - ½dt/dx · Σ_d (F(W+s_d)-F(W-s_d)).
 @fastmath @inline function hancock(m0::NTuple{9,T}, sx,sy,sz, dtdx::T, γ::T) where {T}
@@ -62,7 +169,7 @@ end
     fzp=dir_flux(padd(m0,sz,one(T)),3,γ); fzm=dir_flux(padd(m0,sz,-one(T)),3,γ)
     ntuple(i->u0[i]-h*((fxp[i]-fxm[i])+(fyp[i]-fym[i])+(fzp[i]-fzm[i])), 9)
 end
-# ── Reconstruction options: PLM (MonCen) and local PPM (CW84), unified as the ──
+# ── Reconstruction options: PLM (MonCen/minmod) and local PPM (CW84), unified as ──
 # per-variable face OFFSETS (δL,δR) from the cell mean — face⁻ = m0+δL, face⁺ = m0+δR.
 # Both use only a ±1 stencil, so each fits the cube's 2-cell halo with no resize.
 # PLM: δR=+½·moncen, δL=-½·moncen (recovers prim_slope/padd exactly). PPM: the
@@ -83,8 +190,10 @@ end
 
 const RECON_PLM = 0
 const RECON_PPM = 1
+const RECON_PLM_MINMOD = 2
 recon_code(s::Symbol) = s === :plm ? RECON_PLM : s === :ppm ? RECON_PPM :
-                        error("unknown recon :$s (have :plm, :ppm)")
+                        s === :plm_minmod ? RECON_PLM_MINMOD :
+                        error("unknown recon :$s (have :plm, :plm_minmod, :ppm)")
 
 # Per-axis face offsets (δL,δR) for the 9 primitives, given the ∓ neighbours.
 # `rec` is a `Val` so the kernel specialises to ONE reconstruction — a runtime Int
@@ -93,11 +202,14 @@ recon_code(s::Symbol) = s === :plm ? RECON_PLM : s === :ppm ? RECON_PPM :
     s = prim_slope(mm, m0, mp)                     # ½·moncen per var
     (ntuple(i->-s[i],9), s)
 end
+@inline function recon_offsets(mm::NTuple{9,T},m0::NTuple{9,T},mp::NTuple{9,T},::Val{RECON_PLM_MINMOD}) where {T}
+    s=prim_slope_minmod(mm,m0,mp)                  # ½·minmod per var
+    (ntuple(i->-s[i],9),s)
+end
 @inline function recon_offsets(mm::NTuple{9,T}, m0::NTuple{9,T}, mp::NTuple{9,T}, ::Val{RECON_PPM}) where {T}
     e = ntuple(i->_ppm_edges(mm[i],m0[i],mp[i]), 9)   # (qL,qR) per var
     (ntuple(i->e[i][1]-m0[i],9), ntuple(i->e[i][2]-m0[i],9))
 end
-
 # MUSCL-Hancock ½-step predictor from per-axis edge offsets (PLM δR=+s,δL=-s ⇒ ≡ hancock).
 @fastmath @inline function hancock_edges(m0::NTuple{9,T}, δLx,δRx,δLy,δRy,δLz,δRz, dtdx::T, γ::T) where {T}
     u0=prim2cons(m0,γ); h=T(0.5)*dtdx

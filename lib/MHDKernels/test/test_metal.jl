@@ -12,6 +12,31 @@ else
     @info "Metal backend present"
 
     @testset "MHDKernels Metal" begin
+        @testset "rectangular cube launch geometry" begin
+            shared_bytes = sizeof(Float32) *
+                (9*MHDKernels.RCNCP + 18*(MHDKernels.RCNFX +
+                                           MHDKernels.RCNFY +
+                                           MHDKernels.RCNFZ))
+            @test shared_bytes == 23_040
+            @test shared_bytes <= Int(Metal.device().maxThreadgroupMemoryLength)
+            @test MHDKernels.METAL_CUBE_GS == 128
+        end
+
+        @testset "density-aware sub-ULP increments" begin
+            perturbation = zeros(Float32, 1)
+            rho = 1f0
+            naive = 1f0
+            drho = 1f-8
+            for _ in 1:32
+                rho = MHDKernels._cube_density_update!(perturbation, 1, rho, drho,
+                                                       Val(true))
+                naive += drho
+            end
+            @test perturbation[1] ≈ 32f0*drho rtol=2f-6
+            @test rho == 1f0
+            @test naive == 1f0
+        end
+
         @testset "CPU ref ≈ Metal cube (one step, 32^3 f32) — $recon" for recon in (:plm, :ppm)
             N = 32
             sr = allocate_state(becpu, T, (N,N,N); dx=1/N, gamma=5/3, riemann=:hll, recon=recon)
@@ -97,6 +122,123 @@ else
             hr = fields_to_host(sr); hm = fields_to_host(sm)
             @test maximum(abs, hm[2] .- hr[2]) == 0
             @test maximum(abs, hm[5] .- hr[5]) == 0
+        end
+
+        @testset "source-aware Godunov drag CPU ref / Metal cube parity" begin
+            N = 32
+            sr = allocate_state(becpu, T, (N,N,N); dx=1/N, gamma=5/3,
+                                riemann=:hll, recon=:ppm)
+            sm = allocate_state(be, T, (N,N,N); dx=1/N, gamma=5/3,
+                                riemann=:hll, recon=:ppm)
+            init_turb_field!(sr); init_turb_field!(sm)
+            dt, smax = compute_dt(sr; cfl=0.1)
+            impulse = 2f0
+            step_drag_godunov!(sr, dt; drag_impulse=impulse, ch=smax,
+                               glm_cr=0.18, integrator=:ref)
+            step_drag_godunov!(sm, dt; drag_impulse=impulse, ch=smax,
+                               glm_cr=0.18, integrator=:cube)
+            hr = fields_to_host(sr); hm = fields_to_host(sm)
+            maxabs = 0.0; scale = 0.0
+            for v in 1:9
+                maxabs = max(maxabs, maximum(abs.(Float64.(hr[v]) .- Float64.(hm[v]))))
+                scale = max(scale, maximum(abs.(Float64.(hr[v]))))
+            end
+            rel = maxabs / scale
+            @printf("  [Metal source-aware drag] q=%.1f maxabs=%.3e rel=%.3e\n",
+                    impulse, maxabs, rel)
+            @test isfinite(rel)
+            @test rel < 2e-2
+            @test minimum(hm[1]) > 0
+            @test all(all(isfinite, field) for field in hm)
+        end
+
+        @testset "spectral radiation full-MHD CPU ref / Metal cube parity" begin
+            N=16
+            sr=allocate_state(becpu,T,(N,N,N);dx=1/N,riemann=:hll,recon=:ppm)
+            sm=allocate_state(be,T,(N,N,N);dx=1/N,riemann=:hll,recon=:ppm)
+            init_turb_field!(sr)
+            for v in 1:9 copyto!(sm.U[v],sr.U[v]) end
+            wr=allocate_radiation_workspace(sr); wm=allocate_radiation_workspace(sm)
+            rc=RadiationClosure(inertia_ratio=0.1f0,mean_free_path=0.01f0,
+                                photon_speed=10f0,gas_sound_speed=1f0,
+                                response_model=:angular)
+            lr=RadiationEnergyLedger(); lm=RadiationEnergyLedger()
+            dt,smax=compute_dt(sr;cfl=0.03)
+            step_radiation_godunov!(sr,wr,dt;drag_impulse=1f0,closure=rc,
+                                    ch=smax,integrator=:ref,energy_ledger=lr)
+            step_radiation_godunov!(sm,wm,dt;drag_impulse=1f0,closure=rc,
+                                    ch=smax,integrator=:cube,energy_ledger=lm)
+            hr=fields_to_host(sr); hm=fields_to_host(sm)
+            maxabs=maximum(maximum(abs,hm[v].-hr[v]) for v in 1:9)
+            scale=maximum(maximum(abs,hr[v]) for v in 1:9)
+            @printf("  [Metal radiation MHD] maxabs=%.3e rel=%.3e\n",maxabs,maxabs/scale)
+            @test maxabs/scale < 3f-5
+            @test minimum(hm[1])>0
+            @test all(all(isfinite,x) for x in hm)
+            @test maximum(abs,Array(wm.density_perturbation).-Array(wr.density_perturbation)) < 2f-5
+            @test lm.samples == 1
+            @test lm.total_change ≈ lr.total_change rtol=2f-3 atol=2f-4
+            component_scale=abs(lm.kinetic_change)+abs(lm.internal_change)+
+                            abs(lm.magnetic_change)
+            @test abs(lm.component_residual)/component_scale < 5e-4
+            @test lm.component_residual_abs/component_scale < 1e-3
+        end
+
+        @testset "radiation robust override is global minmod-PLM/HLL" begin
+            N=32
+            so=allocate_state(be,T,(N,N,N);dx=1/N,riemann=:hlld,recon=:ppm)
+            sd=allocate_state(be,T,(N,N,N);dx=1/N,riemann=:hll,
+                              recon=:plm_minmod)
+            init_turb_field!(so)
+            for v in 1:9 copyto!(sd.U[v],so.U[v]) end
+            wo=allocate_radiation_workspace(so)
+            wd=allocate_radiation_workspace(sd)
+            fill!(wo.packed_psi_correction,0f0)
+            fill!(wd.packed_psi_correction,0f0)
+            dt,smax=compute_dt(so;cfl=0.1)
+            kwargs=(ch=smax,decay=exp(-0.18f0*smax*dt/so.dx),
+                    drag_impulse=0.7f0,track_density=true,
+                    check_admissibility=true)
+            step_cube_radiation!(so,dt;kwargs...,
+                correction=wo.packed_psi_correction,robust_fallback=true)
+            step_cube_radiation!(sd,dt;kwargs...,
+                correction=wd.packed_psi_correction)
+            ho=fields_to_host(so); hd=fields_to_host(sd)
+            @test all(ho[v] == hd[v] for v in 1:9)
+            @test Array(wo.density_perturbation) ==
+                  Array(wd.density_perturbation)
+        end
+
+        @testset "evolved photon moments CPU ref / Metal cube parity ($model)" for model in
+                (:moments, :moments_exponential)
+            N=16
+            sr=allocate_state(becpu,T,(N,N,N);dx=1/N,riemann=:hll,recon=:ppm)
+            sm=allocate_state(be,T,(N,N,N);dx=1/N,riemann=:hll,recon=:ppm)
+            init_turb_field!(sr)
+            for v in 1:9 copyto!(sm.U[v],sr.U[v]) end
+            wr=allocate_radiation_workspace(sr); wm=allocate_radiation_workspace(sm)
+            pr=allocate_photon_moment_state(sr); pm=allocate_photon_moment_state(sm)
+            initialize_photon_moments!(pr,wr,sr)
+            initialize_photon_moments!(pm,wm,sm)
+            rc=RadiationClosure(inertia_ratio=0.1f0,mean_free_path=0.01f0,
+                                photon_speed=10f0,gas_sound_speed=1f0,
+                                response_model=model)
+            dt,smax=compute_dt(sr;cfl=0.02)
+            step_radiation_godunov!(sr,wr,dt;drag_impulse=0.5f0,closure=rc,
+                                    ch=smax,integrator=:ref,photon_state=pr)
+            step_radiation_godunov!(sm,wm,dt;drag_impulse=0.5f0,closure=rc,
+                                    ch=smax,integrator=:cube,photon_state=pm)
+            hr=fields_to_host(sr); hm=fields_to_host(sm)
+            maxabs=maximum(maximum(abs,hm[v].-hr[v]) for v in 1:9)
+            scale=maximum(maximum(abs,hr[v]) for v in 1:9)
+            phr=Array(pr.hat_batch); phm=to_host(pm.hat_batch)
+            prel=maximum(abs,phm.-phr)/max(maximum(abs,phr),1f-12)
+            @printf("  [Metal photon moments %s] gas_rel=%.3e photon_rel=%.3e\n",
+                    String(model),maxabs/scale,prel)
+            @test maxabs/scale < 5f-5
+            @test prel < 5f-5
+            @test minimum(hm[1])>0
+            @test all(all(isfinite,x) for x in hm)
         end
 
         @testset "midpoint density predictor CPU/Metal parity" begin

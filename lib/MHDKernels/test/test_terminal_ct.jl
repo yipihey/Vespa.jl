@@ -140,7 +140,10 @@ end
     end
     copyto!(s.U[7], by)
     fx, fy, fz = s.scratch[2:4]
+    pressure = (s.scratch[1], s.scratch[5], s.scratch[6])
+    tension = (s.scratch[7], s.scratch[8], s.scratch[9])
     terminal_magnetic_force!(s, fx, fy, fz)
+    terminal_magnetic_force_split!(s, pressure..., tension...)
     hfx = Array(fx)
     exact = Vector{Float32}(undef, N)
     for i in 1:N
@@ -151,6 +154,17 @@ end
     @test rel_l2 < 0.01
     @test maximum(abs, Array(fy)) < 2f-6
     @test maximum(abs, Array(fz)) < 2f-6
+    @test maximum(abs, Array(pressure[1]) .- hfx) < 2f-6
+    @test maximum(maximum(abs, Array(t)) for t in tension) < 2f-6
+
+    _terminal_ct_seed!(s)
+    terminal_magnetic_force!(s, fx, fy, fz)
+    terminal_magnetic_force_split!(s, pressure..., tension...)
+    for d in 1:3
+        reconstructed = Array(pressure[d]) .+ Array(tension[d])
+        @test reconstructed ≈ Array((fx, fy, fz)[d]) rtol=2f-6 atol=2f-6
+    end
+    @test maximum(maximum(abs, Array(t)) for t in tension) > 1f-5
 end
 
 @testset "terminal CT preserves discrete divergence and thermal energy" begin
@@ -176,6 +190,66 @@ end
     @test div1 <= max(8 * div0, 2f-5)
     @test maximum(abs, eint1 .- eint0) < 2f-6
     @test all(isfinite, h1[5])
+end
+
+@testset "radiation terminal CT freezes gas and preserves divergence" begin
+    N = 16
+    s = allocate_state(backend(:cpu), Float32, (N, N, N); dx=1/N)
+    _terminal_ct_seed!(s; amp=0.04f0)
+    fill!(s.U[2], 0f0); fill!(s.U[3], 0f0); fill!(s.U[4], 0f0)
+    h0 = fields_to_host(s)
+    thermal0 = h0[5] .- 0.5f0 .* (h0[6].^2 .+ h0[7].^2 .+ h0[8].^2)
+    div0 = Float64(max_divb(s))
+    ws = allocate_radiation_workspace(s)
+    compensation = (s.scratch[2], s.scratch[3], s.scratch[4])
+    foreach(field -> fill!(field, 0f0), compensation)
+    closure = RadiationClosure(inertia_ratio=0.2f0, mean_free_path=0.02f0,
+        photon_speed=10f0, gas_sound_speed=0.1f0)
+    result = radiation_terminal_ct_induction!(s, ws, 2f-4;
+        gamma_drag=2f0, closure=closure, cfl=0.3, dissipation=0.02,
+        compensation=compensation, diagnostics=true)
+    h1 = fields_to_host(s)
+    thermal1 = h1[5] .- 0.5f0 .* (h1[6].^2 .+ h1[7].^2 .+ h1[8].^2)
+    div1 = Float64(max_divb(s))
+
+    @test result.nsubcycles >= 1
+    @test isfinite(result.vmax) && isfinite(result.eta)
+    @test isfinite(result.divergence_rms) && result.divergence_rms >= 0
+    @test result.density_change_bound >= 0
+    @test isfinite(result.relaxation_ratio) && result.relaxation_ratio > 0
+    @test h1[1] == h0[1]
+    @test h1[2] == h0[2] && h1[3] == h0[3] && h1[4] == h0[4]
+    @test maximum(abs, h1[6] .- h0[6]) > 1f-8
+    @test maximum(abs, thermal1 .- thermal0) < 3f-6
+    @test div1 * Float64(s.dx) < 2f-6
+    @test div1 <= max(8 * div0, 2f-5)
+end
+
+@testset "radiation terminal velocity restores longitudinal free-streaming force" begin
+    N = 32
+    s = allocate_state(backend(:cpu), Float32, (N, N, N); dx=1/N)
+    by = zeros(Float32, N^3)
+    for k in 1:N, j in 1:N, i in 1:N
+        by[linidx(N, N, i, j, k)] = 0.04f0 * sinpi(2f0 * (i - 1) / N)
+    end
+    fill!(s.U[1], 1f0)
+    fill!(s.U[2], 0f0); fill!(s.U[3], 0f0); fill!(s.U[4], 0f0)
+    fill!(s.U[6], 0f0); copyto!(s.U[7], by); fill!(s.U[8], 0f0)
+    ws = allocate_radiation_workspace(s)
+    tight = RadiationClosure(inertia_ratio=0.2f0, mean_free_path=1f-4,
+        photon_speed=10f0, gas_sound_speed=0.1f0)
+    streaming = RadiationClosure(inertia_ratio=0.2f0, mean_free_path=10f0,
+        photon_speed=10f0, gas_sound_speed=0.1f0)
+
+    vt = radiation_terminal_velocity!(ws, s; gamma_drag=2f0, closure=tight)
+    tight_vx = maximum(abs, Array(vt[1]))
+    vf = radiation_terminal_velocity!(ws, s; gamma_drag=2f0, closure=streaming)
+    free_vx = maximum(abs, Array(vf[1]))
+
+    @test free_vx > 1f-5
+    @test tight_vx < 1f-4 * free_vx
+    @test maximum(abs, Array(vf[2])) < 2f-7
+    @test maximum(abs, Array(vf[3])) < 2f-7
 end
 
 @testset "exact linear drag preserves thermal energy" begin
@@ -243,7 +317,55 @@ end
     end
 end
 
+@testset "source-aware Godunov drag conserves fluxes and accounts work" begin
+    for q in Float32[1f-6,1f-3,0.1f0,1f0,10f0,100f0]
+        s=allocate_state(backend(:cpu),Float32,(8,8,8);dx=1/8,recon=:ppm)
+        rho=1.5f0; v=(0.7f0,-0.2f0,0.1f0); B=(0.3f0,-0.1f0,0.2f0)
+        etherm=2.25f0
+        for c in eachindex(s.U[1])
+            s.U[1][c]=rho
+            s.U[2][c]=rho*v[1]; s.U[3][c]=rho*v[2]; s.U[4][c]=rho*v[3]
+            s.U[6][c]=B[1]; s.U[7][c]=B[2]; s.U[8][c]=B[3]
+            s.U[5][c]=etherm+0.5f0*rho*sum(abs2,v)+0.5f0*sum(abs2,B)
+        end
+        E0=Array(s.U[5])[1]
+        step_drag_godunov!(s,0.01;drag_impulse=q,ch=1,glm_cr=0,integrator=:ref)
+        h=fields_to_host(s); decay=exp(-q)
+        for d in 1:3
+            @test h[d+1][1]/h[1][1] ≈ v[d]*decay rtol=5f-6 atol=2f-7
+        end
+        ek=0.5f0*sum(h[d+1][1]^2 for d in 1:3)/h[1][1]
+        eb=0.5f0*sum(abs2,B)
+        @test h[5][1]-ek-eb ≈ etherm atol=4f-6
+        exact_work=0.5f0*rho*sum(abs2,v)*(1-exp(-2q))
+        @test E0-h[5][1] ≈ exact_work rtol=8f-6 atol=3f-7
+        @test maximum(abs, h[1].-rho) == 0
+        @test all(isfinite,h[5])
+    end
+end
+
+@testset "source-aware drag zero limit" begin
+    s0=allocate_state(backend(:cpu),Float32,(8,8,8);dx=1/8,recon=:ppm)
+    s1=allocate_state(backend(:cpu),Float32,(8,8,8);dx=1/8,recon=:ppm)
+    init_alfven_wave!(s0;amp=0.05,B0=1,p0=0.2)
+    for v in 1:9; copyto!(s1.U[v],s0.U[v]); end
+    step!(s0,0.002;ch=1.5,glm_cr=0.3,integrator=:ref)
+    step_drag_godunov!(s1,0.002;drag_impulse=0,ch=1.5,glm_cr=0.3,integrator=:ref)
+    h0=fields_to_host(s0); h1=fields_to_host(s1)
+    for v in 1:9
+        @test maximum(abs,h0[v].-h1[v]) < 2f-6
+    end
+    @test_throws ErrorException step_drag_godunov!(
+        s1,0.002;drag_impulse=1,ch=1.5,integrator=:cube,
+        target_velocity=(0.1,0,0))
+end
+
 @testset "drag regime handoff is hysteretic and one-way by default" begin
+    defaults = DragRegimeController()
+    @test defaults.exit_drag_over_omega == 1
+    @test defaults.enter_drag_over_omega == 2
+    @test update_drag_regime!(defaults, 3, 0.1).terminal
+
     controller = DragRegimeController(exit_drag_over_omega=8,
                                       enter_drag_over_omega=16,
                                       confirm_checks=2)
@@ -286,4 +408,26 @@ end
     brms = sqrt((sum(abs2, fields[6]) + sum(abs2, fields[7]) +
                  sum(abs2, fields[8])) / length(fields[6]))
     @test max_divb(s) * s.dx / brms < 2e-5
+end
+
+@testset "terminal pressure CT applies adiabatic compression" begin
+    gamma_gas = 5f0 / 3f0
+    s = allocate_state(backend(:cpu), Float32, (8, 8, 8); dx=1 / 8,
+                       gamma=gamma_gas)
+    fill!(s.U[1], 1f0)
+    fill!(s.U[2], 0f0); fill!(s.U[3], 0f0); fill!(s.U[4], 0f0)
+    fill!(s.U[5], 3f0)
+    fill!(s.U[6], 0f0); fill!(s.U[7], 0f0); fill!(s.U[8], 0f0)
+    compression = 1.1f0
+    function uniform_compression!(dst, state, source, coeff_cells2, dt)
+        @. dst = compression * state
+        return dst
+    end
+
+    terminal_pressure_ct_step!(uniform_compression!, s, 1.0e-3;
+                               gamma_drag=10, pressure_coeff=0.5,
+                               induction_dissipation=0)
+    fields = fields_to_host(s)
+    @test fields[1][1] ≈ compression rtol=2f-6
+    @test fields[5][1] ≈ 3f0 * compression^gamma_gas rtol=3f-6
 end

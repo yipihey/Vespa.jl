@@ -109,7 +109,8 @@ end
                                              @Const(eint), @Const(rho_new),
                                              @Const(fx), @Const(fy), @Const(fz),
                                              N::Int, inv2dx, gamma_drag,
-                                             pressure_coeff, smallr, smallE, vcap)
+                                             pressure_coeff, gamma_gas,
+                                             smallr, smallE, vcap)
     c = @index(Global)
     @inbounds begin
         T = eltype(eint)
@@ -127,7 +128,7 @@ end
         eb = T(0.5) * (Bx[c]^2 + By[c]^2 + Bz[c]^2)
         orho[c] = nr
         omx[c] = nmx; omy[c] = nmy; omz[c] = nmz
-        oE[c] = max(eint[c] * (nr / r0) + ek + eb, smallE)
+        oE[c] = max(eint[c] * (nr / r0)^gamma_gas + ek + eb, smallE)
     end
 end
 
@@ -187,7 +188,7 @@ function terminal_pressure_ct_step!(solve_exponential!, s::MHDState{T}, dt::Real
                                            old_u[1], old_u[6], old_u[7], old_u[8],
                                            eint, source, old_u[2], old_u[3], old_u[4],
                                            N, inv2dx, T(gamma_drag), T(pressure_coeff),
-                                           s.smallr, T(1e-30), T(vcap);
+                                           s.γ, s.smallr, T(1e-30), T(vcap);
                                            ndrange=ncells(s))
         KA.synchronize(s.be)
     end

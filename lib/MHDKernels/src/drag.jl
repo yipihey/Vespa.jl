@@ -1,5 +1,6 @@
 export apply_linear_drag!, apply_exponential_drag_increment!, step_drag_strang!,
-       step_drag_exponential!, DragRegimeController, update_drag_regime!
+       step_drag_exponential!, step_drag_godunov!, DragRegimeController,
+       update_drag_regime!
 
 mutable struct DragRegimeController
     terminal::Bool
@@ -12,8 +13,8 @@ mutable struct DragRegimeController
     reenter_terminal::Bool
 end
 
-function DragRegimeController(; exit_drag_over_omega::Real=32,
-                              enter_drag_over_omega::Real=64,
+function DragRegimeController(; exit_drag_over_omega::Real=1,
+                              enter_drag_over_omega::Real=2,
                               min_va_over_cs::Real=0,
                               confirm_checks::Integer=2,
                               reenter_terminal::Bool=false)
@@ -112,11 +113,6 @@ function apply_linear_drag!(s::MHDState{T}, decay::Real;
     return s
 end
 
-@inline function _drag_phi1(q::T) where {T}
-    aq = abs(q)
-    return aq < T(1e-4) ? one(T) - q / T(2) + q*q / T(6) : -expm1(-q) / q
-end
-
 @kernel function _exponential_drag_increment_k!(mx, my, mz, E,
                                                  @Const(rho),
                                                  @Const(old_rho),
@@ -144,6 +140,36 @@ end
         ek1 = T(0.5) * (nmx*nmx + nmy*nmy + nmz*nmz) / rn
         mx[c] = nmx; my[c] = nmy; mz[c] = nmz
         E[c] = max(nonkinetic + ek1, eb + smallE)
+    end
+end
+
+"""
+    step_drag_godunov!(s, dt; drag_impulse, ch, glm_cr=0.18,
+                       integrator=:cube, target_velocity=(0, 0, 0))
+
+Advance one source-aware Godunov step. The exact constant-force Compton
+propagator modifies the Hancock midpoint face states before HLLD, so momentum,
+energy, and induction fluxes all see the drag-limited velocity. The cell
+corrector applies the exact momentum response and integrated drag work in the
+same fused finite-volume kernel. The `:cube` GPU path is specialized for the
+zero-velocity CMB frame; use `integrator=:ref` for a nonzero target velocity.
+"""
+function step_drag_godunov!(s::MHDState{T}, dt::Real; drag_impulse::Real,
+                            ch::Real, glm_cr::Real=GLM_CR,
+                            integrator::Symbol=:cube,
+                            target_velocity=(0, 0, 0)) where {T}
+    isfinite(drag_impulse) && drag_impulse >= 0 ||
+        error("drag impulse must be finite and non-negative")
+    vx0,vy0,vz0=target_velocity
+    decay=exp(-T(glm_cr)*T(ch)*T(dt)/s.dx)
+    if integrator === :ref
+        step_ref_drag!(s,dt; ch=ch,decay=decay,drag_impulse=drag_impulse,
+                       target_velocity=(vx0,vy0,vz0))
+    elseif integrator === :cube
+        step_cube_drag!(s,dt; ch=ch,decay=decay,drag_impulse=drag_impulse,
+                        target_velocity=(vx0,vy0,vz0))
+    else
+        error("unknown integrator :$integrator (have :ref, :cube)")
     end
 end
 
