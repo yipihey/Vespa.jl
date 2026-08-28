@@ -1057,10 +1057,14 @@ end
     @inbounds begin
         T=eltype(E); r=max(rho[c],smallr)
         delta0=rho_perturbation[c]
-        target=ABS ? rho_mean+drho[c] : rho_mean+delta0+drho[c]
-        raw_rn=r+density_blend*(target-r)
+        target_delta=ABS ? drho[c] : delta0+drho[c]
+        deltan=density_blend==one(T) ? target_delta :
+            delta0+density_blend*(target_delta-delta0)
+        raw_rn=rho_mean+deltan
         rn=max(raw_rn,smallr)
-        deltan=rn-rho_mean
+        # `rho` is only a compatibility field.  Preserve the authoritative
+        # perturbation directly so increments below one ULP of rho_mean are not
+        # lost when the compatibility density is reconstructed in Float32.
         rho_perturbation[c]=raw_rn==rn ? deltan : rn-rho_mean
         vx=mx[c]/r+density_blend*cx[c]
         vy=my[c]/r+density_blend*cy[c]

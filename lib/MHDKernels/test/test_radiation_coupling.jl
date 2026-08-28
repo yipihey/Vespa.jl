@@ -32,6 +32,21 @@ using Test
         reconstruct_radiation_density!(ws,s)
         @test ws.density_perturbation[1] == 4f-8
         @test s.U[1][1] == 1f0
+
+        fill!(ws.density_perturbation,0f0)
+        fill!(ws.fft_real,1f-8)
+        foreach(x->fill!(x,0f0),ws.correction)
+        for _ in 1:32
+            MHDKernels._radiation_apply_correction!(s,ws,ws.correction)
+        end
+        @test ws.density_perturbation[1] ≈ 3.2f-7 rtol=2f-6
+        @test s.U[1][1] == 1f0+Float32(3.2f-7)
+
+        fill!(ws.fft_real,4f-8)
+        MHDKernels._radiation_apply_correction!(s,ws,ws.correction;
+                                                density_absolute=true)
+        @test ws.density_perturbation[1] == 4f-8
+        @test s.U[1][1] == 1f0
     end
 
     @testset "positivity blend scales the coupled correction" begin
@@ -50,6 +65,7 @@ using Test
                                                 density_blend=0.25f0)
 
         @test all(s.U[1].==0.9f0)
+        @test all(ws.density_perturbation.==-0.1f0)
         @test all(s.U[2]./s.U[1].==0.5f0)
     end
 
