@@ -142,9 +142,11 @@ mutable struct RadiationEnergyLedger
     resolved_coupled_change::Float64
     component_residual::Float64
     component_residual_abs::Float64
+    component_magnitude_abs::Float64
 end
 
-RadiationEnergyLedger()=RadiationEnergyLedger(0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
+RadiationEnergyLedger()=RadiationEnergyLedger(
+    0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
 
 mutable struct RadiationStepTiming
     predictor_s::Float64
@@ -274,12 +276,16 @@ end
 end
 
 @kernel function _radiation_energy_residuals_k!(signed_residual,absolute_residual,
-        @Const(dkinetic),@Const(dinternal),@Const(dmagnetic),@Const(dtotal))
+        component_magnitude,
+        @Const(dkinetic),@Const(dinternal),@Const(dmagnetic),@Const(dtotal),
+        @Const(E),@Const(E0))
     c=@index(Global)
     @inbounds begin
-        residual=dtotal[c]-(dkinetic[c]+dinternal[c]+dmagnetic[c])
+        dk=dkinetic[c]; di=dinternal[c]; db=dmagnetic[c]; dt=dtotal[c]
+        residual=dt-(dk+di+db)
         signed_residual[c]=residual
         absolute_residual[c]=abs(residual)
+        component_magnitude[c]=abs(E[c])+abs(E0[c])
     end
 end
 
@@ -296,11 +302,12 @@ function _radiation_energy_changes(ws::RadiationWorkspace,s::MHDState,old)
     # Form the identity residual per cell before reducing. On Metal, subtracting
     # four independently reduced Float32 totals loses all useful digits for a
     # nearly uniform state even though the pointwise decomposition is accurate.
-    _radiation_energy_residuals_k!(s.be)(dt,dk,dk,di,db,dt;
+    _radiation_energy_residuals_k!(s.be)(dt,dk,di,dk,di,db,dt,s.U[5],old[5];
                                        ndrange=ncells(s))
     KA.synchronize(s.be)
     merge(change,(component_residual=Float64(sum(dt)),
-                  component_residual_abs=Float64(sum(dk))))
+                  component_residual_abs=Float64(sum(dk)),
+                  component_magnitude_abs=Float64(sum(di))))
 end
 
 function _record_radiation_energy!(ledger::RadiationEnergyLedger,change;
@@ -310,6 +317,10 @@ function _record_radiation_energy!(ledger::RadiationEnergyLedger,change;
         change.total-(change.kinetic+change.internal+change.magnetic)
     component_residual_abs=hasproperty(change,:component_residual_abs) ?
         change.component_residual_abs : abs(component_residual)
+    component_magnitude_abs=hasproperty(change,:component_magnitude_abs) ?
+        change.component_magnitude_abs :
+        2*(abs(change.total)+abs(change.kinetic)+abs(change.internal)+
+           abs(change.magnetic))
     ledger.samples+=1
     ledger.total_change+=change.total
     ledger.kinetic_change+=change.kinetic
@@ -319,6 +330,7 @@ function _record_radiation_energy!(ledger::RadiationEnergyLedger,change;
     ledger.resolved_coupled_change+=change.total+photon_change
     ledger.component_residual+=component_residual
     ledger.component_residual_abs+=component_residual_abs
+    ledger.component_magnitude_abs+=component_magnitude_abs
     ledger
 end
 

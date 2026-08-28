@@ -4903,6 +4903,9 @@ function main()
                 radiation_energy_ledger.resolved_coupled_change = energy.resolved_coupled_change
                 radiation_energy_ledger.component_residual = energy.component_residual
                 radiation_energy_ledger.component_residual_abs = energy.component_residual_abs
+                radiation_energy_ledger.component_magnitude_abs =
+                    hasproperty(energy, :component_magnitude_abs) ?
+                    energy.component_magnitude_abs : NaN
             elseif radiation_energy_ledger !== nothing && reset_energy_ledger
                 @info "resetting radiation energy ledger after checkpoint restore"
             end
@@ -5094,6 +5097,7 @@ function main()
             resolved_coupled_change=radiation_energy_ledger.resolved_coupled_change,
             component_residual=radiation_energy_ledger.component_residual,
             component_residual_abs=radiation_energy_ledger.component_residual_abs,
+            component_magnitude_abs=radiation_energy_ledger.component_magnitude_abs,
         )
         runtime = (
             cycle=cycle_now, measured=measured,
@@ -6250,7 +6254,7 @@ function main()
         max(radiation_component_scale, eps(Float64))
     radiation_component_residual_abs_norm = radiation_energy_ledger === nothing ? NaN :
         radiation_energy_ledger.component_residual_abs /
-        max(radiation_component_scale, eps(Float64))
+        max(radiation_energy_ledger.component_magnitude_abs, eps(Float64))
     pmf_init === :magpressure && @printf("MODE: delta2k_amp %.8e\n", delta2k_final)
     drag_enabled && @printf("DRAG: mode=%s regime=%s boost=%.3f boosted_steps=%d subcycles_total=%d last_nsub=%d max_impulse=%.6e impulse_limited_steps=%d last_explicit_dt=%.3e last_dt=%.3e last_f=%.8f last_Gamma_over_H=%.6e rate_code=%.6e xe_mode=%s last_xe=%.6e terminal_gamma_scale=%.3e terminal_vcap=%.3e terminal_vmax=%.3e terminal_pressure_coeff=%.6e terminal_pressure_coeff_mode=%s induction_subcycles=%d last_induction_nsub=%d terminal_idiff_coeff=%.3e hybrid_va_cs=%.3e hybrid_drag_over_omega=%.3e handoff_events=%d handoff_steps=%d handoff_remaining=%d handoff_alpha_max=%.3f handoff_ramp=cosine handoff_alpha_last=%.3f handoff_error_last=%.6e handoff_error_max=%.6e handoff_error_settled_max=%.6e handoff_dv_rms=%.6e handoff_vt_rms=%.6e handoff_vf_rms=%.6e handoff_error_tol=%.6e handoff_correction_dcell_last=%.6e handoff_correction_dcell_max=%.6e handoff_correction_dcell_sum=%.6e handoff_correction_dcell_tol=%.6e\n",
                             String(drag_dt_mode), last_hybrid_regime, drag_dt_boost, boosted_steps, subcycles_total, last_nsub,
@@ -6285,7 +6289,7 @@ function main()
                 radiation_highz_zmin,radiation_nonlinear_cfl,
                 radiation_workspace_bytes)
         if radiation_energy_ledger !== nothing
-            @printf("RADIATION_ENERGY: samples=%d gas_total_change=%.8e kinetic_change=%.8e internal_change=%.8e magnetic_change=%.8e photon_change=%.8e resolved_coupled_change=%.8e component_residual=%.8e component_residual_abs=%.8e component_residual_norm=%.8e component_residual_abs_norm=%.8e photon_closure=%s\n",
+            @printf("RADIATION_ENERGY: samples=%d gas_total_change=%.8e kinetic_change=%.8e internal_change=%.8e magnetic_change=%.8e photon_change=%.8e resolved_coupled_change=%.8e component_residual=%.8e component_residual_abs=%.8e component_magnitude_abs=%.8e component_residual_norm=%.8e component_residual_abs_norm=%.8e photon_closure=%s\n",
                     radiation_energy_ledger.samples,
                     radiation_energy_ledger.total_change,
                     radiation_energy_ledger.kinetic_change,
@@ -6295,6 +6299,7 @@ function main()
                     radiation_energy_ledger.resolved_coupled_change,
                     radiation_energy_ledger.component_residual,
                     radiation_energy_ledger.component_residual_abs,
+                    radiation_energy_ledger.component_magnitude_abs,
                     radiation_component_residual_norm,
                     radiation_component_residual_abs_norm,
                     radiation_response_model in (
@@ -6351,6 +6356,7 @@ function main()
                                   "radiation_photon_change","radiation_resolved_coupled_change",
                                   "radiation_component_residual",
                                   "radiation_component_residual_abs",
+                                  "radiation_component_magnitude_abs",
                                   "radiation_component_residual_norm",
                                   "radiation_component_residual_abs_norm",
                                   "gravity","gravity_gas_kick","gravity_source",
@@ -6449,6 +6455,7 @@ function main()
                               radiation_energy_ledger === nothing ? NaN : radiation_energy_ledger.resolved_coupled_change,
                               radiation_energy_ledger === nothing ? NaN : radiation_energy_ledger.component_residual,
                               radiation_energy_ledger === nothing ? NaN : radiation_energy_ledger.component_residual_abs,
+                              radiation_energy_ledger === nothing ? NaN : radiation_energy_ledger.component_magnitude_abs,
                               radiation_component_residual_norm,
                               radiation_component_residual_abs_norm,
                               gravity, gravity_gas_kick, String(gravity_source),

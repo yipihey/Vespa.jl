@@ -370,10 +370,11 @@ using Test
         @test all(isfinite,(ledger.total_change,ledger.kinetic_change,
                             ledger.internal_change,ledger.magnetic_change))
         @test ledger.component_residual_abs >= abs(ledger.component_residual)
+        @test ledger.component_magnitude_abs >= ledger.component_residual_abs
         component_scale=abs(ledger.kinetic_change)+abs(ledger.internal_change)+
                         abs(ledger.magnetic_change)
         @test abs(ledger.component_residual)/component_scale < 5e-4
-        @test ledger.component_residual_abs/component_scale < 1e-3
+        @test ledger.component_residual_abs/ledger.component_magnitude_abs < 1e-6
     end
 
     @testset "evolved photon moments close momentum and angular stress" begin
@@ -470,6 +471,7 @@ using Test
         @test ledger.resolved_coupled_change ≈
               ledger.total_change+ledger.photon_change rtol=2f-6 atol=1f-9
         @test ledger.component_residual_abs >= abs(ledger.component_residual)
+        @test ledger.component_magnitude_abs >= ledger.component_residual_abs
 
         missing=allocate_state(backend(:cpu),Float32,(8,8,8);dx=1/8)
         mw=allocate_radiation_workspace(missing)
