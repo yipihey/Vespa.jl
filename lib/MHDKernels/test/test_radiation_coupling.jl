@@ -464,6 +464,8 @@ using Test
             s.U[6][c]=0; s.U[7][c]=0; s.U[8][c]=0; s.U[9][c]=0
         end
         ws=allocate_radiation_workspace(s)
+        @test length(ws.packed_psi_correction)==8*N^3
+        @test all(r -> all(iszero,r),ws.magnetic_residual)
         photons=allocate_photon_moment_state(s)
         initialize_photon_moments!(photons,ws,s)
         rc=RadiationClosure(inertia_ratio=0.2f0,mean_free_path=0.001f0,

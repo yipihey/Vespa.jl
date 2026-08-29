@@ -76,6 +76,21 @@ end
     return rho0 + drho
 end
 
+# Preserve increments that round away when a weak perturbation evolves on top
+# of a strong guide field. This helper is intentionally outside the kernels'
+# `@fastmath` blocks because reassociation would destroy the compensated sum.
+@inline _cube_magnetic_update!(packed, slot, b0::T, db::T,
+                               ::Val{false}) where {T} = b0 + db
+
+@inline function _cube_magnetic_update!(packed, slot, b0::T, db::T,
+                                        ::Val{true}) where {T}
+    residual = @inbounds packed[slot]
+    increment = db + residual
+    bnew = b0 + increment
+    @inbounds packed[slot] = increment - (bnew - b0)
+    return bnew
+end
+
 @inline function _cube_inadmissible(rh::NTuple{9,T},smallr::T,pfl::T,
         gamma::T,llf_dmin::T,::Val{CHECK}) where {T,CHECK}
     if CHECK != false
@@ -101,7 +116,8 @@ end
         dtdx::T, γ::T, ch::T, decay::T, smallr::T, pfl::T,
         llf_dmin::T, llf_pmin::T, drag::Val{DRAG},
         dc::DragCoefficients{T},rad::Val{RAD},track_density::Val{TRACK},
-        check_admissibility::Val{CHECK}) where {T,ST,DRAG,RAD,TRACK,CHECK}
+        track_magnetic::Val{TRACKB},
+        check_admissibility::Val{CHECK}) where {T,ST,DRAG,RAD,TRACK,TRACKB,CHECK}
     SP = @localmem ST (9*RCNCP)
     LX = @localmem ST (9*RCNFX); RX = @localmem ST (9*RCNFX)
     LY = @localmem ST (9*RCNFY); RY = @localmem ST (9*RCNFY)
@@ -229,14 +245,18 @@ end
             U0=(a1[idx],a2[idx],a3[idx],a4[idx],a5[idx],a6[idx],a7[idx],a8[idx],a9[idx])
             rho_new=_cube_density_update!(a9,4*N*N*N+idx,U0[1],
                 dtdx*((Fxl[1]-Fxh[1])+(Fyl[1]-Fyh[1])+(Fzl[1]-Fzh[1])),track_density)
+            stride=N*N*N
+            dbx=dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6]))
+            dby=dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7]))
+            dbz=dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8]))
             rh=(rho_new,
                 U0[2]+dtdx*((Fxl[2]-Fxh[2])+(Fyl[2]-Fyh[2])+(Fzl[2]-Fzh[2])),
                 U0[3]+dtdx*((Fxl[3]-Fxh[3])+(Fyl[3]-Fyh[3])+(Fzl[3]-Fzh[3])),
                 U0[4]+dtdx*((Fxl[4]-Fxh[4])+(Fyl[4]-Fyh[4])+(Fzl[4]-Fzh[4])),
                 U0[5]+dtdx*((Fxl[5]-Fxh[5])+(Fyl[5]-Fyh[5])+(Fzl[5]-Fzh[5])),
-                U0[6]+dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6])),
-                U0[7]+dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7])),
-                U0[8]+dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8])),
+                _cube_magnetic_update!(a9,5stride+idx,U0[6],dbx,track_magnetic),
+                _cube_magnetic_update!(a9,6stride+idx,U0[7],dby,track_magnetic),
+                _cube_magnetic_update!(a9,7stride+idx,U0[8],dbz,track_magnetic),
                 U0[9]+dtdx*((Fxl[9]-Fxh[9])+(Fyl[9]-Fyh[9])+(Fzl[9]-Fzh[9])))
             inadmissible=_cube_inadmissible(rh,smallr,pfl,γ,llf_dmin,
                                              check_admissibility)
@@ -255,7 +275,8 @@ end
         N::Int, nb::Int, cx::Int, cy::Int, cz::Int, shared::Val{ST}, rec::Val, per::Val, rsol::Val, dtdx::T, γ::T, ch::T, decay::T,
         smallr::T, pfl::T, llf_dmin::T, llf_pmin::T, drag::Val{DRAG},
         dc::DragCoefficients{T},rad::Val{RAD},track_density::Val{TRACK},
-        check_admissibility::Val{CHECK}) where {T,ST,DRAG,RAD,TRACK,CHECK}
+        track_magnetic::Val{TRACKB},
+        check_admissibility::Val{CHECK}) where {T,ST,DRAG,RAD,TRACK,TRACKB,CHECK}
     SP = @localmem ST (9*CNCP)
     LX = @localmem ST (9*CNFX); RX = @localmem ST (9*CNFX)
     LY = @localmem ST (9*CNFX); RY = @localmem ST (9*CNFX)
@@ -371,14 +392,18 @@ end
             U0=(a1[idx],a2[idx],a3[idx],a4[idx],a5[idx],a6[idx],a7[idx],a8[idx],a9[idx])
             rho_new=_cube_density_update!(a9,4*N*N*N+idx,U0[1],
                 dtdx*((Fxl[1]-Fxh[1])+(Fyl[1]-Fyh[1])+(Fzl[1]-Fzh[1])),track_density)
+            stride=N*N*N
+            dbx=dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6]))
+            dby=dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7]))
+            dbz=dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8]))
             rh=(rho_new,
                 U0[2]+dtdx*((Fxl[2]-Fxh[2])+(Fyl[2]-Fyh[2])+(Fzl[2]-Fzh[2])),
                 U0[3]+dtdx*((Fxl[3]-Fxh[3])+(Fyl[3]-Fyh[3])+(Fzl[3]-Fzh[3])),
                 U0[4]+dtdx*((Fxl[4]-Fxh[4])+(Fyl[4]-Fyh[4])+(Fzl[4]-Fzh[4])),
                 U0[5]+dtdx*((Fxl[5]-Fxh[5])+(Fyl[5]-Fyh[5])+(Fzl[5]-Fzh[5])),
-                U0[6]+dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6])),
-                U0[7]+dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7])),
-                U0[8]+dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8])),
+                _cube_magnetic_update!(a9,5stride+idx,U0[6],dbx,track_magnetic),
+                _cube_magnetic_update!(a9,6stride+idx,U0[7],dby,track_magnetic),
+                _cube_magnetic_update!(a9,7stride+idx,U0[8],dbz,track_magnetic),
                 U0[9]+dtdx*((Fxl[9]-Fxh[9])+(Fyl[9]-Fyh[9])+(Fzl[9]-Fzh[9])))
             inadmissible=_cube_inadmissible(rh,smallr,pfl,γ,llf_dmin,
                                              check_admissibility)
@@ -417,7 +442,7 @@ function _cube_launch!(::Val, be, s::MHDState{T}, dt::Real, ch::Real, decay::Rea
     rec = Val(recon_code_of(s)); per = Val(all_periodic(s)); rsol = Val(riemann_code_of(s))
     step_cube_kernel!(be, CUBE_GS)(s.scratch..., s.U..., N, nb, cx,cy,cz, Val(Float32), rec, per, rsol, dtdx, s.γ, T(ch), T(decay),
             s.smallr, s.pfl, s.llf_dmin, s.llf_pmin, Val(false),
-            _no_drag_coefficients(T),Val(false),Val(false),Val(false);
+            _no_drag_coefficients(T),Val(false),Val(false),Val(false),Val(false);
             ndrange = nb*nb*nb*CUBE_GS)
     KA.synchronize(be)
 end
@@ -442,7 +467,7 @@ function _cube_drag_launch!(be,s::MHDState{T},dt::Real,ch::Real,decay::Real,
     dc=_drag_coefficients(q)
     step_cube_kernel!(be,CUBE_GS)(s.scratch...,s.U...,N,nb,cx,cy,cz,Val(Float32),rec,per,rsol,
         dtdx,s.γ,T(ch),T(decay),s.smallr,s.pfl,s.llf_dmin,s.llf_pmin,Val(true),
-        dc,Val(false),Val(false),Val(false);
+        dc,Val(false),Val(false),Val(false),Val(false);
         ndrange=nb*nb*nb*CUBE_GS)
     KA.synchronize(be)
 end
@@ -450,20 +475,22 @@ end
 
 function step_cube_radiation!(s::MHDState{T},dt::Real;ch::Real,decay::Real,
         drag_impulse::Real,correction,track_density::Bool=true,
+        track_magnetic::Bool=true,
         check_admissibility::Bool=false,fallback::Bool=false,
         global_fallback::Bool=false,robust_fallback::Bool=false) where {T}
     N=s.dims[1]
     all(==(N),s.dims) || error("step_cube_radiation! requires a cubic grid")
     N%CTB==0 || error("step_cube_radiation! needs N % $CTB == 0")
     _cube_radiation_launch!(s.be,s,dt,ch,decay,T(drag_impulse),correction,
-                            Val(track_density),Val(check_admissibility),Val(fallback),
+                            Val(track_density),Val(track_magnetic),
+                            Val(check_admissibility),Val(fallback),
                             Val(global_fallback),Val(robust_fallback))
     s.U,s.scratch=s.scratch,s.U
     s
 end
 
 function _cube_radiation_launch!(be,s::MHDState{T},dt::Real,ch::Real,decay::Real,
-        q::T,correction,track_density::Val,check::Val,
+        q::T,correction,track_density::Val,track_magnetic::Val,check::Val,
         fallback::Val{FALLBACK},global_fallback::Val{GLOBAL},
         robust_fallback::Val{ROBUST}) where {T,FALLBACK,GLOBAL,ROBUST}
     N=s.dims[1]; nb=N÷CTB; dtdx=T(dt)/s.dx; cx,cy,cz=bc_codes(s)
@@ -476,7 +503,7 @@ function _cube_radiation_launch!(be,s::MHDState{T},dt::Real,ch::Real,decay::Real
     step_cube_kernel!(be,CUBE_GS)(s.scratch...,s.U[1],s.U[2],s.U[3],s.U[4],s.U[5],
         s.U[6],s.U[7],s.U[8],correction,N,nb,cx,cy,cz,Val(Float32),
         rec,per,rsol,dtdx,s.γ,T(ch),T(decay),s.smallr,s.pfl,s.llf_dmin,s.llf_pmin,
-        Val(true),dc,Val(true),track_density,kernel_check;
+        Val(true),dc,Val(true),track_density,track_magnetic,kernel_check;
         ndrange=nb*nb*nb*CUBE_GS)
     KA.synchronize(be)
 end

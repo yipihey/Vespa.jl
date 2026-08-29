@@ -256,6 +256,16 @@ Radiation mode also changes two runner defaults:
   spectral correction inside the nonlinear Godunov update. An unlimited value
   made the angular closure non-finite after 16 high-redshift N64 steps.
 
+For guide-field runs, the radiation workspace also stores three persistent
+Float32 compensated-sum remainders for the magnetic update. They prevent an
+induction increment from being discarded when it is smaller than one ULP of a
+strong uniform field. `MHD_RADIATION_MAGNETIC_COMPENSATION` defaults on for
+`meanfield_linear` and off for zero-mean Batchelor runs. Enabling it costs 12
+bytes per cell. The remainders are checkpointed and legacy checkpoints
+initialize them to zero. A rejected positivity trial resets them, losing at
+most one Float32 rounding remainder before the conservative fallback is
+retried.
+
 `MHD_RADIATION_ENERGY_LEDGER_EVERY=N` samples kinetic, internal, magnetic, and
 total gas-state changes using the existing old-state and FFT workspaces. With
 `:moments` it also reports the quadratic photon perturbation energy and the

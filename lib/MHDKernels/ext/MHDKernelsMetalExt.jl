@@ -153,13 +153,15 @@ function MHDKernels._cube_launch!(::Val, be::MetalBackend, s::MHDKernels.MHDStat
             s.scratch..., s.U..., N, nbx, nby, cx, cy, cz,
             Val(Float32), rec, per, rsol, dtdx, s.γ, T(ch), T(decay),
             s.smallr, s.pfl, s.llf_dmin, s.llf_pmin, Val(false),
-            MHDKernels._no_drag_coefficients(T),Val(false),Val(false),Val(false);
+            MHDKernels._no_drag_coefficients(T),Val(false),Val(false),Val(false),
+            Val(false);
             ndrange = nbx * nby * nbz * gs)
     else
         MHDKernels.step_cube_kernel!(be, gs)(
             s.scratch..., s.U..., N, nb, cx, cy, cz, Val(Float32), rec, per, rsol,
             dtdx, s.γ, T(ch), T(decay), s.smallr, s.pfl, s.llf_dmin, s.llf_pmin,
-            Val(false),MHDKernels._no_drag_coefficients(T),Val(false),Val(false),Val(false);
+            Val(false),MHDKernels._no_drag_coefficients(T),Val(false),Val(false),
+            Val(false),Val(false);
             ndrange = nb * nb * nb * gs)
     end
     MHDKernels.KA.synchronize(be)
@@ -182,13 +184,13 @@ function MHDKernels._cube_drag_launch!(be::MetalBackend,
             s.scratch..., s.U..., N, nbx, nby, cx, cy, cz,
             Val(Float32), rec, per, rsol, dtdx, s.γ, T(ch), T(decay),
             s.smallr, s.pfl, s.llf_dmin, s.llf_pmin, Val(true),
-            dc,Val(false),Val(false),Val(false);
+            dc,Val(false),Val(false),Val(false),Val(false);
             ndrange = nbx * nby * nbz * gs)
     else
         MHDKernels.step_cube_kernel!(be, gs)(
             s.scratch..., s.U..., N, nb, cx, cy, cz, Val(Float32), rec, per, rsol,
             dtdx, s.γ, T(ch), T(decay), s.smallr, s.pfl, s.llf_dmin, s.llf_pmin,
-            Val(true),dc,Val(false),Val(false),Val(false);
+            Val(true),dc,Val(false),Val(false),Val(false),Val(false);
             ndrange = nb * nb * nb * gs)
     end
     MHDKernels.KA.synchronize(be)
@@ -197,7 +199,7 @@ end
 
 function MHDKernels._cube_radiation_launch!(be::MetalBackend,
         s::MHDKernels.MHDState{T},dt::Real,ch::Real,decay::Real,q::T,
-        correction,track_density::Val,check::Val,
+        correction,track_density::Val,track_magnetic::Val,check::Val,
         fallback::Val{FALLBACK},global_fallback::Val{GLOBAL},
         robust_fallback::Val{ROBUST}) where {T,FALLBACK,GLOBAL,ROBUST}
     N=s.dims[1]; dtdx=T(dt)/s.dx; cx,cy,cz=MHDKernels.bc_codes(s)
@@ -216,7 +218,7 @@ function MHDKernels._cube_radiation_launch!(be::MetalBackend,
             s.U[3],s.U[4],s.U[5],s.U[6],s.U[7],s.U[8],correction,
             N,nbx,nby,cx,cy,cz,Val(Float32),rec,per,rsol,dtdx,s.γ,T(ch),T(decay),s.smallr,
             s.pfl,s.llf_dmin,s.llf_pmin,Val(true),dc,Val(true),track_density,
-            kernel_check;
+            track_magnetic,kernel_check;
             ndrange=nbx*nby*nbz*gs)
     else
         nb=N÷MHDKernels.CTB
@@ -224,7 +226,7 @@ function MHDKernels._cube_radiation_launch!(be::MetalBackend,
             s.U[4],s.U[5],s.U[6],s.U[7],s.U[8],correction,N,nb,cx,cy,cz,
             Val(Float32),rec,per,rsol,dtdx,s.γ,T(ch),T(decay),s.smallr,s.pfl,
             s.llf_dmin,s.llf_pmin,Val(true),dc,Val(true),track_density,
-            kernel_check;
+            track_magnetic,kernel_check;
             ndrange=nb*nb*nb*gs)
     end
     MHDKernels.KA.synchronize(be)

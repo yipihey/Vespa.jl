@@ -57,7 +57,8 @@ end
         Nx::Int, Ny::Int, Nz::Int, cx::Int, cy::Int, cz::Int, rec::Val, rsol::Val, dtdx::T, γ::T, ch::T, decay::T,
         smallr::T, pfl::T, llf_dmin::T, llf_pmin::T, drag::Val{DRAG},
         qh::T, qfull::T, vx0::T, vy0::T, vz0::T,
-        rad::Val{RAD},track_density::Val{TRACK}) where {T,DRAG,RAD,TRACK}
+        rad::Val{RAD},track_density::Val{TRACK},
+        track_magnetic::Val{TRACKB}) where {T,DRAG,RAD,TRACK,TRACKB}
     c = @index(Global, Linear)
     @inbounds begin
         u = (a1,a2,a3,a4,a5,a6,a7,a8,a9)
@@ -97,14 +98,17 @@ end
         U0 = (a1[c],a2[c],a3[c],a4[c],a5[c],a6[c],a7[c],a8[c],a9[c])
         drho=dtdx*((Fxl[1]-Fxh[1])+(Fyl[1]-Fyh[1])+(Fzl[1]-Fzh[1]))
         rho_new=_cube_density_update!(a9,4*stride+c,U0[1],drho,track_density)
+        dbx=dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6]))
+        dby=dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7]))
+        dbz=dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8]))
         rh = (rho_new,
               U0[2]+dtdx*((Fxl[2]-Fxh[2])+(Fyl[2]-Fyh[2])+(Fzl[2]-Fzh[2])),
               U0[3]+dtdx*((Fxl[3]-Fxh[3])+(Fyl[3]-Fyh[3])+(Fzl[3]-Fzh[3])),
               U0[4]+dtdx*((Fxl[4]-Fxh[4])+(Fyl[4]-Fyh[4])+(Fzl[4]-Fzh[4])),
               U0[5]+dtdx*((Fxl[5]-Fxh[5])+(Fyl[5]-Fyh[5])+(Fzl[5]-Fzh[5])),
-              U0[6]+dtdx*((Fxl[6]-Fxh[6])+(Fyl[6]-Fyh[6])+(Fzl[6]-Fzh[6])),
-              U0[7]+dtdx*((Fxl[7]-Fxh[7])+(Fyl[7]-Fyh[7])+(Fzl[7]-Fzh[7])),
-              U0[8]+dtdx*((Fxl[8]-Fxh[8])+(Fyl[8]-Fyh[8])+(Fzl[8]-Fzh[8])),
+              _cube_magnetic_update!(a9,5stride+c,U0[6],dbx,track_magnetic),
+              _cube_magnetic_update!(a9,6stride+c,U0[7],dby,track_magnetic),
+              _cube_magnetic_update!(a9,7stride+c,U0[8],dbz,track_magnetic),
               U0[9]+dtdx*((Fxl[9]-Fxh[9])+(Fyl[9]-Fyh[9])+(Fzl[9]-Fzh[9])))
         r = DRAG ? drag_correct_conserved(U0,rh,qfull,vx0,vy0,vz0,smallr,T(1e-30)) : rh
         o1[c]=r[1];o2[c]=r[2];o3[c]=r[3];o4[c]=r[4];o5[c]=r[5];o6[c]=r[6];o7[c]=r[7];o8[c]=r[8]
@@ -123,7 +127,8 @@ function step_ref!(s::MHDState{T}, dt::Real; ch::Real, decay::Real) where {T}
     Nx,Ny,Nz = s.dims; dtdx = T(dt)/s.dx; cx,cy,cz = bc_codes(s); rec = Val(recon_code_of(s)); rsol = Val(riemann_code_of(s))
     step_ref_kernel!(s.be, 256)(s.scratch..., s.U..., Nx,Ny,Nz, cx,cy,cz, rec, rsol, dtdx, s.γ, T(ch), T(decay),
                                 s.smallr, s.pfl, s.llf_dmin, s.llf_pmin, Val(false),
-                                zero(T),zero(T),zero(T),zero(T),zero(T),Val(false),Val(false);
+                                zero(T),zero(T),zero(T),zero(T),zero(T),
+                                Val(false),Val(false),Val(false);
                                 ndrange = ncells(s))
     KA.synchronize(s.be)
     s.U, s.scratch = s.scratch, s.U
@@ -137,7 +142,7 @@ function step_ref_drag!(s::MHDState{T},dt::Real; ch::Real,decay::Real,
     q=T(drag_impulse)
     step_ref_kernel!(s.be,256)(s.scratch...,s.U...,Nx,Ny,Nz,cx,cy,cz,rec,rsol,dtdx,s.γ,T(ch),T(decay),
         s.smallr,s.pfl,s.llf_dmin,s.llf_pmin,Val(true),T(0.5)*q,q,T(vx0),T(vy0),T(vz0),
-        Val(false),Val(false);
+        Val(false),Val(false),Val(false);
         ndrange=ncells(s))
     KA.synchronize(s.be)
     s.U,s.scratch=s.scratch,s.U
@@ -146,13 +151,15 @@ end
 
 
 function step_ref_radiation!(s::MHDState{T},dt::Real;ch::Real,decay::Real,
-        drag_impulse::Real,correction,track_density::Bool=true) where {T}
+        drag_impulse::Real,correction,track_density::Bool=true,
+        track_magnetic::Bool=true) where {T}
     Nx,Ny,Nz=s.dims; dtdx=T(dt)/s.dx; cx,cy,cz=bc_codes(s)
     rec=Val(recon_code_of(s)); rsol=Val(riemann_code_of(s)); q=T(drag_impulse)
     step_ref_kernel!(s.be,256)(s.scratch...,s.U[1],s.U[2],s.U[3],s.U[4],s.U[5],
         s.U[6],s.U[7],s.U[8],correction,Nx,Ny,Nz,cx,cy,cz,rec,rsol,
         dtdx,s.γ,T(ch),T(decay),s.smallr,s.pfl,s.llf_dmin,s.llf_pmin,
-        Val(true),T(0.5)*q,q,zero(T),zero(T),zero(T),Val(true),Val(track_density);
+        Val(true),T(0.5)*q,q,zero(T),zero(T),zero(T),Val(true),Val(track_density),
+        Val(track_magnetic);
         ndrange=ncells(s))
     KA.synchronize(s.be)
     s.U,s.scratch=s.scratch,s.U

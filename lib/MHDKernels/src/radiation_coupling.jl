@@ -77,7 +77,7 @@ function RadiationClosure(; inertia_ratio::Real, mean_free_path::Real,
                             _radiation_response_code(response_model))
 end
 
-struct RadiationWorkspace{T,A,V,H,C,B,D,L,S}
+struct RadiationWorkspace{T,A,V,H,C,B,D,M,L,S}
     packed_psi_correction::V
     real_batch::B
     fft_real::A
@@ -87,6 +87,7 @@ struct RadiationWorkspace{T,A,V,H,C,B,D,L,S}
     hat_batch::H
     velocity_hat::NTuple{3,C}
     density_hat::C
+    magnetic_residual::M
     density_limiter_active::L
     density_limiter_min_theta::S
 end
@@ -175,17 +176,23 @@ end
     result
 end
 
-function allocate_radiation_workspace(s::MHDState{T}) where {T}
+function allocate_radiation_workspace(s::MHDState{T};
+                                      compensate_magnetic::Bool=true) where {T}
     all(==(s.dims[1]), s.dims) ||
         error("spectral radiation coupling currently requires a cubic grid")
     T === Float32 || s.be isa CPU ||
         error("device spectral radiation coupling currently supports Float32")
     n = s.dims[1]
-    packed=device_zeros(s.be,T,(5*n^3,))
+    # The final three real fields carry persistent compensated-summation
+    # remainders for B. They prevent timestep-dependent freezing when a weak
+    # perturbation is updated on top of a strong Float32 guide field.
+    packed=device_zeros(s.be,T,((compensate_magnetic ? 8 : 5)*n^3,))
     real_batch=reshape(view(packed,1:4*n^3),n,n,n,4)
     fft_real=reshape(view(packed,1:n^3),n,n,n)
     corr=ntuple(d -> reshape(view(packed,d*n^3+1:(d+1)*n^3),n,n,n),3)
     density_perturbation=reshape(view(packed,4*n^3+1:5*n^3),s.dims)
+    magnetic_residual=compensate_magnetic ? ntuple(d ->
+        reshape(view(packed,(4+d)*n^3+1:(5+d)*n^3),s.dims),3) : nothing
     hdims = (n ÷ 2 + 1, n, n)
     hat_batch=device_zeros(s.be,Complex{T},(hdims...,4))
     density_hat=reshape(view(hat_batch,:,:,:,1),hdims)
@@ -195,7 +202,14 @@ function allocate_radiation_workspace(s::MHDState{T}) where {T}
                                             ndrange=ncells(s))
     KA.synchronize(s.be)
     RadiationWorkspace(packed,real_batch,fft_real,corr,density_perturbation,
-                       rho_mean,hat_batch,hats,density_hat,Ref(false),Ref(1.0))
+                       rho_mean,hat_batch,hats,density_hat,magnetic_residual,
+                       Ref(false),Ref(1.0))
+end
+
+function _radiation_reset_magnetic_residual!(ws::RadiationWorkspace)
+    ws.magnetic_residual === nothing && return nothing
+    foreach(r -> fill!(r,zero(eltype(r))),ws.magnetic_residual)
+    nothing
 end
 
 function _radiation_trial_admissible(s::MHDState)
@@ -206,6 +220,10 @@ end
 function _restore_radiation_trial!(s::MHDState,ws::RadiationWorkspace,
                                    track_density::Bool)
     s.U,s.scratch=s.scratch,s.U
+    # A rejected trial has already replaced the in-place Kahan remainders.
+    # Resetting loses at most one Float32 rounding remainder while preserving
+    # the accepted conservative state; fallback steps are exceptional.
+    _radiation_reset_magnetic_residual!(ws)
     if track_density
         _radiation_initialize_density_k!(s.be)(ws.density_perturbation,s.U[1],
             ws.rho_mean;ndrange=ncells(s))
@@ -1341,11 +1359,13 @@ function _step_radiation_free_streaming!(s::MHDState{T},ws,dt::T;
         if integrator===:ref
             step_ref_radiation!(s,dt;ch=ch,decay=decay,
                                 drag_impulse=drag_impulse,
-                                correction=ws.packed_psi_correction)
+                                correction=ws.packed_psi_correction,
+                                track_magnetic=ws.magnetic_residual!==nothing)
         elseif integrator===:cube
             step_cube_radiation!(s,dt;ch=ch,decay=decay,
                                  drag_impulse=drag_impulse,
-                                 correction=ws.packed_psi_correction)
+                                 correction=ws.packed_psi_correction,
+                                 track_magnetic=ws.magnetic_residual!==nothing)
         else
             error("unknown radiation integrator :$integrator (have :ref, :cube)")
         end
@@ -1483,11 +1503,13 @@ function step_radiation_godunov!(s::MHDState{T},ws,dt::Real;
         if integrator===:ref
             step_ref_radiation!(s,dt;ch=ch,decay=decay,drag_impulse=drag_impulse,
                                 correction=ws.packed_psi_correction,
-                                track_density=track_density)
+                                track_density=track_density,
+                                track_magnetic=ws.magnetic_residual!==nothing)
         elseif integrator===:cube
             step_cube_radiation!(s,dt;ch=ch,decay=decay,drag_impulse=drag_impulse,
                                  correction=ws.packed_psi_correction,
                                  track_density=track_density,
+                                 track_magnetic=ws.magnetic_residual!==nothing,
                                  check_admissibility=use_fallback)
         else
             error("unknown radiation integrator :$integrator (have :ref, :cube)")
@@ -1513,6 +1535,7 @@ function step_radiation_godunov!(s::MHDState{T},ws,dt::Real;
                     drag_impulse=drag_impulse,
                     correction=ws.packed_psi_correction,
                     track_density=track_density,check_admissibility=true,
+                    track_magnetic=ws.magnetic_residual!==nothing,
                     robust_fallback=true)
                 robust_admissible=_radiation_trial_admissible(s)
                 robust_wave_speed=robust_admissible ?

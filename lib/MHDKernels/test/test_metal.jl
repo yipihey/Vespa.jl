@@ -37,6 +37,21 @@ else
             @test naive == 1f0
         end
 
+        @testset "magnetic compensated sub-ULP increments" begin
+            residual = zeros(Float32,1)
+            compensated = 16f0
+            naive = 16f0
+            db = 1f-7
+            for _ in 1:64
+                compensated = MHDKernels._cube_magnetic_update!(
+                    residual,1,compensated,db,Val(true))
+                naive += db
+            end
+            @test compensated == Float32(16 + 64e-7)
+            @test naive == 16f0
+            @test abs(residual[1]) <= eps(16f0)
+        end
+
         @testset "CPU ref ≈ Metal cube (one step, 32^3 f32) — $recon" for recon in (:plm, :ppm)
             N = 32
             sr = allocate_state(becpu, T, (N,N,N); dx=1/N, gamma=5/3, riemann=:hll, recon=recon)

@@ -15,6 +15,17 @@ include("pmf_dm_lattice_bench.jl")
         @test runtime.cycle == 7
         @test destination == source
 
+        optional_destination = ones(Float32, 3)
+        runtime = _restore_pmf_checkpoint!(
+            path, expected,
+            ["field" => destination, "magnetic_residual_1" => optional_destination];
+            optional_missing_arrays=("magnetic_residual_1",))
+        @test runtime.cycle == 7
+        @test all(iszero, optional_destination)
+        @test_throws ErrorException _restore_pmf_checkpoint!(
+            path, expected,
+            ["field" => destination, "required_trailing" => zeros(Float32, 3)])
+
         incompatible = (N=4, zstart=3.0e6, zend=500.0, cfl=0.2)
         @test_throws ErrorException _restore_pmf_checkpoint!(
             path, incompatible, ["field" => zeros(Float32, 3)])
@@ -166,24 +177,39 @@ end
         open(joinpath(dir, "photon_hat_batch.c32"), "w") do io
             write(io, photon_expected)
         end
+        residual = ntuple(_ -> zeros(Float32, N^3), 3)
+        for (i, name) in enumerate(("magnetic_residual_1",
+                                    "magnetic_residual_2",
+                                    "magnetic_residual_3"))
+            _write_f32_array_atomic(joinpath(dir, "$name.f32"),
+                                    fill(-Float32(i) / 1000, N^3))
+        end
 
         _import_initial_aux_state!(dir; N=N, particles=particles,
-                                   chemistry=chemistry, photons=photon)
+                                   chemistry=chemistry, photons=photon,
+                                   magnetic_residual=residual)
         for i in 1:6
             @test particles[i] == fill(Float32(i) / 10, N^3)
         end
         for i in 1:3
             @test chemistry[i] == fill(Float32(i) / 100, N^3)
+            @test residual[i] == fill(-Float32(i) / 1000, N^3)
         end
         _write_f32_array_atomic(joinpath(dir, "chem_HeII.f32"),
                                 fill(0.04f0, N^3))
         chemistry_helium = ntuple(i -> zeros(Float32, N^3), 4)
         _import_initial_aux_state!(dir; N=N, particles=particles,
-                                   chemistry=chemistry_helium, photons=photon)
+                                   chemistry=chemistry_helium, photons=photon,
+                                   magnetic_residual=residual)
         for i in 1:4
             @test chemistry_helium[i] == fill(Float32(i) / 100, N^3)
         end
         @test Array(photon.hat_batch) == photon_expected
+
+        rm(joinpath(dir, "magnetic_residual_3.f32"))
+        @test_throws ErrorException _import_initial_aux_state!(
+            dir; N=N, particles=particles, chemistry=chemistry_helium,
+            photons=photon, magnetic_residual=residual)
     end
 end
 

@@ -49,7 +49,8 @@ end
 
 function _restore_pmf_checkpoint!(path::AbstractString, expected_config, arrays;
                                   allowed_config_changes=(),
-                                  allowed_config_validator=nothing)
+                                  allowed_config_validator=nothing,
+                                  optional_missing_arrays=())
     open(path, "r") do io
         deserialize(io) == _PMF_CHECKPOINT_MAGIC ||
             error("unsupported PMF checkpoint format: $path")
@@ -101,9 +102,16 @@ function _restore_pmf_checkpoint!(path::AbstractString, expected_config, arrays;
             end
         end
         narrays = deserialize(io)
-        narrays == length(arrays) || error(
+        narrays <= length(arrays) || error(
             "PMF checkpoint array-count mismatch: stored=$narrays expected=$(length(arrays))")
-        for (expected_name, device_array) in arrays
+        optional = Set(String.(optional_missing_arrays))
+        for (index,(expected_name, device_array)) in enumerate(arrays)
+            if index > narrays
+                String(expected_name) in optional || error(
+                    "PMF checkpoint is missing required trailing field $expected_name")
+                fill!(device_array,zero(eltype(device_array)))
+                continue
+            end
             stored_name = deserialize(io)
             stored_name == String(expected_name) || error(
                 "PMF checkpoint field mismatch: stored=$stored_name expected=$expected_name")
@@ -3280,7 +3288,8 @@ end
 
 function _import_initial_aux_state!(dir::AbstractString; N::Int,
                                     particles, chemistry, photons,
-                                    density_perturbation=nothing)
+                                    density_perturbation=nothing,
+                                    magnetic_residual=nothing)
     isempty(dir) && return nothing
     particle_names = ("particle_px", "particle_py", "particle_pz",
                       "particle_vx", "particle_vy", "particle_vz")
@@ -3320,10 +3329,25 @@ function _import_initial_aux_state!(dir::AbstractString; N::Int,
             "initial state contains gas_delta.f32 but radiation density tracking is inactive")
         _read_f32_array_into!(density_perturbation, density_path, (N^3,))
     end
-    @printf("INITIAL_STATE_AUX_IMPORT path=%s particles=%s chemistry=%s photons=%s gas_delta=%s\n",
+    residual_names = ("magnetic_residual_1", "magnetic_residual_2",
+                      "magnetic_residual_3")
+    residual_present = map(
+        name -> isfile(joinpath(dir, "$name.f32")), residual_names)
+    all(residual_present) || !any(residual_present) || error(
+        "initial-state magnetic residual import must provide all three fields")
+    if all(residual_present)
+        magnetic_residual === nothing && error(
+            "initial state contains magnetic residuals but compensation is inactive")
+        length(magnetic_residual) == 3 || error(
+            "initial-state magnetic residual import expects three fields")
+        for (array, name) in zip(magnetic_residual, residual_names)
+            _read_f32_array_into!(array, joinpath(dir, "$name.f32"), (N^3,))
+        end
+    end
+    @printf("INITIAL_STATE_AUX_IMPORT path=%s particles=%s chemistry=%s photons=%s gas_delta=%s magnetic_residual=%s\n",
             dir, string(all(particle_present)), string(chemistry !== nothing &&
             isfile(joinpath(dir, "chem_eint.f32"))), string(isfile(photon_path)),
-            string(isfile(density_path)))
+            string(isfile(density_path)), string(all(residual_present)))
     flush(stdout)
     return nothing
 end
@@ -4038,6 +4062,10 @@ function main()
         error("MHD_PMF_NORMALIZATION_Z must equal MHD_ZSTART unless MHD_INITIAL_STATE_DIR supplies a pre-evolved state")
     end
     pmf_init = Symbol(lowercase(get(ENV, "MHD_PMF_INIT", "batchelor")))
+    radiation_magnetic_compensation = get(
+        ENV,"MHD_RADIATION_MAGNETIC_COMPENSATION",
+        pmf_init === :meanfield_linear ? "1" : "0") in
+        ("1","true","TRUE","yes","on")
     pmf_kmode = parse(Int, get(ENV, "MHD_PMF_KMODE", "1"))
     meanfield_theta = parse(Float64, get(ENV, "MHD_MEANFIELD_THETA",
                                                 string(π / 4)))
@@ -4693,9 +4721,11 @@ function main()
           radiation_initial_closure.mean_free_path^2 * (2pi)^2 <
           radiation_initial_closure.bridge_q2))
     radiation_workspace = radiation_needs_fft ?
-        MHDKernels.allocate_radiation_workspace(s) : nothing
+        MHDKernels.allocate_radiation_workspace(s;
+            compensate_magnetic=radiation_magnetic_compensation) : nothing
     radiation_workspace_bytes = radiation_needs_fft ?
-        5ncells*sizeof(T)+4*(N÷2+1)*N*N*sizeof(ComplexF32) : 0
+        (5+3*Int(radiation_magnetic_compensation))*ncells*sizeof(T)+
+        4*(N÷2+1)*N*N*sizeof(ComplexF32) : 0
     radiation_photon_state = drag_dt_mode === :radiation && radiation_response_model in (
         :moments,:photon_moments,:moments_exponential,
         :photon_moments_exponential) ?
@@ -4713,7 +4743,9 @@ function main()
                 (chem_helium ? (eint, HII, H2I, HeII) : (eint, HII, H2I)),
             photons=radiation_photon_state,
             density_perturbation=radiation_workspace === nothing ? nothing :
-                                 radiation_workspace.density_perturbation)
+                                 radiation_workspace.density_perturbation,
+            magnetic_residual=radiation_workspace === nothing ? nothing :
+                              radiation_workspace.magnetic_residual)
         radiation_workspace === nothing ||
             MHDKernels.reconstruct_radiation_density!(radiation_workspace,s)
     end
@@ -4811,6 +4843,7 @@ function main()
         radiation_free_stream_tolerance=radiation_free_stream_tolerance,
         radiation_max_dlna=radiation_max_dlna,
         radiation_highz_max_dlna=radiation_highz_max_dlna,
+        radiation_magnetic_compensation=radiation_magnetic_compensation,
         chem_mode=chem_mode, chem_coupling=chem_coupling,
         chem_helium=chem_helium,
         chem_expansion=chem_expansion,
@@ -4843,6 +4876,12 @@ function main()
         end
         if radiation_workspace !== nothing
             push!(arrays, "gas_delta" => radiation_workspace.density_perturbation)
+            if radiation_workspace.magnetic_residual !== nothing
+                for d in 1:3
+                    push!(arrays, "magnetic_residual_$d" =>
+                                  radiation_workspace.magnetic_residual[d])
+                end
+            end
         end
         return arrays
     end
@@ -4865,7 +4904,10 @@ function main()
                 checkpoint_read_path, checkpoint_config, _checkpoint_arrays();
                 allowed_config_changes=Tuple(checkpoint_allowed_changes),
                 allowed_config_validator=
-                    _checkpoint_nonlocal_table_change_is_safe)
+                    _checkpoint_nonlocal_table_change_is_safe,
+                optional_missing_arrays=("magnetic_residual_1",
+                                         "magnetic_residual_2",
+                                         "magnetic_residual_3"))
             restart_cycle = runtime.cycle
             measured = runtime.measured
             measured_subcycles = runtime.measured_subcycles
@@ -5009,11 +5051,12 @@ function main()
                 hybrid_exit_drag_omega, hybrid_enter_drag_omega, hybrid_check_every,
                 hybrid_confirm_checks, hybrid_min_va_cs)
     drag_dt_mode === :radiation &&
-        @printf("  radiation full-MHD response=%s bridge_q2=%.6g longitudinal_viscosity=%.6g max_dlna=%.6g highz_max_dlna=%.6g highz_zmin=%.6g nonlinear_cfl=%.6g free_stream_tol=%.6g fft_active=%s workspace_bytes=%d photon_state_bytes=%d\n",
+        @printf("  radiation full-MHD response=%s bridge_q2=%.6g longitudinal_viscosity=%.6g max_dlna=%.6g highz_max_dlna=%.6g highz_zmin=%.6g nonlinear_cfl=%.6g free_stream_tol=%.6g magnetic_compensation=%s fft_active=%s workspace_bytes=%d photon_state_bytes=%d\n",
                 string(radiation_response_model),
                 radiation_bridge_q2,radiation_long_viscosity,radiation_max_dlna,
                 radiation_highz_max_dlna,radiation_highz_zmin,
                 radiation_nonlinear_cfl,radiation_free_stream_tolerance,
+                string(radiation_magnetic_compensation),
                 string(radiation_needs_fft),radiation_workspace_bytes,
                 radiation_photon_bytes)
     chem_nonlocal_enabled &&
@@ -6276,7 +6319,7 @@ function main()
                             hybrid_handoff_displacement_tol)
     if drag_dt_mode === :radiation
         rd = _radiation_scale_diagnostics(last_radiation_closure, N)
-        @printf("RADIATION: response_model=%s R=%.8e lambda_over_box=%.8e q_fund=%.8e q_nyquist=%.8e stream_fund=%.8e stream_nyquist=%.8e crad_fund=%.8e crad_nyquist=%.8e gas_cs=%.8e bridge_q2=%.8e longitudinal_viscosity=%.8e max_dlna=%.8e highz_max_dlna=%.8e highz_zmin=%.8e nonlinear_cfl=%.8e workspace_bytes=%d\n",
+        @printf("RADIATION: response_model=%s R=%.8e lambda_over_box=%.8e q_fund=%.8e q_nyquist=%.8e stream_fund=%.8e stream_nyquist=%.8e crad_fund=%.8e crad_nyquist=%.8e gas_cs=%.8e bridge_q2=%.8e longitudinal_viscosity=%.8e max_dlna=%.8e highz_max_dlna=%.8e highz_zmin=%.8e nonlinear_cfl=%.8e magnetic_compensation=%s workspace_bytes=%d\n",
                 String(radiation_response_model),
                 last_radiation_closure.inertia_ratio,
                 last_radiation_closure.mean_free_path,
@@ -6287,6 +6330,7 @@ function main()
                 last_radiation_closure.longitudinal_viscosity,
                 radiation_max_dlna,radiation_highz_max_dlna,
                 radiation_highz_zmin,radiation_nonlinear_cfl,
+                string(radiation_magnetic_compensation),
                 radiation_workspace_bytes)
         if radiation_energy_ledger !== nothing
             @printf("RADIATION_ENERGY: samples=%d gas_total_change=%.8e kinetic_change=%.8e internal_change=%.8e magnetic_change=%.8e photon_change=%.8e resolved_coupled_change=%.8e component_residual=%.8e component_residual_abs=%.8e component_magnitude_abs=%.8e component_residual_norm=%.8e component_residual_abs_norm=%.8e photon_closure=%s\n",
