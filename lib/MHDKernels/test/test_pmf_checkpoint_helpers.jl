@@ -116,6 +116,40 @@ end
           _hydro_code_dt(dtphys, 0.0, vunit, lbox, a_ref)
 end
 
+@testset "exact cosmological diagnostic landing" begin
+    Om = 0.315
+    Or = 4.15e-5 / 0.674^2
+    OL = 1 - Om - Or
+    Ok = 0.0
+    a0 = z_to_a(3200.0)
+    for target_z in (3000.0, 1600.0, 500.0)
+        target_a = z_to_a(target_z)
+        dt = _dtau_to_scale_factor_rk2(Om, OL, Ok, Or, a0, target_a)
+        landed = _advance_a_rk2(Om, OL, Ok, Or, a0, dt, Inf)
+        @test landed ≈ target_a rtol=8eps(Float64) atol=0
+        @test a_to_z(landed) ≈ target_z rtol=8eps(Float64) atol=0
+    end
+
+    outputs = [3000.0, 1600.0, 500.0]
+    unrestricted = 10 * _dtau_to_scale_factor_rk2(
+        Om, OL, Ok, Or, a0, z_to_a(outputs[1]))
+    limited = _limit_dt_to_output_redshift(
+        unrestricted, Om, OL, Ok, Or, a0, outputs, 1)
+    @test _advance_a_rk2(Om, OL, Ok, Or, a0, limited, Inf) ≈
+          z_to_a(outputs[1]) rtol=8eps(Float64) atol=0
+    @test _limit_dt_to_output_redshift(
+        unrestricted, Om, OL, Ok, Or, a0, outputs, length(outputs) + 1) == unrestricted
+end
+
+@testset "particle supercomoving diagnostic units" begin
+    h = 0.674
+    a = z_to_a(3200.0)
+    box_ckpc_h = 1.0
+    h0 = 100.0 * h * 1.0e5 / 3.0856775814913673e24
+    lbox = box_ckpc_h * 3.0856775814913673e21 / h
+    @test _particle_velocity_cms_per_code(a, box_ckpc_h) ≈ h0 * lbox / a
+end
+
 @testset "imported PMF rescaling" begin
     mktempdir() do dir
         N = 4
@@ -210,6 +244,43 @@ end
         @test_throws ErrorException _import_initial_aux_state!(
             dir; N=N, particles=particles, chemistry=chemistry_helium,
             photons=photon, magnetic_residual=residual)
+    end
+end
+
+@testset "hydrogen-storage handoff contract" begin
+    mktempdir() do dir
+        N = 4
+        chemistry = ntuple(_ -> zeros(Float32, N^3), 3)
+        for (i, name) in enumerate(("chem_eint", "chem_HII", "chem_H2I"))
+            _write_f32_array_atomic(joinpath(dir, "$name.f32"),
+                                    fill(Float32(i) / 100, N^3))
+        end
+
+        # Legacy handoffs have no marker and are ionized-storage by definition.
+        _import_initial_aux_state!(dir; N=N, particles=(), chemistry=chemistry,
+                                   photons=nothing)
+        @test_throws ErrorException _import_initial_aux_state!(
+            dir; N=N, particles=(), chemistry=chemistry, photons=nothing,
+            neutral_hydrogen_storage=true)
+
+        write(joinpath(dir, "chem_hydrogen_storage.txt"), "neutral\n")
+        _import_initial_aux_state!(dir; N=N, particles=(), chemistry=chemistry,
+                                   photons=nothing,
+                                   neutral_hydrogen_storage=true)
+        @test_throws ErrorException _import_initial_aux_state!(
+            dir; N=N, particles=(), chemistry=chemistry, photons=nothing)
+
+        write(joinpath(dir, "chem_hydrogen_storage.txt"), "centered\n")
+        @test_throws ErrorException _import_initial_aux_state!(
+            dir; N=N, particles=(), chemistry=chemistry, photons=nothing,
+            centered_hydrogen_storage=true)
+        reference = 0.9999998123456789
+        write(joinpath(dir, "chem_hydrogen_reference.txt"), "$reference\n")
+        _import_initial_aux_state!(
+            dir; N=N, particles=(), chemistry=chemistry, photons=nothing,
+            centered_hydrogen_storage=true)
+        @test _initial_hydrogen_reference(dir, :centered) == reference
+        @test_throws ErrorException _initial_hydrogen_reference(dir, :neutral)
     end
 end
 

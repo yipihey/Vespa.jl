@@ -60,6 +60,16 @@ using MHDKernels, Test
     @test minimum(species1) >= 0
     @test maximum(species1 .+ species2) <= 1
 
+    centered = to_device(be, reshape(T[-3e-8 + 2e-8sin(2pi * (i - 1) / n) for
+                                      i in 1:n, j in 1:n, k in 1:n], :), T)
+    advect_passive_scalar!(centered, s.scratch[4], s, dt)
+    centered_expected = T[-3e-8 + 2e-8sin(2pi * ((i - 1) - 0.125) / n) for
+                          i in 1:n, j in 1:n, k in 1:n]
+    centered_host = to_host(centered)
+    @test minimum(centered_host) < 0
+    @test maximum(centered_host) > -3e-8
+    @test maximum(abs.(centered_host .- vec(centered_expected))) < 2e-10
+
     function compressible_transport_drift(n)
         Tcomp = backend_name === :metal ? Float32 : Float64
         s = allocate_state(

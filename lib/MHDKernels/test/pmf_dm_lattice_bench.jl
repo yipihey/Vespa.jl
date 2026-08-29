@@ -163,6 +163,14 @@ a_to_z(a) = 1.0 / a - 1.0
 dadtau(Om, OL, Ok, Or, a) = sqrt(a^3 * (Om + OL*a^3 + Ok*a + Or/a))
 dtau_for_dlna(Om, OL, Ok, Or, a, dlna) = a * dlna / dadtau(Om, OL, Ok, Or, a)
 
+function _particle_velocity_cms_per_code(a, box_ckpc_h)
+    a > 0 || throw(ArgumentError("particle velocity conversion requires a > 0"))
+    box_ckpc_h > 0 ||
+        throw(ArgumentError("particle velocity conversion requires a positive box"))
+    # H0 * (box_ckpc_h / h) = 10^4 * box_ckpc_h cm/s.
+    return 1.0e4 * Float64(box_ckpc_h) / Float64(a)
+end
+
 if BACKEND_NAME === :metal
     using Metal
     Metal.functional() || error("Metal backend is not functional")
@@ -317,18 +325,25 @@ end
         j = (q ÷ N) % N
         k = q ÷ (N * N)
         nT = Tv(N)
-        # Reconstruct directly in cell coordinates. Adding dxp to an absolute
-        # Float32 box position would round away the tiny high-z drift.
-        xpos = mod(Tv(i) + c05 + nT * (Tv(dxp[p]) + dcoef * Tv(vx[p])), nT)
-        ypos = mod(Tv(j) + c05 + nT * (Tv(dyp[p]) + dcoef * Tv(vy[p])), nT)
-        zpos = mod(Tv(k) + c05 + nT * (Tv(dzp[p]) + dcoef * Tv(vz[p])), nT)
-        i1 = unsafe_trunc(Int, xpos + c05)
-        j1 = unsafe_trunc(Int, ypos + c05)
-        k1 = unsafe_trunc(Int, zpos + c05)
-        dxr = Tv(i1) + c05 - xpos
-        dyr = Tv(j1) + c05 - ypos
-        dzr = Tv(k1) + c05 - zpos
-        ex = c1 - dxr; ey = c1 - dyr; ez = c1 - dzr
+        # Keep the fractional offset separate from the integer lattice cell.
+        # Forming i + N*dxp in Float32 discards the high-z displacement.
+        ux = c05 + nT * (Tv(dxp[p]) + dcoef * Tv(vx[p]))
+        uy = c05 + nT * (Tv(dyp[p]) + dcoef * Tv(vy[p]))
+        uz = c05 + nT * (Tv(dzp[p]) + dcoef * Tv(vz[p]))
+        ox = unsafe_trunc(Int, floor(ux + c05))
+        oy = unsafe_trunc(Int, floor(uy + c05))
+        oz = unsafe_trunc(Int, floor(uz + c05))
+        i1 = i + ox
+        j1 = j + oy
+        k1 = k + oz
+        dxr = Tv(ox) + c05 - ux
+        dyr = Tv(oy) + c05 - uy
+        dzr = Tv(oz) + c05 - uz
+        # Resolve both complementary weights directly. Computing 1-dxr would
+        # round a sub-ULP interpolation weight to zero when dxr is near one.
+        ex = ux - Tv(ox) + c05
+        ey = uy - Tv(oy) + c05
+        ez = uz - Tv(oz) + c05
         ax, ay, az = PoissonKernels._global_phi_force(phi, i1, j1, k1,
                                                        dxr, dyr, dzr, ex, ey, ez,
                                                        N, N, N, hc)
@@ -367,8 +382,9 @@ end
 function _deposit_particles!(rho, px, py, pz, vx, vy, vz;
                              N::Int, disp::Real, lattice_displacements::Bool)
     if lattice_displacements
-        MHDKernels.deposit_lattice_displacements!(rho, px, py, pz, vx, vy, vz;
-                                                   N=N, disp=disp, shift=-0.5)
+        MHDKernels.deposit_lattice_displacement_delta!(
+            rho, px, py, pz, vx, vy, vz; N=N, disp=disp, shift=-0.5,
+        )
     else
         PoissonKernels.cic_deposit!(rho, px, py, pz, vx, vy, vz, one(eltype(rho));
                                     N=N, disp=disp, shift=-0.5)
@@ -390,22 +406,22 @@ function _push_particles!(px, py, pz, vx, vy, vz, phi;
     return nothing
 end
 
-@kernel function _assemble_total_delta_k!(ρtot, @Const(gasρ), @Const(dmρ),
-                                          fb, fdm, N::Int)
+@kernel function _assemble_total_perturbation_k!(ρtot, @Const(gasρ), @Const(dmρ),
+                                                 fb, fdm, gas_mean, dm_mean,
+                                                 N::Int)
     c = @index(Global)
-    @inbounds ρtot[c] = fb * (gasρ[c] - one(eltype(ρtot))) +
-                        fdm * (dmρ[c] - one(eltype(ρtot)))
-end
-
-@kernel function _assemble_total_from_gas_delta_k!(ρtot,@Const(gas_delta),
-                                                   @Const(dmρ),fb,fdm,N::Int)
-    c=@index(Global)
-    @inbounds ρtot[c]=fb*gas_delta[c]+fdm*(dmρ[c]-one(eltype(ρtot)))
+    @inbounds ρtot[c] = fb * (gasρ[c] - gas_mean) +
+                            fdm * (dmρ[c] - dm_mean)
 end
 
 @kernel function _delta_from_density_k!(dst, @Const(src), N::Int)
     c = @index(Global)
     @inbounds dst[c] = src[c] - one(eltype(dst))
+end
+
+@kernel function _density_from_delta_k!(dst, @Const(src), N::Int)
+    c = @index(Global)
+    @inbounds dst[c] = src[c] + one(eltype(dst))
 end
 
 @kernel function _init_single_b_k!(rho, mx, my, mz, E, Bx, By, Bz, psi,
@@ -471,13 +487,21 @@ function _single_b_mode(env::AbstractString)
     error("MHD_PMF_INIT must be batchelor, forcefree, sine/magpressure, or alfven_linear; got '$env'")
 end
 
-@kernel function _init_reduced_chem_k!(HII, H2I, @Const(rho), xhii, xh2, fh, N::Int)
+@kernel function _init_reduced_chem_k!(HII, H2I, @Const(rho), xhii, xh2, fh,
+                                      hydrogen_reference, N::Int,
+                                      ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global)
     @inbounds begin
         r = rho[c]
-        HII[c] = xhii * fh * r
+        HII[c] = CH ? xhii - hydrogen_reference :
+                 (NH ? max(one(r) - xhii - xh2, zero(r)) : xhii) * fh * r
         H2I[c] = xh2 * fh * r
     end
+end
+
+@kernel function _recenter_hydrogen_delta_k!(hydrogen_delta, shift)
+    c = @index(Global)
+    @inbounds hydrogen_delta[c] -= shift
 end
 
 @kernel function _init_reduced_helium_k!(HeII, @Const(rho), heii_mass_fraction, N::Int)
@@ -549,33 +573,54 @@ end
 @kernel function _chem_mixing_mhd_k!(rho, @Const(mx), @Const(my), @Const(mz),
                                      E, @Const(Bx), @Const(By), @Const(Bz),
                                      HII, H2I, @Const(nsm),
-                                     nsm_scalar, du, vu2, tu, dt, z,
+                                     nsm_scalar, du, vu2, dt, z,
                                      f_alpha, Xe_mean, fudge, gauss,
                                      hubble, Om, OL, fh, hubble_expansion,
                                      rate_tables, dtfrac, itcap, small,
-                                     ::Val{NS}, ::Val{SN}) where {NS,SN}
+                                     hydrogen_references,
+                                     ::Val{NH}, ::Val{CH},
+                                     ::Val{NS}, ::Val{SN}) where {NH,CH,NS,SN}
     c = @index(Global)
     @inbounds begin
         T = eltype(E)
+        hydrogen_reference = real(hydrogen_references)
+        hydrogen_complement_reference = imag(hydrogen_references)
         r_code = max(rho[c], small)
         ek = T(0.5) * (mx[c]*mx[c] + my[c]*my[c] + mz[c]*mz[c]) / r_code
         eb = T(0.5) * (Bx[c]*Bx[c] + By[c]*By[c] + Bz[c]*Bz[c])
         e_code = max((E[c] - ek - eb) / r_code, T(1e-30))
+        hcap = max(T(fh) * r_code, eps(T))
+        h2_code_in = min(max(H2I[c], zero(T)), hcap)
+        xh2 = h2_code_in / hcap
+        hydrogen_code = if CH
+            fraction = NH ? T(hydrogen_complement_reference) - HII[c] - xh2 :
+                            T(hydrogen_reference) + HII[c]
+            min(max(fraction, zero(T)), max(one(T) - xh2, zero(T))) * hcap
+        else
+            HII[c]
+        end
         nsm_code = NS ? T(nsm_scalar) : nsm[c]
         nsm_h = nsm_code * du * (SN ? one(T) : T(fh)) / T(ChemistryKernels.MH)
         en, hii, h2, _, _ = ChemistryKernels.evolve_cell_mixing(
-            r_code * du, e_code * vu2, HII[c] * du, H2I[c] * du, zero(T),
-            nsm_h, dt * tu, z;
+            r_code * du, e_code * vu2, hydrogen_code * du, H2I[c] * du, zero(T),
+            nsm_h, dt, z;
             f_alpha=T(f_alpha), Xe_mean=T(Xe_mean),
             smoothed_is_neutral=Val(SN), fudge=T(fudge), gauss=T(gauss),
             hubble=T(hubble), Om=T(Om), OL=T(OL), fh=T(fh),
             deuterium=false, helium=false, hubble_expansion=hubble_expansion,
-            rate_tables=rate_tables, dtfrac=T(dtfrac), itcap=itcap)
+            rate_tables=rate_tables, dtfrac=T(dtfrac), itcap=itcap,
+            neutral_hydrogen_storage=Val(NH))
         cap = max(T(fh) * r_code, zero(T))
         h2_code = min(max(h2 / du, zero(T)), cap)
         hii_code = min(max(hii / du, zero(T)), max(cap - h2_code, zero(T)))
         H2I[c] = h2_code
-        HII[c] = hii_code
+        HII[c] = if CH
+            NH ? T(hydrogen_complement_reference) -
+                 (hii_code + h2_code) / max(cap, eps(T)) :
+                 hii_code / max(cap, eps(T)) - T(hydrogen_reference)
+        else
+            hii_code
+        end
         e_new = max(en / vu2, T(1e-30))
         E[c] = max(r_code * e_new + ek + eb, T(1e-30))
     end
@@ -584,35 +629,56 @@ end
 @kernel function _chem_mixing_helium_mhd_k!(rho, @Const(mx), @Const(my), @Const(mz),
                                             E, @Const(Bx), @Const(By), @Const(Bz),
                                             HII, H2I, HeII, @Const(nsm),
-                                            nsm_scalar, du, vu2, tu, dt, z,
+                                            nsm_scalar, du, vu2, dt, z,
                                             f_alpha, Xe_mean, fudge, gauss,
                                             hubble, Om, OL, fh, hubble_expansion,
                                             rate_tables, dtfrac, itcap, small,
-                                            ::Val{NS}, ::Val{SN}) where {NS,SN}
+                                            hydrogen_references,
+                                            ::Val{NH}, ::Val{CH},
+                                            ::Val{NS}, ::Val{SN}) where {NH,CH,NS,SN}
     c = @index(Global)
     @inbounds begin
         T = eltype(E)
+        hydrogen_reference = real(hydrogen_references)
+        hydrogen_complement_reference = imag(hydrogen_references)
         r_code = max(rho[c], small)
         ek = T(0.5) * (mx[c]*mx[c] + my[c]*my[c] + mz[c]*mz[c]) / r_code
         eb = T(0.5) * (Bx[c]*Bx[c] + By[c]*By[c] + Bz[c]*Bz[c])
         e_code = max((E[c] - ek - eb) / r_code, T(1e-30))
+        hcap = max(T(fh) * r_code, eps(T))
+        h2_code_in = min(max(H2I[c], zero(T)), hcap)
+        xh2 = h2_code_in / hcap
+        hydrogen_code = if CH
+            fraction = NH ? T(hydrogen_complement_reference) - HII[c] - xh2 :
+                            T(hydrogen_reference) + HII[c]
+            min(max(fraction, zero(T)), max(one(T) - xh2, zero(T))) * hcap
+        else
+            HII[c]
+        end
         nsm_code = NS ? T(nsm_scalar) : nsm[c]
         nsm_h = nsm_code * du * (SN ? one(T) : T(fh)) / T(ChemistryKernels.MH)
         en, hii, h2, _, heii = ChemistryKernels.evolve_cell_mixing(
-            r_code * du, e_code * vu2, HII[c] * du, H2I[c] * du, zero(T),
-            nsm_h, dt * tu, z;
+            r_code * du, e_code * vu2, hydrogen_code * du, H2I[c] * du, zero(T),
+            nsm_h, dt, z;
             f_alpha=T(f_alpha), Xe_mean=T(Xe_mean),
             smoothed_is_neutral=Val(SN), fudge=T(fudge), gauss=T(gauss),
             hubble=T(hubble), Om=T(Om), OL=T(OL), fh=T(fh),
             deuterium=false, helium=true, HeII_m=HeII[c] * du,
             hubble_expansion=hubble_expansion,
-            rate_tables=rate_tables, dtfrac=T(dtfrac), itcap=itcap)
+            rate_tables=rate_tables, dtfrac=T(dtfrac), itcap=itcap,
+            neutral_hydrogen_storage=Val(NH))
         hcap = max(T(fh) * r_code, zero(T))
         h2_code = min(max(h2 / du, zero(T)), hcap)
         hii_code = min(max(hii / du, zero(T)), max(hcap - h2_code, zero(T)))
         hecap = max((one(T) - T(fh)) * r_code, zero(T))
         H2I[c] = h2_code
-        HII[c] = hii_code
+        HII[c] = if CH
+            NH ? T(hydrogen_complement_reference) -
+                 (hii_code + h2_code) / max(hcap, eps(T)) :
+                 hii_code / max(hcap, eps(T)) - T(hydrogen_reference)
+        else
+            hii_code
+        end
         HeII[c] = min(max(heii / du, zero(T)), hecap)
         e_new = max(en / vu2, T(1e-30))
         E[c] = max(r_code * e_new + ek + eb, T(1e-30))
@@ -1790,13 +1856,23 @@ function _terminal_implicit_diffuse_B!(s, coeff_cells2::Real)
     return nothing
 end
 
-@kernel function _clamp_reduced_chem_k!(HII, H2I, @Const(rho), fh, N::Int)
+@kernel function _clamp_reduced_chem_k!(HII, H2I, @Const(rho), fh,
+                                        hydrogen_reference,
+                                        hydrogen_complement_reference,
+                                        N::Int, ::Val{CH}) where {CH}
     c = @index(Global)
     @inbounds begin
         T = eltype(HII)
         cap = max(fh * rho[c], zero(T))
         h2 = min(max(H2I[c], zero(T)), cap)
-        hii = min(max(HII[c], zero(T)), max(cap - h2, zero(T)))
+        hii = if CH
+            xh2 = h2 / max(cap, eps(T))
+            min(max(HII[c], -hydrogen_reference),
+                max(hydrogen_complement_reference - xh2,
+                    -hydrogen_reference))
+        else
+            min(max(HII[c], zero(T)), max(cap - h2, zero(T)))
+        end
         H2I[c] = h2
         HII[c] = hii
     end
@@ -1811,11 +1887,17 @@ end
     end
 end
 
-@kernel function _neutral_h_mass_k!(dst, @Const(rho), @Const(HII), @Const(H2I), fh, N::Int)
+@kernel function _neutral_h_mass_k!(dst, @Const(rho), @Const(HII), @Const(H2I),
+                                    fh, hydrogen_complement_reference, N::Int,
+                                    ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global)
     @inbounds begin
         T = eltype(dst)
-        dst[c] = max(fh * rho[c] - HII[c] - H2I[c], zero(T))
+        dst[c] = CH ? max(fh * rho[c] *
+                              (hydrogen_complement_reference - HII[c]) - H2I[c],
+                          zero(T)) :
+                 NH ? max(HII[c], zero(T)) :
+                 max(fh * rho[c] - HII[c] - H2I[c], zero(T))
     end
 end
 
@@ -1954,14 +2036,48 @@ end
     end
 end
 
+@kernel function _hydrogen_complement_fraction_diag_k!(dst, @Const(rho),
+                                                        @Const(hydrogen),
+                                                        @Const(H2I), fh,
+                                                        ::Val{NH}) where {NH}
+    c = @index(Global, Linear)
+    @inbounds begin
+        den = max(Float32(fh) * Float32(rho[c]), eps(Float32))
+        if NH
+            dst[c] = max((Float32(hydrogen[c]) + Float32(H2I[c])) / den, 0f0)
+        else
+            dst[c] = max(1f0 - Float32(hydrogen[c]) / den, 0f0)
+        end
+    end
+end
+
+@kernel function _centered_hii_fraction_diag_k!(dst, @Const(rho),
+                                                @Const(hydrogen_delta),
+                                                @Const(H2I), fh,
+                                                hydrogen_reference)
+    c = @index(Global, Linear)
+    @inbounds begin
+        R = eltype(dst)
+        hden = max(R(fh) * R(rho[c]), eps(R))
+        xh2 = max(R(H2I[c]) / hden, zero(R))
+        dst[c] = min(max(R(hydrogen_reference) + R(hydrogen_delta[c]), zero(R)),
+                     max(one(R) - xh2, zero(R)))
+    end
+end
+
 @kernel function _total_electron_fraction_diag_k!(dst, @Const(rho), @Const(HII),
-                                                  @Const(HeII), density_unit,
-                                                  z, fh)
+                                                  @Const(H2I), @Const(HeII),
+                                                  density_unit, z, fh,
+                                                  hydrogen_reference,
+                                                  ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global, Linear)
     @inbounds begin
         R = eltype(dst)
         r = max(R(rho[c]), eps(R))
-        xhii = max(R(HII[c]) / max(R(fh) * r, eps(R)), zero(R))
+        hden = max(R(fh) * r, eps(R))
+        xhii = CH ? max(R(hydrogen_reference) + R(HII[c]), zero(R)) :
+                NH ? max(one(R) - (R(HII[c]) + R(H2I[c])) / hden, zero(R)) :
+                    max(R(HII[c]) / hden, zero(R))
         xheii = max(R(HeII[c]) / max(R(4) * R(fh) * r, eps(R)), zero(R))
         nH = max(R(density_unit) * r * R(fh) / R(ChemistryKernels.MH), R(1e-30))
         dst[c] = ChemistryKernels.total_electron_fraction(
@@ -1989,7 +2105,8 @@ end
 
 @kernel function _gas_temperature_diag_k!(dst, @Const(rho), @Const(mx), @Const(my),
         @Const(mz), @Const(E), @Const(Bx), @Const(By), @Const(Bz), @Const(HII),
-        @Const(H2I), velocity_unit2, fh, gamma, smallr)
+        @Const(H2I), velocity_unit2, fh, gamma, smallr,
+        hydrogen_reference, ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global, Linear)
     @inbounds begin
         T = eltype(dst)
@@ -1997,8 +2114,10 @@ end
         kinetic = T(0.5) * (T(mx[c])^2 + T(my[c])^2 + T(mz[c])^2) / r
         magnetic = T(0.5) * (T(Bx[c])^2 + T(By[c])^2 + T(Bz[c])^2)
         specific_e = max((T(E[c]) - kinetic - magnetic) / r, T(1e-30))
-        hii_fraction = max(T(HII[c]) / r, zero(T))
         h2_fraction = max(T(H2I[c]) / r, zero(T))
+        hii_fraction = CH ? T(fh) * max(T(hydrogen_reference) + T(HII[c]), zero(T)) :
+                       NH ? max(T(fh) - T(HII[c]) / r - h2_fraction, zero(T)) :
+                            max(T(HII[c]) / r, zero(T))
         particles_per_mass_h = max(
             T(fh) + hii_fraction - T(0.5) * h2_fraction +
             (one(T) - T(fh)) / T(4),
@@ -2013,7 +2132,8 @@ end
 @kernel function _gas_temperature_helium_diag_k!(dst, @Const(rho), @Const(mx),
         @Const(my), @Const(mz), @Const(E), @Const(Bx), @Const(By), @Const(Bz),
         @Const(HII), @Const(H2I), @Const(HeII), density_unit, velocity_unit2, z,
-        fh, gamma, smallr)
+        fh, gamma, smallr, hydrogen_reference,
+        ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global, Linear)
     @inbounds begin
         R = eltype(dst)
@@ -2022,8 +2142,12 @@ end
         magnetic = R(0.5) * (R(Bx[c])^2 + R(By[c])^2 + R(Bz[c])^2)
         specific_e = max((R(E[c]) - kinetic - magnetic) / r, R(1e-30))
         du = R(density_unit)
+        hii_code = CH ? max(R(fh) * r *
+                             (R(hydrogen_reference) + R(HII[c])), zero(R)) :
+                   NH ? max(R(fh) * r - R(HII[c]) - R(H2I[c]), zero(R)) :
+                         R(HII[c])
         dst[c] = ChemistryKernels.temperature_from_reduced_helium(
-            r * du, specific_e * R(velocity_unit2), R(HII[c]) * du,
+            r * du, specific_e * R(velocity_unit2), hii_code * du,
             R(H2I[c]) * du, R(HeII[c]) * du, R(z);
             fh=R(fh), gamma=R(gamma))
     end
@@ -2125,7 +2249,9 @@ end
 end
 
 @kernel function _chem_ionized_compton_k!(rho, eint, HII, H2I,
-                                          du, vu2, dt, z, fh, gamma)
+                                          du, vu2, dt, z, fh, gamma,
+                                          hydrogen_reference, hydrogen_complement_reference,
+                                          ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global)
     @inbounds begin
         R = eltype(eint)
@@ -2136,15 +2262,18 @@ end
         r = r_code * du
         fhd = max(R(fh) * r, tiny)
         h2 = min(max(H2I[c] * du, tiny), fhd)
-        hii = max(fhd - h2, tiny)
+        Trad = R(2.725) * (one(R) + R(z))
+        nH = fhd / mh
+        hi = min(ChemistryKernels.hydrogen_saha_neutral_fraction(Trad, nH) * fhd,
+                 max(fhd - h2, zero(R)))
+        hii = max(fhd - h2 - hi, tiny)
         nHII = hii / mh
         nH2I = h2 / mh
-        nHI = tiny
+        nHI = max(hi / mh, tiny)
         nHeI = max((one(R) - R(fh)) * r / (R(4) * mh), tiny)
         ne = nHII
         ntot = max(nHI + nHII + ne + nHeI + R(0.5) * nH2I, tiny)
         e = max(eint[c] * vu2, tiny)
-        Trad = R(2.725) * (one(R) + R(z))
         Tnow = max((R(gamma) - one(R)) * r * e / (kb * ntot), one(R))
         c1 = ChemistryKernels.comp1_cmb(R(z))
         Kc = c1 * nHII * (Tnow / max(e, tiny)) / r
@@ -2156,14 +2285,17 @@ end
             e = e + (edot_c / r) * dt
         end
         eint[c] = max(e, tiny) / vu2
-        HII[c] = hii / du
+        HII[c] = CH ? hydrogen_complement_reference - (h2 + hi) / fhd :
+                 (NH ? hi : hii) / du
         H2I[c] = h2 / du
     end
 end
 
 @kernel function _chem_ionized_compton_helium_k!(rho, eint, HII, H2I, HeII,
                                                  du, vu2, dt, z, fh, gamma,
-                                                 xe_total, heii_mass_fraction)
+                                                 xe_total, heii_mass_fraction,
+                                                 hydrogen_reference, hydrogen_complement_reference,
+                                                 ::Val{NH}, ::Val{CH}) where {NH,CH}
     c = @index(Global)
     @inbounds begin
         R = eltype(eint)
@@ -2174,16 +2306,18 @@ end
         r = r_code * du
         fhd = max(R(fh) * r, tiny)
         h2 = min(max(H2I[c] * du, tiny), fhd)
-        hii = max(fhd - h2, tiny)
         nH = fhd / mh
+        Trad = R(2.725) * (one(R) + R(z))
+        hi = min(ChemistryKernels.hydrogen_saha_neutral_fraction(Trad, nH) * fhd,
+                 max(fhd - h2, zero(R)))
+        hii = max(fhd - h2 - hi, tiny)
         nH2I = h2 / mh
         nHII = hii / mh
-        nHI = tiny
+        nHI = max(hi / mh, tiny)
         nHe = max((one(R) - R(fh)) * r / (R(4) * mh), tiny)
         ne = max(R(xe_total) * nH, tiny)
         ntot = max(nHI + nHII + ne + nHe + R(0.5) * nH2I, tiny)
         e = max(eint[c] * vu2, tiny)
-        Trad = R(2.725) * (one(R) + R(z))
         Tnow = max((R(gamma) - one(R)) * r * e / (kb * ntot), one(R))
         c1 = ChemistryKernels.comp1_cmb(R(z))
         Kc = c1 * ne * (Tnow / max(e, tiny)) / r
@@ -2195,7 +2329,8 @@ end
             e = e + (edot_c / r) * dt
         end
         eint[c] = max(e, tiny) / vu2
-        HII[c] = hii / du
+        HII[c] = CH ? hydrogen_complement_reference - (h2 + hi) / fhd :
+                 (NH ? hi : hii) / du
         H2I[c] = h2 / du
         HeII[c] = R(heii_mass_fraction) * r_code
     end
@@ -2304,15 +2439,39 @@ function _device_complex_species_mode!(be, scratch, species, rho,
     return complex(values[1], -values[2])
 end
 
+function _device_complex_hii_mode!(be, scratch, fraction_scratch, hydrogen, H2I,
+                                   rho, N::Int, kmode::Int, fh,
+                                   neutral_hydrogen_storage::Bool,
+                                   centered_hydrogen_storage::Bool=false,
+                                   hydrogen_reference::Real=1)
+    centered_hydrogen_storage && return _device_complex_mode!(
+        be, scratch, hydrogen, N, kmode; mean=zero(eltype(hydrogen)))
+    neutral_hydrogen_storage || return _device_complex_species_mode!(
+        be, scratch, hydrogen, rho, N, kmode, fh)
+    _hydrogen_complement_fraction_diag_k!(be)(
+        fraction_scratch, rho, hydrogen, H2I, eltype(rho)(fh), Val(true);
+        ndrange=length(rho))
+    KA.synchronize(be)
+    mean_complement = Float64(sum(fraction_scratch)) / Float64(length(rho))
+    # x_HII = 1 - (x_HI + x_H2), so every nonzero Fourier mode is the
+    # negative complement mode. This avoids ever forming 1-x in Float32.
+    -_device_complex_mode!(be, scratch, fraction_scratch, N, kmode;
+                           mean=mean_complement)
+end
+
 function _device_complex_temperature_fraction_mode!(be, scratch, temperature_scratch,
         s, HII, H2I, HeII, N::Int, kmode::Int, velocity_unit2, z, fh,
-        hubble, omega_b)
+        hubble, omega_b, neutral_hydrogen_storage::Bool=false,
+        centered_hydrogen_storage::Bool=false,
+        hydrogen_reference::Real=1)
     n = length(s.U[1])
     if HeII === nothing
         _gas_temperature_diag_k!(be)(
             temperature_scratch, s.U[1], s.U[2], s.U[3], s.U[4], s.U[5],
             s.U[6], s.U[7], s.U[8], HII, H2I, eltype(s.U[1])(velocity_unit2),
-            eltype(s.U[1])(fh), s.γ, s.smallr; ndrange=n,
+            eltype(s.U[1])(fh), s.γ, s.smallr,
+            eltype(s.U[1])(hydrogen_reference), Val(neutral_hydrogen_storage),
+            Val(centered_hydrogen_storage); ndrange=n,
         )
     else
         density_unit = _density_unit_cgs(z, hubble, omega_b)
@@ -2321,7 +2480,9 @@ function _device_complex_temperature_fraction_mode!(be, scratch, temperature_scr
             s.U[6], s.U[7], s.U[8], HII, H2I, HeII,
             eltype(s.U[1])(density_unit), eltype(s.U[1])(velocity_unit2),
             eltype(s.U[1])(z),
-            eltype(s.U[1])(fh), s.γ, s.smallr; ndrange=n,
+            eltype(s.U[1])(fh), s.γ, s.smallr,
+            eltype(s.U[1])(hydrogen_reference), Val(neutral_hydrogen_storage),
+            Val(centered_hydrogen_storage); ndrange=n,
         )
     end
     KA.synchronize(be)
@@ -2397,16 +2558,38 @@ function _device_density_cos_mode_amp!(be,scratch,rho,N::Int,kmode::Int,
 end
 
 function _device_species_stats!(be, scratch, rho, HII, H2I, HeII, fh;
-                                z=NaN, h=0.674, Ob=0.049)
+                                z=NaN, h=0.674, Ob=0.049,
+                                neutral_hydrogen_storage::Bool=false,
+                                centered_hydrogen_storage::Bool=false,
+                                hydrogen_reference::Real=1)
     if HII === nothing
         return ntuple(_ -> NaN, 12)
     end
     n = length(rho)
-    _species_fraction_diag_k!(be)(scratch, rho, HII, T(fh); ndrange=n)
-    KA.synchronize(be)
-    xhmean = Float64(sum(scratch)) / Float64(n)
-    xhmin = Float64(minimum(scratch))
-    xhmax = Float64(maximum(scratch))
+    if centered_hydrogen_storage
+        _centered_hii_fraction_diag_k!(be)(
+            scratch, rho, HII, H2I, T(fh), T(hydrogen_reference); ndrange=n)
+        KA.synchronize(be)
+        xhmean = Float64(sum(scratch)) / Float64(n)
+        xhmin = Float64(minimum(scratch))
+        xhmax = Float64(maximum(scratch))
+    elseif neutral_hydrogen_storage
+        _hydrogen_complement_fraction_diag_k!(be)(
+            scratch, rho, HII, H2I, T(fh), Val(true); ndrange=n)
+        KA.synchronize(be)
+        complement_mean = Float64(sum(scratch)) / Float64(n)
+        complement_min = Float64(minimum(scratch))
+        complement_max = Float64(maximum(scratch))
+        xhmean = 1.0 - complement_mean
+        xhmin = 1.0 - complement_max
+        xhmax = 1.0 - complement_min
+    else
+        _species_fraction_diag_k!(be)(scratch, rho, HII, T(fh); ndrange=n)
+        KA.synchronize(be)
+        xhmean = Float64(sum(scratch)) / Float64(n)
+        xhmin = Float64(minimum(scratch))
+        xhmax = Float64(maximum(scratch))
+    end
 
     _species_fraction_diag_k!(be)(scratch, rho, H2I, T(fh); ndrange=n)
     KA.synchronize(be)
@@ -2426,13 +2609,29 @@ function _device_species_stats!(be, scratch, rho, HII, H2I, HeII, fh;
 
     density_unit = _density_unit_cgs(z, h, Ob)
     _total_electron_fraction_diag_k!(be)(
-        scratch, rho, HII, HeII, T(density_unit), T(z), T(fh); ndrange=n)
+        scratch, rho, HII, H2I, HeII, T(density_unit), T(z), T(fh),
+        T(hydrogen_reference), Val(neutral_hydrogen_storage),
+        Val(centered_hydrogen_storage); ndrange=n)
     KA.synchronize(be)
     xtmean = Float64(sum(scratch)) / Float64(n)
     xtmin = Float64(minimum(scratch))
     xtmax = Float64(maximum(scratch))
     return (xhmean, xhmin, xhmax, x2mean, x2min, x2max,
             xhemean, xhemin, xhemax, xtmean, xtmin, xtmax)
+end
+
+function _device_hii_mean!(be, scratch, rho, hydrogen, H2I, fh,
+                           neutral_hydrogen_storage::Bool,
+                           centered_hydrogen_storage::Bool=false,
+                           hydrogen_reference::Real=1)
+    centered_hydrogen_storage && return hydrogen_reference +
+        Float64(sum(hydrogen)) / Float64(length(hydrogen))
+    neutral_hydrogen_storage ||
+        return _device_species_mean!(be, scratch, rho, hydrogen, fh)
+    _hydrogen_complement_fraction_diag_k!(be)(
+        scratch, rho, hydrogen, H2I, T(fh), Val(true); ndrange=length(rho))
+    KA.synchronize(be)
+    1.0 - Float64(sum(scratch)) / Float64(length(rho))
 end
 
 function _device_species_mean!(be, scratch, rho, species, fh)
@@ -2463,19 +2662,25 @@ function _device_thermal_stats!(be, s, scratch)
 end
 
 function _device_temperature_stats!(be, s, scratch, HII, H2I, HeII,
-                                    density_unit, velocity_unit2, z, fh)
+                                    density_unit, velocity_unit2, z, fh,
+                                    neutral_hydrogen_storage::Bool=false,
+                                    centered_hydrogen_storage::Bool=false,
+                                    hydrogen_reference::Real=1)
     HII === nothing && return (NaN, NaN, NaN)
     n = length(s.U[1])
     if HeII === nothing
         _gas_temperature_diag_k!(be)(
             scratch, s.U[1], s.U[2], s.U[3], s.U[4], s.U[5],
             s.U[6], s.U[7], s.U[8], HII, H2I, T(velocity_unit2), T(fh),
-            s.γ, s.smallr; ndrange=n)
+            s.γ, s.smallr, T(hydrogen_reference), Val(neutral_hydrogen_storage),
+            Val(centered_hydrogen_storage); ndrange=n)
     else
         _gas_temperature_helium_diag_k!(be)(
             scratch, s.U[1], s.U[2], s.U[3], s.U[4], s.U[5],
             s.U[6], s.U[7], s.U[8], HII, H2I, HeII, T(density_unit),
-            T(velocity_unit2), T(z), T(fh), s.γ, s.smallr; ndrange=n)
+            T(velocity_unit2), T(z), T(fh), s.γ, s.smallr,
+            T(hydrogen_reference), Val(neutral_hydrogen_storage),
+            Val(centered_hydrogen_storage); ndrange=n)
     end
     KA.synchronize(be)
     (Float64(sum(scratch)) / Float64(n), Float64(minimum(scratch)),
@@ -2493,26 +2698,39 @@ end
 
 function _final_device_stats!(be,s,ρdm,scratch,HII,H2I,HeII,fh;
                               density_perturbation=nothing, z=NaN,
-                              h=0.674, Ob=0.049)
+                              h=0.674, Ob=0.049,
+                              dm_mean=one(eltype(ρdm)),
+                              neutral_hydrogen_storage::Bool=false,
+                              centered_hydrogen_storage::Bool=false,
+                              hydrogen_reference::Real=1)
     br = _device_brms!(be, s, scratch)
     divn = _device_divb_norm!(be, s, scratch, br)
     δb=density_perturbation === nothing ?
         _device_delta_rms!(be,scratch,s.U[1],one(T)) :
         _device_delta_rms!(be,scratch,density_perturbation,zero(T))
-    δdm = _device_delta_rms!(be, scratch, ρdm, one(T))
+    δdm = _device_delta_rms!(be, scratch, ρdm, dm_mean)
     chemstats = _device_species_stats!(be, scratch, s.U[1], HII, H2I, HeII, fh;
-                                       z=z, h=h, Ob=Ob)
+                                       z=z, h=h, Ob=Ob,
+                                       neutral_hydrogen_storage=neutral_hydrogen_storage,
+                                       centered_hydrogen_storage=centered_hydrogen_storage,
+                                       hydrogen_reference=hydrogen_reference)
     return br, divn, δb, δdm, chemstats
 end
 
 function _adaptive_diag_watch!(be,s,scratch,HII,H2I,HeII,fh;
                                density_perturbation=nothing, z=NaN,
-                               h=0.674, Ob=0.049)
+                               h=0.674, Ob=0.049,
+                               neutral_hydrogen_storage::Bool=false,
+                               centered_hydrogen_storage::Bool=false,
+                               hydrogen_reference::Real=1)
     δb=density_perturbation === nothing ?
         _device_delta_rms!(be,scratch,s.U[1],one(T)) :
         _device_delta_rms!(be,scratch,density_perturbation,zero(T))
     chemstats = _device_species_stats!(be, scratch, s.U[1], HII, H2I, HeII, fh;
-                                       z=z, h=h, Ob=Ob)
+                                       z=z, h=h, Ob=Ob,
+                                       neutral_hydrogen_storage=neutral_hydrogen_storage,
+                                       centered_hydrogen_storage=centered_hydrogen_storage,
+                                       hydrogen_reference=hydrogen_reference)
     return δb, chemstats[1]
 end
 
@@ -2676,6 +2894,8 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                                   chem_fused_analytic::Bool,
                                   chem_fused_mixing::Bool,
                                   chem_helium::Bool,
+                                  chem_neutral_hydrogen_storage::Bool,
+                                  chem_centered_hydrogen_storage::Bool,
                                   chem_expansion::Bool,
                                   chem_profile_enabled::Bool, measuring::Bool,
                                   refresh_mean::Bool,
@@ -2697,6 +2917,10 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
     T = eltype(s.U[1])
     xe_mean = evolving_xe_mean
     xheii_mean = evolving_xheii_mean
+    hydrogen_reference = evolving_xe_mean
+    hydrogen_complement_reference = 1.0 - hydrogen_reference
+    internal_neutral_hydrogen = chem_neutral_hydrogen_storage ||
+        (chem_centered_hydrogen_storage && hydrogen_reference >= 0.5)
     tc = _time_phase(be_p, be_mhd) do
         profile_chem = chem_profile_enabled && measuring
         zchem = zrun ? a_to_z(0.5 * (a0 + a1)) : 0.0
@@ -2726,6 +2950,10 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                 fundamental_k_mpc=2pi * _PMF_MPC_CM / terminal_lbox_cm,
                 theta_over_aH_conversion=theta_conversion,
                 hydrogen_mass_fraction=fh,
+                neutral_hydrogen_storage=internal_neutral_hydrogen,
+                centered_hydrogen_storage=chem_centered_hydrogen_storage,
+                hydrogen_reference=hydrogen_reference,
+                hydrogen_complement_reference=hydrogen_complement_reference,
                 velocity_unit2=velocity_unit2,
                 temperature_reference=_PMF_T_CMB * (1 + zchem))
             if profile_chem
@@ -2769,11 +2997,18 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                             s.U[1], eint, HII, H2I, HeII,
                             T(dunit), T(velocity_unit2), T(dtphys), T(zchem), fh,
                             T(s.γ), T(helium_state.xe_total),
-                            T(helium_state.heii_mass_fraction); ndrange=ncells)
+                            T(helium_state.heii_mass_fraction),
+                            T(hydrogen_reference), T(hydrogen_complement_reference),
+                            Val(internal_neutral_hydrogen),
+                            Val(chem_centered_hydrogen_storage); ndrange=ncells)
                     else
                         _chem_ionized_compton_k!(be_p)(s.U[1], eint, HII, H2I,
                                                        T(dunit), T(velocity_unit2),
-                                                       T(dtphys), T(zchem), fh, T(s.γ);
+                                                       T(dtphys), T(zchem), fh, T(s.γ),
+                                                       T(hydrogen_reference),
+                                                       T(hydrogen_complement_reference),
+                                                       Val(internal_neutral_hydrogen),
+                                                       Val(chem_centered_hydrogen_storage);
                                                        ndrange=ncells)
                     end
                 end
@@ -2782,12 +3017,19 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                     _chem_ionized_compton_helium_k!(be_p)(
                         s.U[1], eint, HII, H2I, HeII,
                         T(dunit), T(velocity_unit2), T(dtphys), T(zchem), fh,
-                        T(s.γ), T(helium_state.xe_total),
-                        T(helium_state.heii_mass_fraction); ndrange=ncells)
+                            T(s.γ), T(helium_state.xe_total),
+                            T(helium_state.heii_mass_fraction),
+                            T(hydrogen_reference), T(hydrogen_complement_reference),
+                            Val(internal_neutral_hydrogen),
+                            Val(chem_centered_hydrogen_storage); ndrange=ncells)
                 else
                     _chem_ionized_compton_k!(be_p)(s.U[1], eint, HII, H2I,
                                                    T(dunit), T(velocity_unit2),
-                                                   T(dtphys), T(zchem), fh, T(s.γ);
+                                                   T(dtphys), T(zchem), fh, T(s.γ),
+                                                   T(hydrogen_reference),
+                                                   T(hydrogen_complement_reference),
+                                                   Val(internal_neutral_hydrogen),
+                                                   Val(chem_centered_hydrogen_storage);
                                                    ndrange=ncells)
                 end
             end
@@ -2807,14 +3049,20 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                 elseif chem_smooth === :gaussian
                     if profile_chem
                         chem_phase[:smooth] += _time_phase(be_p, be_mhd) do
-                            _neutral_h_mass_k!(be_p)(ρtot, s.U[1], HII, H2I, fh, Int(N);
-                                                     ndrange=ncells)
+                            _neutral_h_mass_k!(be_p)(ρtot, s.U[1], HII, H2I, fh,
+                                                   T(hydrogen_complement_reference), Int(N),
+                                                   Val(internal_neutral_hydrogen),
+                                                   Val(chem_centered_hydrogen_storage);
+                                                   ndrange=ncells)
                             PoissonKernels.rfft_smooth_gaussian!(φ, ρtot;
                                 sigma_cells=chem_smooth_sigma, boxsize=boxsize)
                         end
                     else
-                        _neutral_h_mass_k!(be_p)(ρtot, s.U[1], HII, H2I, fh, Int(N);
-                                                 ndrange=ncells)
+                        _neutral_h_mass_k!(be_p)(ρtot, s.U[1], HII, H2I, fh,
+                                               T(hydrogen_complement_reference), Int(N),
+                                               Val(internal_neutral_hydrogen),
+                                               Val(chem_centered_hydrogen_storage);
+                                               ndrange=ncells)
                         PoissonKernels.rfft_smooth_gaussian!(φ, ρtot;
                             sigma_cells=chem_smooth_sigma, boxsize=boxsize)
                     end
@@ -2834,23 +3082,31 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                             _chem_mixing_helium_mhd_k!(be_p)(
                                 s.U[1], s.U[2], s.U[3], s.U[4], s.U[5],
                                 s.U[6], s.U[7], s.U[8], HII, H2I, HeII, nsm_arg,
-                                nsm_scalar, T(dunit), T(velocity_unit2), T(1.0),
+                                nsm_scalar, T(dunit), T(velocity_unit2),
                                 T(dtphys), T(zchem), T(f_alpha_step), T(xmean),
                                 T(chem_fudge), T(gauss), T(100hub), T(Om), T(OL), fh,
                                 chem_hubble_expansion, chem_rate_tables,
                                 T(chem_dtfrac), chem_itcap, T(s.smallr),
+                                Complex{T}(T(hydrogen_reference),
+                                           T(hydrogen_complement_reference)),
+                                Val(internal_neutral_hydrogen),
+                                Val(chem_centered_hydrogen_storage),
                                 Val(nsm_is_scalar == 1),
                                 Val(nsm_neutral == 1); ndrange=ncells)
                         else
                             _chem_mixing_mhd_k!(be_p)(
                                 s.U[1], s.U[2], s.U[3], s.U[4], s.U[5],
                                 s.U[6], s.U[7], s.U[8], HII, H2I, nsm_arg,
-                                nsm_scalar, T(dunit), T(velocity_unit2), T(1.0),
+                                nsm_scalar, T(dunit), T(velocity_unit2),
                                 T(dtphys), T(zchem), T(f_alpha_step), T(xmean),
                                 T(chem_fudge), T(gauss), T(100hub), T(Om), T(OL), fh,
-                                chem_hubble_expansion, chem_rate_tables,
-                                T(chem_dtfrac), chem_itcap, T(s.smallr),
-                                Val(nsm_is_scalar == 1),
+                            chem_hubble_expansion, chem_rate_tables,
+                            T(chem_dtfrac), chem_itcap, T(s.smallr),
+                            Complex{T}(T(hydrogen_reference),
+                                       T(hydrogen_complement_reference)),
+                            Val(internal_neutral_hydrogen),
+                            Val(chem_centered_hydrogen_storage),
+                            Val(nsm_is_scalar == 1),
                                 Val(nsm_neutral == 1); ndrange=ncells)
                         end
                     else
@@ -2939,7 +3195,10 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
         if profile_chem
             if !use_fused_chem
                 chem_phase[:clamp] += _time_phase(be_p, be_mhd) do
-                    _clamp_reduced_chem_k!(be_p)(HII, H2I, s.U[1], fh, Int(N);
+                    _clamp_reduced_chem_k!(be_p)(
+                        HII, H2I, s.U[1], fh, T(hydrogen_reference),
+                        T(hydrogen_complement_reference), Int(N),
+                        Val(chem_centered_hydrogen_storage);
                                                 ndrange=ncells)
                     chem_helium && _clamp_reduced_helium_k!(be_p)(
                         HeII, s.U[1], fh, Int(N); ndrange=ncells)
@@ -2947,7 +3206,15 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
             end
             if refresh_mean
                 chem_phase[:mean] += @elapsed begin
-                    xe_mean = _device_species_mean!(be_p, s.scratch[1], s.U[1], HII, fh)
+                    xe_mean = _device_hii_mean!(
+                        be_p, s.scratch[1], s.U[1], HII, H2I, fh,
+                        internal_neutral_hydrogen,
+                        chem_centered_hydrogen_storage, hydrogen_reference)
+                    if chem_centered_hydrogen_storage
+                        _recenter_hydrogen_delta_k!(be_p)(
+                            HII, T(xe_mean - hydrogen_reference); ndrange=ncells)
+                        KA.synchronize(be_p)
+                    end
                     chem_helium && (xheii_mean = _device_species_mean!(
                         be_p, s.scratch[1], s.U[1], HeII, 4T(fh)))
                 end
@@ -2961,14 +3228,25 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
             end
         else
             if !use_fused_chem
-                _clamp_reduced_chem_k!(be_p)(HII, H2I, s.U[1], fh, Int(N);
+                _clamp_reduced_chem_k!(be_p)(
+                    HII, H2I, s.U[1], fh, T(hydrogen_reference),
+                    T(hydrogen_complement_reference), Int(N),
+                    Val(chem_centered_hydrogen_storage);
                                             ndrange=ncells)
                 chem_helium && _clamp_reduced_helium_k!(be_p)(
                     HeII, s.U[1], fh, Int(N); ndrange=ncells)
                 KA.synchronize(be_p)
             end
             if refresh_mean
-                xe_mean = _device_species_mean!(be_p, s.scratch[1], s.U[1], HII, fh)
+                xe_mean = _device_hii_mean!(
+                    be_p, s.scratch[1], s.U[1], HII, H2I, fh,
+                    internal_neutral_hydrogen,
+                    chem_centered_hydrogen_storage, hydrogen_reference)
+                if chem_centered_hydrogen_storage
+                    _recenter_hydrogen_delta_k!(be_p)(
+                        HII, T(xe_mean - hydrogen_reference); ndrange=ncells)
+                    KA.synchronize(be_p)
+                end
                 chem_helium && (xheii_mean = _device_species_mean!(
                     be_p, s.scratch[1], s.U[1], HeII, 4T(fh)))
             end
@@ -2993,6 +3271,36 @@ function _advance_a_rk2(Om, OL, Ok, Or, a, dt, a_end)
     amid = a + 0.5 * k1 * dt
     k2 = dadtau(Om, OL, Ok, Or, amid)
     return min(a + k2 * dt, a_end)
+end
+
+function _dtau_to_scale_factor_rk2(Om, OL, Ok, Or, a, target_a)
+    target_a > a || return 0.0
+    estimate = (target_a - a) / max(dadtau(Om, OL, Ok, Or, a), eps(Float64))
+    lo = 0.0
+    hi = max(estimate, eps(Float64))
+    while _advance_a_rk2(Om, OL, Ok, Or, a, hi, Inf) < target_a
+        hi *= 2
+    end
+    for _ in 1:56
+        mid = 0.5 * (lo + hi)
+        if _advance_a_rk2(Om, OL, Ok, Or, a, mid, Inf) < target_a
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    return hi
+end
+
+function _limit_dt_to_output_redshift(dt, Om, OL, Ok, Or, a, output_zs, next_index)
+    next_index <= length(output_zs) || return Float64(dt)
+    target_a = z_to_a(output_zs[next_index])
+    tolerance = 64eps(Float64) * max(1.0, abs(a), abs(target_a))
+    target_a > a + tolerance || return Float64(dt)
+    estimate = dtau_for_dlna(Om, OL, Ok, Or, a, log(target_a / a))
+    estimate <= Float64(dt) * (1 + 1e-8) || return Float64(dt)
+    return min(Float64(dt),
+               _dtau_to_scale_factor_rk2(Om, OL, Ok, Or, a, target_a))
 end
 
 function _cosmic_dt_seconds(a0, a1, h, Om, OL, Or)
@@ -3286,11 +3594,42 @@ function _import_initial_mhd_state!(be, dir::AbstractString, s; N::Int)
     return Float32(brms)
 end
 
+function _initial_hydrogen_storage(dir::AbstractString)
+    storage_path = joinpath(dir, "chem_hydrogen_storage.txt")
+    storage = isfile(storage_path) ?
+        Symbol(lowercase(strip(read(storage_path, String)))) : :ionized
+    storage in (:ionized, :neutral, :centered) || error(
+        "invalid initial-state hydrogen storage marker $storage in $storage_path")
+    storage
+end
+
+function _initial_hydrogen_reference(dir::AbstractString, requested_storage::Symbol)
+    isempty(dir) && return nothing
+    isfile(joinpath(dir, "chem_HII.f32")) || return nothing
+    imported_storage = _initial_hydrogen_storage(dir)
+    imported_storage === requested_storage || error(
+        "initial-state chemistry uses $imported_storage hydrogen storage, " *
+        "but this run requests $requested_storage; regenerate or migrate the handoff")
+    requested_storage === :centered || return nothing
+    reference_path = joinpath(dir, "chem_hydrogen_reference.txt")
+    isfile(reference_path) || error(
+        "centered initial-state chemistry requires $reference_path")
+    reference = tryparse(Float64, strip(read(reference_path, String)))
+    reference === nothing && error("invalid centered hydrogen reference in $reference_path")
+    isfinite(reference) && 0 <= reference <= 1 || error(
+        "centered hydrogen reference must lie in [0,1]; got $reference")
+    reference
+end
+
 function _import_initial_aux_state!(dir::AbstractString; N::Int,
                                     particles, chemistry, photons,
                                     density_perturbation=nothing,
-                                    magnetic_residual=nothing)
+                                    magnetic_residual=nothing,
+                                    neutral_hydrogen_storage::Bool=false,
+                                    centered_hydrogen_storage::Bool=false)
     isempty(dir) && return nothing
+    neutral_hydrogen_storage && centered_hydrogen_storage && error(
+        "initial-state hydrogen storage cannot be both neutral and centered")
     particle_names = ("particle_px", "particle_py", "particle_pz",
                       "particle_vx", "particle_vy", "particle_vz")
     particle_present = map(name -> isfile(joinpath(dir, "$name.f32")), particle_names)
@@ -3311,6 +3650,14 @@ function _import_initial_aux_state!(dir::AbstractString; N::Int,
         all(chem_present) || !any(chem_present) ||
             error("initial-state chemistry import must provide all requested chemistry fields")
         if all(chem_present)
+            imported_storage = _initial_hydrogen_storage(dir)
+            requested_storage = centered_hydrogen_storage ? :centered :
+                                neutral_hydrogen_storage ? :neutral : :ionized
+            imported_storage === requested_storage || error(
+                "initial-state chemistry uses $imported_storage hydrogen storage, " *
+                "but this run requests $requested_storage; regenerate or migrate the handoff")
+            requested_storage === :centered &&
+                _initial_hydrogen_reference(dir, requested_storage)
             for (array, name) in zip(chemistry, chem_names)
                 _read_f32_array_into!(array, joinpath(dir, "$name.f32"), (N^3,))
             end
@@ -3549,10 +3896,17 @@ end
 function _write_linear_mode!(path; be, s, rho_dm, scratch, N, gravity,
                              cycle, measured, a, kmode, boxsize, hubble,
                              omega_b=0.049,
+                             rho_dm_mean=one(eltype(rho_dm)),
+                             particle_displacement_x=nothing,
+                             particle_velocity_x=nothing,
+                             particle_velocity_cms_factor=NaN,
                              gas_delta=nothing, HII=nothing, H2I=nothing,
                              HeII=nothing,
                              fh=0.76f0, photon_real_batch=nothing,
-                             temperature_velocity_unit2=NaN)
+                             temperature_velocity_unit2=NaN,
+                             neutral_hydrogen_storage=false,
+                             centered_hydrogen_storage=false,
+                             hydrogen_reference=1.0)
     isempty(path) && return
     0 < kmode < N ÷ 2 ||
         error("complex mode diagnostics require 0 < MHD_PMF_KMODE < N/2")
@@ -3584,7 +3938,21 @@ function _write_linear_mode!(path; be, s, rho_dm, scratch, N, gravity,
     end
     if gravity
         push!(rows, "dm_delta" => _device_complex_mode!(be, scratch, rho_dm, N,
-                                                          kmode; mean=one(eltype(rho_dm))))
+                                                          kmode; mean=rho_dm_mean))
+        if particle_displacement_x !== nothing
+            push!(rows, "dm_displacement_x" =>
+                        _device_complex_mode!(be, scratch,
+                                              particle_displacement_x, N,
+                                              kmode))
+        end
+        if particle_velocity_x !== nothing &&
+           isfinite(particle_velocity_cms_factor)
+            particle_velocity = _device_complex_mode!(
+                be, scratch, particle_velocity_x, N, kmode,
+            )
+            push!(rows, "dm_v_x" =>
+                        particle_velocity_cms_factor * particle_velocity)
+        end
     end
     if photon_real_batch !== nothing
         photon_delta = reshape(view(photon_real_batch, :, :, :, 1), :)
@@ -3604,7 +3972,11 @@ function _write_linear_mode!(path; be, s, rho_dm, scratch, N, gravity,
         end
     end
     HII === nothing || push!(rows, "x_HII" =>
-        _device_complex_species_mode!(be, scratch, HII, s.U[1], N, kmode, fh))
+        _device_complex_hii_mode!(be, scratch, s.scratch[4], HII, H2I,
+                                  s.U[1], N, kmode, fh,
+                                  neutral_hydrogen_storage,
+                                  centered_hydrogen_storage,
+                                  hydrogen_reference))
     H2I === nothing || push!(rows, "x_H2" =>
         _device_complex_species_mode!(be, scratch, H2I, s.U[1], N, kmode, fh))
     HeII === nothing || push!(rows, "x_HeII" =>
@@ -3623,6 +3995,9 @@ function _write_linear_mode!(path; be, s, rho_dm, scratch, N, gravity,
             _device_complex_temperature_fraction_mode!(
                 be, scratch, s.scratch[4], s, HII, H2I, HeII, N, kmode,
                 temperature_velocity_unit2, a_to_z(a), fh, hubble, omega_b,
+                neutral_hydrogen_storage,
+                centered_hydrogen_storage,
+                hydrogen_reference,
             ))
     end
 
@@ -3656,7 +4031,10 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
                             radiation_workspace=nothing,
                             radiation_photon_state=nothing,
                             radiation_drag_rate=NaN,
-                            temperature_velocity_unit2=NaN)
+                            temperature_velocity_unit2=NaN,
+                            neutral_hydrogen_storage=false,
+                            centered_hydrogen_storage=false,
+                            hydrogen_reference=1.0)
     T = eltype(s.U[1])
     if gravity
         _deposit_particles!(ρdm, px, py, pz, vx, vy, vz;
@@ -3667,17 +4045,24 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
     divn = _device_divb_norm!(be_p, s, scratch, br)
     gas_delta=radiation_workspace === nothing ? nothing :
               radiation_workspace.density_perturbation
+    dm_mean = lattice_displacements ? zero(T) : one(T)
     δb = gas_delta === nothing ? _device_delta_rms!(be_p,scratch,s.U[1],one(T)) :
                                  _device_delta_rms!(be_p,scratch,gas_delta,zero(T))
-    δdm = gravity ? _device_delta_rms!(be_p, scratch, ρdm, one(T)) : NaN
+    δdm = gravity ? _device_delta_rms!(be_p, scratch, ρdm, dm_mean) : NaN
     chemstats = _device_species_stats!(
         be_p, scratch, s.U[1], HII, H2I, HeII, fh;
-        z=a_to_z(a), h=hubble, Ob=omega_b)
+        z=a_to_z(a), h=hubble, Ob=omega_b,
+        neutral_hydrogen_storage=neutral_hydrogen_storage,
+        centered_hydrogen_storage=centered_hydrogen_storage,
+        hydrogen_reference=hydrogen_reference)
     thermalstats = _device_thermal_stats!(be_p, s, scratch)
     temperaturestats = isfinite(temperature_velocity_unit2) ?
         _device_temperature_stats!(be_p, s, scratch, HII, H2I, HeII,
                                    _density_unit_cgs(a_to_z(a), hubble, omega_b),
-                                   temperature_velocity_unit2, a_to_z(a), fh) :
+                                   temperature_velocity_unit2, a_to_z(a), fh,
+                                   neutral_hydrogen_storage,
+                                   centered_hydrogen_storage,
+                                   hydrogen_reference) :
         (NaN, NaN, NaN)
     btrans = _device_component_rms!(be_p, scratch, s.U[7])
     delta2k = gas_delta === nothing ?
@@ -3700,9 +4085,18 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
                             scratch=scratch, N=N, gravity=gravity, cycle=cycle,
                             measured=measured, a=a, kmode=mode_kmode,
                             boxsize=boxsize, hubble=hubble, omega_b=omega_b,
+                            rho_dm_mean=dm_mean,
+                            particle_displacement_x=lattice_displacements ? px : nothing,
+                            particle_velocity_x=lattice_displacements ? vx : nothing,
+                            particle_velocity_cms_factor=
+                                lattice_displacements ?
+                                _particle_velocity_cms_per_code(a, boxsize) : NaN,
                             gas_delta=gas_delta,
                             HII=HII, H2I=H2I, HeII=HeII, fh=fh,
                             temperature_velocity_unit2=temperature_velocity_unit2,
+                            neutral_hydrogen_storage=neutral_hydrogen_storage,
+                            centered_hydrogen_storage=centered_hydrogen_storage,
+                            hydrogen_reference=hydrogen_reference,
                             photon_real_batch=photon_real_ready ?
                                 radiation_workspace.real_batch : nothing)
     end
@@ -3712,7 +4106,14 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
                             be=be_p, cycle=cycle, measured=measured, a=a,
                             loglo=pdf_loglo, loghi=pdf_loghi)
         if gravity
-            _write_density_pdf!(pdf_path, "dm_rho", pdf_counts, ρdm;
+            dm_pdf_source = ρdm
+            if lattice_displacements
+                _density_from_delta_k!(be_p)(scratch, ρdm, Int(N);
+                                             ndrange=ncells)
+                KA.synchronize(be_p)
+                dm_pdf_source = scratch
+            end
+            _write_density_pdf!(pdf_path, "dm_rho", pdf_counts, dm_pdf_source;
                                 be=be_p, cycle=cycle, measured=measured, a=a,
                                 loglo=pdf_loglo, loghi=pdf_loghi)
         end
@@ -3733,8 +4134,12 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
                                                           kmax=kmax);
                  cycle=cycle, measured=measured, a=a, nmu=isotropic_nmu)
     if gravity
-        _delta_from_density_k!(be_p)(scratch, ρdm, Int(N); ndrange=ncells)
-        KA.synchronize(be_p)
+        if lattice_displacements
+            copyto!(scratch, ρdm)
+        else
+            _delta_from_density_k!(be_p)(scratch, ρdm, Int(N); ndrange=ncells)
+            KA.synchronize(be_p)
+        end
         _write_pkmu!(pk_path, "dm_delta",
                      PoissonKernels.power_spectrum_aniso_gpu(scratch; boxsize=boxsize,
                                                               nmu=isotropic_nmu,
@@ -4210,6 +4615,7 @@ function main()
     particle_wrap = get(ENV, "MHD_PARTICLE_WRAP", "1") in ("1", "true", "TRUE", "yes", "on")
     lattice_displacements = get(ENV, "MHD_PARTICLE_LATTICE_DISPLACEMENTS", "1") in
                                 ("1", "true", "TRUE", "yes", "on")
+    dm_density_mean = lattice_displacements ? zero(T) : one(T)
     gravity_phi_interp = get(ENV, "MHD_GRAVITY_PHI_INTERP", "0") in ("1", "true", "TRUE", "yes", "on")
     gravity_midpoint_source = get(ENV, "MHD_GRAVITY_MIDPOINT_SOURCE", "1") in
                                  ("1", "true", "TRUE", "yes", "on")
@@ -4288,6 +4694,19 @@ function main()
                                       string(max(abs(alfven_bguide), eps(Float64)) * alfven_bpert_frac)))
     chem_density_fixed = get(ENV, "MHD_CHEM_DENSITY_UNITS", "")
     mixing_chem = chem_mode === :mixing || chem_mode === :analytic_mixing
+    chem_hydrogen_storage = Symbol(lowercase(strip(get(
+        ENV, "MHD_CHEM_H_STORAGE", zrun && chem_mode === :mixing ? "centered" : "ionized"))))
+    chem_hydrogen_storage in (:ionized, :neutral, :centered) ||
+        error("MHD_CHEM_H_STORAGE must be ionized, neutral, or centered")
+    chem_neutral_hydrogen_storage = chem_hydrogen_storage === :neutral
+    chem_centered_hydrogen_storage = chem_hydrogen_storage === :centered
+    (chem_neutral_hydrogen_storage || chem_centered_hydrogen_storage) &&
+        chem_mode !== :mixing && error(
+            "MHD_CHEM_H_STORAGE=neutral/centered currently requires MHD_CHEM=mixing")
+    imported_hydrogen_reference = _initial_hydrogen_reference(
+        initial_state_dir, chem_hydrogen_storage)
+    imported_hydrogen_reference === nothing ||
+        (xhii0 = T(imported_hydrogen_reference))
     chem_dtfrac = parse(Float64, get(ENV, "MHD_CHEM_DTFRAC",
                                      zrun && mixing_chem ? "1.0" : "0.1"))
     # Boosted terminal steps can span the entire stiff recombination interval.
@@ -4338,10 +4757,15 @@ function main()
     chem_fused_mixing = get(ENV, "MHD_CHEM_FUSED_MIXING",
                             chem_mode === :mixing ? "1" : "0") in
                         ("1", "true", "TRUE", "yes", "on")
+    (chem_neutral_hydrogen_storage || chem_centered_hydrogen_storage) &&
+        !chem_fused_mixing && error(
+            "MHD_CHEM_H_STORAGE=neutral/centered requires MHD_CHEM_FUSED_MIXING=1")
     chem_helium && !chem_fused_mixing && error(
         "MHD_CHEM_HELIUM=1 requires MHD_CHEM_FUSED_MIXING=1")
     chem_mean_every = parse(Int, get(ENV, "MHD_CHEM_MEAN_EVERY", "1"))
     chem_mean_every >= 1 || error("MHD_CHEM_MEAN_EVERY must be positive")
+    chem_centered_hydrogen_storage && chem_mean_every != 1 && error(
+        "MHD_CHEM_H_STORAGE=centered requires MHD_CHEM_MEAN_EVERY=1")
     chem_fudge = parse(Float64, get(ENV, "MHD_CHEM_RECFAST_FUDGE",
                                     chem_recfast_hswitch ? "1.125" : "1.0"))
     final_diag = get(ENV, "MHD_FINAL_DIAG", "1") != "0"
@@ -4663,7 +5087,11 @@ function main()
             _init_lattice_k!(be_p)(px, py, pz, vx, vy, vz, Int(N); ndrange=ncells)
         end
         if chem_mode !== :off
-            _init_reduced_chem_k!(be_p)(HII, H2I, s.U[1], xhii0, xh20, fh, Int(N); ndrange=ncells)
+            _init_reduced_chem_k!(be_p)(HII, H2I, s.U[1], xhii0, xh20, fh,
+                                              T(xhii0), Int(N),
+                                              Val(chem_neutral_hydrogen_storage),
+                                              Val(chem_centered_hydrogen_storage);
+                                              ndrange=ncells)
             chem_helium && _init_reduced_helium_k!(be_p)(
                 HeII, s.U[1], T(initial_helium_state.heii_mass_fraction), Int(N);
                 ndrange=ncells)
@@ -4745,7 +5173,9 @@ function main()
             density_perturbation=radiation_workspace === nothing ? nothing :
                                  radiation_workspace.density_perturbation,
             magnetic_residual=radiation_workspace === nothing ? nothing :
-                              radiation_workspace.magnetic_residual)
+                                radiation_workspace.magnetic_residual,
+            neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+            centered_hydrogen_storage=chem_centered_hydrogen_storage)
         radiation_workspace === nothing ||
             MHDKernels.reconstruct_radiation_density!(radiation_workspace,s)
     end
@@ -4846,6 +5276,7 @@ function main()
         radiation_magnetic_compensation=radiation_magnetic_compensation,
         chem_mode=chem_mode, chem_coupling=chem_coupling,
         chem_helium=chem_helium,
+        chem_hydrogen_storage=chem_hydrogen_storage,
         chem_expansion=chem_expansion,
         chem_nonlocal_table=chem_nonlocal_table_path,
         chem_nonlocal_scale=chem_nonlocal_scale, gravity=gravity,
@@ -4962,12 +5393,16 @@ function main()
     if φprev !== nothing
         _stage("init_previous_gas_potential") do
             if radiation_workspace === nothing
-                _assemble_total_delta_k!(be_p)(ρtot,s.U[1],ρdm,
-                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                _assemble_total_perturbation_k!(be_p)(
+                    ρtot, s.U[1], ρdm, grav_gas_weight, grav_dm_weight,
+                    one(T), dm_density_mean, Int(N); ndrange=ncells,
+                )
             else
-                _assemble_total_from_gas_delta_k!(be_p)(ρtot,
-                    radiation_workspace.density_perturbation,ρdm,
-                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                _assemble_total_perturbation_k!(be_p)(
+                    ρtot, radiation_workspace.density_perturbation, ρdm,
+                    grav_gas_weight, grav_dm_weight, zero(T), dm_density_mean,
+                    Int(N); ndrange=ncells,
+                )
             end
             gravcoef0 = zrun ? 1.5 * Om * a : 1.0
             if fft_mode === :mps
@@ -5039,9 +5474,10 @@ function main()
             string(terminal_induction), terminal_induction_cfl, terminal_induction_dissipation,
             terminal_induction_dissipation_order, string(terminal_project_b),
             terminal_induction_max_subcycles)
-    @printf("  chemistry coupling=%s fused_analytic=%s fused_mixing=%s helium=%s ionized_fast_zmin=%.6g mean_every=%d profile=%s rate_tables=%s itcap=%d dtfrac=%.3g\n",
+    @printf("  chemistry coupling=%s fused_analytic=%s fused_mixing=%s helium=%s hydrogen_storage=%s ionized_fast_zmin=%.6g mean_every=%d profile=%s rate_tables=%s itcap=%d dtfrac=%.3g\n",
             String(chem_coupling), string(chem_fused_analytic), string(chem_fused_mixing),
-            string(chem_helium), chem_ionized_fast_zmin, chem_mean_every,
+            string(chem_helium), String(chem_hydrogen_storage),
+            chem_ionized_fast_zmin, chem_mean_every,
             string(chem_profile_enabled), string(chem_rate_tables_enabled),
             chem_itcap, chem_dtfrac)
     @printf("  chemistry species transport=%s scheme=bounded_fraction_backtrace scratch=reused_mhd\n",
@@ -5109,6 +5545,8 @@ function main()
             chem_fused_analytic=chem_fused_analytic,
             chem_fused_mixing=chem_fused_mixing,
             chem_helium=chem_helium,
+            chem_neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+            chem_centered_hydrogen_storage=chem_centered_hydrogen_storage,
             chem_expansion=chem_expansion,
             chem_profile_enabled=chem_profile_enabled, measuring=measuring_now,
             refresh_mean=refresh_mean, chem_phase=chem_phase,
@@ -5195,6 +5633,9 @@ function main()
                            mode_kmode=pmf_kmode, hubble=hub, omega_b=Ob,
                            radiation_workspace=radiation_workspace,
                            radiation_photon_state=radiation_photon_state,
+                           neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+                           centered_hydrogen_storage=chem_centered_hydrogen_storage,
+                           hydrogen_reference=evolving_xe_mean,
                            temperature_velocity_unit2=chem_mode === :off ? NaN :
                                chem_vunit^2 * (isfinite(cosmological_mhd_aref) ?
                                cosmological_mhd_aref / a : 1.0))
@@ -5269,7 +5710,14 @@ function main()
                                (max(nonlinear_signal, eps(Float64)) * hydro_per_tau)
                 dt = min(dt, dt_radiation)
             end
-            dt_end = dtau_for_dlna(Om, OL, Ok, Or, a, max(0.0, log(a_end / a)))
+            # Land on diagnostic redshifts with the same RK2 map used by the
+            # evolution. Post-crossing snapshots can otherwise differ in z by
+            # O(dt), contaminating convergence tests during recombination.
+            dt = _limit_dt_to_output_redshift(
+                dt, Om, OL, Ok, Or, a, pk_zs, pk_next[])
+            dt = _limit_dt_to_output_redshift(
+                dt, Om, OL, Ok, Or, a, frame_zs, frame_next[])
+            dt_end = _dtau_to_scale_factor_rk2(Om, OL, Ok, Or, a, a_end)
             if dt_end <= 8eps(Float64) * max(1.0, abs(dt))
                 a = a_end
                 break
@@ -5577,8 +6025,13 @@ function main()
             vcap_step = terminal_vcap
             if chem_advect_species
                 tm += _time_phase(be_mhd, be_p) do
-                    MHDKernels.conserved_species_to_fractions!(
-                        HII, H2I, s.U[1]; maximum_total=fh)
+                    if chem_centered_hydrogen_storage
+                        MHDKernels.conserved_species_to_fraction!(
+                            H2I, s.U[1]; maximum_total=fh)
+                    else
+                        MHDKernels.conserved_species_to_fractions!(
+                            HII, H2I, s.U[1]; maximum_total=fh)
+                    end
                     chem_helium && MHDKernels.conserved_species_to_fraction!(
                         HeII, s.U[1]; maximum_total=one(T) - fh)
                 end
@@ -5623,9 +6076,16 @@ function main()
             end
             if chem_advect_species
                 tm += _time_phase(be_mhd, be_p) do
-                    MHDKernels.advect_species_fractions!(
-                        HII, H2I, s.scratch[5], s.scratch[9], s, dt_hydro;
-                        maximum_total=fh)
+                    if chem_centered_hydrogen_storage
+                        MHDKernels.advect_passive_scalar!(
+                            HII, s.scratch[5], s, dt_hydro)
+                        MHDKernels.advect_species_fraction!(
+                            H2I, s.scratch[9], s, dt_hydro; maximum_total=fh)
+                    else
+                        MHDKernels.advect_species_fractions!(
+                            HII, H2I, s.scratch[5], s.scratch[9], s, dt_hydro;
+                            maximum_total=fh)
+                    end
                     chem_helium && MHDKernels.advect_species_fraction!(
                         HeII, eint, s, dt_hydro; maximum_total=one(T) - fh)
                 end
@@ -5666,8 +6126,13 @@ function main()
                 godunov_before = radiation_step_timing.godunov_s
                 if chem_advect_species
                     tm += _time_phase(be_mhd, be_p) do
-                        MHDKernels.conserved_species_to_fractions!(
-                            HII, H2I, s.U[1]; maximum_total=fh)
+                        if chem_centered_hydrogen_storage
+                            MHDKernels.conserved_species_to_fraction!(
+                                H2I, s.U[1]; maximum_total=fh)
+                        else
+                            MHDKernels.conserved_species_to_fractions!(
+                                HII, H2I, s.U[1]; maximum_total=fh)
+                        end
                         chem_helium && MHDKernels.conserved_species_to_fraction!(
                             HeII, s.U[1]; maximum_total=one(T) - fh)
                     end
@@ -5738,9 +6203,16 @@ function main()
                 end
                 if chem_advect_species
                     tm += _time_phase(be_mhd, be_p) do
-                        MHDKernels.advect_species_fractions!(
-                            HII, H2I, s.scratch[5], s.scratch[9], s, dtsub;
-                            maximum_total=fh)
+                        if chem_centered_hydrogen_storage
+                            MHDKernels.advect_passive_scalar!(
+                                HII, s.scratch[5], s, dtsub)
+                            MHDKernels.advect_species_fraction!(
+                                H2I, s.scratch[9], s, dtsub; maximum_total=fh)
+                        else
+                            MHDKernels.advect_species_fractions!(
+                                HII, H2I, s.scratch[5], s.scratch[9], s, dtsub;
+                                maximum_total=fh)
+                        end
                         chem_helium && MHDKernels.advect_species_fraction!(
                             HeII, eint, s, dtsub; maximum_total=one(T) - fh)
                     end
@@ -5842,24 +6314,35 @@ function main()
                     if gravity_midpoint_source
                         if radiation_workspace === nothing
                             MHDKernels.predict_density_backward!(ρtot,s,0.5*dt_hydro)
-                            _assemble_total_delta_k!(be_p)(ρtot,ρtot,ρdm,
-                                grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                            _assemble_total_perturbation_k!(be_p)(
+                                ρtot, ρtot, ρdm, grav_gas_weight,
+                                grav_dm_weight, one(T), dm_density_mean, Int(N);
+                                ndrange=ncells,
+                            )
                         else
                             MHDKernels.predict_density_perturbation_backward!(ρtot,
                                 radiation_workspace.density_perturbation,
                                 s.U[2],s.U[3],s.U[4],s.dims;
                                 dx=s.dx,dt_back=0.5*dt_hydro)
-                            _assemble_total_from_gas_delta_k!(be_p)(ρtot,ρtot,ρdm,
-                                grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                            _assemble_total_perturbation_k!(be_p)(
+                                ρtot, ρtot, ρdm, grav_gas_weight,
+                                grav_dm_weight, zero(T), dm_density_mean, Int(N);
+                                ndrange=ncells,
+                            )
                         end
                     else
                         if radiation_workspace === nothing
-                            _assemble_total_delta_k!(be_p)(ρtot,s.U[1],ρdm,
-                                grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                            _assemble_total_perturbation_k!(be_p)(
+                                ρtot, s.U[1], ρdm, grav_gas_weight,
+                                grav_dm_weight, one(T), dm_density_mean, Int(N);
+                                ndrange=ncells,
+                            )
                         else
-                            _assemble_total_from_gas_delta_k!(be_p)(ρtot,
-                                radiation_workspace.density_perturbation,ρdm,
-                                grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                            _assemble_total_perturbation_k!(be_p)(
+                                ρtot, radiation_workspace.density_perturbation,
+                                ρdm, grav_gas_weight, grav_dm_weight, zero(T),
+                                dm_density_mean, Int(N); ndrange=ncells,
+                            )
                         end
                     end
                 end
@@ -5928,24 +6411,37 @@ function main()
                             dt_back_hydro = _hydro_subinterval(dt_hydro, dt, dt_back)
                             if radiation_workspace === nothing
                                 MHDKernels.predict_density_backward!(ρtot,s,dt_back_hydro)
-                                _assemble_total_delta_k!(be_p)(ρtot,ρtot,ρdm,
-                                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                                _assemble_total_perturbation_k!(be_p)(
+                                    ρtot, ρtot, ρdm, grav_gas_weight,
+                                    grav_dm_weight, one(T), dm_density_mean,
+                                    Int(N); ndrange=ncells,
+                                )
                             else
                                 MHDKernels.predict_density_perturbation_backward!(ρtot,
                                     radiation_workspace.density_perturbation,
                                     s.U[2],s.U[3],s.U[4],s.dims;
                                     dx=s.dx,dt_back=dt_back_hydro)
-                                _assemble_total_from_gas_delta_k!(be_p)(ρtot,ρtot,ρdm,
-                                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                                _assemble_total_perturbation_k!(be_p)(
+                                    ρtot, ρtot, ρdm, grav_gas_weight,
+                                    grav_dm_weight, zero(T), dm_density_mean,
+                                    Int(N); ndrange=ncells,
+                                )
                             end
                         else
                             if radiation_workspace === nothing
-                                _assemble_total_delta_k!(be_p)(ρtot,s.U[1],ρdm,
-                                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                                _assemble_total_perturbation_k!(be_p)(
+                                    ρtot, s.U[1], ρdm, grav_gas_weight,
+                                    grav_dm_weight, one(T), dm_density_mean,
+                                    Int(N); ndrange=ncells,
+                                )
                             else
-                                _assemble_total_from_gas_delta_k!(be_p)(ρtot,
-                                    radiation_workspace.density_perturbation,ρdm,
-                                    grav_gas_weight,grav_dm_weight,Int(N);ndrange=ncells)
+                                _assemble_total_perturbation_k!(be_p)(
+                                    ρtot,
+                                    radiation_workspace.density_perturbation,
+                                    ρdm, grav_gas_weight, grav_dm_weight,
+                                    zero(T), dm_density_mean, Int(N);
+                                    ndrange=ncells,
+                                )
                             end
                         end
                     end
@@ -6095,7 +6591,10 @@ function main()
                     be_p,s,ρtot,HII,H2I,HeII,fh;
                     z=znow,h=hub,Ob=Ob,
                     density_perturbation=radiation_workspace === nothing ? nothing :
-                                         radiation_workspace.density_perturbation)
+                                         radiation_workspace.density_perturbation,
+                    neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+                    centered_hydrogen_storage=chem_centered_hydrogen_storage,
+                    hydrogen_reference=evolving_xe_mean)
                 due_adaptive = _rel_changed(adaptive_delta_b, adaptive_last_delta_b[], adaptive_diag_rel) ||
                                _rel_changed(adaptive_xhii, adaptive_last_xhii[], adaptive_diag_rel)
             end
@@ -6121,6 +6620,9 @@ function main()
                                        radiation_photon_state=radiation_photon_state,
                                        radiation_drag_rate=drag_impulse /
                                            max(dt_hydro,eps(Float64)),
+                                       neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+                                       centered_hydrogen_storage=chem_centered_hydrogen_storage,
+                                       hydrogen_reference=evolving_xe_mean,
                                        temperature_velocity_unit2=chem_mode === :off ? NaN :
                                            chem_vunit^2 *
                                            (isfinite(cosmological_mhd_aref) ?
@@ -6144,7 +6646,12 @@ function main()
                     adaptive_last_xhii[] = isfinite(adaptive_xhii) ? adaptive_xhii :
                                            _device_species_stats!(
                                                be_p, ρtot, s.U[1], HII, H2I,
-                                               HeII, fh; z=znow,h=hub,Ob=Ob)[1]
+                                               HeII, fh; z=znow,h=hub,Ob=Ob,
+                                               neutral_hydrogen_storage=
+                                                   chem_neutral_hydrogen_storage,
+                                               centered_hydrogen_storage=
+                                                   chem_centered_hydrogen_storage,
+                                               hydrogen_reference=evolving_xe_mean)[1]
                 end
                 if full_diag && !isempty(pk_path)
                     reason = due_z ? "z" : due_every ? "every" : due_adaptive ? "adaptive" : "manual"
@@ -6206,6 +6713,9 @@ function main()
                            radiation_photon_state=radiation_photon_state,
                            radiation_drag_rate=drag_impulse /
                                max(dt_hydro,eps(Float64)),
+                           neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+                           centered_hydrogen_storage=chem_centered_hydrogen_storage,
+                           hydrogen_reference=evolving_xe_mean,
                            temperature_velocity_unit2=chem_mode === :off ? NaN :
                                chem_vunit^2 * (isfinite(cosmological_mhd_aref) ?
                                cosmological_mhd_aref / a : 1.0))
@@ -6224,7 +6734,11 @@ function main()
         final_diag ? _final_device_stats!(be_p,s,ρdm,ρtot,HII,H2I,HeII,fh;
             density_perturbation=radiation_workspace === nothing ? nothing :
                                  radiation_workspace.density_perturbation,
-            z=zrun ? a_to_z(a) : NaN,h=hub,Ob=Ob) :
+            z=zrun ? a_to_z(a) : NaN,h=hub,Ob=Ob,
+            dm_mean=dm_density_mean,
+            neutral_hydrogen_storage=chem_neutral_hydrogen_storage,
+            centered_hydrogen_storage=chem_centered_hydrogen_storage,
+            hydrogen_reference=evolving_xe_mean) :
         (NaN, NaN, NaN, NaN, ntuple(_ -> NaN, 12))
     gravity || (δdm = NaN)
     _write_final_b_field!(get(ENV, "MHD_FINAL_B_DIR", ""), s;

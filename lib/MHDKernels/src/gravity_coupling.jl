@@ -4,7 +4,8 @@
 export predict_density_backward!, predict_density_perturbation_backward!,
        apply_cell_center_gravity!
 export initialize_lattice_displacements!
-export deposit_lattice_displacements!, drift_lattice_displacements!
+export deposit_lattice_displacements!, deposit_lattice_displacement_delta!
+export drift_lattice_displacements!
 
 @kernel function _initialize_lattice_displacements_k!(dxp, dyp, dzp, vx, vy, vz)
     p = @index(Global)
@@ -41,18 +42,24 @@ end
         i = q % N
         j = (q ÷ N) % N
         k = q ÷ (N * N)
-        # Keep the small displacement separate from the O(1) box coordinate.
-        # Forming (i+1/2)/N + dxp first would discard early-time f32 drifts.
-        gx = T(i) + T(0.5) + T(N) * (T(dxp[p]) + disp * T(vx[p])) + shift
-        gy = T(j) + T(0.5) + T(N) * (T(dyp[p]) + disp * T(vy[p])) + shift
-        gz = T(k) + T(0.5) + T(N) * (T(dzp[p]) + disp * T(vz[p])) + shift
-        fi = floor(gx); i0 = unsafe_trunc(Int, fi); fx = gx - fi
-        fj = floor(gy); j0 = unsafe_trunc(Int, fj); fy = gy - fj
-        fk = floor(gz); k0 = unsafe_trunc(Int, fk); fz = gz - fk
-        one_ = one(T)
-        ia = mod(i0, N); ib = mod(i0 + 1, N); wxa = one_ - fx; wxb = fx
-        ja = mod(j0, N); jb = mod(j0 + 1, N); wya = one_ - fy; wyb = fy
-        ka = mod(k0, N); kb = mod(k0 + 1, N); wza = one_ - fz; wzb = fz
+        # Resolve the fractional coordinate before adding the integer cell.
+        # Adding N*dxp to i rounds away early-time drifts for large i in f32.
+        base = T(0.5) + shift
+        ux = base + T(N) * (T(dxp[p]) + disp * T(vx[p]))
+        uy = base + T(N) * (T(dyp[p]) + disp * T(vy[p]))
+        uz = base + T(N) * (T(dzp[p]) + disp * T(vz[p]))
+        ox = unsafe_trunc(Int, floor(ux))
+        oy = unsafe_trunc(Int, floor(uy))
+        oz = unsafe_trunc(Int, floor(uz))
+        # Compute both weights from the local coordinate. The small member of
+        # each pair then remains representable whether the drift is positive
+        # or negative.
+        wxa = T(ox + 1) - ux; wxb = ux - T(ox)
+        wya = T(oy + 1) - uy; wyb = uy - T(oy)
+        wza = T(oz + 1) - uz; wzb = uz - T(oz)
+        ia = mod(i + ox, N); ib = mod(i + ox + 1, N)
+        ja = mod(j + oy, N); jb = mod(j + oy + 1, N)
+        ka = mod(k + oz, N); kb = mod(k + oz + 1, N)
         Nj = N; Nk = N * N
         KA.@atomic rho[ia + Nj*ja + Nk*ka + 1] += wxa*wya*wza
         KA.@atomic rho[ib + Nj*ja + Nk*ka + 1] += wxb*wya*wza
@@ -62,6 +69,70 @@ end
         KA.@atomic rho[ib + Nj*ja + Nk*kb + 1] += wxb*wya*wzb
         KA.@atomic rho[ia + Nj*jb + Nk*kb + 1] += wxa*wyb*wzb
         KA.@atomic rho[ib + Nj*jb + Nk*kb + 1] += wxb*wyb*wzb
+    end
+end
+
+@inline function _unit_product_delta(lx, ly, lz)
+    # (1-lx)*(1-ly)*(1-lz) - 1, without subtracting two values near one.
+    return -(lx + ly + lz) + lx*ly + lx*lz + ly*lz - lx*ly*lz
+end
+
+@kernel function _deposit_lattice_displacement_delta_k!(delta,
+                                                        @Const(dxp), @Const(dyp),
+                                                        @Const(dzp), @Const(vx),
+                                                        @Const(vy), @Const(vz),
+                                                        N::Int, disp, shift)
+    p = @index(Global)
+    @inbounds begin
+        T = eltype(delta)
+        q = p - 1
+        i = q % N
+        j = (q ÷ N) % N
+        k = q ÷ (N * N)
+        base = T(0.5) + shift
+        ux = base + T(N) * (T(dxp[p]) + disp * T(vx[p]))
+        uy = base + T(N) * (T(dyp[p]) + disp * T(vy[p]))
+        uz = base + T(N) * (T(dzp[p]) + disp * T(vz[p]))
+        ox = unsafe_trunc(Int, floor(ux))
+        oy = unsafe_trunc(Int, floor(uy))
+        oz = unsafe_trunc(Int, floor(uz))
+        wxa = T(ox + 1) - ux; wxb = ux - T(ox)
+        wya = T(oy + 1) - uy; wyb = uy - T(oy)
+        wza = T(oz + 1) - uz; wzb = uz - T(oz)
+        ia = mod(i + ox, N); ib = mod(i + ox + 1, N)
+        ja = mod(j + oy, N); jb = mod(j + oy + 1, N)
+        ka = mod(k + oz, N); kb = mod(k + oz + 1, N)
+        Nj = N; Nk = N * N
+
+        h000 = ia == i && ja == j && ka == k
+        h100 = ib == i && ja == j && ka == k
+        h010 = ia == i && jb == j && ka == k
+        h110 = ib == i && jb == j && ka == k
+        h001 = ia == i && ja == j && kb == k
+        h101 = ib == i && ja == j && kb == k
+        h011 = ia == i && jb == j && kb == k
+        h111 = ib == i && jb == j && kb == k
+
+        v000 = h000 ? _unit_product_delta(wxb, wyb, wzb) : wxa*wya*wza
+        v100 = h100 ? _unit_product_delta(wxa, wyb, wzb) : wxb*wya*wza
+        v010 = h010 ? _unit_product_delta(wxb, wya, wzb) : wxa*wyb*wza
+        v110 = h110 ? _unit_product_delta(wxa, wya, wzb) : wxb*wyb*wza
+        v001 = h001 ? _unit_product_delta(wxb, wyb, wza) : wxa*wya*wzb
+        v101 = h101 ? _unit_product_delta(wxa, wyb, wza) : wxb*wya*wzb
+        v011 = h011 ? _unit_product_delta(wxb, wya, wza) : wxa*wyb*wzb
+        v111 = h111 ? _unit_product_delta(wxa, wya, wza) : wxb*wyb*wzb
+
+        KA.@atomic delta[ia + Nj*ja + Nk*ka + 1] += v000
+        KA.@atomic delta[ib + Nj*ja + Nk*ka + 1] += v100
+        KA.@atomic delta[ia + Nj*jb + Nk*ka + 1] += v010
+        KA.@atomic delta[ib + Nj*jb + Nk*ka + 1] += v110
+        KA.@atomic delta[ia + Nj*ja + Nk*kb + 1] += v001
+        KA.@atomic delta[ib + Nj*ja + Nk*kb + 1] += v101
+        KA.@atomic delta[ia + Nj*jb + Nk*kb + 1] += v011
+        KA.@atomic delta[ib + Nj*jb + Nk*kb + 1] += v111
+        if !(h000 || h100 || h010 || h110 || h001 || h101 || h011 || h111)
+            KA.@atomic delta[i + Nj*j + Nk*k + 1] -= one(T)
+        end
     end
 end
 
@@ -83,6 +154,33 @@ function deposit_lattice_displacements!(rho::AbstractArray{T}, dxp, dyp, dzp,
                                            Int(N), T(disp), T(shift);
                                            ndrange=length(dxp))
     return rho
+end
+
+"""
+    deposit_lattice_displacement_delta!(delta, dxp, dyp, dzp, vx, vy, vz;
+                                         N, disp=0, shift=-0.5)
+
+Deposit the density contrast of one particle per implicit lattice cell. The
+kernel accumulates the displaced CIC weights minus the undisplaced lattice
+weight directly, so perturbations much smaller than `eps(Float32)` are not
+lost by first constructing a density near one. No additional grid is needed.
+"""
+function deposit_lattice_displacement_delta!(delta::AbstractArray{T}, dxp, dyp,
+                                             dzp, vx, vy, vz; N::Integer,
+                                             disp::Real=0,
+                                             shift::Real=-0.5) where {T}
+    N >= 2 || throw(ArgumentError("lattice density-contrast deposit requires N >= 2"))
+    length(delta) == N^3 ||
+        throw(DimensionMismatch("delta must contain N^3 cells"))
+    length(dxp) == N^3 ||
+        throw(DimensionMismatch("lattice must contain N^3 particles"))
+    fill!(delta, zero(T))
+    be = KA.get_backend(delta)
+    _deposit_lattice_displacement_delta_k!(be)(
+        delta, dxp, dyp, dzp, vx, vy, vz, Int(N), T(disp), T(shift);
+        ndrange=length(dxp),
+    )
+    return delta
 end
 
 @kernel function _drift_lattice_displacements_k!(dxp, dyp, dzp,

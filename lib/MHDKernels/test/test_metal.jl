@@ -321,6 +321,35 @@ else
             KA.synchronize(be)
             @test maximum(abs, Array(rho_metal) .- rho_cpu) < 3f-6
             @test sum(Array(rho_metal)) ≈ T(np) rtol=3f-6
+
+            target_delta = 3f-8
+            displacement_amplitude = -target_delta / T(2pi)
+            for p in 1:np
+                i = (p - 1) % N
+                x = (T(i) + 0.5f0) / T(N)
+                dxh[p] = displacement_amplitude * sinpi(2f0 * x)
+            end
+            copyto!(dxm, dxh)
+            delta_cpu = zeros(T, np)
+            delta_metal = device_zeros(be, T, (np,))
+            deposit_lattice_displacement_delta!(
+                delta_cpu, dxh, dyh, dzh, vxh, vyh, vzh; N=N,
+            )
+            deposit_lattice_displacement_delta!(
+                delta_metal, dxm, dym, dzm, vxm, vym, vzm; N=N,
+            )
+            KA.synchronize(be)
+            delta_host = Array(delta_metal)
+            @test maximum(abs, delta_host .- delta_cpu) < 5f-10
+            mode = 0.0im
+            for p in 1:np
+                i = (p - 1) % N
+                x = (Float64(i) + 0.5) / N
+                mode += Float64(delta_host[p]) * cis(-2pi * x)
+            end
+            mode *= 2 / np
+            expected_transfer = sinpi(2 / N) / (2pi / N)
+            @test abs(mode) / target_delta ≈ expected_transfer rtol=2f-5
         end
 
         @testset "exponential force-drag CPU/Metal parity" begin

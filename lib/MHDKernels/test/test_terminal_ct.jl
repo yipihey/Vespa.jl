@@ -104,6 +104,30 @@ end
     deposit_lattice_displacements!(rho, dxp, dyp, dzp, vx, vy, vz; N=N)
     @test sum(rho) ≈ Float32(np) rtol=2f-6
     @test sqrt(sum(abs2, rho .- 1f0) / np) > 0.005f0
+
+    # A direct density deposit rounds this mode against the unit background.
+    # The contrast deposit must retain it without allocating another grid.
+    target_delta = 3f-8
+    displacement_amplitude = -target_delta / Float32(2pi)
+    for p in 1:np
+        i = (p - 1) % N
+        x = (Float32(i) + 0.5f0) / Float32(N)
+        dxp[p] = displacement_amplitude * sinpi(2f0 * x)
+    end
+    delta = similar(rho)
+    deposit_lattice_displacement_delta!(delta, dxp, dyp, dzp, vx, vy, vz;
+                                         N=N)
+    mode = 0.0im
+    for p in 1:np
+        i = (p - 1) % N
+        x = (Float64(i) + 0.5) / N
+        mode += Float64(delta[p]) * cis(-2pi * x)
+    end
+    mode *= 2 / np
+    expected_transfer = sinpi(2 / N) / (2pi / N)
+    @test abs(mode) / target_delta ≈ expected_transfer rtol=2f-5
+    @test abs(sum(delta)) < 2f-9
+    @test maximum(abs, delta) > 0.9f0 * target_delta
 end
 
 function _terminal_ct_seed!(s; amp=0.08f0)

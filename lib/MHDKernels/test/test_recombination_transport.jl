@@ -52,6 +52,99 @@ using Test
     @test maximum(abs, xe .- expected) < 8f-7
     @test abs(sum(xe) / length(xe) - xe_mean) < 2f-7
 
+    # The high-ionization representation stores neutral H in the same slot.
+    # It must yield the identical physical electron response without forming
+    # 1 - x_HI in Float32 until the diagnostic conversion below.
+    hi_host = fh .* rho_host .- hii_host
+    HI = to_device(be, hi_host, Float32)
+    workspace_neutral = allocate_radiation_workspace(s)
+    @test apply_nonlocal_recombination!(HI, H2I, s, workspace_neutral, table;
+        redshift=redshifts[2], xe_mean=xe_mean, dt_seconds=dt_seconds,
+        fundamental_k_mpc=10.0, theta_over_aH_conversion=1.0,
+        hydrogen_mass_fraction=fh, neutral_hydrogen_storage=true)
+    xe_neutral = 1f0 .- to_host(HI) ./ (fh .* rho_host)
+    @test maximum(abs, xe_neutral .- xe) < 8f-7
+    @test maximum(abs, xe_neutral .- expected) < 8f-7
+
+    # Centered storage carries x_HII-<x_HII> directly. Verify that a mode much
+    # smaller than an ULP of a nearly ionized background survives the FFT
+    # response instead of disappearing when added to that background.
+    centered_reference = Float32(1 - 2.0^-20)
+    centered_amplitude = 3f-8
+    centered_host = Float32[
+        centered_amplitude * cospi(2f0 * (i - 1) / N)
+        for k in 1:N for j in 1:N for i in 1:N
+    ]
+    HII_centered = to_device(be, centered_host, Float32)
+    negligible_density_rate = fill(-1.0e-30, 3, 3)
+    negligible_velocity_rate = fill(1.0e-30, 3, 3)
+    centered_table = NonlocalRecombinationTable(
+        be, redshifts, wavenumbers, negligible_density_rate, ionization_rate,
+        negligible_velocity_rate;
+        precision=Float32,
+    )
+    workspace_centered = allocate_radiation_workspace(s)
+    @test apply_nonlocal_recombination!(
+        HII_centered, H2I, s, workspace_centered, centered_table;
+        redshift=redshifts[2], xe_mean=centered_reference,
+        dt_seconds=dt_seconds, fundamental_k_mpc=10.0,
+        theta_over_aH_conversion=0.0, hydrogen_mass_fraction=fh,
+        centered_hydrogen_storage=true,
+        hydrogen_reference=centered_reference,
+        hydrogen_complement_reference=Float32(1 - Float64(centered_reference)),
+    )
+    centered_result = to_host(HII_centered)
+    centered_expected = exp(Float32(q)) .* centered_host
+    @test maximum(abs, centered_result .- centered_expected) < 2f-10
+    @test maximum(abs, centered_result) > 2f-8
+
+    # A production table also carries the k=0 Jacobian already advanced by
+    # the nonlinear local network. The Fourier correction must replace that
+    # finite-step local map with the total map, rather than Lie-splitting two
+    # stiff exponentials.
+    local_density_rate = -2.0e-12
+    local_ionization_rate = -4.0e-12
+    differential_density_rate = fill(-3.0e-12, 3, 3)
+    differential_ionization_rate = fill(-6.0e-12, 3, 3)
+    local_response = zeros(3, 4)
+    local_response[:, 1] .= local_density_rate
+    local_response[:, 2] .= local_ionization_rate
+    composed_table = NonlocalRecombinationTable(
+        be, redshifts, wavenumbers, differential_density_rate,
+        differential_ionization_rate, negligible_velocity_rate;
+        local_response_rate=local_response, precision=Float32,
+    )
+    composed_dt = 1.0e11
+    local_phi = expm1(local_ionization_rate * composed_dt) /
+                local_ionization_rate
+    local_amplitude = local_phi * local_density_rate * density_amplitude
+    composed_initial = Float32[
+        local_amplitude * cospi(2f0 * (i - 1) / N)
+        for k in 1:N for j in 1:N for i in 1:N
+    ]
+    HII_composed = to_device(be, composed_initial, Float32)
+    workspace_composed = allocate_radiation_workspace(s)
+    composed_reference = 0.5f0
+    @test apply_nonlocal_recombination!(
+        HII_composed, H2I, s, workspace_composed, composed_table;
+        redshift=redshifts[2], xe_mean=composed_reference,
+        dt_seconds=composed_dt, fundamental_k_mpc=10.0,
+        theta_over_aH_conversion=0.0, hydrogen_mass_fraction=fh,
+        centered_hydrogen_storage=true,
+        hydrogen_reference=composed_reference,
+        hydrogen_complement_reference=1f0 - composed_reference,
+    )
+    total_ionization_rate = local_ionization_rate - 6.0e-12
+    total_density_rate = local_density_rate - 3.0e-12
+    total_phi = expm1(total_ionization_rate * composed_dt) /
+                total_ionization_rate
+    expected_composed_amplitude = total_phi * total_density_rate * density_amplitude
+    expected_composed = Float32[
+        expected_composed_amplitude * cospi(2f0 * (i - 1) / N)
+        for k in 1:N for j in 1:N for i in 1:N
+    ]
+    @test maximum(abs, to_host(HII_composed) .- expected_composed) < 8f-7
+
     before = to_host(HII)
     @test !apply_nonlocal_recombination!(HII, H2I, s, workspace, table;
         redshift=3000.0, xe_mean=xe_mean, dt_seconds=dt_seconds,

@@ -1,5 +1,6 @@
 export conserved_species_to_fraction!, conserved_species_to_fractions!
 export advect_species_fraction!, advect_species_fractions!
+export advect_passive_scalar!
 
 @kernel function _conserved_species_to_fraction_k!(species, @Const(rho), maximum_total)
     c = @index(Global)
@@ -138,6 +139,39 @@ end
     end
 end
 
+@kernel function _advect_passive_scalar_k!(out, @Const(scalar), @Const(rho),
+        @Const(mx), @Const(my), @Const(mz), n::Int32, dtdx)
+    c = @index(Global)
+    @inbounds begin
+        T = eltype(rho)
+        q = Int32(c - 1)
+        i = q % n
+        q = q ÷ n
+        j = q % n
+        k = q ÷ n
+        density = max(rho[c], eps(T))
+        x = T(i) - dtdx * mx[c] / density
+        y = T(j) - dtdx * my[c] / density
+        z = T(k) - dtdx * mz[c] / density
+        i0 = unsafe_trunc(Int32, floor(x))
+        j0 = unsafe_trunc(Int32, floor(y))
+        k0 = unsafe_trunc(Int32, floor(z))
+        onei = Int32(1)
+        p000 = scalar[_passive_index(i0,        j0,        k0,        n)]
+        p100 = scalar[_passive_index(i0 + onei, j0,        k0,        n)]
+        p010 = scalar[_passive_index(i0,        j0 + onei, k0,        n)]
+        p110 = scalar[_passive_index(i0 + onei, j0 + onei, k0,        n)]
+        p001 = scalar[_passive_index(i0,        j0,        k0 + onei, n)]
+        p101 = scalar[_passive_index(i0 + onei, j0,        k0 + onei, n)]
+        p011 = scalar[_passive_index(i0,        j0 + onei, k0 + onei, n)]
+        p111 = scalar[_passive_index(i0 + onei, j0 + onei, k0 + onei, n)]
+        out[c] = _passive_trilinear_component(
+            p000, p100, p010, p110, p001, p101, p011, p111,
+            x - T(i0), y - T(j0), z - T(k0),
+        )
+    end
+end
+
 """
     conserved_species_to_fraction!(species, rho; maximum_total=1)
 
@@ -227,4 +261,27 @@ function advect_species_fraction!(species, scratch, s::MHDState{T}, dt::Real;
     copyto!(species, scratch)
     KA.synchronize(s.be)
     species
+end
+
+"""
+    advect_passive_scalar!(scalar, scratch, s, dt)
+
+Backtrace an unconstrained signed material scalar with the post-step cell
+velocity. Unlike the species helpers this neither clips the value nor multiplies
+it by density. It is used for centered composition perturbations whose uniform
+background is carried separately.
+"""
+function advect_passive_scalar!(scalar, scratch, s::MHDState{T}, dt::Real) where {T}
+    length(scalar) == ncells(s) || error("scalar field must match the MHD state")
+    length(scratch) == ncells(s) || error("scalar scratch must match the MHD state")
+    n = s.dims[1]
+    all(==(n), s.dims) || error("scalar remap currently requires a cubic grid")
+    _advect_passive_scalar_k!(s.be)(
+        scratch, scalar, s.U[1], s.U[2], s.U[3], s.U[4], Int32(n), T(dt) / s.dx;
+        ndrange=ncells(s),
+    )
+    KA.synchronize(s.be)
+    copyto!(scalar, scratch)
+    KA.synchronize(s.be)
+    scalar
 end
