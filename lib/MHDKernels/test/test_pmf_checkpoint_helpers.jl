@@ -3,6 +3,14 @@ using Test
 ENV["MHD_BACKEND"] = "cpu"
 include("pmf_dm_lattice_bench.jl")
 
+@testset "incremental chemistry energy update" begin
+    total = 980.8842f0
+    internal = 418.7102f0
+    @test _incremental_total_energy(total, 1f0, internal, internal, 1f-30) === total
+    @test _incremental_total_energy(total, 2f0, internal, internal + 0.25f0, 1f-30) ==
+          total + 0.5f0
+end
+
 @testset "PMF checkpoint endpoint extension" begin
     mktempdir() do dir
         path = joinpath(dir, "checkpoint.jls")

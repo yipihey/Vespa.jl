@@ -509,27 +509,37 @@ end
     @inbounds HeII[c] = heii_mass_fraction * rho[c]
 end
 
-@kernel function _mhd_to_eint_k!(eint, @Const(rho), @Const(mx), @Const(my), @Const(mz),
-                                 @Const(E), @Const(Bx), @Const(By), @Const(Bz), small)
+@kernel function _mhd_to_eint_k!(eint, eint_before, @Const(rho), @Const(mx),
+                                 @Const(my), @Const(mz), @Const(E), @Const(Bx),
+                                 @Const(By), @Const(Bz), small)
     c = @index(Global)
     @inbounds begin
         T = eltype(eint)
         r = max(rho[c], small)
         ek = T(0.5) * (mx[c]*mx[c] + my[c]*my[c] + mz[c]*mz[c]) / r
         eb = T(0.5) * (Bx[c]*Bx[c] + By[c]*By[c] + Bz[c]*Bz[c])
-        eint[c] = max((E[c] - ek - eb) / r, T(1e-30))
+        value = max((E[c] - ek - eb) / r, T(1e-30))
+        eint[c] = value
+        eint_before[c] = value
     end
 end
 
-@kernel function _eint_to_mhd_k!(E, @Const(eint), @Const(rho), @Const(mx), @Const(my), @Const(mz),
-                                 @Const(Bx), @Const(By), @Const(Bz), small)
+# Rebuilding E from kinetic, magnetic, and internal energy can round even a
+# chemistry no-op. Applying only the changed internal component is bitwise
+# identity when the network leaves it unchanged and also reads fewer arrays.
+@inline function _incremental_total_energy(E, rho, eint_before, eint_after, small)
+    max(E + rho * (eint_after - eint_before), small)
+end
+
+@kernel function _eint_delta_to_mhd_k!(E, @Const(eint), @Const(eint_before),
+                                       @Const(rho), small)
     c = @index(Global)
     @inbounds begin
         T = eltype(E)
         r = max(rho[c], small)
-        ek = T(0.5) * (mx[c]*mx[c] + my[c]*my[c] + mz[c]*mz[c]) / r
-        eb = T(0.5) * (Bx[c]*Bx[c] + By[c]*By[c] + Bz[c]*Bz[c])
-        E[c] = max(r * max(eint[c], T(1e-30)) + ek + eb, T(1e-30))
+        E[c] = _incremental_total_energy(
+            E[c], r, max(eint_before[c], T(1e-30)),
+            max(eint[c], T(1e-30)), T(1e-30))
     end
 end
 
@@ -566,7 +576,7 @@ end
         H2I[c] = h2_code
         HII[c] = hii_code
         e_new = max(en / vu2, T(1e-30))
-        E[c] = max(r_code * e_new + ek + eb, T(1e-30))
+        E[c] = _incremental_total_energy(E[c], r_code, e_code, e_new, T(1e-30))
     end
 end
 
@@ -622,7 +632,7 @@ end
             hii_code
         end
         e_new = max(en / vu2, T(1e-30))
-        E[c] = max(r_code * e_new + ek + eb, T(1e-30))
+        E[c] = _incremental_total_energy(E[c], r_code, e_code, e_new, T(1e-30))
     end
 end
 
@@ -681,7 +691,7 @@ end
         end
         HeII[c] = min(max(heii / du, zero(T)), hecap)
         e_new = max(en / vu2, T(1e-30))
-        E[c] = max(r_code * e_new + ek + eb, T(1e-30))
+        E[c] = _incremental_total_energy(E[c], r_code, e_code, e_new, T(1e-30))
     end
 end
 
@@ -2977,14 +2987,14 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
         use_fused_chem = use_fused_analytic || use_fused_mixing
         if profile_chem && !use_fused_chem
             chem_phase[:unpack] += _time_phase(be_p, be_mhd) do
-                _mhd_to_eint_k!(be_p)(eint, s.U[1], s.U[2], s.U[3], s.U[4],
-                                      s.U[5], s.U[6], s.U[7], s.U[8],
-                                      T(s.smallr); ndrange=ncells)
+                _mhd_to_eint_k!(be_p)(eint, s.scratch[9], s.U[1], s.U[2],
+                                      s.U[3], s.U[4], s.U[5], s.U[6], s.U[7],
+                                      s.U[8], T(s.smallr); ndrange=ncells)
             end
         elseif !use_fused_chem
-            _mhd_to_eint_k!(be_p)(eint, s.U[1], s.U[2], s.U[3], s.U[4],
-                                  s.U[5], s.U[6], s.U[7], s.U[8],
-                                  T(s.smallr); ndrange=ncells)
+            _mhd_to_eint_k!(be_p)(eint, s.scratch[9], s.U[1], s.U[2],
+                                  s.U[3], s.U[4], s.U[5], s.U[6], s.U[7],
+                                  s.U[8], T(s.smallr); ndrange=ncells)
             KA.synchronize(be_p)
         end
         if ionized_fast
@@ -3221,9 +3231,9 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
             end
             if !use_fused_chem
                 chem_phase[:repack] += _time_phase(be_p, be_mhd) do
-                    _eint_to_mhd_k!(be_p)(s.U[5], eint, s.U[1], s.U[2], s.U[3],
-                                          s.U[4], s.U[6], s.U[7], s.U[8],
-                                          T(s.smallr); ndrange=ncells)
+                    _eint_delta_to_mhd_k!(be_p)(
+                        s.U[5], eint, s.scratch[9], s.U[1], T(s.smallr);
+                        ndrange=ncells)
                 end
             end
         else
@@ -3251,9 +3261,9 @@ function _run_pmf_chemistry_step!(be_p, be_mhd, s, eint, HII, H2I, HeII, ρtot, 
                     be_p, s.scratch[1], s.U[1], HeII, 4T(fh)))
             end
             if !use_fused_chem
-                _eint_to_mhd_k!(be_p)(s.U[5], eint, s.U[1], s.U[2], s.U[3],
-                                      s.U[4], s.U[6], s.U[7], s.U[8],
-                                      T(s.smallr); ndrange=ncells)
+                _eint_delta_to_mhd_k!(be_p)(
+                    s.U[5], eint, s.scratch[9], s.U[1], T(s.smallr);
+                    ndrange=ncells)
             end
         end
     end
