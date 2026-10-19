@@ -5,10 +5,280 @@ using ChemistryKernels
 using Printf
 using Dates
 using Serialization
+using RunConvention
 
 const KA = KernelAbstractions
-const BACKEND_NAME = Symbol(lowercase(get(ENV, "MHD_BACKEND", "metal")))
-const T = let precision = lowercase(get(ENV, "MHD_PRECISION", "f32"))
+
+# ---------------------------------------------------------------------------------
+# Run convention (koine docs/plan-run-convention.md; the Julia library is
+# RunConvention.jl, R-D12). Every MHD_* environment variable this driver reads is
+# declared once, where it is read, through `@P` (R-D2.0): the declaration names the
+# variable (`env=`), so the `env MHD_…=… julia … pmf_dm_lattice_bench.jl` invocations
+# keep working unchanged, and the resolved value lands in the run directory's
+# params.json with its source. `@P` resolves the one parameter it declares at once
+# (default -> params file -> environment -> `--group.name=value`), because a default
+# here may depend on a value read a few lines earlier (MHD_OR on MHD_H, MHD_PMF_KCUT
+# on N and the box); the library's `params()` then re-resolves the whole registry
+# once, where the run starts, and `_rc_verify` insists the two agree.
+# `--schema` prints the JSON Schema of every parameter and exits.
+# ---------------------------------------------------------------------------------
+const _RC_ARGV = RunConvention.parse_argv(ARGS)   # (--params files, --name=value sets, --relaxed)
+const _RC_PARENT_PARAMS = Ref{Union{Nothing,String}}(nothing)   # params.json of the run resumed from
+const _RC_FILE_CACHE = Dict{String,Dict{String,Any}}()
+const _RC_READ = Dict{String,Any}()
+const _RC_SOURCE = Dict{String,String}()
+const _RC_RUN = Ref{Any}(nothing)
+const _RC_ON_CHECKPOINT = Ref{Any}(nothing)
+const _MEMPROBE = Ref(false)
+
+@noinline function _rc_read(spec::RunConvention.ParamSpec)
+    name = spec.name
+    v = spec.default
+    src = "default"
+    files = String[]
+    _RC_PARENT_PARAMS[] === nothing || push!(files, _RC_PARENT_PARAMS[])
+    append!(files, _RC_ARGV[1])
+    for f in files
+        d = get!(() -> RunConvention.read_params_file(f), _RC_FILE_CACHE, f)
+        if haskey(d, name)
+            v = RunConvention.coerce_value(spec.type, d[name], name)
+            src = "file:" * basename(f)
+        end
+    end
+    if spec.env !== nothing && haskey(ENV, spec.env)
+        v = RunConvention.parse_text(spec.type, ENV[spec.env], name)
+        src = "env:" * spec.env
+    end
+    for (k, s) in _RC_ARGV[2]
+        k == name || continue
+        v = RunConvention.parse_text(spec.type, s, name)
+        src = "cli"
+    end
+    RunConvention.check_constraints(spec, v)
+    _RC_READ[name] = v
+    _RC_SOURCE[name] = src
+    return v
+end
+
+"""
+    @P group.name::T = default env="MHD_…" group="…" mutable=:never|:restart|:always doc="…"
+
+Declare one parameter (RunConvention's `@param`) and return its resolved value.
+"""
+macro P(decl, kws...)
+    (decl isa Expr && decl.head == :(=) && decl.args[1] isa Expr && decl.args[1].head == :(::)) ||
+        error("@P: expected `group.name::Type = default …`")
+    T = decl.args[1].args[2]
+    # The type assertion keeps every parameter variable concretely typed in `main`;
+    # `ParamSpec.default` is `Any`, and an `Any` here would make the whole driver dynamic.
+    esc(Expr(:(::), Expr(:call, :_rc_read,
+             Expr(:macrocall, GlobalRef(RunConvention, Symbol("@param")), __source__, decl, kws...)), T))
+end
+
+# A declared parameter is re-read through the library once at run start; the two
+# resolutions must agree, and every declaration above counts as read.
+function _rc_verify(P)
+    for (n, v) in _RC_READ
+        isequal(P.values[n], v) || error(
+            "run convention: parameter $n resolved to $(repr(P.values[n])) by params() " *
+            "but to $(repr(v)) where it was declared")
+    end
+    for n in keys(_RC_READ)
+        push!(P.read, n)
+    end
+    return P
+end
+
+# RFC 8785 has no spelling for a non-finite number (the library's `es_number` throws),
+# but Inf and NaN are legitimate values here (MHD_TERMINAL_VCAP=Inf, MHD_DRAG_RATE_CODE=NaN).
+# The record therefore carries the spelling the library's own file writer uses for them,
+# so the key hashes exactly what params.json holds, which is what `run-check` recomputes.
+# The driver keeps reading the real Float64 values; only the recorded copy is spelled.
+function _rc_record_params(P)
+    spell(v) = v isa AbstractFloat && !isfinite(v) ?
+               (isnan(v) ? "NaN" : v > 0 ? "Infinity" : "-Infinity") : v
+    vals = Dict{String,Any}(k => spell(v) for (k, v) in P.values)
+    return RunConvention.Params(P.specs, P.order, vals, P.sources, P.read, P.open, P.lock)
+end
+
+"Is `path` inside the run directory `dir`? Only such paths can be indexed (R-D7)."
+function _rc_inside(dir::AbstractString, path::AbstractString)
+    startswith(normpath(abspath(path)), normpath(abspath(dir)) * "/")
+end
+
+"The step at which `dir`'s run recorded a checkpoint with this content hash, or nothing."
+function _rc_checkpoint_step(dir::AbstractString, sha::AbstractString)
+    step = nothing
+    for e in RunConvention.read_events(dir)
+        e["kind"] == "checkpoint" && get(e, "sha256", nothing) == sha && (step = get(e, "step", nothing))
+    end
+    return step
+end
+
+"""
+The run directory a checkpoint belongs to: the nearest ancestor holding run.json, or,
+when a resumed run beneath it (`run-<stamp>/`) recorded a checkpoint with this exact
+content, that run. A checkpoint rewritten in place by a resume belongs to the resume.
+"""
+function _rc_run_root(path::AbstractString)
+    d = dirname(abspath(path))
+    while !isfile(joinpath(d, "run.json"))
+        up = dirname(d)
+        up == d && return nothing
+        d = up
+    end
+    sha = RunConvention.sha256_file(path)
+    best = d
+    for child in sort(filter(x -> startswith(x, "run-") && isfile(joinpath(d, x, "run.json")), readdir(d)))
+        _rc_checkpoint_step(joinpath(d, child), sha) === nothing || (best = joinpath(d, child))
+    end
+    return best
+end
+
+# The library's `resume` (lineage + the never/restart classes, R-D2.3) with the one
+# difference that the recorded parameter copy is `_rc_record_params(P)`.
+function _rc_resume(dir::AbstractString, from::AbstractString, P; on_checkpoint)
+    pdir = _rc_run_root(from)
+    parent = RunConvention.read_json(joinpath(pdir, "run.json"))
+    parent_vals = Dict{String,Any}(k => (v isa AbstractDict ? v["value"] : v)
+                                   for (k, v) in RunConvention.read_json(joinpath(pdir, "params.json")))
+    changed = Tuple{String,Any,Any}[]
+    for n in P.order
+        haskey(parent_vals, n) || continue
+        old = RunConvention.coerce_value(P.specs[n].type, parent_vals[n], n)
+        new = P.values[n]
+        isequal(old, new) && continue
+        cls = P.specs[n].mutable
+        cls == "never" && throw(RunConvention.ImmutableParameterError(n, old, new, cls))
+        push!(changed, (n, old, new))
+    end
+    ck = abspath(from)
+    root = normpath(abspath(pdir)) * "/"
+    rel = startswith(ck, root) ? ck[length(root)+1:end] : ck
+    sha = RunConvention.sha256_file(ck)
+    pstep = _rc_checkpoint_step(pdir, sha)
+    lineage = Dict{String,Any}("parent" => Dict{String,Any}(
+        "run" => parent["id"], "relation" => "resume",
+        "checkpoint" => Dict{String,Any}("path" => rel, "sha256" => sha)))
+    run = start_run(dir; problem=parent["problem"], name=get(parent, "name", nothing),
+                    params=_rc_record_params(P), lineage=lineage, on_checkpoint=on_checkpoint)
+    for (n, old, new) in changed
+        RunConvention.emit!(run, "changed", "param" => n, "from" => old, "to" => new,
+                            "by" => "restart", "step" => pstep)
+    end
+    return run
+end
+
+# An artifact inside the run directory is indexed (R-D7). One outside it (a resumed run
+# appending to its parent's tables, or MHD_*_TSV pointing elsewhere) cannot be: the
+# index holds relative paths only, so it is recorded as a `note` naming the absolute
+# path and content hash instead.
+function _rc_output!(path::AbstractString; kind="other", format=nothing, step=nothing, time=nothing)
+    run = _RC_RUN[]
+    (run === nothing || run.finished || !isfile(path)) && return nothing
+    if _rc_inside(run.dir, path)
+        output!(run, path; kind=kind, format=format, step=step, time=time)
+    else
+        data = Dict{String,Any}("path" => abspath(path), "kind" => String(kind),
+                                "sha256" => RunConvention.sha256_file(path), "bytes" => filesize(path))
+        step === nothing || (data["step"] = step)
+        time === nothing || (data["time"] = time)
+        note!(run, "output outside the run directory"; step=step, data=data)
+    end
+    return nothing
+end
+
+# A checkpoint outside the run directory keeps its `checkpoint` event (with the absolute
+# path), which is what a later resume reads to find the run that wrote it.
+function _rc_checkpoint!(path::AbstractString, step::Integer)
+    run = _RC_RUN[]
+    (run === nothing || run.finished || !isfile(path)) && return nothing
+    if _rc_inside(run.dir, path)
+        checkpoint!(run, path; step=step, format="jls")
+    else
+        RunConvention.emit!(run, "checkpoint", "path" => abspath(path),
+                            "sha256" => RunConvention.sha256_file(path),
+                            "bytes" => filesize(path), "step" => step)
+    end
+    return nothing
+end
+
+function _rc_progress!(; step, time, dt, fraction)
+    run = _RC_RUN[]
+    (run === nothing || run.finished) && return nothing
+    frac = isfinite(fraction) ? clamp(fraction, 0.0, 1.0) : nothing
+    progress!(run; step=step, time=isfinite(time) ? time : nothing,
+              dt=isfinite(dt) ? dt : nothing, fraction=frac)
+    return nothing
+end
+
+"Control inbox (R-D8): `set` on an `always` parameter, `checkpoint`, `pause`, `stop`."
+function _rc_poll!(step::Integer)
+    run = _RC_RUN[]
+    (run === nothing || run.finished) && return :continue
+    return poll_control!(run; step=step)
+end
+
+# The history columns are the declared metrics (R-D6.4); one `metric!` per history row.
+const _RC_HISTORY_COLUMNS = ("z", "a", "brms", "divBdx_over_brms", "delta_b_rms", "delta_dm_rms",
+                             "xHII_mean", "xHII_min", "xHII_max", "fH2_mean", "fH2_min", "fH2_max",
+                             "xHeII_mean", "xHeII_min", "xHeII_max",
+                             "xe_total_mean", "xe_total_min", "xe_total_max",
+                             "btrans_rms", "btrans_ratio", "delta2k_amp",
+                             "p_mean", "p_min", "p_max", "eint_mean", "eint_min", "eint_max",
+                             "temperature_mean", "temperature_min", "temperature_max")
+@metric z unit="" doc="redshift of the history row (NaN outside a cosmological run)"
+@metric a unit="" doc="scale factor of the history row"
+@metric brms unit="code" doc="rms magnetic field in code units"
+@metric divBdx_over_brms unit="" doc="|div B| dx relative to the rms field"
+@metric delta_b_rms unit="" doc="rms gas density contrast"
+@metric delta_dm_rms unit="" doc="rms dark-matter density contrast"
+@metric xHII_mean unit="" doc="mean ionized hydrogen fraction"
+@metric xHII_min unit="" doc="minimum ionized hydrogen fraction"
+@metric xHII_max unit="" doc="maximum ionized hydrogen fraction"
+@metric fH2_mean unit="" doc="mean molecular hydrogen fraction"
+@metric fH2_min unit="" doc="minimum molecular hydrogen fraction"
+@metric fH2_max unit="" doc="maximum molecular hydrogen fraction"
+@metric xHeII_mean unit="" doc="mean singly ionized helium fraction"
+@metric xHeII_min unit="" doc="minimum singly ionized helium fraction"
+@metric xHeII_max unit="" doc="maximum singly ionized helium fraction"
+@metric xe_total_mean unit="" doc="mean total electron fraction"
+@metric xe_total_min unit="" doc="minimum total electron fraction"
+@metric xe_total_max unit="" doc="maximum total electron fraction"
+@metric btrans_rms unit="code" doc="rms transverse field of the linear-mode initial conditions"
+@metric btrans_ratio unit="" doc="transverse field relative to its initial value"
+@metric delta2k_amp unit="" doc="amplitude of the 2k density mode of the magnetic-pressure initial condition"
+@metric p_mean unit="code" doc="mean gas pressure"
+@metric p_min unit="code" doc="minimum gas pressure"
+@metric p_max unit="code" doc="maximum gas pressure"
+@metric eint_mean unit="code" doc="mean specific internal energy"
+@metric eint_min unit="code" doc="minimum specific internal energy"
+@metric eint_max unit="code" doc="maximum specific internal energy"
+@metric temperature_mean unit="K" doc="mean gas temperature"
+@metric temperature_min unit="K" doc="minimum gas temperature"
+@metric temperature_max unit="K" doc="maximum gas temperature"
+
+function _rc_history_metrics!(cycle::Integer, values)
+    run = _RC_RUN[]
+    (run === nothing || run.finished) && return nothing
+    vals = Dict{String,Any}()
+    for (name, v) in zip(_RC_HISTORY_COLUMNS, values)
+        v isa Real && isfinite(v) && (vals[name] = Float64(v))
+    end
+    isempty(vals) || metric!(run; step=cycle, values=vals)
+    return nothing
+end
+
+function _rc_finish!(code::Integer, label::AbstractString; message=nothing)
+    run = _RC_RUN[]
+    (run === nothing || run.finished) && return nothing
+    finish!(run; code=code, label=label, message=message)
+    return nothing
+end
+const _BACKEND_ENV = @P run.backend::String = "metal" env="MHD_BACKEND" group="run" mutable=:never doc="compute backend: cpu or metal (cuda where built); the checkpoint fingerprint pins it"
+const BACKEND_NAME = Symbol(lowercase(_BACKEND_ENV))
+const _PRECISION_ENV = @P run.precision::String = "f32" env="MHD_PRECISION" group="run" mutable=:never doc="floating-point precision: f32 (every backend) or f64 (CPU reference only)"
+const T = let precision = lowercase(_PRECISION_ENV)
     precision in ("f32", "float32") ? Float32 :
     precision in ("f64", "float64") ? Float64 :
     error("MHD_PRECISION must be f32 or f64")
@@ -2346,12 +2616,8 @@ end
     end
 end
 
-function _parse_list(name, default)
-    parse.(Float64, split(get(ENV, name, default), ","))
-end
-
-function _parse_optional_list(name)
-    raw = strip(get(ENV, name, ""))
+function _parse_optional_list_text(raw)
+    raw = strip(raw)
     isempty(raw) && return Float64[]
     return parse.(Float64, split(raw, ","))
 end
@@ -2821,7 +3087,7 @@ function _device_memory_gib()
 end
 
 function _log_device_memory(label::AbstractString)
-    get(ENV, "MHD_MEMPROBE", "0") == "1" || return nothing
+    _MEMPROBE[] || return nothing
     stats = _device_memory_gib()
     @printf("[%s] MEMORY %-28s live_device=%.3f GiB allocated=%.3f GiB freed=%.3f GiB\n",
             Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS"), label,
@@ -3529,6 +3795,8 @@ function _write_density_frame!(frame_dir::AbstractString, hostrho, hostslice, ho
         exists || println(io, "cycle\tz\tN\tslice_f32\tmaxproj_f32\tlayout")
         println(io, join((cycle, Float64(z), N, slice_name, proj_name, "julia-column-major"), '\t'))
     end
+    _rc_output!(joinpath(frame_dir, slice_name); kind="image", format="f32", step=cycle, time=Float64(z))
+    _rc_output!(joinpath(frame_dir, proj_name); kind="image", format="f32", step=cycle, time=Float64(z))
     return nothing
 end
 
@@ -3781,6 +4049,9 @@ function _write_initial_b_field!(dir::AbstractString, s, st; N::Int, boxsize,
                           brms, st.brms_measured), ','))
     end
     mv(joinpath(dir, "metadata.csv.tmp"), joinpath(dir, "metadata.csv"); force=true)
+    for f in ("bx.f32", "by.f32", "bz.f32", "metadata.csv")
+        _rc_output!(joinpath(dir, f); kind="snapshot", step=0)
+    end
     @printf("INITIAL_B_EXPORT path=%s n=%d brms=%.8e\n", dir, N, st.brms_measured)
     flush(stdout)
     return nothing
@@ -3799,6 +4070,9 @@ function _write_final_b_field!(dir::AbstractString, s; N::Int, z, cycle, brms)
         println(io, join((N, z, cycle, brms, suffix), ','))
     end
     mv(joinpath(dir, "metadata.csv.tmp"), joinpath(dir, "metadata.csv"); force=true)
+    for f in ("bx.$suffix", "by.$suffix", "bz.$suffix", "metadata.csv")
+        _rc_output!(joinpath(dir, f); kind="snapshot", step=cycle, time=isfinite(z) ? z : nothing)
+    end
     @printf("FINAL_B_EXPORT path=%s n=%d z=%.8e brms=%.8e\n",
             dir, N, z, brms)
     flush(stdout)
@@ -3830,6 +4104,9 @@ function _write_history!(path, cycle, measured, a, br, divn, δb, δdm;
                           btrans, btrans / btrans0, delta2k,
                           thermalstats..., temperaturestats...), '\t'))
     end
+    _rc_history_metrics!(cycle, (a_to_z(a), a, br, divn, δb, δdm, ntuple(_ -> NaN, 12)...,
+                                 btrans, btrans / btrans0, delta2k,
+                                 thermalstats..., temperaturestats...))
 end
 
 function _write_history!(path, cycle, measured, a, br, divn, δb, δdm, chemstats;
@@ -3856,6 +4133,9 @@ function _write_history!(path, cycle, measured, a, br, divn, δb, δdm, chemstat
                           chemstats..., btrans, btrans / btrans0, delta2k,
                           thermalstats..., temperaturestats...), '\t'))
     end
+    _rc_history_metrics!(cycle, (a_to_z(a), a, br, divn, δb, δdm, chemstats...,
+                                 btrans, btrans / btrans0, delta2k,
+                                 thermalstats..., temperaturestats...))
 end
 
 function _write_pkmu!(path, label, result; cycle, measured, a, nmu)
@@ -4256,81 +4536,102 @@ function _emit_diagnostics!(; be_p, s, ρdm, scratch, px, py, pz, vx, vy, vz,
     end
 end
 
-function main()
-    N = parse(Int, get(ENV, "MHD_PMF_N", "128"))
-    steps = parse(Int, get(ENV, "MHD_STEPS", "8"))
-    tfinal_env = get(ENV, "MHD_TFINAL", "")
+"""
+Read every parameter of a run, declaring each where it is read (`@P`), and return
+them as one named tuple for `main`. This is a function of its own so the driver's
+`main` stays within what LLVM schedules in reasonable time: the ~230 declarations
+in one straight-line block made the machine scheduler superlinear.
+"""
+function _declare_parameters()
+    # The checkpoint trio is read first: when the checkpoint being restored lies inside a
+    # conforming run directory, that run's params.json is the first source of every
+    # parameter read below (the library's `resume` semantics, R-D2.3), so it has to be
+    # known before anything else is declared. The trio itself is re-read once it is.
+    p_checkpoint_path = @P checkpoint.path::String = "" env="MHD_CHECKPOINT_PATH" group="checkpoint" mutable=:restart doc="checkpoint file read at start (when present) and written at the cadence; empty = no checkpointing"
+    checkpoint_path = strip(p_checkpoint_path)
+    p_checkpoint_read_path = @P checkpoint.read_path::String = checkpoint_path env="MHD_CHECKPOINT_READ_PATH" group="checkpoint" mutable=:restart doc="checkpoint to restore from (default MHD_CHECKPOINT_PATH); inside a conforming run directory the resume records lineage"
+    checkpoint_read_path = strip(p_checkpoint_read_path)
+    checkpoint_resume = @P checkpoint.resume::Bool = true env="MHD_CHECKPOINT_RESUME" group="checkpoint" mutable=:restart doc="restore from the read path when it exists"
+    if checkpoint_resume && !isempty(checkpoint_read_path) && isfile(checkpoint_read_path)
+        rc_root = _rc_run_root(checkpoint_read_path)
+        if rc_root !== nothing
+            _RC_PARENT_PARAMS[] = joinpath(rc_root, "params.json")
+            checkpoint_path = strip(_rc_read(RunConvention.REGISTRY.params["checkpoint.path"]))
+            checkpoint_read_path = strip(_rc_read(RunConvention.REGISTRY.params["checkpoint.read_path"]))
+            checkpoint_resume = _rc_read(RunConvention.REGISTRY.params["checkpoint.resume"])
+        end
+    end
+    N = @P pmf.n::Int = 128 env="MHD_PMF_N" group="pmf" mutable=:never doc="cells per axis of the periodic cube (N^3 cells, N^3 lattice particles)"
+    steps = @P run.steps::Int = 8 env="MHD_STEPS" group="run" mutable=:restart doc="measured cycles to run when MHD_ZSTART is unset and MHD_TFINAL is unset (benchmark mode)"
+    tfinal_env = @P run.tfinal::String = "" env="MHD_TFINAL" group="run" mutable=:restart doc="stop once the evolved code time reaches this value; empty = run by cycle count or redshift"
     tfinal = isempty(tfinal_env) ? nothing : parse(Float64, tfinal_env)
-    zstart_env = get(ENV, "MHD_ZSTART", "")
+    zstart_env = @P cosmo.zstart::String = "" env="MHD_ZSTART" group="cosmo" mutable=:never doc="starting redshift; set it to make this a cosmological run (empty = fixed-time benchmark)"
     zrun = !isempty(zstart_env)
     # A benchmark warmup advances every state array but intentionally does not
     # advance cosmological time. It is therefore valid only for fixed-time
     # throughput tests, never as the default for a physical redshift trajectory.
-    warmup = parse(Int, get(ENV, "MHD_WARMUP", zrun ? "0" : "1"))
-    profile_skip_cycles = parse(Int, get(ENV, "MHD_PROFILE_SKIP_CYCLES", "0"))
+    warmup = @P run.warmup::Int = (zrun ? 0 : 1) env="MHD_WARMUP" group="run" mutable=:restart doc="benchmark warm-up cycles that advance every state array but never cosmological time (default 1, or 0 for a redshift run)"
+    memprobe = @P profile.memprobe::Bool = false env="MHD_MEMPROBE" group="profile" mutable=:restart doc="probe and print device memory at each stage and in the summary"
+    _MEMPROBE[] = memprobe
+    profile_skip_cycles = @P profile.skip_cycles::Int = 0 env="MHD_PROFILE_SKIP_CYCLES" group="profile" mutable=:restart doc="measured cycles excluded from the phase timings"
     profile_skip_cycles >= 0 || error("MHD_PROFILE_SKIP_CYCLES must be non-negative")
     zstart = zrun ? parse(Float64, zstart_env) : NaN
-    zend = zrun ? parse(Float64, get(ENV, "MHD_ZEND", "20")) : NaN
-    hub = parse(Float64, get(ENV, "MHD_H", "0.674"))
-    Om = parse(Float64, get(ENV, "MHD_OM", "0.315"))
-    OL = parse(Float64, get(ENV, "MHD_OL", "0.685"))
-    Or = parse(Float64, get(ENV, "MHD_OR", string(4.15e-5 / hub^2)))
+    p_cosmo_zend = @P cosmo.zend::Float64 = 20.0 env="MHD_ZEND" group="cosmo" mutable=:restart doc="stopping redshift of a cosmological run (not part of any update, so a resume may extend or shorten the run)"
+    zend = zrun ? p_cosmo_zend : NaN
+    hub = @P cosmo.h::Float64 = 0.674 env="MHD_H" group="cosmo" mutable=:restart doc="Hubble parameter h (H0 = 100 h km/s/Mpc)"
+    Om = @P cosmo.om::Float64 = 0.315 env="MHD_OM" group="cosmo" mutable=:restart doc="matter density parameter Omega_m"
+    OL = @P cosmo.ol::Float64 = 0.685 env="MHD_OL" group="cosmo" mutable=:restart doc="dark-energy density parameter Omega_Lambda"
+    Or = @P cosmo.or::Float64 = (4.15e-5 / hub^2) env="MHD_OR" group="cosmo" mutable=:restart doc="radiation density parameter Omega_r (default 4.15e-5/h^2)"
     Ok = 1.0 - Om - OL - Or
-    Ob = parse(Float64, get(ENV, "MHD_OB", string(0.17037 * Om)))
-    maxexp = parse(Float64, get(ENV, "MHD_MAXEXP", "0.01"))
+    Ob = @P cosmo.ob::Float64 = (0.17037 * Om) env="MHD_OB" group="cosmo" mutable=:restart doc="baryon density parameter Omega_b (default 0.17037*Omega_m)"
+    maxexp = @P cosmo.maxexp::Float64 = 0.01 env="MHD_MAXEXP" group="cosmo" mutable=:restart doc="largest d ln a per cycle; caps the cosmological timestep"
     # Source factor 1 is the corrected-clock science reference.  Larger factors
     # are explicit performance experiments and must pass the cadence gate.
-    source_max_dt_factor = parse(Float64, get(ENV, "MHD_SOURCE_MAX_DT_FACTOR", "1.0"))
+    source_max_dt_factor = @P mhd.source_max_dt_factor::Float64 = 1.0 env="MHD_SOURCE_MAX_DT_FACTOR" group="mhd" mutable=:restart doc="source-term timestep limiter relative to the explicit step; 1 is the corrected-clock science reference, larger values are performance experiments"
     source_max_dt_factor >= 1 || error("MHD_SOURCE_MAX_DT_FACTOR must be >= 1")
-    maxcycles = parse(Int, get(ENV, "MHD_MAX_CYCLES", "100000000"))
-    debug_stop_cycle = parse(Int, get(ENV, "MHD_DEBUG_STOP_CYCLE", "0"))
-    print_every = parse(Int, get(ENV, "MHD_PRINT_EVERY", "100"))
-    cycle_print_every = parse(Int, get(ENV, "MHD_CYCLE_PRINT_EVERY", "1"))
-    check_every = parse(Int, get(ENV, "MHD_CHECK_EVERY", zrun ? "25" : "0"))
-    cfl = parse(Float64, get(ENV, "MHD_CFL", "0.4"))
-    p0_env = lowercase(strip(get(ENV, "MHD_P0", "1.0")))
+    maxcycles = @P run.max_cycles::Int = 100000000 env="MHD_MAX_CYCLES" group="run" mutable=:restart doc="stop a cosmological run after this many measured cycles even before zend"
+    debug_stop_cycle = @P debug.stop_cycle::Int = 0 env="MHD_DEBUG_STOP_CYCLE" group="debug" mutable=:restart doc="abort with an error once the cycle counter passes this value (0 = never)"
+    print_every = @P io.print_every::Int = 100 env="MHD_PRINT_EVERY" group="io" mutable=:always doc="print the z/a line every this many measured cycles of a redshift run (0 = never)"
+    cycle_print_every = @P io.cycle_print_every::Int = 1 env="MHD_CYCLE_PRINT_EVERY" group="io" mutable=:always doc="print the per-cycle timing line every this many cycles (0 = never)"
+    check_every = @P io.check_every::Int = (zrun ? 25 : 0) env="MHD_CHECK_EVERY" group="io" mutable=:always doc="finite-state check (and control-inbox poll) every this many cycles (default 25 for a redshift run, else 0)"
+    cfl = @P mhd.cfl::Float64 = 0.4 env="MHD_CFL" group="mhd" mutable=:restart doc="hydro CFL number (waived in the checkpoint fingerprint, so a resume may change it)"
+    p_mhd_p0 = @P mhd.p0::String = "1.0" env="MHD_P0" group="mhd" mutable=:restart doc="initial gas pressure in code units, or auto/cosmology/cmb for the ionized-gas CMB-temperature pressure at zstart"
+    p0_env = lowercase(strip(p_mhd_p0))
     p0_auto = p0_env in ("auto", "cosmology", "cmb")
     p0 = p0_auto ? NaN : parse(Float64, p0_env)
-    pfloor = parse(Float64, get(ENV, "MHD_PFLOOR", "1e-7"))
-    llf_dmin = parse(Float64, get(ENV, "MHD_LLF_DMIN", "1e-4"))
-    llf_pmin = parse(Float64, get(ENV, "MHD_LLF_PMIN", "0"))
-    drag_enabled = get(ENV, "MHD_COMPTON_DRAG", "0") in ("1", "true", "TRUE", "yes", "on")
+    pfloor = @P mhd.pfloor::Float64 = 1e-07 env="MHD_PFLOOR" group="mhd" mutable=:restart doc="pressure floor in code units"
+    llf_dmin = @P mhd.llf_dmin::Float64 = 0.0001 env="MHD_LLF_DMIN" group="mhd" mutable=:never doc="density below which the HLLD solver falls back to LLF"
+    llf_pmin = @P mhd.llf_pmin::Float64 = 0.0 env="MHD_LLF_PMIN" group="mhd" mutable=:never doc="pressure below which the HLLD solver falls back to LLF"
+    drag_enabled = @P drag.enabled::Bool = false env="MHD_COMPTON_DRAG" group="drag" mutable=:restart doc="apply Compton drag of the gas against the CMB"
     # Source-aware full MHD is the science default. The terminal closure did not
     # pass the density-response validation and must remain an explicit legacy
     # comparison mode rather than an automatically selected production regime.
     default_drag_dt_mode = drag_enabled && zrun ? "radiation" :
                            (drag_enabled ? "godunov" : "explicit")
-    drag_dt_mode = Symbol(lowercase(get(ENV, "MHD_DRAG_DT_MODE", default_drag_dt_mode)))
+    p_drag_dt_mode = @P drag.dt_mode::String = default_drag_dt_mode env="MHD_DRAG_DT_MODE" group="drag" mutable=:never doc="drag timestep treatment: explicit, boost, subcycle, semiimplicit, aware, godunov, radiation, terminal or hybrid (default radiation for a cosmological drag run, godunov with drag, else explicit)"
+    drag_dt_mode = Symbol(lowercase(p_drag_dt_mode))
     drag_dt_mode in (:explicit, :boost, :subcycle, :semiimplicit, :aware,
                      :godunov, :radiation, :terminal, :hybrid) ||
         error("MHD_DRAG_DT_MODE must be explicit, boost, subcycle, semiimplicit, aware, godunov, radiation, terminal, or hybrid; got $(drag_dt_mode)")
     drag_dt_mode in (:godunov, :radiation, :terminal, :hybrid) && !drag_enabled &&
         error("MHD_DRAG_DT_MODE=$(drag_dt_mode) requires MHD_COMPTON_DRAG=1")
-    radiation_bridge_q2=parse(Float64,get(ENV,"MHD_RADIATION_BRIDGE_Q2","5.0"))
-    radiation_long_viscosity=parse(Float64,get(ENV,"MHD_RADIATION_LONG_VISCOSITY",string(4/3)))
-    radiation_max_dlna=parse(Float64,get(ENV,"MHD_RADIATION_MAX_DLNA","2.5e-4"))
-    radiation_highz_max_dlna=parse(Float64,get(ENV,"MHD_RADIATION_HIGHZ_MAX_DLNA",
-                                                    string(radiation_max_dlna)))
-    radiation_highz_zmin=parse(Float64,get(ENV,"MHD_RADIATION_HIGHZ_ZMIN","Inf"))
-    radiation_nyquist_guard=parse(Float64,get(ENV,"MHD_RADIATION_NYQUIST_GUARD","1"))
-    radiation_response_model=Symbol(lowercase(get(ENV,"MHD_RADIATION_RESPONSE_MODEL","moments")))
-    radiation_nonlinear_default=radiation_response_model in (:angular,:transport) ? "0.4" : "Inf"
-    radiation_nonlinear_cfl=parse(Float64,get(ENV,"MHD_RADIATION_NONLINEAR_CFL",
-                                                   radiation_nonlinear_default))
-    radiation_energy_ledger_every=parse(Int,get(ENV,"MHD_RADIATION_ENERGY_LEDGER_EVERY","0"))
-    radiation_free_stream_tolerance=parse(Float64,
-        get(ENV,"MHD_RADIATION_FREE_STREAM_TOL","5e-3"))
-    radiation_positivity_fallback=get(ENV,"MHD_RADIATION_POSITIVITY_FALLBACK","1") in
-        ("1","true","TRUE","yes","on")
-    radiation_positivity_max_fallback_passes=parse(Int,
-        get(ENV,"MHD_RADIATION_POSITIVITY_MAX_FALLBACK_PASSES","8"))
-    radiation_positivity_wave_growth_limit=parse(Float64,
-        get(ENV,"MHD_RADIATION_POSITIVITY_WAVE_GROWTH_LIMIT","4"))
-    radiation_positivity_max_subdivisions=parse(Int,
-        get(ENV,"MHD_RADIATION_POSITIVITY_MAX_SUBDIVISIONS","8"))
-    radiation_checkpoint_fallback=get(ENV,
-        "MHD_RADIATION_CHECKPOINT_FALLBACK","0") in
-        ("1","true","TRUE","yes","on")
+    radiation_bridge_q2 = @P radiation.bridge_q2::Float64 = 5.0 env="MHD_RADIATION_BRIDGE_Q2" group="radiation" mutable=:restart doc="bridge response model q^2 coefficient"
+    radiation_long_viscosity = @P radiation.long_viscosity::Float64 = (4/3) env="MHD_RADIATION_LONG_VISCOSITY" group="radiation" mutable=:restart doc="longitudinal radiation viscosity coefficient (default 4/3)"
+    radiation_max_dlna = @P radiation.max_dlna::Float64 = 0.00025 env="MHD_RADIATION_MAX_DLNA" group="radiation" mutable=:never doc="largest d ln a per cycle while the radiation closure is active"
+    radiation_highz_max_dlna = @P radiation.highz_max_dlna::Float64 = (radiation_max_dlna) env="MHD_RADIATION_HIGHZ_MAX_DLNA" group="radiation" mutable=:never doc="d ln a cap used above MHD_RADIATION_HIGHZ_ZMIN (default MHD_RADIATION_MAX_DLNA)"
+    radiation_highz_zmin = @P radiation.highz_zmin::Float64 = Inf env="MHD_RADIATION_HIGHZ_ZMIN" group="radiation" mutable=:restart doc="redshift above which the high-z d ln a cap applies"
+    radiation_nyquist_guard = @P radiation.nyquist_guard::Float64 = 1.0 env="MHD_RADIATION_NYQUIST_GUARD" group="radiation" mutable=:restart doc="fraction of the Nyquist wavenumber the radiation closure resolves, in (0,1]"
+    p_radiation_response_model = @P radiation.response_model::String = "moments" env="MHD_RADIATION_RESPONSE_MODEL" group="radiation" mutable=:never doc="radiation response closure: bridge, angular, transport, moments, photon_moments, moments_exponential or photon_moments_exponential"
+    radiation_response_model=Symbol(lowercase(p_radiation_response_model))
+    radiation_nonlinear_default=radiation_response_model in (:angular,:transport) ? 0.4 : Inf
+    radiation_nonlinear_cfl = @P radiation.nonlinear_cfl::Float64 = radiation_nonlinear_default env="MHD_RADIATION_NONLINEAR_CFL" group="radiation" mutable=:restart doc="CFL number of the nonlinear radiation update (default 0.4 for angular/transport, else Inf; waived in the checkpoint fingerprint)"
+    radiation_energy_ledger_every = @P radiation.energy_ledger_every::Int = 0 env="MHD_RADIATION_ENERGY_LEDGER_EVERY" group="radiation" mutable=:restart doc="sample the radiation energy ledger every this many cycles (0 = off)"
+    radiation_free_stream_tolerance = @P radiation.free_stream_tol::Float64 = 0.005 env="MHD_RADIATION_FREE_STREAM_TOL" group="radiation" mutable=:never doc="tolerance of the free-streaming bound check"
+    radiation_positivity_fallback = @P radiation.positivity_fallback::Bool = true env="MHD_RADIATION_POSITIVITY_FALLBACK" group="radiation" mutable=:restart doc="fall back to a positivity-preserving update when the spectral step would go negative"
+    radiation_positivity_max_fallback_passes = @P radiation.positivity_max_fallback_passes::Int = 8 env="MHD_RADIATION_POSITIVITY_MAX_FALLBACK_PASSES" group="radiation" mutable=:restart doc="maximum positivity fallback passes per step"
+    radiation_positivity_wave_growth_limit = @P radiation.positivity_wave_growth_limit::Float64 = 4.0 env="MHD_RADIATION_POSITIVITY_WAVE_GROWTH_LIMIT" group="radiation" mutable=:restart doc="largest per-step wave amplitude growth before the positivity fallback engages (> 1)"
+    radiation_positivity_max_subdivisions = @P radiation.positivity_max_subdivisions::Int = 8 env="MHD_RADIATION_POSITIVITY_MAX_SUBDIVISIONS" group="radiation" mutable=:restart doc="maximum step subdivisions of the positivity fallback"
+    radiation_checkpoint_fallback = @P radiation.checkpoint_fallback::Bool = false env="MHD_RADIATION_CHECKPOINT_FALLBACK" group="radiation" mutable=:restart doc="restore the radiation state from the previous checkpoint when a step fails"
     radiation_bridge_q2>0 || error("MHD_RADIATION_BRIDGE_Q2 must be positive")
     radiation_long_viscosity>0 || error("MHD_RADIATION_LONG_VISCOSITY must be positive")
     radiation_max_dlna>0 || error("MHD_RADIATION_MAX_DLNA must be positive")
@@ -4355,120 +4656,115 @@ function main()
         error("MHD_RADIATION_POSITIVITY_MAX_SUBDIVISIONS must be non-negative")
     drag_dt_mode===:radiation && !zrun &&
         error("MHD_DRAG_DT_MODE=radiation requires a cosmological redshift run")
-    allow_uncertified_terminal = get(ENV, "MHD_ALLOW_UNCERTIFIED_TERMINAL", "0") in
-                                 ("1", "true", "TRUE", "yes", "on")
+    allow_uncertified_terminal = @P terminal.allow_uncertified::Bool = false env="MHD_ALLOW_UNCERTIFIED_TERMINAL" group="terminal" mutable=:restart doc="permit the uncertified terminal/hybrid closures (legacy comparison experiments only; production uses godunov)"
     drag_dt_mode in (:terminal, :hybrid) && !allow_uncertified_terminal &&
         error("MHD_DRAG_DT_MODE=$(drag_dt_mode) uses the uncertified terminal closure; " *
               "production runs must use godunov. Set MHD_ALLOW_UNCERTIFIED_TERMINAL=1 " *
               "only for legacy comparison experiments.")
-    drag_dt_boost = parse(Float64, get(ENV, "MHD_DRAG_DT_BOOST", "1.0"))
+    drag_dt_boost = @P drag.dt_boost::Float64 = 1.0 env="MHD_DRAG_DT_BOOST" group="drag" mutable=:restart doc="multiply the explicit timestep by this factor in the boosted drag modes (>= 1)"
     drag_dt_boost >= 1 || error("MHD_DRAG_DT_BOOST must be >= 1")
-    drag_max_impulse = parse(Float64, get(ENV, "MHD_DRAG_MAX_IMPULSE", "Inf"))
+    drag_max_impulse = @P drag.max_impulse::Float64 = Inf env="MHD_DRAG_MAX_IMPULSE" group="drag" mutable=:restart doc="largest drag impulse per step; limits the step when exceeded"
     drag_max_impulse > 0 || error("MHD_DRAG_MAX_IMPULSE must be positive")
-    drag_xe_env = lowercase(get(ENV, "MHD_DRAG_XE", "auto"))
+    p_drag_xe = @P drag.xe::String = "auto" env="MHD_DRAG_XE" group="drag" mutable=:restart doc="electron fraction for the drag rate, or auto to take it from the chemistry"
+    drag_xe_env = lowercase(p_drag_xe)
     drag_xe_fixed = drag_xe_env == "auto" ? NaN : parse(Float64, drag_xe_env)
-    drag_helium_electrons = get(ENV, "MHD_DRAG_HELIUM_ELECTRONS", "1") in
-                            ("1", "true", "TRUE", "yes", "on")
-    drag_rate_code = parse(Float64, get(ENV, "MHD_DRAG_RATE_CODE", "NaN"))
+    drag_helium_electrons = @P drag.helium_electrons::Bool = true env="MHD_DRAG_HELIUM_ELECTRONS" group="drag" mutable=:restart doc="count helium electrons in the drag electron fraction"
+    drag_rate_code = @P drag.rate_code::Float64 = NaN env="MHD_DRAG_RATE_CODE" group="drag" mutable=:restart doc="fixed drag rate in code units; NaN = the cosmological Compton rate"
     (isnan(drag_rate_code) || drag_rate_code >= 0) ||
         error("MHD_DRAG_RATE_CODE must be non-negative or NaN")
-    init_terminal_momenta = get(ENV, "MHD_INIT_TERMINAL_MOMENTA", "0") in
-                            ("1", "true", "TRUE", "yes", "on")
+    init_terminal_momenta = @P drag.init_terminal_momenta::Bool = false env="MHD_INIT_TERMINAL_MOMENTA" group="drag" mutable=:restart doc="initialize gas momenta at the terminal (drag-balanced) velocity"
     init_terminal_momenta && !drag_enabled &&
         error("MHD_INIT_TERMINAL_MOMENTA=1 requires MHD_COMPTON_DRAG=1")
     init_terminal_momenta && !zrun && !isfinite(drag_rate_code) &&
         error("automatic terminal-momentum initialization requires MHD_ZSTART")
-    drag_vx0 = parse(Float64, get(ENV, "MHD_DRAG_VX0", "0.0"))
-    drag_vy0 = parse(Float64, get(ENV, "MHD_DRAG_VY0", "0.0"))
-    drag_vz0 = parse(Float64, get(ENV, "MHD_DRAG_VZ0", "0.0"))
-    terminal_vcap = parse(Float64, get(ENV, "MHD_TERMINAL_VCAP", "Inf"))
-    terminal_gamma_scale = parse(Float64, get(ENV, "MHD_TERMINAL_GAMMA_SCALE", "1.0"))
-    terminal_gamma_code_override = parse(Float64, get(ENV, "MHD_TERMINAL_GAMMA_CODE", "NaN"))
-    terminal_split = get(ENV, "MHD_TERMINAL_SPLIT", "0") != "0"
-    terminal_vsmooth = parse(Float64, get(ENV, "MHD_TERMINAL_VSMOOTH", "0.0"))
+    drag_vx0 = @P drag.vx0::Float64 = 0.0 env="MHD_DRAG_VX0" group="drag" mutable=:restart doc="x velocity of the CMB frame in code units"
+    drag_vy0 = @P drag.vy0::Float64 = 0.0 env="MHD_DRAG_VY0" group="drag" mutable=:restart doc="y velocity of the CMB frame in code units"
+    drag_vz0 = @P drag.vz0::Float64 = 0.0 env="MHD_DRAG_VZ0" group="drag" mutable=:restart doc="z velocity of the CMB frame in code units"
+    terminal_vcap = @P terminal.vcap::Float64 = Inf env="MHD_TERMINAL_VCAP" group="terminal" mutable=:restart doc="cap on the terminal velocity in code units"
+    terminal_gamma_scale = @P terminal.gamma_scale::Float64 = 1.0 env="MHD_TERMINAL_GAMMA_SCALE" group="terminal" mutable=:restart doc="scale factor on the terminal drag rate"
+    terminal_gamma_code_override = @P terminal.gamma_code::Float64 = NaN env="MHD_TERMINAL_GAMMA_CODE" group="terminal" mutable=:restart doc="override the terminal drag rate in code units (NaN = derive it)"
+    terminal_split = @P terminal.split::Bool = false env="MHD_TERMINAL_SPLIT" group="terminal" mutable=:restart doc="operator-split the terminal velocity update"
+    terminal_vsmooth = @P terminal.vsmooth::Float64 = 0.0 env="MHD_TERMINAL_VSMOOTH" group="terminal" mutable=:restart doc="smoothing weight of the cached terminal velocity, in [0,1]"
     0 <= terminal_vsmooth <= 1 || error("MHD_TERMINAL_VSMOOTH must be in [0,1]")
-    terminal_dedicated_scratch = get(ENV, "MHD_TERMINAL_DEDICATED_SCRATCH", "0") in
-                                 ("1", "true", "TRUE", "yes", "on")
-    terminal_lbox_cm_env = get(ENV, "MHD_TERMINAL_LBOX_CM", "")
-    terminal_lbox_ckpc_env = get(ENV, "MHD_TERMINAL_LBOX_CKPC", "")
+    terminal_dedicated_scratch = @P terminal.dedicated_scratch::Bool = false env="MHD_TERMINAL_DEDICATED_SCRATCH" group="terminal" mutable=:restart doc="give the terminal closure its own scratch arrays"
+    terminal_lbox_cm_env = @P terminal.lbox_cm::String = "" env="MHD_TERMINAL_LBOX_CM" group="terminal" mutable=:restart unit="cm" doc="comoving box length in cm for the terminal closure (empty = use MHD_TERMINAL_LBOX_CKPC)"
+    terminal_lbox_ckpc_env = @P terminal.lbox_ckpc::String = "" env="MHD_TERMINAL_LBOX_CKPC" group="terminal" mutable=:restart unit="ckpc" doc="comoving box length in ckpc for the terminal closure and the cosmological clock"
     terminal_lbox_cm = !isempty(strip(terminal_lbox_cm_env)) ? parse(Float64, terminal_lbox_cm_env) :
                        (!isempty(strip(terminal_lbox_ckpc_env)) ? parse(Float64, terminal_lbox_ckpc_env) * _PMF_KPC_CM : NaN)
-    terminal_max_disp_cells = parse(Float64, get(ENV, "MHD_TERMINAL_MAX_DISP_CELLS", "0.1"))
-    terminal_diff_cfl = parse(Float64, get(ENV, "MHD_TERMINAL_DIFF_CFL", "Inf"))
+    terminal_max_disp_cells = @P terminal.max_disp_cells::Float64 = 0.1 env="MHD_TERMINAL_MAX_DISP_CELLS" group="terminal" mutable=:restart doc="largest gas displacement per step in cells under the terminal closure"
+    terminal_diff_cfl = @P terminal.diff_cfl::Float64 = Inf env="MHD_TERMINAL_DIFF_CFL" group="terminal" mutable=:restart doc="CFL number of the terminal diffusion step"
     terminal_diff_cfl > 0 || error("MHD_TERMINAL_DIFF_CFL must be positive")
-    terminal_accuracy_cfl = parse(Float64, get(ENV, "MHD_TERMINAL_ACCURACY_CFL", "Inf"))
+    terminal_accuracy_cfl = @P terminal.accuracy_cfl::Float64 = Inf env="MHD_TERMINAL_ACCURACY_CFL" group="terminal" mutable=:restart doc="accuracy CFL number of the terminal step"
     terminal_accuracy_cfl > 0 || error("MHD_TERMINAL_ACCURACY_CFL must be positive")
+    p_terminal_accuracy_pressure = @P terminal.accuracy_pressure::String = "auto" env="MHD_TERMINAL_ACCURACY_PRESSURE" group="terminal" mutable=:restart doc="reference pressure of the terminal accuracy limiter, or auto/initial/p0 for the initial pressure"
     terminal_accuracy_pressure_env = lowercase(strip(
-        get(ENV, "MHD_TERMINAL_ACCURACY_PRESSURE", "auto")))
+        p_terminal_accuracy_pressure))
     terminal_accuracy_pressure_auto = terminal_accuracy_pressure_env in
                                       ("auto", "initial", "p0")
     terminal_accuracy_pressure = terminal_accuracy_pressure_auto ? NaN :
                                  parse(Float64, terminal_accuracy_pressure_env)
-    terminal_implicit_diffuse = get(ENV, "MHD_TERMINAL_IMPLICIT_DIFFUSE", "0") in
-                                ("1", "true", "TRUE", "yes", "on")
-    terminal_implicit_diffuse_fac = parse(Float64, get(ENV, "MHD_TERMINAL_IMPLICIT_DIFFUSE_FAC", "1.0"))
+    terminal_implicit_diffuse = @P terminal.implicit_diffuse::Bool = false env="MHD_TERMINAL_IMPLICIT_DIFFUSE" group="terminal" mutable=:restart doc="diffuse B implicitly in the terminal closure"
+    terminal_implicit_diffuse_fac = @P terminal.implicit_diffuse_fac::Float64 = 1.0 env="MHD_TERMINAL_IMPLICIT_DIFFUSE_FAC" group="terminal" mutable=:restart doc="coefficient of the implicit terminal diffusion (>= 0)"
     terminal_implicit_diffuse_fac >= 0 || error("MHD_TERMINAL_IMPLICIT_DIFFUSE_FAC must be non-negative")
-    terminal_pressure_implicit = get(ENV, "MHD_TERMINAL_PRESSURE_IMPLICIT", "0") in
-                                 ("1", "true", "TRUE", "yes", "on")
-    terminal_pressure_coeff_env = lowercase(strip(get(ENV, "MHD_TERMINAL_PRESSURE_COEFF", "auto")))
+    terminal_pressure_implicit = @P terminal.pressure_implicit::Bool = false env="MHD_TERMINAL_PRESSURE_IMPLICIT" group="terminal" mutable=:restart doc="treat the pressure force implicitly in the terminal closure"
+    p_terminal_pressure_coeff = @P terminal.pressure_coeff::String = "auto" env="MHD_TERMINAL_PRESSURE_COEFF" group="terminal" mutable=:restart doc="implicit pressure coefficient, or auto"
+    terminal_pressure_coeff_env = lowercase(strip(p_terminal_pressure_coeff))
     terminal_pressure_coeff_auto = terminal_pressure_coeff_env == "auto"
     terminal_pressure_coeff = terminal_pressure_coeff_auto ? NaN :
                               parse(Float64, terminal_pressure_coeff_env)
     (terminal_pressure_coeff_auto || terminal_pressure_coeff >= 0) ||
         error("MHD_TERMINAL_PRESSURE_COEFF must be auto or non-negative")
-    terminal_rho_rel_limit = parse(Float64, get(ENV, "MHD_TERMINAL_RHO_REL_LIMIT", "Inf"))
+    terminal_rho_rel_limit = @P terminal.rho_rel_limit::Float64 = Inf env="MHD_TERMINAL_RHO_REL_LIMIT" group="terminal" mutable=:restart doc="largest relative density change per terminal step"
     terminal_rho_rel_limit > 0 || error("MHD_TERMINAL_RHO_REL_LIMIT must be positive")
-    terminal_b_rel_limit = parse(Float64, get(ENV, "MHD_TERMINAL_B_REL_LIMIT", "Inf"))
+    terminal_b_rel_limit = @P terminal.b_rel_limit::Float64 = Inf env="MHD_TERMINAL_B_REL_LIMIT" group="terminal" mutable=:restart doc="largest relative B change per terminal step"
     terminal_b_rel_limit > 0 || error("MHD_TERMINAL_B_REL_LIMIT must be positive")
-    terminal_induction = Symbol(lowercase(get(ENV, "MHD_TERMINAL_INDUCTION", "centered")))
+    p_terminal_induction = @P terminal.induction::String = "centered" env="MHD_TERMINAL_INDUCTION" group="terminal" mutable=:restart doc="induction scheme of the terminal closure: centered, ssprk2 or ct"
+    terminal_induction = Symbol(lowercase(p_terminal_induction))
     terminal_induction in (:centered, :ssprk2, :ct) ||
         error("MHD_TERMINAL_INDUCTION must be centered, ssprk2, or ct")
-    terminal_induction_cfl = parse(Float64, get(ENV, "MHD_TERMINAL_INDUCTION_CFL", "0.4"))
+    terminal_induction_cfl = @P terminal.induction_cfl::Float64 = 0.4 env="MHD_TERMINAL_INDUCTION_CFL" group="terminal" mutable=:restart doc="CFL number of the terminal induction subcycles, in (0,1]"
     0 < terminal_induction_cfl <= 1 || error("MHD_TERMINAL_INDUCTION_CFL must be in (0,1]")
-    terminal_induction_dissipation = parse(Float64, get(ENV, "MHD_TERMINAL_INDUCTION_DISSIPATION", "0.05"))
+    terminal_induction_dissipation = @P terminal.induction_dissipation::Float64 = 0.05 env="MHD_TERMINAL_INDUCTION_DISSIPATION" group="terminal" mutable=:restart doc="artificial dissipation of the terminal induction update, in [0,1]"
     0 <= terminal_induction_dissipation <= 1 ||
         error("MHD_TERMINAL_INDUCTION_DISSIPATION must be in [0,1]")
-    terminal_induction_dissipation_order = parse(Int, get(ENV, "MHD_TERMINAL_INDUCTION_DISSIPATION_ORDER", "4"))
+    terminal_induction_dissipation_order = @P terminal.induction_dissipation_order::Int = 4 env="MHD_TERMINAL_INDUCTION_DISSIPATION_ORDER" group="terminal" mutable=:restart doc="order of the terminal induction dissipation: 2 or 4"
     terminal_induction_dissipation_order in (2, 4) ||
         error("MHD_TERMINAL_INDUCTION_DISSIPATION_ORDER must be 2 or 4")
-    terminal_project_b = get(ENV, "MHD_TERMINAL_PROJECT_B", terminal_induction === :ssprk2 ? "1" : "0") in
-                         ("1", "true", "TRUE", "yes", "on")
-    terminal_induction_max_subcycles = parse(Int, get(ENV, "MHD_TERMINAL_INDUCTION_MAX_SUBCYCLES", "256"))
+    terminal_project_b = @P terminal.project_b::Bool = (terminal_induction === :ssprk2 ? true : false) env="MHD_TERMINAL_PROJECT_B" group="terminal" mutable=:restart doc="project B to zero divergence after the terminal induction update (default on for ssprk2)"
+    terminal_induction_max_subcycles = @P terminal.induction_max_subcycles::Int = 256 env="MHD_TERMINAL_INDUCTION_MAX_SUBCYCLES" group="terminal" mutable=:restart doc="maximum induction subcycles per terminal step"
     terminal_induction_max_subcycles >= 1 ||
         error("MHD_TERMINAL_INDUCTION_MAX_SUBCYCLES must be positive")
-    hybrid_min_va_cs = parse(Float64, get(ENV, "MHD_HYBRID_MIN_VA_CS", "0.0"))
+    hybrid_min_va_cs = @P hybrid.min_va_cs::Float64 = 0.0 env="MHD_HYBRID_MIN_VA_CS" group="hybrid" mutable=:restart doc="smallest Alfven-to-sound speed ratio for which the hybrid scheme uses the terminal closure"
     hybrid_min_va_cs >= 0 || error("MHD_HYBRID_MIN_VA_CS must be non-negative")
-    hybrid_exit_drag_omega = parse(Float64,
-        get(ENV, "MHD_HYBRID_EXIT_DRAG_OVER_OMEGA",
-            get(ENV, "MHD_HYBRID_MIN_DRAG_OVER_OMEGA", "1.0")))
-    hybrid_enter_drag_omega = parse(Float64,
-        get(ENV, "MHD_HYBRID_ENTER_DRAG_OVER_OMEGA", string(2 * hybrid_exit_drag_omega)))
+    p_hybrid_min_drag_over_omega = @P hybrid.min_drag_over_omega::Float64 = NaN env="MHD_HYBRID_MIN_DRAG_OVER_OMEGA" group="hybrid" mutable=:restart doc="deprecated alias of MHD_HYBRID_EXIT_DRAG_OVER_OMEGA, honoured when that one is unset (NaN = unset)"
+    hybrid_exit_drag_omega = @P hybrid.exit_drag_over_omega::Float64 = (isnan(p_hybrid_min_drag_over_omega) ? 1.0 : p_hybrid_min_drag_over_omega) env="MHD_HYBRID_EXIT_DRAG_OVER_OMEGA" group="hybrid" mutable=:restart doc="drag-rate-over-Alfven-frequency ratio below which the hybrid scheme leaves the terminal regime"
+    hybrid_enter_drag_omega = @P hybrid.enter_drag_over_omega::Float64 = (2 * hybrid_exit_drag_omega) env="MHD_HYBRID_ENTER_DRAG_OVER_OMEGA" group="hybrid" mutable=:restart doc="ratio above which the hybrid scheme enters the terminal regime (default 2x the exit ratio)"
     0 < hybrid_exit_drag_omega < hybrid_enter_drag_omega ||
         error("hybrid drag hysteresis requires 0 < exit < enter")
-    hybrid_check_every = parse(Int, get(ENV, "MHD_HYBRID_CHECK_EVERY", "1"))
+    hybrid_check_every = @P hybrid.check_every::Int = 1 env="MHD_HYBRID_CHECK_EVERY" group="hybrid" mutable=:restart doc="evaluate the hybrid regime test every this many cycles"
     hybrid_check_every >= 1 || error("MHD_HYBRID_CHECK_EVERY must be positive")
-    hybrid_confirm_checks = parse(Int, get(ENV, "MHD_HYBRID_CONFIRM_CHECKS", "2"))
+    hybrid_confirm_checks = @P hybrid.confirm_checks::Int = 2 env="MHD_HYBRID_CONFIRM_CHECKS" group="hybrid" mutable=:restart doc="consecutive regime checks required before switching"
     hybrid_confirm_checks >= 1 || error("MHD_HYBRID_CONFIRM_CHECKS must be positive")
-    hybrid_handoff_steps = parse(Int, get(ENV, "MHD_HYBRID_HANDOFF_STEPS", "0"))
+    hybrid_handoff_steps = @P hybrid.handoff_steps::Int = 0 env="MHD_HYBRID_HANDOFF_STEPS" group="hybrid" mutable=:restart doc="cycles over which the terminal-to-full handoff is ramped"
     hybrid_handoff_steps >= 0 || error("MHD_HYBRID_HANDOFF_STEPS must be non-negative")
-    hybrid_handoff_alpha = parse(Float64, get(ENV, "MHD_HYBRID_HANDOFF_ALPHA", "0.0"))
+    hybrid_handoff_alpha = @P hybrid.handoff_alpha::Float64 = 0.0 env="MHD_HYBRID_HANDOFF_ALPHA" group="hybrid" mutable=:restart doc="peak blending weight of the handoff ramp, in [0,1]"
     0 <= hybrid_handoff_alpha <= 1 || error("MHD_HYBRID_HANDOFF_ALPHA must be in [0,1]")
-    hybrid_handoff_error_tol = parse(Float64, get(ENV, "MHD_HYBRID_HANDOFF_ERROR_TOL", "Inf"))
+    hybrid_handoff_error_tol = @P hybrid.handoff_error_tol::Float64 = Inf env="MHD_HYBRID_HANDOFF_ERROR_TOL" group="hybrid" mutable=:restart doc="largest handoff velocity error tolerated before the run aborts"
     hybrid_handoff_error_tol > 0 || error("MHD_HYBRID_HANDOFF_ERROR_TOL must be positive")
-    hybrid_handoff_displacement_tol = parse(Float64,
-        get(ENV, "MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL", "0.02"))
+    hybrid_handoff_displacement_tol = @P hybrid.handoff_displacement_tol::Float64 = 0.02 env="MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL" group="hybrid" mutable=:restart doc="largest handoff displacement in cells tolerated before the run aborts"
     hybrid_handoff_displacement_tol > 0 ||
         error("MHD_HYBRID_HANDOFF_DISPLACEMENT_TOL must be positive")
-    hybrid_handoff_diag_every = parse(Int, get(ENV, "MHD_HYBRID_HANDOFF_DIAG_EVERY", "8"))
+    hybrid_handoff_diag_every = @P hybrid.handoff_diag_every::Int = 8 env="MHD_HYBRID_HANDOFF_DIAG_EVERY" group="hybrid" mutable=:restart doc="handoff diagnostic cadence in cycles"
     hybrid_handoff_diag_every >= 1 || error("MHD_HYBRID_HANDOFF_DIAG_EVERY must be positive")
-    hybrid_reenter_terminal = get(ENV, "MHD_HYBRID_REENTER_TERMINAL", "0") in
-                              ("1", "true", "TRUE", "yes", "on")
-    hybrid_aware_dt_factor = parse(Float64, get(ENV, "MHD_HYBRID_AWARE_DT_FACTOR", "1.0"))
+    hybrid_reenter_terminal = @P hybrid.reenter_terminal::Bool = false env="MHD_HYBRID_REENTER_TERMINAL" group="hybrid" mutable=:restart doc="allow the hybrid scheme to re-enter the terminal regime after leaving it"
+    hybrid_aware_dt_factor = @P hybrid.aware_dt_factor::Float64 = 1.0 env="MHD_HYBRID_AWARE_DT_FACTOR" group="hybrid" mutable=:restart doc="timestep factor of the drag-aware full-MHD regime"
     hybrid_aware_dt_factor > 0 || error("MHD_HYBRID_AWARE_DT_FACTOR must be positive")
-    brms = parse(Float64, get(ENV, "MHD_PMF_BRMS", "1e-3"))
-    pmf_b0_ng_env = get(ENV, "MHD_PMF_B0_NG", "")
-    initial_state_dir = strip(get(ENV, "MHD_INITIAL_STATE_DIR", ""))
-    pmf_normalization_z_env = strip(get(ENV, "MHD_PMF_NORMALIZATION_Z", ""))
+    brms = @P pmf.brms::Float64 = 0.001 env="MHD_PMF_BRMS" group="pmf" mutable=:restart doc="initial rms field in code units (overridden by MHD_PMF_B0_NG when set)"
+    pmf_b0_ng_env = @P pmf.b0_ng::String = "" env="MHD_PMF_B0_NG" group="pmf" mutable=:never unit="nG" doc="comoving rms field in nG at the normalization redshift; empty = use MHD_PMF_BRMS"
+    p_io_initial_state_dir = @P io.initial_state_dir::String = "" env="MHD_INITIAL_STATE_DIR" group="io" mutable=:never doc="directory of a pre-evolved joint state to import (fields, particles, chemistry); empty = generate"
+    initial_state_dir = strip(p_io_initial_state_dir)
+    p_pmf_normalization_z = @P pmf.normalization_z::String = "" env="MHD_PMF_NORMALIZATION_Z" group="pmf" mutable=:never doc="redshift at which MHD_PMF_B0_NG is defined; must equal MHD_ZSTART unless a state is imported"
+    pmf_normalization_z_env = strip(p_pmf_normalization_z)
     pmf_normalization_z = isempty(pmf_normalization_z_env) ? zstart :
                           parse(Float64, pmf_normalization_z_env)
     if zrun && isempty(initial_state_dir) &&
@@ -4476,62 +4772,67 @@ function main()
                  atol=8eps(Float64) * max(1, zstart))
         error("MHD_PMF_NORMALIZATION_Z must equal MHD_ZSTART unless MHD_INITIAL_STATE_DIR supplies a pre-evolved state")
     end
-    pmf_init = Symbol(lowercase(get(ENV, "MHD_PMF_INIT", "batchelor")))
-    radiation_magnetic_compensation = get(
-        ENV,"MHD_RADIATION_MAGNETIC_COMPENSATION",
-        pmf_init === :meanfield_linear ? "1" : "0") in
-        ("1","true","TRUE","yes","on")
-    pmf_kmode = parse(Int, get(ENV, "MHD_PMF_KMODE", "1"))
-    meanfield_theta = parse(Float64, get(ENV, "MHD_MEANFIELD_THETA",
-                                                string(π / 4)))
+    p_pmf_init = @P pmf.init::String = "batchelor" env="MHD_PMF_INIT" group="pmf" mutable=:never doc="initial field: batchelor, meanfield/meanfield_linear/sv25_mode, alfven, or a single-mode name"
+    pmf_init = Symbol(lowercase(p_pmf_init))
+    radiation_magnetic_compensation = @P radiation.magnetic_compensation::Bool = (pmf_init === :meanfield_linear ? true : false) env="MHD_RADIATION_MAGNETIC_COMPENSATION" group="radiation" mutable=:never doc="compensate the magnetic residual in the radiation closure (default on for meanfield_linear)"
+    pmf_kmode = @P pmf.kmode::Int = 1 env="MHD_PMF_KMODE" group="pmf" mutable=:never doc="wave number (in 2pi/box) of the single-mode and mean-field initial conditions"
+    meanfield_theta = @P meanfield.theta::Float64 = (π / 4) env="MHD_MEANFIELD_THETA" group="meanfield" mutable=:never unit="rad" doc="angle between the guide field and the wave vector, in [0,pi/2]"
     0 <= meanfield_theta <= π / 2 ||
         error("MHD_MEANFIELD_THETA must be in [0,pi/2]")
+    p_meanfield_polarization = @P meanfield.polarization::String = "magnetosonic" env="MHD_MEANFIELD_POLARIZATION" group="meanfield" mutable=:never doc="mean-field perturbation polarization: magnetosonic or alfven"
     meanfield_polarization = Symbol(lowercase(
-        get(ENV, "MHD_MEANFIELD_POLARIZATION", "magnetosonic")))
+        p_meanfield_polarization))
     meanfield_polarization_code =
         meanfield_polarization in (:magnetosonic, :compressive, :inplane) ? 1 :
         meanfield_polarization in (:alfven, :alfvenic, :outofplane) ? 2 :
         error("MHD_MEANFIELD_POLARIZATION must be magnetosonic or alfven")
-    meanfield_pert_frac = parse(Float64,
-        get(ENV, "MHD_MEANFIELD_PERT_FRAC", "1.0e-4"))
+    meanfield_pert_frac = @P meanfield.pert_frac::Float64 = 0.0001 env="MHD_MEANFIELD_PERT_FRAC" group="meanfield" mutable=:never doc="perturbation amplitude as a fraction of the guide field"
     meanfield_pert_frac > 0 || error("MHD_MEANFIELD_PERT_FRAC must be positive")
+    p_pmf_single_mode_normalization = @P pmf.single_mode_normalization::String = "amplitude" env="MHD_PMF_SINGLE_MODE_NORMALIZATION" group="pmf" mutable=:never doc="single-mode amplitude convention: amplitude or rms"
     pmf_single_mode_normalization =
-        Symbol(lowercase(get(ENV, "MHD_PMF_SINGLE_MODE_NORMALIZATION", "amplitude")))
+        Symbol(lowercase(p_pmf_single_mode_normalization))
     pmf_single_mode_normalization in (:amplitude, :rms) ||
         error("MHD_PMF_SINGLE_MODE_NORMALIZATION must be amplitude or rms")
-    boxsize = parse(Float64, get(ENV, "MHD_BOXSIZE", "1.0"))
+    boxsize = @P run.boxsize::Float64 = 1.0 env="MHD_BOXSIZE" group="run" mutable=:never doc="box length in code units (the production scripts pass the comoving size in ckpc and set MHD_TERMINAL_LBOX_CKPC to the same number)"
     boxsize > 0 || error("MHD_BOXSIZE must be positive")
-    pmf_tile_box_env = strip(get(ENV, "MHD_PMF_TILE_BOXSIZE", ""))
+    p_pmf_tile_boxsize = @P pmf.tile_boxsize::String = "" env="MHD_PMF_TILE_BOXSIZE" group="pmf" mutable=:never doc="box length of one Batchelor tile; empty = untiled"
+    pmf_tile_box_env = strip(p_pmf_tile_boxsize)
     pmf_tile_box = isempty(pmf_tile_box_env) ? nothing : parse(Float64, pmf_tile_box_env)
     pmf_tile_box === nothing || (pmf_tile_box > 0 && pmf_tile_box <= boxsize) ||
         error("MHD_PMF_TILE_BOXSIZE must be positive and no larger than MHD_BOXSIZE")
-    pmf_tile_n_env = strip(get(ENV, "MHD_PMF_TILE_N", ""))
+    p_pmf_tile_n = @P pmf.tile_n::String = "" env="MHD_PMF_TILE_N" group="pmf" mutable=:never doc="cells per axis of one Batchelor tile; empty = auto"
+    pmf_tile_n_env = strip(p_pmf_tile_n)
     pmf_tile_n = isempty(pmf_tile_n_env) ? nothing : parse(Int, pmf_tile_n_env)
     pmf_tile_n === nothing || pmf_tile_n > 0 || error("MHD_PMF_TILE_N must be positive")
-    kcut = parse(Float64, get(ENV, "MHD_PMF_KCUT", string(0.625π*N / boxsize)))
-    kmax_env = strip(get(ENV, "MHD_PMF_KMAX", ""))
+    kcut = @P pmf.kcut::Float64 = (0.625π*N / boxsize) env="MHD_PMF_KCUT" group="pmf" mutable=:never doc="Batchelor spectrum cutoff wave number (default 0.625 pi N / box)"
+    p_pmf_kmax = @P pmf.kmax::String = "" env="MHD_PMF_KMAX" group="pmf" mutable=:never doc="hard upper wave number of the initial field; empty = none"
+    kmax_env = strip(p_pmf_kmax)
     pmf_kmax = isempty(kmax_env) ? nothing : parse(Float64, kmax_env)
     pmf_kmax === nothing || pmf_kmax > 0 || error("MHD_PMF_KMAX must be positive")
-    pmf_kmin = parse(Float64, get(ENV, "MHD_PMF_KMIN", "0"))
+    pmf_kmin = @P pmf.kmin::Float64 = 0.0 env="MHD_PMF_KMIN" group="pmf" mutable=:never doc="lower wave number of the initial field"
     pmf_kmin >= 0 || error("MHD_PMF_KMIN must be non-negative")
     pmf_kmax === nothing || pmf_kmin < pmf_kmax ||
         error("MHD_PMF_KMIN must be smaller than MHD_PMF_KMAX")
-    pmf_required_cells_env = strip(get(ENV, "MHD_PMF_MIN_CELLS_PER_WAVELENGTH", ""))
+    p_pmf_min_cells_per_wavelength = @P pmf.min_cells_per_wavelength::String = "" env="MHD_PMF_MIN_CELLS_PER_WAVELENGTH" group="pmf" mutable=:never doc="required cells per wavelength at MHD_PMF_KMAX; empty = unchecked"
+    pmf_required_cells_env = strip(p_pmf_min_cells_per_wavelength)
     pmf_required_cells = isempty(pmf_required_cells_env) ? nothing :
                          parse(Float64, pmf_required_cells_env)
     pmf_required_cells === nothing || pmf_required_cells > 0 ||
         error("MHD_PMF_MIN_CELLS_PER_WAVELENGTH must be positive")
     pmf_required_cells === nothing || pmf_kmax !== nothing ||
         error("MHD_PMF_KMAX is required when enforcing PMF wavelength resolution")
-    preserve_low_kmax_env = strip(get(ENV, "MHD_PMF_PRESERVE_LOW_KMAX", ""))
+    p_pmf_preserve_low_kmax = @P pmf.preserve_low_kmax::String = "" env="MHD_PMF_PRESERVE_LOW_KMAX" group="pmf" mutable=:never doc="upper wave number of the preserved low-k band; empty = none"
+    preserve_low_kmax_env = strip(p_pmf_preserve_low_kmax)
     pmf_preserve_low_kmax = isempty(preserve_low_kmax_env) ? nothing : parse(Float64, preserve_low_kmax_env)
     pmf_preserve_low_kmax === nothing || pmf_preserve_low_kmax > 0 ||
         error("MHD_PMF_PRESERVE_LOW_KMAX must be positive")
-    preserve_low_kcut_env = strip(get(ENV, "MHD_PMF_PRESERVE_LOW_KCUT", ""))
+    p_pmf_preserve_low_kcut = @P pmf.preserve_low_kcut::String = "" env="MHD_PMF_PRESERVE_LOW_KCUT" group="pmf" mutable=:never doc="cutoff wave number of the preserved low-k band; empty = none"
+    preserve_low_kcut_env = strip(p_pmf_preserve_low_kcut)
     pmf_preserve_low_kcut = isempty(preserve_low_kcut_env) ? nothing : parse(Float64, preserve_low_kcut_env)
     pmf_preserve_low_kcut === nothing || pmf_preserve_low_kcut > 0 ||
         error("MHD_PMF_PRESERVE_LOW_KCUT must be positive")
-    pmf_normalization_kind = Symbol(lowercase(get(ENV, "MHD_PMF_NORMALIZATION_KIND", "auto")))
+    p_pmf_normalization_kind = @P pmf.normalization_kind::String = "auto" env="MHD_PMF_NORMALIZATION_KIND" group="pmf" mutable=:never doc="rms normalization band: auto, total_band_rms or reference_band_rms"
+    pmf_normalization_kind = Symbol(lowercase(p_pmf_normalization_kind))
     pmf_normalization_kind = pmf_normalization_kind in (:total, :total_band) ?
                              :total_band_rms : pmf_normalization_kind
     pmf_normalization_kind = pmf_normalization_kind in (:reference, :reference_band, :low_band) ?
@@ -4543,22 +4844,24 @@ function main()
     pmf_normalization_kind_resolved = pmf_normalization_kind === :auto ?
         (pmf_preserve_low_kmax === nothing ? :total_band_rms : :reference_band_rms) :
         pmf_normalization_kind
-    pmf_fixed_mode_power = get(ENV, "MHD_PMF_FIXED_MODE_POWER", "0") in
-                           ("1", "true", "TRUE", "yes", "on")
-    pmf_mode_realization = Symbol(lowercase(get(ENV, "MHD_PMF_MODE_REALIZATION",
-                                                   "legacy")))
+    pmf_fixed_mode_power = @P pmf.fixed_mode_power::Bool = false env="MHD_PMF_FIXED_MODE_POWER" group="pmf" mutable=:never doc="fix every mode's power to the spectrum (no Rayleigh scatter)"
+    p_pmf_mode_realization = @P pmf.mode_realization::String = "legacy" env="MHD_PMF_MODE_REALIZATION" group="pmf" mutable=:never doc="mode phase realization: legacy, physical_hash or physical_hash_zero_phase"
+    pmf_mode_realization = Symbol(lowercase(p_pmf_mode_realization))
     pmf_mode_realization in (:legacy, :physical_hash, :physical_hash_zero_phase) ||
         error("MHD_PMF_MODE_REALIZATION must be legacy, physical_hash, or " *
               "physical_hash_zero_phase")
-    realization_box_env = strip(get(ENV, "MHD_PMF_REALIZATION_BOX", ""))
+    p_pmf_realization_box = @P pmf.realization_box::String = "" env="MHD_PMF_REALIZATION_BOX" group="pmf" mutable=:never doc="box length the physical-hash realization is keyed on; empty = MHD_BOXSIZE"
+    realization_box_env = strip(p_pmf_realization_box)
     pmf_realization_box = isempty(realization_box_env) ? boxsize :
                           parse(Float64, realization_box_env)
     pmf_realization_box > 0 || error("MHD_PMF_REALIZATION_BOX must be positive")
-    pmf_curl_symbol = Symbol(lowercase(get(ENV, "MHD_PMF_CURL_SYMBOL", "centered")))
+    p_pmf_curl_symbol = @P pmf.curl_symbol::String = "centered" env="MHD_PMF_CURL_SYMBOL" group="pmf" mutable=:never doc="curl operator of the vector-potential construction: centered or continuum"
+    pmf_curl_symbol = Symbol(lowercase(p_pmf_curl_symbol))
     pmf_curl_symbol in (:centered, :continuum, :spectral) ||
         error("MHD_PMF_CURL_SYMBOL must be centered or continuum")
     pmf_curl_symbol === :spectral && (pmf_curl_symbol = :continuum)
-    curl_reference_env = strip(get(ENV, "MHD_PMF_CURL_REFERENCE_N", ""))
+    p_pmf_curl_reference_n = @P pmf.curl_reference_n::String = "" env="MHD_PMF_CURL_REFERENCE_N" group="pmf" mutable=:never doc="resolution whose centered curl symbol is reproduced; empty = this run's N"
+    curl_reference_env = strip(p_pmf_curl_reference_n)
     pmf_curl_reference_n = isempty(curl_reference_env) ? nothing :
                            parse(Int, curl_reference_env)
     if pmf_curl_reference_n !== nothing
@@ -4567,9 +4870,11 @@ function main()
         0 < pmf_curl_reference_n <= N ||
             error("MHD_PMF_CURL_REFERENCE_N must be positive and no larger than MHD_PMF_N")
     end
-    mode_lock_env = strip(get(ENV, "MHD_PMF_MODE_LOCK_N", ""))
+    p_pmf_mode_lock_n = @P pmf.mode_lock_n::String = "" env="MHD_PMF_MODE_LOCK_N" group="pmf" mutable=:never doc="lock the mode set to that of an N-cell run; empty = none"
+    mode_lock_env = strip(p_pmf_mode_lock_n)
     pmf_mode_lock_n = isempty(mode_lock_env) ? nothing : parse(Int, mode_lock_env)
-    high_mode_lock_env = strip(get(ENV, "MHD_PMF_HIGH_MODE_LOCK_N", ""))
+    p_pmf_high_mode_lock_n = @P pmf.high_mode_lock_n::String = "" env="MHD_PMF_HIGH_MODE_LOCK_N" group="pmf" mutable=:never doc="lock the high-k mode set to that of an N-cell run; empty = none"
+    high_mode_lock_env = strip(p_pmf_high_mode_lock_n)
     pmf_high_mode_lock_n = isempty(high_mode_lock_env) ? nothing :
                            parse(Int, high_mode_lock_env)
     pmf_shortest_k = pmf_kmax === nothing ? kcut : pmf_kmax
@@ -4591,80 +4896,85 @@ function main()
         pmf_shortest_k <= π * pmf_high_mode_lock_n / boxsize ||
             error("PMF band exceeds the high-mode-lock Nyquist frequency")
     end
-    seed = parse(Int, get(ENV, "MHD_PMF_SEED", "42"))
-    recon = Symbol(lowercase(get(ENV, "MHD_RECON", "ppm")))
-    debug_recon_override = strip(get(ENV, "MHD_DEBUG_RECON_OVERRIDE", ""))
+    seed = @P pmf.seed::Int = 42 env="MHD_PMF_SEED" group="pmf" mutable=:never doc="random seed of the initial field realization"
+    p_mhd_recon = @P mhd.recon::String = "ppm" env="MHD_RECON" group="mhd" mutable=:never doc="reconstruction: ppm or plm"
+    recon = Symbol(lowercase(p_mhd_recon))
+    p_debug_recon_override = @P debug.recon_override::String = "" env="MHD_DEBUG_RECON_OVERRIDE" group="debug" mutable=:never doc="override MHD_RECON (debugging); empty = none"
+    debug_recon_override = strip(p_debug_recon_override)
     isempty(debug_recon_override) ||
         (recon = Symbol(lowercase(debug_recon_override)))
-    riemann = Symbol(lowercase(get(ENV, "MHD_RIEMANN", "hlld")))
-    debug_riemann_override = strip(get(ENV, "MHD_DEBUG_RIEMANN_OVERRIDE", ""))
+    p_mhd_riemann = @P mhd.riemann::String = "hlld" env="MHD_RIEMANN" group="mhd" mutable=:never doc="Riemann solver: hlld or llf"
+    riemann = Symbol(lowercase(p_mhd_riemann))
+    p_debug_riemann_override = @P debug.riemann_override::String = "" env="MHD_DEBUG_RIEMANN_OVERRIDE" group="debug" mutable=:never doc="override MHD_RIEMANN (debugging); empty = none"
+    debug_riemann_override = strip(p_debug_riemann_override)
     isempty(debug_riemann_override) ||
         (riemann = Symbol(lowercase(debug_riemann_override)))
-    glm_ch_fac = parse(Float64, get(ENV, "MHD_GLM_CH_FAC", "2.0"))
-    glm_cr = parse(Float64, get(ENV, "MHD_GLM_CR", "1.0"))
-    glm_project_every = parse(Int, get(ENV, "MHD_GLM_PROJECT_EVERY",
-        drag_dt_mode === :radiation ? "1" : "0"))
+    glm_ch_fac = @P mhd.glm_ch_fac::Float64 = 2.0 env="MHD_GLM_CH_FAC" group="mhd" mutable=:restart doc="GLM cleaning speed as a multiple of the fastest signal speed"
+    glm_cr = @P mhd.glm_cr::Float64 = 1.0 env="MHD_GLM_CR" group="mhd" mutable=:restart doc="GLM parabolic damping ratio cr"
+    glm_project_every = @P mhd.glm_project_every::Int = (drag_dt_mode === :radiation ? 1 : 0) env="MHD_GLM_PROJECT_EVERY" group="mhd" mutable=:restart doc="project B to zero divergence every this many cycles (default 1 in radiation mode, else 0 = never)"
     glm_project_every >= 0 || error("MHD_GLM_PROJECT_EVERY must be non-negative")
-    fb = T(parse(Float64, get(ENV, "MHD_FB", "0.17037")))
+    p_cosmo_fb = @P cosmo.fb::Float64 = 0.17037 env="MHD_FB" group="cosmo" mutable=:restart doc="baryon mass fraction Omega_b/Omega_m of the gas+particle split"
+    fb = T(p_cosmo_fb)
     fdm = one(T) - fb
-    gravity = parse(Bool, get(ENV, "MHD_GRAVITY", "true"))
-    gravity_gas_kick = get(ENV, "MHD_GRAVITY_GAS_KICK", "1") in
-                           ("1", "true", "TRUE", "yes", "on")
-    gravity_subcycles_fixed = parse(Int, get(ENV, "MHD_GRAVITY_SUBCYCLES", "1"))
+    gravity = @P gravity.enabled::Bool = true env="MHD_GRAVITY" group="gravity" mutable=:never doc="solve self-gravity (FFT Poisson) and push the lattice particles"
+    gravity_gas_kick = @P gravity.gas_kick::Bool = true env="MHD_GRAVITY_GAS_KICK" group="gravity" mutable=:never doc="apply the gravitational kick to the gas"
+    gravity_subcycles_fixed = @P gravity.subcycles::Int = 1 env="MHD_GRAVITY_SUBCYCLES" group="gravity" mutable=:restart doc="fixed number of particle push subcycles per cycle (>= 1)"
     gravity_subcycles_fixed >= 1 || error("MHD_GRAVITY_SUBCYCLES must be >= 1")
-    gravity_dt_boost = parse(Float64, get(ENV, "MHD_GRAVITY_DT_BOOST", "0.0"))
+    gravity_dt_boost = @P gravity.dt_boost::Float64 = 0.0 env="MHD_GRAVITY_DT_BOOST" group="gravity" mutable=:restart doc="particle timestep boost: 0 = off, else >= 1"
     (gravity_dt_boost == 0 || gravity_dt_boost >= 1) ||
         error("MHD_GRAVITY_DT_BOOST must be 0 or >= 1")
-    gravity_source = Symbol(lowercase(get(ENV, "MHD_GRAVITY_SOURCE", "total")))
+    p_gravity_source = @P gravity.source::String = "total" env="MHD_GRAVITY_SOURCE" group="gravity" mutable=:never doc="mass sourcing the potential: total, gas or dm"
+    gravity_source = Symbol(lowercase(p_gravity_source))
     gravity_source in (:total, :gas, :dm) ||
         error("MHD_GRAVITY_SOURCE must be total, gas, or dm")
     grav_gas_weight = gravity_source === :dm ? zero(T) : fb
     grav_dm_weight = gravity_source === :gas ? zero(T) : fdm
-    particle_max_disp_cells = parse(Float64, get(ENV, "MHD_PARTICLE_MAX_DISP_CELLS", "Inf"))
+    particle_max_disp_cells = @P particle.max_disp_cells::Float64 = Inf env="MHD_PARTICLE_MAX_DISP_CELLS" group="particle" mutable=:restart doc="largest particle displacement per step in cells"
     particle_max_disp_cells > 0 || error("MHD_PARTICLE_MAX_DISP_CELLS must be positive")
-    particle_wrap = get(ENV, "MHD_PARTICLE_WRAP", "1") in ("1", "true", "TRUE", "yes", "on")
-    lattice_displacements = get(ENV, "MHD_PARTICLE_LATTICE_DISPLACEMENTS", "1") in
-                                ("1", "true", "TRUE", "yes", "on")
+    particle_wrap = @P particle.wrap::Bool = true env="MHD_PARTICLE_WRAP" group="particle" mutable=:restart doc="wrap particle positions periodically"
+    lattice_displacements = @P particle.lattice_displacements::Bool = true env="MHD_PARTICLE_LATTICE_DISPLACEMENTS" group="particle" mutable=:never doc="store particles as displacements from the lattice (exact mean density)"
     dm_density_mean = lattice_displacements ? zero(T) : one(T)
-    gravity_phi_interp = get(ENV, "MHD_GRAVITY_PHI_INTERP", "0") in ("1", "true", "TRUE", "yes", "on")
-    gravity_midpoint_source = get(ENV, "MHD_GRAVITY_MIDPOINT_SOURCE", "1") in
-                                 ("1", "true", "TRUE", "yes", "on")
+    gravity_phi_interp = @P gravity.phi_interp::Bool = false env="MHD_GRAVITY_PHI_INTERP" group="gravity" mutable=:restart doc="interpolate the potential to particles instead of the force (not with lattice displacements)"
+    gravity_midpoint_source = @P gravity.midpoint_source::Bool = true env="MHD_GRAVITY_MIDPOINT_SOURCE" group="gravity" mutable=:never doc="source the gas kick from the midpoint potential"
     gravity_phi_interp && gravity_midpoint_source &&
         error("choose either MHD_GRAVITY_PHI_INTERP=1 or MHD_GRAVITY_MIDPOINT_SOURCE=1")
     gravity_phi_interp && lattice_displacements &&
         error("potential interpolation is not implemented for lattice-displacement particles")
-    fft_mode = _fft_mode(BACKEND_NAME, get(ENV, "MHD_FFT", "auto"))
+    p_mhd_fft = @P mhd.fft::String = "auto" env="MHD_FFT" group="mhd" mutable=:never doc="FFT path: auto, mps/native/rfft, ka or c2c"
+    fft_mode = _fft_mode(BACKEND_NAME, p_mhd_fft)
+    p_mhd_allow_non_mps_fft = @P mhd.allow_non_mps_fft::Bool = false env="MHD_ALLOW_NON_MPS_FFT" group="mhd" mutable=:restart doc="permit a non-MPS FFT on Metal (benchmarking)"
     if BACKEND_NAME === :metal && fft_mode !== :mps &&
-       !(get(ENV, "MHD_ALLOW_NON_MPS_FFT", "0") in ("1", "true", "TRUE", "yes", "on"))
+       !(p_mhd_allow_non_mps_fft)
         error("Metal PMF runs use the MPS rfft Poisson path by default; set MHD_ALLOW_NON_MPS_FFT=1 to benchmark MHD_FFT=$(fft_mode)")
     end
-    gravity_1buf = get(ENV, "MHD_GRAVITY_1BUF",
-                       (BACKEND_NAME === :metal && fft_mode === :mps) ? "1" : "0") in
-                   ("1", "true", "TRUE", "yes", "on")
+    gravity_1buf = @P gravity.onebuf::Bool = ((BACKEND_NAME === :metal && fft_mode === :mps) ? true : false) env="MHD_GRAVITY_1BUF" group="gravity" mutable=:restart doc="single-buffer Poisson solve (default on for Metal+MPS)"
     # Cosmological PMF production uses the fused full mixing network.
     # Non-cosmological hydro/MHD benchmarks retain chemistry-off.
-    chem_mode = _chem_mode(get(ENV, "MHD_CHEM", zrun ? "mixing" : "off"))
-    chem_helium = get(ENV, "MHD_CHEM_HELIUM",
-                       chem_mode === :mixing ? "1" : "0") in
-                   ("1", "true", "TRUE", "yes", "on")
+    p_chem_mode = @P chem.mode::String = (zrun ? "mixing" : "off") env="MHD_CHEM" group="chem" mutable=:never doc="chemistry network: off, peebles/recfast, dense, mixing or analytic_mixing (default mixing for a redshift run)"
+    chem_mode = _chem_mode(p_chem_mode)
+    chem_helium = @P chem.helium::Bool = (chem_mode === :mixing ? true : false) env="MHD_CHEM_HELIUM" group="chem" mutable=:never doc="evolve helium (requires MHD_CHEM=mixing; default on for mixing)"
     chem_helium && chem_mode !== :mixing && error(
         "MHD_CHEM_HELIUM=1 currently requires the full MHD_CHEM=mixing network")
+    p_chem_advect_species = @P chem.advect_species::Bool = true env="MHD_CHEM_ADVECT_SPECIES" group="chem" mutable=:restart doc="advect the species fields with the gas"
     chem_advect_species = chem_mode !== :off &&
-        get(ENV, "MHD_CHEM_ADVECT_SPECIES", "1") in
-            ("1", "true", "TRUE", "yes", "on")
+        p_chem_advect_species
     chem_coupling_default = zrun && chem_mode !== :off ? "strang" : "lie"
-    chem_coupling = _chem_coupling_mode(get(ENV, "MHD_CHEM_COUPLING",
-                                                chem_coupling_default))
-    chem_expansion = _chem_expansion_enabled(get(ENV, "MHD_CHEM_EXPANSION", "auto"),
+    p_chem_coupling = @P chem.coupling::String = chem_coupling_default env="MHD_CHEM_COUPLING" group="chem" mutable=:never doc="chemistry-hydro coupling: lie/split or strang/midpoint (default strang for a cosmological run with chemistry)"
+    chem_coupling = _chem_coupling_mode(p_chem_coupling)
+    p_chem_expansion = @P chem.expansion::String = "auto" env="MHD_CHEM_EXPANSION" group="chem" mutable=:never doc="apply the expansion term in the chemistry step: auto, on or off"
+    chem_expansion = _chem_expansion_enabled(p_chem_expansion,
                                              zrun, chem_mode)
-    fh = T(parse(Float64, get(ENV, "MHD_CHEM_FH", "0.76")))
-    xhii_default = zrun && zstart > 1500 ? "1.0" : "2e-4"
-    xhii0 = T(parse(Float64, get(ENV, "MHD_XHII_INIT", xhii_default)))
-    xh20 = T(parse(Float64, get(ENV, "MHD_XH2_INIT", "1e-12")))
-    chem_len_unit = parse(Float64, get(ENV, "MHD_CHEM_LENGTH_UNITS", "1.0"))
-    chem_time_unit = parse(Float64, get(ENV, "MHD_CHEM_TIME_UNITS", "1.0"))
-    chem_vunit_default = zrun ? "8e5" : string(chem_len_unit / chem_time_unit)
-    chem_vunit = parse(Float64, get(ENV, "MHD_CHEM_VUNIT", chem_vunit_default))
+    p_chem_fh = @P chem.fh::Float64 = 0.76 env="MHD_CHEM_FH" group="chem" mutable=:restart doc="hydrogen mass fraction"
+    fh = T(p_chem_fh)
+    xhii_default = zrun && zstart > 1500 ? 1.0 : 2e-4
+    p_chem_xhii_init = @P chem.xhii_init::Float64 = xhii_default env="MHD_XHII_INIT" group="chem" mutable=:restart doc="initial ionized hydrogen fraction (default 1 above z=1500, else 2e-4)"
+    xhii0 = T(p_chem_xhii_init)
+    p_chem_xh2_init = @P chem.xh2_init::Float64 = 1e-12 env="MHD_XH2_INIT" group="chem" mutable=:restart doc="initial molecular hydrogen fraction"
+    xh20 = T(p_chem_xh2_init)
+    chem_len_unit = @P chem.length_units::Float64 = 1.0 env="MHD_CHEM_LENGTH_UNITS" group="chem" mutable=:restart unit="cm" doc="code length unit of the chemistry in cm"
+    chem_time_unit = @P chem.time_units::Float64 = 1.0 env="MHD_CHEM_TIME_UNITS" group="chem" mutable=:restart unit="s" doc="code time unit of the chemistry in s"
+    chem_vunit_default = zrun ? 8e5 : chem_len_unit / chem_time_unit
+    chem_vunit = @P chem.vunit::Float64 = chem_vunit_default env="MHD_CHEM_VUNIT" group="chem" mutable=:restart unit="cm/s" doc="code velocity unit in cm/s (default 8e5 for a redshift run, else length/time)"
     chem_time_unit = chem_len_unit / chem_vunit
     if p0_auto
         zrun || error("MHD_P0=auto requires MHD_ZSTART")
@@ -4675,13 +4985,14 @@ function main()
     terminal_accuracy_pressure > 0 ||
         error("MHD_TERMINAL_ACCURACY_PRESSURE must be positive")
     pmf_b0_ng = isempty(strip(pmf_b0_ng_env)) ? NaN : parse(Float64, pmf_b0_ng_env)
-    pmf_comoving_clock = get(ENV, "MHD_PMF_COMOVING_CLOCK", "1") in
-                         ("1", "true", "TRUE", "yes", "on")
+    pmf_comoving_clock = @P pmf.comoving_clock::Bool = true env="MHD_PMF_COMOVING_CLOCK" group="pmf" mutable=:restart doc="run the terminal clock on the comoving field normalization"
+    p_pmf_b0_zref = @P pmf.b0_zref::Float64 = 3000.0 env="MHD_PMF_B0_ZREF" group="pmf" mutable=:restart doc="reference redshift of MHD_PMF_B0_NG for a non-cosmological run"
     pmf_b_zref = zrun ? pmf_normalization_z :
-                 parse(Float64, get(ENV, "MHD_PMF_B0_ZREF", "3000"))
+                 p_pmf_b0_zref
     pmf_b_aref = isfinite(pmf_b0_ng) && pmf_comoving_clock ? z_to_a(pmf_b_zref) : NaN
+    p_cosmo_mhd_scaling = @P cosmo.mhd_scaling::String = "legacy" env="MHD_COSMOLOGICAL_MHD_SCALING" group="cosmo" mutable=:never doc="comoving MHD variable scaling: legacy or jedamzik"
     cosmological_mhd_scaling = Symbol(lowercase(strip(
-        get(ENV, "MHD_COSMOLOGICAL_MHD_SCALING", "legacy"))))
+        p_cosmo_mhd_scaling)))
     cosmological_mhd_scaling in (:legacy, :jedamzik) ||
         error("MHD_COSMOLOGICAL_MHD_SCALING must be legacy or jedamzik")
     cosmological_mhd_scaling === :jedamzik && !zrun &&
@@ -4692,20 +5003,17 @@ function main()
     if isfinite(pmf_b0_ng)
         brms = _pmf_code_brms_from_comoving_ng(pmf_b0_ng, pmf_b_zref, hub, Ob, chem_vunit)
     end
-    meanfield_bguide = parse(Float64,
-        get(ENV, "MHD_MEANFIELD_BGUIDE", string(brms)))
-    meanfield_bpert = parse(Float64, get(ENV, "MHD_MEANFIELD_BPERT",
-        string(max(abs(meanfield_bguide), eps(Float64)) * meanfield_pert_frac)))
+    meanfield_bguide = @P meanfield.bguide::Float64 = (brms) env="MHD_MEANFIELD_BGUIDE" group="meanfield" mutable=:never doc="guide field in code units (default the rms field)"
+    meanfield_bpert = @P meanfield.bpert::Float64 = (max(abs(meanfield_bguide), eps(Float64)) * meanfield_pert_frac) env="MHD_MEANFIELD_BPERT" group="meanfield" mutable=:never doc="perturbation field in code units (default guide field times MHD_MEANFIELD_PERT_FRAC)"
     meanfield_bguide > 0 || error("MHD_MEANFIELD_BGUIDE must be positive")
     meanfield_bpert > 0 || error("MHD_MEANFIELD_BPERT must be positive")
-    alfven_bguide = parse(Float64, get(ENV, "MHD_ALFVEN_BGUIDE", string(brms)))
-    alfven_bpert_frac = parse(Float64, get(ENV, "MHD_ALFVEN_BPERT_FRAC", "1.0e-3"))
-    alfven_bpert = parse(Float64, get(ENV, "MHD_ALFVEN_BPERT",
-                                      string(max(abs(alfven_bguide), eps(Float64)) * alfven_bpert_frac)))
-    chem_density_fixed = get(ENV, "MHD_CHEM_DENSITY_UNITS", "")
+    alfven_bguide = @P alfven.bguide::Float64 = (brms) env="MHD_ALFVEN_BGUIDE" group="alfven" mutable=:restart doc="guide field of the linear Alfven wave in code units (default the rms field)"
+    alfven_bpert_frac = @P alfven.bpert_frac::Float64 = 0.001 env="MHD_ALFVEN_BPERT_FRAC" group="alfven" mutable=:restart doc="Alfven perturbation as a fraction of the guide field"
+    alfven_bpert = @P alfven.bpert::Float64 = (max(abs(alfven_bguide), eps(Float64)) * alfven_bpert_frac) env="MHD_ALFVEN_BPERT" group="alfven" mutable=:restart doc="Alfven perturbation field in code units (default guide field times MHD_ALFVEN_BPERT_FRAC)"
+    chem_density_fixed = @P chem.density_units::String = "" env="MHD_CHEM_DENSITY_UNITS" group="chem" mutable=:restart unit="g/cm^3" doc="fixed code density unit in g/cm^3; empty = the cosmological baryon density"
     mixing_chem = chem_mode === :mixing || chem_mode === :analytic_mixing
-    chem_hydrogen_storage = Symbol(lowercase(strip(get(
-        ENV, "MHD_CHEM_H_STORAGE", zrun && chem_mode === :mixing ? "centered" : "ionized"))))
+    p_chem_h_storage = @P chem.h_storage::String = (zrun && chem_mode === :mixing ? "centered" : "ionized") env="MHD_CHEM_H_STORAGE" group="chem" mutable=:never doc="hydrogen species storage: ionized, neutral or centered (default centered for cosmological mixing)"
+    chem_hydrogen_storage = Symbol(lowercase(strip(p_chem_h_storage)))
     chem_hydrogen_storage in (:ionized, :neutral, :centered) ||
         error("MHD_CHEM_H_STORAGE must be ionized, neutral, or centered")
     chem_neutral_hydrogen_storage = chem_hydrogen_storage === :neutral
@@ -4717,27 +5025,27 @@ function main()
         initial_state_dir, chem_hydrogen_storage)
     imported_hydrogen_reference === nothing ||
         (xhii0 = T(imported_hydrogen_reference))
-    chem_dtfrac = parse(Float64, get(ENV, "MHD_CHEM_DTFRAC",
-                                     zrun && mixing_chem ? "1.0" : "0.1"))
+    chem_dtfrac = @P chem.dtfrac::Float64 = (zrun && mixing_chem ? 1.0 : 0.1) env="MHD_CHEM_DTFRAC" group="chem" mutable=:restart doc="chemistry substep as a fraction of the hydro step (default 1 for cosmological mixing, else 0.1)"
     # Boosted terminal steps can span the entire stiff recombination interval.
     # The loop exits early after consuming dt, so a high ceiling is cheap once
     # converged; lower ceilings silently left ionized cells partially evolved.
-    chem_itcap_default = chem_mode === :mixing ? "1024" :
-                         chem_mode === :analytic_mixing ? "64" :
-                         chem_mode === :peebles ? "64" : "64"
-    chem_itcap = parse(Int, get(ENV, "MHD_CHEM_ITCAP", chem_itcap_default))
-    chem_falpha = parse(Float64, get(ENV, "MHD_CHEM_FALPHA",
-                                     zrun && mixing_chem ? "1.0" : "0.0"))
-    chem_falpha_zs = _parse_optional_list("MHD_CHEM_FALPHA_ZS")
-    chem_falpha_vals = _parse_optional_list("MHD_CHEM_FALPHA_VALS")
-    chem_smooth = _chem_smooth_mode(get(ENV, "MHD_CHEM_SMOOTH",
-                                            zrun && mixing_chem ? "gaussian" : "local"))
-    chem_allow_local_mixing = get(ENV, "MHD_CHEM_ALLOW_LOCAL_MIXING", "0") in
-                              ("1", "true", "TRUE", "yes", "on")
-    chem_nsmean = parse(Float64, get(ENV, "MHD_CHEM_NSMEAN", "1.0"))
-    chem_smooth_sigma = parse(Float64, get(ENV, "MHD_CHEM_SMOOTH_SIGMA_CELLS", "16.0"))
-    chem_nonlocal_table_path = strip(get(ENV, "MHD_CHEM_NONLOCAL_TABLE", ""))
-    chem_nonlocal_scale = parse(Float64, get(ENV, "MHD_CHEM_NONLOCAL_SCALE", "1.0"))
+    chem_itcap_default = chem_mode === :mixing ? 1024 :
+                         chem_mode === :analytic_mixing ? 64 :
+                         chem_mode === :peebles ? 64 : 64
+    chem_itcap = @P chem.itcap::Int = chem_itcap_default env="MHD_CHEM_ITCAP" group="chem" mutable=:restart doc="iteration cap of the chemistry solver (default 1024 for mixing, else 64)"
+    chem_falpha = @P chem.falpha::Float64 = (zrun && mixing_chem ? 1.0 : 0.0) env="MHD_CHEM_FALPHA" group="chem" mutable=:restart doc="Lyman-alpha mixing strength (default 1 for cosmological mixing, else 0)"
+    p_chem_falpha_zs = @P chem.falpha_zs::String = "" env="MHD_CHEM_FALPHA_ZS" group="chem" mutable=:restart doc="comma-separated redshifts of the MHD_CHEM_FALPHA table; empty = constant"
+    chem_falpha_zs = _parse_optional_list_text(p_chem_falpha_zs)
+    p_chem_falpha_vals = @P chem.falpha_vals::String = "" env="MHD_CHEM_FALPHA_VALS" group="chem" mutable=:restart doc="comma-separated falpha values at MHD_CHEM_FALPHA_ZS"
+    chem_falpha_vals = _parse_optional_list_text(p_chem_falpha_vals)
+    p_chem_smooth = @P chem.smooth::String = (zrun && mixing_chem ? "gaussian" : "local") env="MHD_CHEM_SMOOTH" group="chem" mutable=:restart doc="mixing smoothing: local, global or gaussian (default gaussian for cosmological mixing)"
+    chem_smooth = _chem_smooth_mode(p_chem_smooth)
+    chem_allow_local_mixing = @P chem.allow_local_mixing::Bool = false env="MHD_CHEM_ALLOW_LOCAL_MIXING" group="chem" mutable=:restart doc="permit local mixing without a nonlocal table"
+    chem_nsmean = @P chem.nsmean::Float64 = 1.0 env="MHD_CHEM_NSMEAN" group="chem" mutable=:restart doc="mean-density weighting exponent of the mixing term"
+    chem_smooth_sigma = @P chem.smooth_sigma_cells::Float64 = 16.0 env="MHD_CHEM_SMOOTH_SIGMA_CELLS" group="chem" mutable=:restart doc="Gaussian smoothing width in cells"
+    p_chem_nonlocal_table = @P chem.nonlocal_table::String = "" env="MHD_CHEM_NONLOCAL_TABLE" group="chem" mutable=:restart doc="path of the nonlocal response table; empty = none (waived in the checkpoint fingerprint outside both tables' redshift support)"
+    chem_nonlocal_table_path = strip(p_chem_nonlocal_table)
+    chem_nonlocal_scale = @P chem.nonlocal_scale::Float64 = 1.0 env="MHD_CHEM_NONLOCAL_SCALE" group="chem" mutable=:never doc="scale of the nonlocal response (>= 0)"
     chem_nonlocal_scale >= 0 || error("MHD_CHEM_NONLOCAL_SCALE must be non-negative")
     !isempty(chem_nonlocal_table_path) && chem_nonlocal_scale == 0 && error(
         "remove MHD_CHEM_NONLOCAL_TABLE rather than configuring a zero response scale")
@@ -4750,107 +5058,90 @@ function main()
         "nonlocal response tables require MHD_CHEM_FALPHA=0 to avoid double-counting mixing")
     chem_nonlocal_enabled && chem_smooth !== :local && error(
         "nonlocal response tables require MHD_CHEM_SMOOTH=local")
-    chem_xe_mean = parse(Float64, get(ENV, "MHD_CHEM_XE_MEAN", "NaN"))
-    chem_ionized_fast_zmin = parse(Float64, get(ENV, "MHD_CHEM_IONIZED_FAST_ZMIN",
-        zrun && chem_helium ? "3000" : "0"))
+    chem_xe_mean = @P chem.xe_mean::Float64 = NaN env="MHD_CHEM_XE_MEAN" group="chem" mutable=:restart doc="fixed mean electron fraction; NaN = evolve it"
+    chem_ionized_fast_zmin = @P chem.ionized_fast_zmin::Float64 = (zrun && chem_helium ? 3000.0 : 0.0) env="MHD_CHEM_IONIZED_FAST_ZMIN" group="chem" mutable=:restart doc="use the fast ionized solver above this redshift (default 3000 with helium, else 0)"
     chem_helium && 0 < chem_ionized_fast_zmin < 3000 && error(
         "helium freeze-out must be evolved explicitly: set " *
         "MHD_CHEM_IONIZED_FAST_ZMIN=0 or >=3000")
-    chem_recfast_hswitch = get(ENV, "MHD_CHEM_RECFAST_HSWITCH", "1") == "1"
-    chem_rate_tables_enabled = get(ENV, "MHD_CHEM_RATE_TABLES", "1") in
-                               ("1", "true", "TRUE", "yes", "on")
-    chem_profile_enabled = get(ENV, "MHD_CHEM_PROFILE", "0") in
-                           ("1", "true", "TRUE", "yes", "on")
-    chem_fused_analytic = get(ENV, "MHD_CHEM_FUSED_ANALYTIC",
-                              chem_mode === :analytic_mixing ? "1" : "0") in
-                          ("1", "true", "TRUE", "yes", "on")
-    chem_fused_mixing = get(ENV, "MHD_CHEM_FUSED_MIXING",
-                            chem_mode === :mixing ? "1" : "0") in
-                        ("1", "true", "TRUE", "yes", "on")
+    chem_recfast_hswitch = @P chem.recfast_hswitch::Bool = true env="MHD_CHEM_RECFAST_HSWITCH" group="chem" mutable=:restart doc="RECFAST hydrogen switch"
+    chem_rate_tables_enabled = @P chem.rate_tables::Bool = true env="MHD_CHEM_RATE_TABLES" group="chem" mutable=:restart doc="use log-log rate and cooling tables"
+    chem_profile_enabled = @P chem.profile::Bool = false env="MHD_CHEM_PROFILE" group="chem" mutable=:restart doc="time the chemistry phases"
+    chem_fused_analytic = @P chem.fused_analytic::Bool = (chem_mode === :analytic_mixing ? true : false) env="MHD_CHEM_FUSED_ANALYTIC" group="chem" mutable=:restart doc="fused analytic mixing kernel (default on for analytic_mixing)"
+    chem_fused_mixing = @P chem.fused_mixing::Bool = (chem_mode === :mixing ? true : false) env="MHD_CHEM_FUSED_MIXING" group="chem" mutable=:restart doc="fused mixing kernel (default on for mixing)"
     (chem_neutral_hydrogen_storage || chem_centered_hydrogen_storage) &&
         !chem_fused_mixing && error(
             "MHD_CHEM_H_STORAGE=neutral/centered requires MHD_CHEM_FUSED_MIXING=1")
     chem_helium && !chem_fused_mixing && error(
         "MHD_CHEM_HELIUM=1 requires MHD_CHEM_FUSED_MIXING=1")
-    chem_mean_every = parse(Int, get(ENV, "MHD_CHEM_MEAN_EVERY", "1"))
+    chem_mean_every = @P chem.mean_every::Int = 1 env="MHD_CHEM_MEAN_EVERY" group="chem" mutable=:restart doc="refresh the chemistry mean state every this many cycles"
     chem_mean_every >= 1 || error("MHD_CHEM_MEAN_EVERY must be positive")
     chem_centered_hydrogen_storage && chem_mean_every != 1 && error(
         "MHD_CHEM_H_STORAGE=centered requires MHD_CHEM_MEAN_EVERY=1")
-    chem_fudge = parse(Float64, get(ENV, "MHD_CHEM_RECFAST_FUDGE",
-                                    chem_recfast_hswitch ? "1.125" : "1.0"))
-    final_diag = get(ENV, "MHD_FINAL_DIAG", "1") != "0"
-    history_path = get(ENV, "MHD_HISTORY_TSV", "")
-    initial_history = get(ENV, "MHD_INITIAL_HISTORY", "1") in
-                      ("1", "true", "TRUE", "yes", "on")
-    initial_pk = get(ENV, "MHD_INITIAL_PK", "0") in
-                 ("1", "true", "TRUE", "yes", "on")
-    pk_path = get(ENV, "MHD_PK_TSV", "")
-    mode_history_path = get(ENV, "MHD_MODE_HISTORY_TSV", "")
+    chem_fudge = @P chem.recfast_fudge::Float64 = (chem_recfast_hswitch ? 1.125 : 1.0) env="MHD_CHEM_RECFAST_FUDGE" group="chem" mutable=:restart doc="RECFAST fudge factor (default 1.125 with the hydrogen switch, else 1)"
+    final_diag = @P io.final_diag::Bool = true env="MHD_FINAL_DIAG" group="io" mutable=:restart doc="compute the final diagnostics and summary statistics"
+    history_path = @P io.history_tsv::String = "" env="MHD_HISTORY_TSV" group="io" mutable=:restart doc="path of the history time series (appended; empty = none)"
+    initial_history = @P io.initial_history::Bool = true env="MHD_INITIAL_HISTORY" group="io" mutable=:restart doc="write a history row for the initial state before the first step"
+    initial_pk = @P io.initial_pk::Bool = false env="MHD_INITIAL_PK" group="io" mutable=:restart doc="write P(k,mu) for the initial state before the first step"
+    pk_path = @P io.pk_tsv::String = "" env="MHD_PK_TSV" group="io" mutable=:restart doc="path of the P(k,mu) table (appended; empty = none)"
+    mode_history_path = @P io.mode_history_tsv::String = "" env="MHD_MODE_HISTORY_TSV" group="io" mutable=:restart doc="path of the linear-mode history (empty = none)"
     if pmf_init in (:meanfield, :meanfield_linear, :sv25_mode) ||
        !isempty(mode_history_path)
         0 < pmf_kmode < N ÷ 2 ||
             error("matched linear modes require 0 < MHD_PMF_KMODE < N/2")
     end
-    pdf_path = get(ENV, "MHD_PDF_TSV", "")
-    adaptive_diag_rel = parse(Float64, get(ENV, "MHD_ADAPTIVE_DIAG_REL", "0"))
+    pdf_path = @P io.pdf_tsv::String = "" env="MHD_PDF_TSV" group="io" mutable=:restart doc="path of the density PDF table (empty = none)"
+    adaptive_diag_rel = @P diag.adaptive_rel::Float64 = 0.0 env="MHD_ADAPTIVE_DIAG_REL" group="diag" mutable=:restart doc="relative change of delta_b or x_HII that triggers an extra history row (0 = off)"
     adaptive_diag_rel >= 0 || error("MHD_ADAPTIVE_DIAG_REL must be non-negative")
-    adaptive_diag_zmin = parse(Float64, get(ENV, "MHD_ADAPTIVE_DIAG_ZMIN", "-Inf"))
-    adaptive_diag_zmax = parse(Float64, get(ENV, "MHD_ADAPTIVE_DIAG_ZMAX", "Inf"))
+    adaptive_diag_zmin = @P diag.adaptive_zmin::Float64 = -Inf env="MHD_ADAPTIVE_DIAG_ZMIN" group="diag" mutable=:restart doc="lowest redshift of the adaptive diagnostic window"
+    adaptive_diag_zmax = @P diag.adaptive_zmax::Float64 = Inf env="MHD_ADAPTIVE_DIAG_ZMAX" group="diag" mutable=:restart doc="highest redshift of the adaptive diagnostic window"
     adaptive_diag_zmax >= adaptive_diag_zmin ||
         error("MHD_ADAPTIVE_DIAG_ZMAX must be >= MHD_ADAPTIVE_DIAG_ZMIN")
-    pdf_nbins = parse(Int, get(ENV, "MHD_PDF_NBINS", "128"))
+    pdf_nbins = @P diag.pdf_nbins::Int = 128 env="MHD_PDF_NBINS" group="diag" mutable=:restart doc="bins of the log-density PDF"
     pdf_nbins > 0 || error("MHD_PDF_NBINS must be positive")
-    pdf_loglo = parse(Float64, get(ENV, "MHD_PDF_LOGRHO_MIN", "-4"))
-    pdf_loghi = parse(Float64, get(ENV, "MHD_PDF_LOGRHO_MAX", "4"))
+    pdf_loglo = @P diag.pdf_logrho_min::Float64 = -4.0 env="MHD_PDF_LOGRHO_MIN" group="diag" mutable=:restart doc="lower edge of the log10 density PDF"
+    pdf_loghi = @P diag.pdf_logrho_max::Float64 = 4.0 env="MHD_PDF_LOGRHO_MAX" group="diag" mutable=:restart doc="upper edge of the log10 density PDF"
     pdf_loghi > pdf_loglo || error("MHD_PDF_LOGRHO_MAX must exceed MHD_PDF_LOGRHO_MIN")
-    pk_every = parse(Int, get(ENV, "MHD_PK_EVERY", "0"))
-    pk_zs = _parse_z_outputs(get(ENV, "MHD_PK_ZS", ""))
+    pk_every = @P diag.pk_every::Int = 0 env="MHD_PK_EVERY" group="diag" mutable=:restart doc="write P(k,mu) every this many measured cycles (0 = only at MHD_PK_ZS)"
+    p_diag_pk_zs = @P diag.pk_zs::String = "" env="MHD_PK_ZS" group="diag" mutable=:restart doc="comma-separated redshifts at which P(k,mu), the PDF and a history row are written"
+    pk_zs = _parse_z_outputs(p_diag_pk_zs)
     pk_next = Ref(1)
-    diag_clear_fft = get(ENV, "MHD_DIAG_CLEAR_FFT", "0") in
-                     ("1", "true", "TRUE", "yes", "on")
-    frame_dir = get(ENV, "MHD_DENSITY_FRAME_DIR", "")
-    frame_zs = _parse_z_outputs(get(ENV, "MHD_DENSITY_FRAME_ZS", ""))
+    diag_clear_fft = @P diag.clear_fft::Bool = false env="MHD_DIAG_CLEAR_FFT" group="diag" mutable=:restart doc="clear the Metal FFT scratch after a full diagnostic"
+    frame_dir = @P io.density_frame_dir::String = "" env="MHD_DENSITY_FRAME_DIR" group="io" mutable=:restart doc="directory for density slice and projection frames (empty = none)"
+    p_io_density_frame_zs = @P io.density_frame_zs::String = "" env="MHD_DENSITY_FRAME_ZS" group="io" mutable=:restart doc="comma-separated redshifts at which density frames are written"
+    frame_zs = _parse_z_outputs(p_io_density_frame_zs)
     !isempty(frame_zs) && isempty(frame_dir) &&
         error("MHD_DENSITY_FRAME_ZS requires MHD_DENSITY_FRAME_DIR")
     frame_next = Ref(1)
-    pk_nmu = parse(Int, get(ENV, "MHD_PK_NMU", "4"))
-    pk_nbins = parse(Int, get(ENV, "MHD_PK_NBINS", string(max(1, N ÷ 2))))
-    pk_axis = parse(Int, get(ENV, "MHD_PK_AXIS", "1"))
-    pk_kmax_env = strip(get(ENV, "MHD_PK_KMAX", ""))
+    pk_nmu = @P diag.pk_nmu::Int = 4 env="MHD_PK_NMU" group="diag" mutable=:restart doc="mu bins of P(k,mu)"
+    pk_nbins = @P diag.pk_nbins::Int = (max(1, N ÷ 2)) env="MHD_PK_NBINS" group="diag" mutable=:restart doc="k bins of P(k,mu) (default N/2)"
+    pk_axis = @P diag.pk_axis::Int = 1 env="MHD_PK_AXIS" group="diag" mutable=:restart doc="line-of-sight axis of the mu decomposition (1, 2 or 3)"
+    p_diag_pk_kmax = @P diag.pk_kmax::String = "" env="MHD_PK_KMAX" group="diag" mutable=:restart doc="largest k of P(k,mu); empty = Nyquist"
+    pk_kmax_env = strip(p_diag_pk_kmax)
     pk_kmax = isempty(pk_kmax_env) ? nothing : parse(Float64, pk_kmax_env)
     pk_kmax === nothing || pk_kmax > 0 || error("MHD_PK_KMAX must be positive")
-    debug_div_every = parse(Int, get(ENV, "MHD_DEBUG_DIV_EVERY", "0"))
+    debug_div_every = @P debug.div_every::Int = 0 env="MHD_DEBUG_DIV_EVERY" group="debug" mutable=:restart doc="print the div B diagnostic every this many cycles (0 = off)"
     debug_div_every >= 0 || error("MHD_DEBUG_DIV_EVERY must be non-negative")
-    debug_phase_finite = get(ENV, "MHD_DEBUG_PHASE_FINITE", "0") in
-                         ("1", "true", "TRUE", "yes", "on")
-    debug_phase_cycle_min = parse(Int, get(ENV, "MHD_DEBUG_PHASE_CYCLE_MIN", "0"))
+    debug_phase_finite = @P debug.phase_finite::Bool = false env="MHD_DEBUG_PHASE_FINITE" group="debug" mutable=:restart doc="check every phase of the step for finite values"
+    debug_phase_cycle_min = @P debug.phase_cycle_min::Int = 0 env="MHD_DEBUG_PHASE_CYCLE_MIN" group="debug" mutable=:restart doc="first cycle of the per-phase finite checks"
     debug_phase_cycle_min >= 0 || error("MHD_DEBUG_PHASE_CYCLE_MIN must be non-negative")
-    debug_phase_zmax = parse(Float64, get(ENV, "MHD_DEBUG_PHASE_ZMAX", "Inf"))
-    debug_phase_rho_min = parse(Float64, get(ENV, "MHD_DEBUG_PHASE_RHO_MIN", "0"))
+    debug_phase_zmax = @P debug.phase_zmax::Float64 = Inf env="MHD_DEBUG_PHASE_ZMAX" group="debug" mutable=:restart doc="highest redshift of the per-phase finite checks"
+    debug_phase_rho_min = @P debug.phase_rho_min::Float64 = 0.0 env="MHD_DEBUG_PHASE_RHO_MIN" group="debug" mutable=:restart doc="density floor asserted by the per-phase checks"
     debug_phase_rho_min >= 0 || error("MHD_DEBUG_PHASE_RHO_MIN must be non-negative")
-    debug_radiation_rho_min = parse(Float64,
-        get(ENV, "MHD_DEBUG_RADIATION_RHO_MIN", "0"))
-    debug_radiation_cycle_min = parse(Int,
-        get(ENV, "MHD_DEBUG_RADIATION_CYCLE_MIN", "0"))
-    debug_radiation_correction_cfl = parse(Float64,
-        get(ENV, "MHD_DEBUG_RADIATION_CORRECTION_CFL", "Inf"))
+    debug_radiation_rho_min = @P debug.radiation_rho_min::Float64 = 0.0 env="MHD_DEBUG_RADIATION_RHO_MIN" group="debug" mutable=:restart doc="density floor asserted after the radiation step"
+    debug_radiation_cycle_min = @P debug.radiation_cycle_min::Int = 0 env="MHD_DEBUG_RADIATION_CYCLE_MIN" group="debug" mutable=:restart doc="first cycle of the radiation debug checks"
+    debug_radiation_correction_cfl = @P debug.radiation_correction_cfl::Float64 = Inf env="MHD_DEBUG_RADIATION_CORRECTION_CFL" group="debug" mutable=:restart doc="CFL limit of the radiation correction debug check"
     debug_radiation_rho_min >= 0 ||
         error("MHD_DEBUG_RADIATION_RHO_MIN must be non-negative")
     debug_radiation_cycle_min >= 0 ||
         error("MHD_DEBUG_RADIATION_CYCLE_MIN must be non-negative")
-    checkpoint_path = strip(get(ENV, "MHD_CHECKPOINT_PATH", ""))
-    checkpoint_read_path = strip(get(ENV, "MHD_CHECKPOINT_READ_PATH", checkpoint_path))
-    checkpoint_write_path = strip(get(ENV, "MHD_CHECKPOINT_WRITE_PATH", checkpoint_path))
-    checkpoint_every = parse(Int, get(ENV, "MHD_CHECKPOINT_EVERY", "0"))
-    checkpoint_at_cycle = parse(Int, get(ENV, "MHD_CHECKPOINT_AT_CYCLE", "0"))
+    p_checkpoint_write_path = @P checkpoint.write_path::String = checkpoint_path env="MHD_CHECKPOINT_WRITE_PATH" group="checkpoint" mutable=:restart doc="checkpoint to write (default MHD_CHECKPOINT_PATH)"
+    checkpoint_write_path = strip(p_checkpoint_write_path)
+    checkpoint_every = @P checkpoint.every::Int = 0 env="MHD_CHECKPOINT_EVERY" group="checkpoint" mutable=:restart doc="write a checkpoint every this many measured cycles (0 = only the final one)"
+    checkpoint_at_cycle = @P checkpoint.at_cycle::Int = 0 env="MHD_CHECKPOINT_AT_CYCLE" group="checkpoint" mutable=:restart doc="write a checkpoint at this cycle (0 = none)"
     checkpoint_every >= 0 || error("MHD_CHECKPOINT_EVERY must be non-negative")
     checkpoint_at_cycle >= 0 || error("MHD_CHECKPOINT_AT_CYCLE must be non-negative")
-    checkpoint_resume = get(ENV, "MHD_CHECKPOINT_RESUME", "1") in
-                        ("1", "true", "TRUE", "yes", "on")
-    checkpoint_final = get(ENV, "MHD_CHECKPOINT_FINAL", "1") in
-                       ("1", "true", "TRUE", "yes", "on")
-    checkpoint_disable_writes = get(ENV, "MHD_CHECKPOINT_DISABLE_WRITES", "0") in
-                                ("1", "true", "TRUE", "yes", "on")
+    checkpoint_final = @P checkpoint.final::Bool = true env="MHD_CHECKPOINT_FINAL" group="checkpoint" mutable=:restart doc="write a checkpoint after the last cycle"
+    checkpoint_disable_writes = @P checkpoint.disable_writes::Bool = false env="MHD_CHECKPOINT_DISABLE_WRITES" group="checkpoint" mutable=:restart doc="never write checkpoints (restore only)"
     checkpoint_every > 0 && isempty(checkpoint_path) &&
         error("MHD_CHECKPOINT_EVERY requires MHD_CHECKPOINT_PATH")
     adaptive_last_delta_b = Ref(NaN)
@@ -4864,17 +5155,199 @@ function main()
         error("MHD_CHEM=$(chem_mode) needs MHD_CHEM_SMOOTH=global or gaussian")
     end
 
+    default_mhd_integrator = BACKEND_NAME === :cpu ? "ref" : "cube"
+    p_mhd_integrator = @P mhd.integrator::String = default_mhd_integrator env="MHD_INTEGRATOR" group="mhd" mutable=:never doc="MHD integrator: ref (CPU reference) or cube (GPU cube kernel); default ref on cpu, cube elsewhere"
+    mhd_integrator = Symbol(lowercase(p_mhd_integrator))
+    mhd_integrator in (:ref, :cube) ||
+        error("MHD_INTEGRATOR must be ref or cube; got $mhd_integrator")
+    # Parameters read later in the run are declared here, before the run record is
+    # written, so params.json is complete (R-D3) and `--schema` names every one.
+    terminal_keff = @P terminal.keff::Float64 = (pmf_init === :batchelor ? max(1.0, kcut * boxsize / (2π)) : Float64(max(1, pmf_kmode))) env="MHD_TERMINAL_KEFF" group="terminal" mutable=:restart doc="effective wave number of the Alfven frequency in the hybrid regime test (default kcut*box/2pi for batchelor, else the mode number)"
+    checkpoint_allow_cfl_change = @P checkpoint.allow_cfl_change::Bool = false env="MHD_CHECKPOINT_ALLOW_CFL_CHANGE" group="checkpoint" mutable=:restart doc="deprecated no-op: mhd.cfl and radiation.nonlinear_cfl are mutable=restart, so a resume may always change them"
+    checkpoint_allow_cfl_change &&
+        _log_line("DEPRECATED MHD_CHECKPOINT_ALLOW_CFL_CHANGE is a no-op: mhd.cfl and radiation.nonlinear_cfl are mutable=restart, so a resume may always change them")
+    checkpoint_allow_nonlocal_table_change = @P checkpoint.allow_nonlocal_table_change::Bool = false env="MHD_CHECKPOINT_ALLOW_NONLOCAL_TABLE_CHANGE" group="checkpoint" mutable=:restart doc="deprecated no-op: chem.nonlocal_table is mutable=restart, so a resume may change it (outside both tables' redshift support)"
+    checkpoint_allow_nonlocal_table_change &&
+        _log_line("DEPRECATED MHD_CHECKPOINT_ALLOW_NONLOCAL_TABLE_CHANGE is a no-op: chem.nonlocal_table is mutable=restart, so a resume may change it outside both tables' redshift support")
+    reset_energy_ledger = @P checkpoint.reset_energy_ledger::Bool = false env="MHD_CHECKPOINT_RESET_ENERGY_LEDGER" group="checkpoint" mutable=:restart doc="discard the radiation energy ledger carried in the checkpoint on restore"
+    import_rescale_to_pmf = @P io.initial_b_rescale_to_pmf::Bool = false env="MHD_INITIAL_B_RESCALE_TO_PMF" group="io" mutable=:restart doc="rescale an imported initial field to the PMF rms"
+    p_io_initial_b_import_dir = @P io.initial_b_import_dir::String = "" env="MHD_INITIAL_B_IMPORT_DIR" group="io" mutable=:restart doc="directory of an initial field (bx/by/bz.f32) to import; empty = generate"
+    initial_b_import_dir = strip(p_io_initial_b_import_dir)
+    initial_b_dir = @P io.initial_b_dir::String = "" env="MHD_INITIAL_B_DIR" group="io" mutable=:restart doc="directory to export the initial field to (empty = none)"
+    final_b_dir = @P io.final_b_dir::String = "" env="MHD_FINAL_B_DIR" group="io" mutable=:restart doc="directory to export the final field to (empty = none)"
+    radiation_photon_adiabatic = @P radiation.photon_adiabatic::Bool = true env="MHD_RADIATION_PHOTON_ADIABATIC" group="radiation" mutable=:restart doc="initialize the photon moments with the adiabatic density perturbation"
+    radiation_photon_comoving = @P radiation.photon_comoving::Bool = true env="MHD_RADIATION_PHOTON_COMOVING" group="radiation" mutable=:restart doc="initialize the photon moments with the comoving gas velocity"
+    out_tsv = @P io.out_tsv::String = "" env="MHD_OUT_TSV" group="io" mutable=:restart doc="path of the one-row-per-run summary table (appended; empty = none)"
+    p_run_dir = @P run.dir::String = get(ENV, "VESPA_RUN_DIR", "") env="MHD_RUN_DIR" group="run" mutable=:restart doc="directory of the run record (run.json, params.json, events.jsonl, outputs.json, control/); defaults to VESPA_RUN_DIR, else the directory of the first configured output table, else a fresh directory under the temp dir"
+
+    return (;
+        checkpoint_read_path, checkpoint_resume, N, steps, tfinal, zrun, warmup, memprobe,
+        profile_skip_cycles, zstart, zend, hub, Om, OL, Or, Ok, Ob, maxexp,
+        source_max_dt_factor, maxcycles, debug_stop_cycle, print_every, cycle_print_every,
+        check_every, cfl, p0_auto, p0, pfloor, llf_dmin, llf_pmin, drag_enabled, drag_dt_mode,
+        radiation_bridge_q2, radiation_long_viscosity, radiation_max_dlna,
+        radiation_highz_max_dlna, radiation_highz_zmin, radiation_nyquist_guard,
+        radiation_response_model, radiation_nonlinear_cfl, radiation_energy_ledger_every,
+        radiation_free_stream_tolerance, radiation_positivity_fallback,
+        radiation_positivity_max_fallback_passes, radiation_positivity_wave_growth_limit,
+        radiation_positivity_max_subdivisions, radiation_checkpoint_fallback, drag_dt_boost,
+        drag_max_impulse, drag_xe_env, drag_xe_fixed, drag_helium_electrons, drag_rate_code,
+        init_terminal_momenta, drag_vx0, drag_vy0, drag_vz0, terminal_vcap,
+        terminal_gamma_scale, terminal_gamma_code_override, terminal_split, terminal_vsmooth,
+        terminal_dedicated_scratch, terminal_lbox_cm, terminal_max_disp_cells,
+        terminal_diff_cfl, terminal_accuracy_cfl, terminal_accuracy_pressure_auto,
+        terminal_accuracy_pressure, terminal_implicit_diffuse, terminal_implicit_diffuse_fac,
+        terminal_pressure_implicit, terminal_pressure_coeff_auto, terminal_pressure_coeff,
+        terminal_rho_rel_limit, terminal_b_rel_limit, terminal_induction,
+        terminal_induction_cfl, terminal_induction_dissipation,
+        terminal_induction_dissipation_order, terminal_project_b,
+        terminal_induction_max_subcycles, hybrid_min_va_cs, hybrid_exit_drag_omega,
+        hybrid_enter_drag_omega, hybrid_check_every, hybrid_confirm_checks,
+        hybrid_handoff_steps, hybrid_handoff_alpha, hybrid_handoff_error_tol,
+        hybrid_handoff_displacement_tol, hybrid_handoff_diag_every, hybrid_reenter_terminal,
+        hybrid_aware_dt_factor, brms, pmf_b0_ng_env, initial_state_dir, pmf_normalization_z,
+        pmf_init, radiation_magnetic_compensation, pmf_kmode, meanfield_theta,
+        meanfield_polarization, boxsize, pmf_tile_box, pmf_tile_n, kcut, pmf_kmax, pmf_kmin,
+        pmf_required_cells, pmf_preserve_low_kmax, pmf_preserve_low_kcut,
+        pmf_normalization_kind, pmf_normalization_kind_resolved, pmf_fixed_mode_power,
+        pmf_mode_realization, pmf_realization_box, pmf_curl_symbol, pmf_curl_reference_n,
+        pmf_mode_lock_n, pmf_high_mode_lock_n, pmf_min_cells_per_wavelength, seed, recon,
+        riemann, glm_ch_fac, glm_cr, glm_project_every, gravity, gravity_gas_kick,
+        gravity_subcycles_fixed, gravity_dt_boost, gravity_source, grav_gas_weight,
+        grav_dm_weight, particle_max_disp_cells, particle_wrap, lattice_displacements,
+        dm_density_mean, gravity_phi_interp, gravity_midpoint_source, fft_mode, gravity_1buf,
+        chem_mode, chem_helium, chem_advect_species, chem_coupling, chem_expansion, fh, xhii0,
+        xh20, chem_time_unit, chem_vunit, pmf_b0_ng, pmf_comoving_clock, pmf_b_zref,
+        pmf_b_aref, cosmological_mhd_scaling, cosmological_mhd_aref, meanfield_bguide,
+        meanfield_bpert, alfven_bguide, alfven_bpert, chem_density_fixed,
+        chem_hydrogen_storage, chem_neutral_hydrogen_storage, chem_centered_hydrogen_storage,
+        chem_dtfrac, chem_itcap, chem_falpha, chem_falpha_zs, chem_falpha_vals, chem_smooth,
+        chem_nsmean, chem_smooth_sigma, chem_nonlocal_table_path, chem_nonlocal_scale,
+        chem_nonlocal_enabled, chem_xe_mean, chem_ionized_fast_zmin, chem_recfast_hswitch,
+        chem_rate_tables_enabled, chem_profile_enabled, chem_fused_analytic, chem_fused_mixing,
+        chem_mean_every, chem_fudge, final_diag, history_path, initial_history, initial_pk,
+        pk_path, mode_history_path, pdf_path, adaptive_diag_rel, adaptive_diag_zmin,
+        adaptive_diag_zmax, pdf_nbins, pdf_loglo, pdf_loghi, pk_every, pk_zs, pk_next,
+        diag_clear_fft, frame_dir, frame_zs, frame_next, pk_nmu, pk_nbins, pk_axis, pk_kmax,
+        debug_div_every, debug_phase_finite, debug_phase_cycle_min, debug_phase_zmax,
+        debug_phase_rho_min, debug_radiation_rho_min, debug_radiation_cycle_min,
+        debug_radiation_correction_cfl, checkpoint_write_path, checkpoint_every,
+        checkpoint_at_cycle, checkpoint_final, checkpoint_disable_writes,
+        adaptive_last_delta_b, adaptive_last_xhii, mhd_integrator, terminal_keff,
+        reset_energy_ledger, import_rescale_to_pmf, initial_b_import_dir, initial_b_dir,
+        final_b_dir, radiation_photon_adiabatic, radiation_photon_comoving, out_tsv, p_run_dir
+    )
+end
+
+function main()
+    (;
+        checkpoint_read_path, checkpoint_resume, N, steps, tfinal, zrun, warmup, memprobe,
+        profile_skip_cycles, zstart, zend, hub, Om, OL, Or, Ok, Ob, maxexp,
+        source_max_dt_factor, maxcycles, debug_stop_cycle, print_every, cycle_print_every,
+        check_every, cfl, p0_auto, p0, pfloor, llf_dmin, llf_pmin, drag_enabled, drag_dt_mode,
+        radiation_bridge_q2, radiation_long_viscosity, radiation_max_dlna,
+        radiation_highz_max_dlna, radiation_highz_zmin, radiation_nyquist_guard,
+        radiation_response_model, radiation_nonlinear_cfl, radiation_energy_ledger_every,
+        radiation_free_stream_tolerance, radiation_positivity_fallback,
+        radiation_positivity_max_fallback_passes, radiation_positivity_wave_growth_limit,
+        radiation_positivity_max_subdivisions, radiation_checkpoint_fallback, drag_dt_boost,
+        drag_max_impulse, drag_xe_env, drag_xe_fixed, drag_helium_electrons, drag_rate_code,
+        init_terminal_momenta, drag_vx0, drag_vy0, drag_vz0, terminal_vcap,
+        terminal_gamma_scale, terminal_gamma_code_override, terminal_split, terminal_vsmooth,
+        terminal_dedicated_scratch, terminal_lbox_cm, terminal_max_disp_cells,
+        terminal_diff_cfl, terminal_accuracy_cfl, terminal_accuracy_pressure_auto,
+        terminal_accuracy_pressure, terminal_implicit_diffuse, terminal_implicit_diffuse_fac,
+        terminal_pressure_implicit, terminal_pressure_coeff_auto, terminal_pressure_coeff,
+        terminal_rho_rel_limit, terminal_b_rel_limit, terminal_induction,
+        terminal_induction_cfl, terminal_induction_dissipation,
+        terminal_induction_dissipation_order, terminal_project_b,
+        terminal_induction_max_subcycles, hybrid_min_va_cs, hybrid_exit_drag_omega,
+        hybrid_enter_drag_omega, hybrid_check_every, hybrid_confirm_checks,
+        hybrid_handoff_steps, hybrid_handoff_alpha, hybrid_handoff_error_tol,
+        hybrid_handoff_displacement_tol, hybrid_handoff_diag_every, hybrid_reenter_terminal,
+        hybrid_aware_dt_factor, brms, pmf_b0_ng_env, initial_state_dir, pmf_normalization_z,
+        pmf_init, radiation_magnetic_compensation, pmf_kmode, meanfield_theta,
+        meanfield_polarization, boxsize, pmf_tile_box, pmf_tile_n, kcut, pmf_kmax, pmf_kmin,
+        pmf_required_cells, pmf_preserve_low_kmax, pmf_preserve_low_kcut,
+        pmf_normalization_kind, pmf_normalization_kind_resolved, pmf_fixed_mode_power,
+        pmf_mode_realization, pmf_realization_box, pmf_curl_symbol, pmf_curl_reference_n,
+        pmf_mode_lock_n, pmf_high_mode_lock_n, pmf_min_cells_per_wavelength, seed, recon,
+        riemann, glm_ch_fac, glm_cr, glm_project_every, gravity, gravity_gas_kick,
+        gravity_subcycles_fixed, gravity_dt_boost, gravity_source, grav_gas_weight,
+        grav_dm_weight, particle_max_disp_cells, particle_wrap, lattice_displacements,
+        dm_density_mean, gravity_phi_interp, gravity_midpoint_source, fft_mode, gravity_1buf,
+        chem_mode, chem_helium, chem_advect_species, chem_coupling, chem_expansion, fh, xhii0,
+        xh20, chem_time_unit, chem_vunit, pmf_b0_ng, pmf_comoving_clock, pmf_b_zref,
+        pmf_b_aref, cosmological_mhd_scaling, cosmological_mhd_aref, meanfield_bguide,
+        meanfield_bpert, alfven_bguide, alfven_bpert, chem_density_fixed,
+        chem_hydrogen_storage, chem_neutral_hydrogen_storage, chem_centered_hydrogen_storage,
+        chem_dtfrac, chem_itcap, chem_falpha, chem_falpha_zs, chem_falpha_vals, chem_smooth,
+        chem_nsmean, chem_smooth_sigma, chem_nonlocal_table_path, chem_nonlocal_scale,
+        chem_nonlocal_enabled, chem_xe_mean, chem_ionized_fast_zmin, chem_recfast_hswitch,
+        chem_rate_tables_enabled, chem_profile_enabled, chem_fused_analytic, chem_fused_mixing,
+        chem_mean_every, chem_fudge, final_diag, history_path, initial_history, initial_pk,
+        pk_path, mode_history_path, pdf_path, adaptive_diag_rel, adaptive_diag_zmin,
+        adaptive_diag_zmax, pdf_nbins, pdf_loglo, pdf_loghi, pk_every, pk_zs, pk_next,
+        diag_clear_fft, frame_dir, frame_zs, frame_next, pk_nmu, pk_nbins, pk_axis, pk_kmax,
+        debug_div_every, debug_phase_finite, debug_phase_cycle_min, debug_phase_zmax,
+        debug_phase_rho_min, debug_radiation_rho_min, debug_radiation_cycle_min,
+        debug_radiation_correction_cfl, checkpoint_write_path, checkpoint_every,
+        checkpoint_at_cycle, checkpoint_final, checkpoint_disable_writes,
+        adaptive_last_delta_b, adaptive_last_xhii, mhd_integrator, terminal_keff,
+        reset_energy_ledger, import_rescale_to_pmf, initial_b_import_dir, initial_b_dir,
+        final_b_dir, radiation_photon_adiabatic, radiation_photon_comoving, out_tsv, p_run_dir
+    ) = _declare_parameters()
+
+    # ---- run convention: every parameter is declared; resolve, record, start ----------
+    maybe_print_schema() && exit(0)
+    P = _rc_verify(RunConvention.params(;
+        file=_RC_PARENT_PARAMS[] === nothing ? nothing : [_RC_PARENT_PARAMS[]]))
+    rc_dir = strip(p_run_dir)
+    if isempty(rc_dir)
+        for candidate in (history_path, out_tsv, pk_path, pdf_path, checkpoint_write_path, frame_dir)
+            isempty(strip(candidate)) && continue
+            rc_dir = candidate === frame_dir ? abspath(frame_dir) : dirname(abspath(candidate))
+            break
+        end
+    end
+    if isempty(rc_dir)
+        rc_dir = joinpath(tempdir(), "pmf-dm-lattice-" * Dates.format(now(UTC), dateformat"yyyymmddTHHMMSSZ"))
+        _log_line("RUN_DIR no output path is configured; recording the run under $rc_dir (set MHD_RUN_DIR to choose)")
+    elseif isfile(joinpath(rc_dir, "run.json"))
+        # The directory already holds a run (the one being resumed, or an earlier attempt):
+        # a run directory is one run, so this one goes beneath it.
+        rc_dir = joinpath(rc_dir, "run-" * Dates.format(now(UTC), dateformat"yyyymmddTHHMMSSZ"))
+        _log_line("RUN_DIR parent directory already holds a run; recording this run under $rc_dir")
+    end
+    rc_on_checkpoint = _ -> (f = _RC_ON_CHECKPOINT[]; f === nothing ? nothing : f())
+    rc_resuming = _RC_PARENT_PARAMS[] !== nothing
+    _RC_RUN[] = if rc_resuming
+        _rc_resume(rc_dir, checkpoint_read_path, P; on_checkpoint=rc_on_checkpoint)
+    else
+        start_run(rc_dir;
+                  problem=(name="pmf-dm-lattice", version="1",
+                           params=Dict{String,Any}(
+                               "n" => N, "seed" => seed, "init" => String(pmf_init),
+                               "boxsize" => boxsize, "kcut" => kcut, "kmin" => pmf_kmin,
+                               "kmax" => pmf_kmax, "kmode" => pmf_kmode,
+                               "mode_realization" => String(pmf_mode_realization),
+                               "normalization_kind" => String(pmf_normalization_kind_resolved),
+                               "lattice_displacements" => lattice_displacements,
+                               "zstart" => zrun ? zstart : nothing,
+                               "b0_ng" => isempty(strip(pmf_b0_ng_env)) ? nothing : pmf_b0_ng_env,
+                               "initial_state_dir" => isempty(initial_state_dir) ? nothing : initial_state_dir,
+                               "initial_b_import_dir" => isempty(initial_b_import_dir) ? nothing : initial_b_import_dir)),
+                  params=_rc_record_params(P), code_name="Vespa.jl/MHDKernels pmf_dm_lattice_bench",
+                  on_checkpoint=rc_on_checkpoint)
+    end
+    _log_line("RUN_DIR $(rc_dir) id=$(_RC_RUN[].id) key=$(_RC_RUN[].key)$(rc_resuming ? " resumed" : "")")
+
     be_mhd = MHDKernels.backend(BACKEND_NAME)
     be_p = PoissonKernels.backend(BACKEND_NAME)
     pdf_counts = isempty(pdf_path) ? nothing : PoissonKernels.device_zeros(be_p, Int32, (pdf_nbins,))
     frame_hostrho = isempty(frame_dir) ? nothing : Array{Float32}(undef, N, N, N)
     frame_hostslice = isempty(frame_dir) ? nothing : Array{Float32}(undef, N, N)
     frame_hostproj = isempty(frame_dir) ? nothing : Array{Float32}(undef, N, N)
-    default_mhd_integrator = BACKEND_NAME === :cpu ? "ref" : "cube"
-    mhd_integrator = Symbol(lowercase(get(ENV, "MHD_INTEGRATOR",
-                                              default_mhd_integrator)))
-    mhd_integrator in (:ref, :cube) ||
-        error("MHD_INTEGRATOR must be ref or cube; got $mhd_integrator")
     if BACKEND_NAME === :metal && mhd_integrator === :cube
         f16max = Float64(floatmax(Float16))
         p0 < f16max || error(
@@ -5005,9 +5478,6 @@ function main()
              alfven_bpert=Float32(NaN))
         end
     end
-    import_rescale_to_pmf = get(ENV, "MHD_INITIAL_B_RESCALE_TO_PMF", "0") in
-                            ("1", "true", "TRUE", "yes", "on")
-    initial_b_import_dir = strip(get(ENV, "MHD_INITIAL_B_IMPORT_DIR", ""))
     isempty(initial_state_dir) || isempty(initial_b_import_dir) ||
         error("MHD_INITIAL_STATE_DIR and MHD_INITIAL_B_IMPORT_DIR are mutually exclusive")
     imported_brms = _stage("import_initial_b") do
@@ -5041,7 +5511,7 @@ function main()
         Float64(st.reference_band_brms_measured) * pmf_ng_per_code
     pmf_initial_total_comoving_ng = Float64(st.total_brms_measured) * pmf_ng_per_code
     _stage("export_initial_b") do
-        _write_initial_b_field!(get(ENV, "MHD_INITIAL_B_DIR", ""), s, st;
+        _write_initial_b_field!(initial_b_dir, s, st;
                                 N=N, boxsize=boxsize, zstart=zstart, zend=zend,
                                 seed=seed, kcut=kcut, kmax=pmf_kmax,
                                 mode_lock_n=pmf_mode_lock_n,
@@ -5171,8 +5641,8 @@ function main()
     if radiation_photon_state !== nothing
         MHDKernels.initialize_photon_moments!(radiation_photon_state,
             radiation_workspace,s;
-            adiabatic_density=parse(Bool,get(ENV,"MHD_RADIATION_PHOTON_ADIABATIC","true")),
-            comoving_velocity=parse(Bool,get(ENV,"MHD_RADIATION_PHOTON_COMOVING","true")))
+            adiabatic_density=radiation_photon_adiabatic,
+            comoving_velocity=radiation_photon_comoving)
     end
     _stage("import_initial_aux_state") do
         _import_initial_aux_state!(initial_state_dir; N=N,
@@ -5333,14 +5803,11 @@ function main()
     if resumed_from_checkpoint
         _log_line("START restore_checkpoint path=$checkpoint_read_path")
         restore_seconds = @elapsed begin
-            checkpoint_allowed_changes = Symbol[]
-            get(ENV, "MHD_CHECKPOINT_ALLOW_CFL_CHANGE", "0") in
-                ("1", "true", "TRUE", "yes", "on") &&
-                append!(checkpoint_allowed_changes,
-                        (:cfl, :radiation_nonlinear_cfl))
-            get(ENV, "MHD_CHECKPOINT_ALLOW_NONLOCAL_TABLE_CHANGE", "0") in
-                ("1", "true", "TRUE", "yes", "on") &&
-                push!(checkpoint_allowed_changes, :chem_nonlocal_table)
+            # The fingerprint fields whose parameter is mutable=restart (R-D2.3) may
+            # differ on a resume; the old MHD_CHECKPOINT_ALLOW_*_CHANGE waivers are
+            # no-ops. The nonlocal-table validator still runs for that field.
+            checkpoint_allowed_changes = Symbol[:cfl, :radiation_nonlinear_cfl,
+                                                :chem_nonlocal_table]
             runtime = _restore_pmf_checkpoint!(
                 checkpoint_read_path, checkpoint_config, _checkpoint_arrays();
                 allowed_config_changes=Tuple(checkpoint_allowed_changes),
@@ -5371,9 +5838,6 @@ function main()
             adaptive_last_delta_b[] = runtime.adaptive_last_delta_b
             adaptive_last_xhii[] = runtime.adaptive_last_xhii
             last_radiation_closure = runtime.last_radiation_closure
-            reset_energy_ledger = get(
-                ENV, "MHD_CHECKPOINT_RESET_ENERGY_LEDGER", "0") in
-                ("1", "true", "TRUE", "yes", "on")
             if radiation_energy_ledger !== nothing && runtime.radiation_energy !== nothing &&
                !reset_energy_ledger
                 energy = runtime.radiation_energy
@@ -5429,9 +5893,6 @@ function main()
 
     cs_floor = sqrt(Float64(s.γ) * max(p0, pfloor))
     va_rms = Float64(st.brms_measured)
-    terminal_keff = parse(Float64, get(ENV, "MHD_TERMINAL_KEFF",
-                                       pmf_init === :batchelor ? string(max(1.0, kcut * boxsize / (2π))) :
-                                       string(max(1, pmf_kmode))))
     hybrid_va_rms = va_rms
     if isfinite(pmf_b0_ng)
         @printf("PMF physical normalization: kind=%s epoch=initial_handoff z=%.3f target=%.6g comoving_nG reference_band=%.6g comoving_nG total_band=%.6g comoving_nG brms_code=%.6e vunit=%.6e cm/s\n",
@@ -5618,8 +6079,11 @@ function main()
         @printf("  checkpoint cycle=%d z=%.6f bytes=%d path=%s\n",
                 cycle_now, zrun ? a_to_z(a) : NaN, bytes, checkpoint_write_path)
         flush(stdout)
+        _rc_checkpoint!(checkpoint_write_path, cycle_now)
         return nothing
     end
+    rc_cycle = Ref(restart_cycle)
+    _RC_ON_CHECKPOINT[] = () -> _save_checkpoint!(rc_cycle[])
 
     # Establish the actual initialized state before any MHD/drag source step.
     # Batchelor ICs deliberately start with uniform gas density; recording this
@@ -5667,6 +6131,7 @@ function main()
     end
 
     cyc = restart_cycle
+    rc_stop_requested = false
     while true
         cyc += 1
         if debug_stop_cycle > 0 && cyc > debug_stop_cycle
@@ -6531,7 +6996,12 @@ function main()
                 terminal_phase[:projection] += terminal_step_timing.projection_s
             end
         end
+        rc_cycle[] = cyc
         if cycle_print_every > 0 && (cyc <= warmup || cyc % cycle_print_every == 0)
+            _rc_progress!(step=cyc, time=zrun ? a_to_z(a) : elapsed_time, dt=Float64(dt),
+                          fraction=zrun ? (zstart - a_to_z(a)) / (zstart - zend) :
+                                   tfinal === nothing ? (cyc - warmup) / max(steps, 1) :
+                                   elapsed_time / tfinal)
             @printf("cycle %3d%s dt=%.3e hdt=%.3e pdt_s=%.3e expdt=%.3e nsub=%d gsub=%d pvmax=%.3e pgmax=%.3e regime=%s handoff=%d herr=%.3e va/cs=%.3e G/omA=%.3e idiff=%.3e drag %.4f f=%.6f G/H=%.3e  cfl %.4f mhd %.4f rad %.4f chem %.4f dep %.4f asm %.4f fft %.4f ggas %.4f push %.4f\n",
                     cyc, measuring ? "" : " warm", dt, dt_hydro, dtphys_source,
                     dt_explicit, nsub, last_gravity_nsub,
@@ -6565,6 +7035,16 @@ function main()
             @printf("  check rho=[%.6e, %.6e] E=[%.6e, %.6e] Bmax=%.6e\n",
                     Float64(ss.ρmin), Float64(ss.ρmax), Float64(ss.Emin), Float64(ss.Emax), ss.Bmax)
             flush(stdout)
+            if _rc_poll!(cyc) === :stop
+                rc_stop_requested = true
+                _log_line("STOP requested through the control inbox at cycle $cyc")
+            end
+            if _RC_RUN[] !== nothing
+                rc_live = _RC_RUN[].params.values
+                print_every = rc_live["io.print_every"]
+                cycle_print_every = rc_live["io.cycle_print_every"]
+                check_every = rc_live["io.check_every"]
+            end
         end
         if zrun && cyc > warmup
             a = a_after_step
@@ -6680,6 +7160,7 @@ function main()
            (checkpoint_at_cycle > 0 && cyc == checkpoint_at_cycle)
             _save_checkpoint!(cyc)
         end
+        rc_stop_requested && break
         if tfinal === nothing
             if zrun
                 (a >= a_end || measured >= maxcycles) && break
@@ -6735,7 +7216,7 @@ function main()
         flush(stdout)
     end
     _log_device_memory("final")
-    memory_stats = get(ENV, "MHD_MEMPROBE", "0") == "1" ? _device_memory_gib() :
+    memory_stats = memprobe ? _device_memory_gib() :
                    (live=NaN, allocated=NaN, freed=NaN)
     total = sum(values(phase))
     mcells = ncells * measured / total / 1e6
@@ -6751,7 +7232,7 @@ function main()
             hydrogen_reference=evolving_xe_mean) :
         (NaN, NaN, NaN, NaN, ntuple(_ -> NaN, 12))
     gravity || (δdm = NaN)
-    _write_final_b_field!(get(ENV, "MHD_FINAL_B_DIR", ""), s;
+    _write_final_b_field!(final_b_dir, s;
                           N=N, z=zrun ? a_to_z(a) : NaN,
                           cycle=measured, brms=br)
     delta2k_final = final_diag && pmf_init === :magpressure ?
@@ -6886,7 +7367,7 @@ function main()
                                   chemstats...)
     flush(stdout)
 
-    out = get(ENV, "MHD_OUT_TSV", "")
+    out = out_tsv
     if !isempty(out)
         exists = isfile(out)
         open(out, "a") do io
@@ -7071,8 +7552,24 @@ function main()
                               memory_stats.live, memory_stats.allocated, memory_stats.freed), '\t'))
         end
     end
+
+    # The appended tables are indexed once, with their final hash (R-D7).
+    for (path, kind) in ((history_path, "series"), (mode_history_path, "series"),
+                         (pk_path, "spectrum"), (pdf_path, "series"), (out, "series"))
+        isempty(path) || _rc_output!(path; kind=kind, format="tsv", step=cyc)
+    end
+    if rc_stop_requested
+        _rc_finish!(100, "stopped"; message="stop requested through the control inbox")
+    else
+        _rc_finish!(0, "ok")
+    end
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    try
+        main()
+    catch err
+        _rc_finish!(300, "error"; message=sprint(showerror, err))
+        rethrow()
+    end
 end
