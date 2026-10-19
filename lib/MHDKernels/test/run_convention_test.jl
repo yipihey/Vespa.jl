@@ -11,6 +11,7 @@
 # discipline); set RUN_CHECK to the checker binary when it is not at the default path.
 
 using Test
+using RunConvention
 using RunConvention: parse_json
 
 const DRIVER = joinpath(@__DIR__, "pmf_dm_lattice_bench.jl")
@@ -144,6 +145,36 @@ const TINY = Dict("MHD_BACKEND" => "cpu", "MHD_PMF_N" => "16", "MHD_STEPS" => "4
             @test any(e -> e["kind"] == "checkpoint", cevents)
             @test cevents[end]["kind"] == "finished" && cevents[end]["exit"]["code"] == 0
             @test read_json(joinpath(child, "params.json"))["run.steps"]["source"] == "env:MHD_STEPS"
+
+            # Non-finite values survive the resume: the fresh run wrote the spelled strings,
+            # the library read them back as Inf / NaN (the driver asserts they equal its own
+            # values), the child records the same spelling, and run-check hashed it (exit 0 above).
+            cparams = read_json(joinpath(child, "params.json"))
+            @test cparams["terminal.vcap"]["value"] == "Infinity"
+            @test cparams["drag.rate_code"]["value"] == "NaN"
+            @test RunConvention.coerce_value(Float64, cparams["terminal.vcap"]["value"], "terminal.vcap") == Inf
+            @test run["params"]["key"] != crun["params"]["key"]     # steps changed, so the key did
+
+            # Resume a resume: the child rewrote ckpt.jls in place, so the file now belongs to
+            # the child, not to the run above it. Run directories are named to the second.
+            sleep(1.2)
+            env4 = merge(env, Dict("MHD_STEPS" => "8"))
+            code4, log4 = run_driver(String[], env4, joinpath(d, "grandchild.log"))
+            @test code4 == 0
+            grandchildren = filter(x -> startswith(x, "run-") && isdir(joinpath(d, x)) && x != children[1], readdir(d))
+            @test length(grandchildren) == 1
+            grand = joinpath(d, grandchildren[1])
+            gcode, gout = run_check(grand)
+            @test gcode == 0
+            gcode == 0 || println(gout)
+            grun = read_json(joinpath(grand, "run.json"))
+            @test grun["lineage"]["parent"]["run"] == crun["id"]
+            @test grun["lineage"]["parent"]["run"] != run["id"]
+            @test grun["lineage"]["parent"]["checkpoint"]["path"] == "../ckpt.jls"
+            @test any(e -> e["kind"] == "checkpoint" && e["sha256"] == grun["lineage"]["parent"]["checkpoint"]["sha256"], cevents)
+            @test any(e -> e["kind"] == "changed" && e["param"] == "run.steps" && e["from"] == 6 && e["to"] == 8 &&
+                           e["by"] == "restart", read_events(grand))
+            @test read_json(joinpath(grand, "params.json"))["terminal.vcap"]["value"] == "Infinity"
 
             # A never-class parameter cannot change on resume: the library refuses before
             # the checkpoint fingerprint even gets to look.

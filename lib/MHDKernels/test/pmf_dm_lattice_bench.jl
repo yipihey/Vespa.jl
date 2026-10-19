@@ -89,84 +89,9 @@ function _rc_verify(P)
     return P
 end
 
-# RFC 8785 has no spelling for a non-finite number (the library's `es_number` throws),
-# but Inf and NaN are legitimate values here (MHD_TERMINAL_VCAP=Inf, MHD_DRAG_RATE_CODE=NaN).
-# The record therefore carries the spelling the library's own file writer uses for them,
-# so the key hashes exactly what params.json holds, which is what `run-check` recomputes.
-# The driver keeps reading the real Float64 values; only the recorded copy is spelled.
-function _rc_record_params(P)
-    spell(v) = v isa AbstractFloat && !isfinite(v) ?
-               (isnan(v) ? "NaN" : v > 0 ? "Infinity" : "-Infinity") : v
-    vals = Dict{String,Any}(k => spell(v) for (k, v) in P.values)
-    return RunConvention.Params(P.specs, P.order, vals, P.sources, P.read, P.open, P.lock)
-end
-
 "Is `path` inside the run directory `dir`? Only such paths can be indexed (R-D7)."
 function _rc_inside(dir::AbstractString, path::AbstractString)
     startswith(normpath(abspath(path)), normpath(abspath(dir)) * "/")
-end
-
-"The step at which `dir`'s run recorded a checkpoint with this content hash, or nothing."
-function _rc_checkpoint_step(dir::AbstractString, sha::AbstractString)
-    step = nothing
-    for e in RunConvention.read_events(dir)
-        e["kind"] == "checkpoint" && get(e, "sha256", nothing) == sha && (step = get(e, "step", nothing))
-    end
-    return step
-end
-
-"""
-The run directory a checkpoint belongs to: the nearest ancestor holding run.json, or,
-when a resumed run beneath it (`run-<stamp>/`) recorded a checkpoint with this exact
-content, that run. A checkpoint rewritten in place by a resume belongs to the resume.
-"""
-function _rc_run_root(path::AbstractString)
-    d = dirname(abspath(path))
-    while !isfile(joinpath(d, "run.json"))
-        up = dirname(d)
-        up == d && return nothing
-        d = up
-    end
-    sha = RunConvention.sha256_file(path)
-    best = d
-    for child in sort(filter(x -> startswith(x, "run-") && isfile(joinpath(d, x, "run.json")), readdir(d)))
-        _rc_checkpoint_step(joinpath(d, child), sha) === nothing || (best = joinpath(d, child))
-    end
-    return best
-end
-
-# The library's `resume` (lineage + the never/restart classes, R-D2.3) with the one
-# difference that the recorded parameter copy is `_rc_record_params(P)`.
-function _rc_resume(dir::AbstractString, from::AbstractString, P; on_checkpoint)
-    pdir = _rc_run_root(from)
-    parent = RunConvention.read_json(joinpath(pdir, "run.json"))
-    parent_vals = Dict{String,Any}(k => (v isa AbstractDict ? v["value"] : v)
-                                   for (k, v) in RunConvention.read_json(joinpath(pdir, "params.json")))
-    changed = Tuple{String,Any,Any}[]
-    for n in P.order
-        haskey(parent_vals, n) || continue
-        old = RunConvention.coerce_value(P.specs[n].type, parent_vals[n], n)
-        new = P.values[n]
-        isequal(old, new) && continue
-        cls = P.specs[n].mutable
-        cls == "never" && throw(RunConvention.ImmutableParameterError(n, old, new, cls))
-        push!(changed, (n, old, new))
-    end
-    ck = abspath(from)
-    root = normpath(abspath(pdir)) * "/"
-    rel = startswith(ck, root) ? ck[length(root)+1:end] : ck
-    sha = RunConvention.sha256_file(ck)
-    pstep = _rc_checkpoint_step(pdir, sha)
-    lineage = Dict{String,Any}("parent" => Dict{String,Any}(
-        "run" => parent["id"], "relation" => "resume",
-        "checkpoint" => Dict{String,Any}("path" => rel, "sha256" => sha)))
-    run = start_run(dir; problem=parent["problem"], name=get(parent, "name", nothing),
-                    params=_rc_record_params(P), lineage=lineage, on_checkpoint=on_checkpoint)
-    for (n, old, new) in changed
-        RunConvention.emit!(run, "changed", "param" => n, "from" => old, "to" => new,
-                            "by" => "restart", "step" => pstep)
-    end
-    return run
 end
 
 # An artifact inside the run directory is indexed (R-D7). One outside it (a resumed run
@@ -4553,7 +4478,14 @@ function _declare_parameters()
     checkpoint_read_path = strip(p_checkpoint_read_path)
     checkpoint_resume = @P checkpoint.resume::Bool = true env="MHD_CHECKPOINT_RESUME" group="checkpoint" mutable=:restart doc="restore from the read path when it exists"
     if checkpoint_resume && !isempty(checkpoint_read_path) && isfile(checkpoint_read_path)
-        rc_root = _rc_run_root(checkpoint_read_path)
+        # The run that wrote this checkpoint (a rewritten-in-place one belongs to the
+        # `run-*/` child that wrote it): the library's own attribution, so the parameters
+        # read here are the ones `resume` will start from.
+        rc_root = try
+            RunConvention.checkpoint_owner(abspath(checkpoint_read_path), RunConvention.sha256_file(checkpoint_read_path))
+        catch err
+            err isa ArgumentError ? nothing : rethrow()
+        end
         if rc_root !== nothing
             _RC_PARENT_PARAMS[] = joinpath(rc_root, "params.json")
             checkpoint_path = strip(_rc_read(RunConvention.REGISTRY.params["checkpoint.path"]))
@@ -5322,7 +5254,17 @@ function main()
     rc_on_checkpoint = _ -> (f = _RC_ON_CHECKPOINT[]; f === nothing ? nothing : f())
     rc_resuming = _RC_PARENT_PARAMS[] !== nothing
     _RC_RUN[] = if rc_resuming
-        _rc_resume(rc_dir, checkpoint_read_path, P; on_checkpoint=rc_on_checkpoint)
+        # `resume` re-resolves the parameters itself, from the same parent params.json,
+        # ARGS and ENV the driver used; the values must be the ones already in `P`.
+        rrun = RunConvention.resume(rc_dir; from=checkpoint_read_path, argv=ARGS, env=ENV,
+                                    parent=dirname(_RC_PARENT_PARAMS[]), on_checkpoint=rc_on_checkpoint)
+        for n in P.order
+            isequal(rrun.params.values[n], P.values[n]) || error(
+                "run convention: parameter $n resolved to $(repr(rrun.params.values[n])) by resume() " *
+                "but to $(repr(P.values[n])) by the driver")
+        end
+        union!(rrun.params.read, P.read)
+        rrun
     else
         start_run(rc_dir;
                   problem=(name="pmf-dm-lattice", version="1",
@@ -5337,7 +5279,7 @@ function main()
                                "b0_ng" => isempty(strip(pmf_b0_ng_env)) ? nothing : pmf_b0_ng_env,
                                "initial_state_dir" => isempty(initial_state_dir) ? nothing : initial_state_dir,
                                "initial_b_import_dir" => isempty(initial_b_import_dir) ? nothing : initial_b_import_dir)),
-                  params=_rc_record_params(P), code_name="Vespa.jl/MHDKernels pmf_dm_lattice_bench",
+                  params=P, code_name="Vespa.jl/MHDKernels pmf_dm_lattice_bench",
                   on_checkpoint=rc_on_checkpoint)
     end
     _log_line("RUN_DIR $(rc_dir) id=$(_RC_RUN[].id) key=$(_RC_RUN[].key)$(rc_resuming ? " resumed" : "")")
