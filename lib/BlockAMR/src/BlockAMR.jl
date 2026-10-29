@@ -32,6 +32,14 @@ Design contract:
 
   * **Backend by name.** `backend(:cpu)` always works; `backend(:cuda)` after
     `using CUDA` (extension). Allocation via `device_zeros`/`to_device`/`to_host`.
+
+  * **2-D or 3-D; any domain face.** `AMRHierarchy(; nbase = (Nx, Ny))` builds a
+    2-D hierarchy of B×B×1 blocks (flat z: one cell, no ghosts, never refined;
+    elongated boxes are just Nx ≠ Ny, `box` = x length).  `bc` sets each face to
+    `:periodic`, `:outflow`, `:reflecting` or `:inflow` (fixed (ρ,u,v,w,P) from
+    `inflow`), in 2-D and 3-D.  2-D covers the hydro stack (RK2 + tiled CTU,
+    dual energy, f16 scales, species, reflux, subcycling, regrid, checkpoint);
+    gravity, chemistry and particles remain 3-D only.
 """
 module BlockAMR
 
@@ -44,7 +52,7 @@ export backend, has_backend, device_zeros, to_device, to_host
 export BlockMeta, Level, AMRHierarchy
 export add_block!, remove_block!, init_base_level!, overlapping_blocks, check_nesting
 export build_sibling_jobs, build_prolong_jobs, build_restrict_jobs, RectJobTable
-export fill_ghosts!, restrict_level!, blockview
+export fill_ghosts!, restrict_level!, blockview, fill_boundary!, periodic_axes
 export stage_level!, max_signal, max_accel, hierarchy_rk2_step!, compute_dt, total_conserved
 export ctu_level!
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
@@ -150,6 +158,7 @@ include("topology.jl")     # exact-integer origins, wrapped intervals, BlockMeta
 include("pool.jl")         # Level block pool, slot alloc/free/grow, AMRHierarchy
 include("tables.jl")       # RectJobTable + sibling/prolong/restrict builders
 include("transfer.jl")     # batched copy/prolong/restrict kernels + fill_ghosts!
+include("boundary.jl")     # non-periodic domain faces: outflow/reflecting/inflow ghosts
 include("kernels.jl")      # fused batched SSP-RK2 PLM+HLLC dual-energy hydro
 include("kernels_ctu.jl")  # tiled single-pass CTU (GPU) + per-cell oracle
 include("reflux.jl")       # C/F face registry + recompute capture/apply

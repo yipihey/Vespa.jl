@@ -150,14 +150,14 @@ end
 # the old local gate ((Tau−KE) > 1e-3·Tau) let exactly that through and drove
 # the static-level runaway (uncovered coarse cells ×172 in 10 steps).
 @inline function _demax6(Tau, base::Int32, i::Int32, j::Int32, k::Int32,
-                         nd::Int32, esc::Float32)
+                         nd::Int32, esc::Float32, kz::Int32 = Int32(1))
     m = abs(Float32(Tau[base + _lidx(i, j, k, nd)]))
     m = max(m, abs(Float32(Tau[base + _lidx(i - Int32(1), j, k, nd)])))
     m = max(m, abs(Float32(Tau[base + _lidx(i + Int32(1), j, k, nd)])))
     m = max(m, abs(Float32(Tau[base + _lidx(i, j - Int32(1), k, nd)])))
     m = max(m, abs(Float32(Tau[base + _lidx(i, j + Int32(1), k, nd)])))
-    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k - Int32(1), nd)])))
-    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k + Int32(1), nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k - kz, nd)])))    # 2-D: self
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k + kz, nd)])))
     return m * esc
 end
 
@@ -192,7 +192,7 @@ end
                             λ::Float32, γ::Float32, ax::Int32,
                             dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32,
                             vb1::Float32 = 0.0f0, vb2::Float32 = 0.0f0,
-                            vb3::Float32 = 0.0f0)
+                            vb3::Float32 = 0.0f0, kz::Int32 = Int32(1))
     di = ax == Int32(1) ? Int32(1) : Int32(0)
     dj = ax == Int32(2) ? Int32(1) : Int32(0)
     dk = ax == Int32(3) ? Int32(1) : Int32(0)
@@ -202,11 +202,11 @@ end
     cL = P(i, j, k); cR = P(i + di, j + dj, k + dk)
     dUL = _ctu_dU5(P(i - Int32(1), j, k), cL, P(i + Int32(1), j, k),
                    P(i, j - Int32(1), k), P(i, j + Int32(1), k),
-                   P(i, j, k - Int32(1)), P(i, j, k + Int32(1)), λ, γ)
+                   P(i, j, k - kz), P(i, j, k + kz), λ, γ)
     i2 = i + di; j2 = j + dj; k2 = k + dk
     dUR = _ctu_dU5(P(i2 - Int32(1), j2, k2), cR, P(i2 + Int32(1), j2, k2),
                    P(i2, j2 - Int32(1), k2), P(i2, j2 + Int32(1), k2),
-                   P(i2, j2, k2 - Int32(1)), P(i2, j2, k2 + Int32(1)), λ, γ)
+                   P(i2, j2, k2 - kz), P(i2, j2, k2 + kz), λ, γ)
     L = _ctu_predicted(P(i - di, j - dj, k - dk), cL, cR, dUL, 1.0f0)
     R = _ctu_predicted(cL, cR, P(i2 + di, j2 + dj, k2 + dk), dUR, -1.0f0)
     F, Fge, _ = _ctu_face(L, R, γ, ax)
@@ -224,11 +224,14 @@ end
                               λ::Float32, γ::Float32, η::Float32, scap::Float32,
                               pdv::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
-                              ::Val{NS}) where {NS}
+                              ::Val{NS}, dimv::Val{DIM}) where {NS,DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
+    # 2-D: the predictor's z taps read the cell itself (zero z slope ⇒ the z
+    # flux difference is exactly 0) and the corrector sweeps x, y only
+    kz = _kzv(dimv)
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
@@ -236,7 +239,7 @@ end
         vb1 = Vb[3*(slot-Int32(1))+Int32(1)]           # per-block bulk velocity (BAM_BULKV; 0 = off)
         vb2 = Vb[3*(slot-Int32(1))+Int32(2)]
         vb3 = Vb[3*(slot-Int32(1))+Int32(3)]
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         idx = base + _lidx(i, j, k, nd)
         P(ii, jj, kk) = _ctu_prims_pool(D, S1, S2, S3, Tau, Ge,
                                         base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc,
@@ -244,7 +247,7 @@ end
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
         aU = 0.0f0                                    # Σ_ax (Ss_hi − Ss_lo): pdV face-velocity div
         aX1 = 0.0f0; aX2 = 0.0f0
-        for ax in Int32(1):Int32(3)
+        for ax in Int32(1):Int32(DIM)
             di = ax == Int32(1) ? Int32(1) : Int32(0)
             dj = ax == Int32(2) ? Int32(1) : Int32(0)
             dk = ax == Int32(3) ? Int32(1) : Int32(0)
@@ -258,11 +261,11 @@ end
                 cL = P(fi, fj, fk); cR = P(fi + di, fj + dj, fk + dk)
                 dUL = _ctu_dU5(P(fi - Int32(1), fj, fk), cL, P(fi + Int32(1), fj, fk),
                                P(fi, fj - Int32(1), fk), P(fi, fj + Int32(1), fk),
-                               P(fi, fj, fk - Int32(1)), P(fi, fj, fk + Int32(1)), λ, γ)
+                               P(fi, fj, fk - kz), P(fi, fj, fk + kz), λ, γ)
                 gi = fi + di; gj = fj + dj; gk = fk + dk
                 dUR = _ctu_dU5(P(gi - Int32(1), gj, gk), cR, P(gi + Int32(1), gj, gk),
                                P(gi, gj - Int32(1), gk), P(gi, gj + Int32(1), gk),
-                               P(gi, gj, gk - Int32(1)), P(gi, gj, gk + Int32(1)), λ, γ)
+                               P(gi, gj, gk - kz), P(gi, gj, gk + kz), λ, γ)
                 L = _ctu_predicted(P(fi - di, fj - dj, fk - dk), cL, cR, dUL, 1.0f0)
                 R = _ctu_predicted(cL, cR, P(gi + di, gj + dj, gk + dk), dUR, -1.0f0)
                 F, Fge, Fm, Ssf = _ctu_face(L, R, γ, ax)
@@ -285,25 +288,25 @@ end
                         XpR = decode_log2sp(Float32, sq[base + _lidx(gi + di, gj + dj, gk + dk, nd)])
                         dUXL = _ctu_dUX(P(fi - Int32(1), fj, fk), cL, P(fi + Int32(1), fj, fk),
                                         P(fi, fj - Int32(1), fk), P(fi, fj + Int32(1), fk),
-                                        P(fi, fj, fk - Int32(1)), P(fi, fj, fk + Int32(1)),
+                                        P(fi, fj, fk - kz), P(fi, fj, fk + kz),
                                         decode_log2sp(Float32, sq[base + _lidx(fi - Int32(1), fj, fk, nd)]),
                                         XcL,
                                         decode_log2sp(Float32, sq[base + _lidx(fi + Int32(1), fj, fk, nd)]),
                                         decode_log2sp(Float32, sq[base + _lidx(fi, fj - Int32(1), fk, nd)]),
                                         decode_log2sp(Float32, sq[base + _lidx(fi, fj + Int32(1), fk, nd)]),
-                                        decode_log2sp(Float32, sq[base + _lidx(fi, fj, fk - Int32(1), nd)]),
-                                        decode_log2sp(Float32, sq[base + _lidx(fi, fj, fk + Int32(1), nd)]),
+                                        decode_log2sp(Float32, sq[base + _lidx(fi, fj, fk - kz, nd)]),
+                                        decode_log2sp(Float32, sq[base + _lidx(fi, fj, fk + kz, nd)]),
                                         λ, γ)
                         dUXR = _ctu_dUX(P(gi - Int32(1), gj, gk), cR, P(gi + Int32(1), gj, gk),
                                         P(gi, gj - Int32(1), gk), P(gi, gj + Int32(1), gk),
-                                        P(gi, gj, gk - Int32(1)), P(gi, gj, gk + Int32(1)),
+                                        P(gi, gj, gk - kz), P(gi, gj, gk + kz),
                                         decode_log2sp(Float32, sq[base + _lidx(gi - Int32(1), gj, gk, nd)]),
                                         XcR,
                                         decode_log2sp(Float32, sq[base + _lidx(gi + Int32(1), gj, gk, nd)]),
                                         decode_log2sp(Float32, sq[base + _lidx(gi, gj - Int32(1), gk, nd)]),
                                         decode_log2sp(Float32, sq[base + _lidx(gi, gj + Int32(1), gk, nd)]),
-                                        decode_log2sp(Float32, sq[base + _lidx(gi, gj, gk - Int32(1), nd)]),
-                                        decode_log2sp(Float32, sq[base + _lidx(gi, gj, gk + Int32(1), nd)]),
+                                        decode_log2sp(Float32, sq[base + _lidx(gi, gj, gk - kz, nd)]),
+                                        decode_log2sp(Float32, sq[base + _lidx(gi, gj, gk + kz, nd)]),
                                         λ, γ)
                         fX = _ctu_faceX(Fm, L[1], R[1], ρfL, ρfR, XmL, XcL, XcR, XpR, dUXL, dUXR)
                         if s == Int32(-1)
@@ -330,7 +333,7 @@ end
         nT  = U0[5] - λ * a5
         nG  = U0[6] - λ * (a6 + pdv * P_c * aU)       # pdv: BAM_NO_PDV diag (0 zeros pdV work)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        demax = _demax6(Tau, base, i, j, k, nd, esc, kz)
         (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
         # extreme-frontier safety: a degenerate Riemann state can still emit a
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
@@ -400,10 +403,26 @@ const _DS3  = _DSX * _DSY * _DSZ
 const _FSMX = max((_TBX + 1) * _TBY * _TBZ, _TBX * (_TBY + 1) * _TBZ,
                   _TBX * _TBY * (_TBZ + 1))
 
-@inline _wsi(lx::Int32, ly::Int32, lz::Int32) =
-    (lz * Int32(_WSY) + ly) * Int32(_WSX) + lx        # 0-based
-@inline _dsi(lx::Int32, ly::Int32, lz::Int32) =
-    (lz * Int32(_DSY) + ly) * Int32(_DSX) + lx        # 0-based
+# 2-D tile: 16×16×1 (same 256 threads), NO z halo — the flat z axis has no
+# neighbours, so the predictor's z taps read the cell itself (zero z flux).
+const _TBX2, _TBY2 = 16, 16
+const _WS2  = (_TBX2 + 4) * (_TBY2 + 4)
+const _DS2  = (_TBX2 + 2) * (_TBY2 + 2)
+const _FSMX2 = max((_TBX2 + 1) * _TBY2, _TBX2 * (_TBY2 + 1))
+
+# (TBX, TBY, TBZ, hz): tile extent + z-halo unit (W tile ±2hz, dU tile ±hz)
+@inline _tgeom(::Val{3}) = (Int32(_TBX), Int32(_TBY), Int32(_TBZ), Int32(1))
+@inline _tgeom(::Val{2}) = (Int32(_TBX2), Int32(_TBY2), Int32(1), Int32(0))
+@inline _ws3(::Val{3}) = _WS3;   @inline _ws3(::Val{2}) = _WS2
+@inline _ds3(::Val{3}) = _DS3;   @inline _ds3(::Val{2}) = _DS2
+@inline _fsmx(::Val{3}) = _FSMX; @inline _fsmx(::Val{2}) = _FSMX2
+
+@inline _wsi(lx::Int32, ly::Int32, lz::Int32,
+             wsx::Int32 = Int32(_WSX), wsy::Int32 = Int32(_WSY)) =
+    (lz * wsy + ly) * wsx + lx                        # 0-based
+@inline _dsi(lx::Int32, ly::Int32, lz::Int32,
+             dsx::Int32 = Int32(_DSX), dsy::Int32 = Int32(_DSY)) =
+    (lz * dsy + ly) * dsx + lx                        # 0-based
 
 # physical 5-lane state of W-tile cell (lx,ly,lz) from the f16 hat tile.
 # BAM_BULKV: the tile stores velocities in the per-block BULK FRAME (u − vb) so
@@ -413,8 +432,9 @@ const _FSMX = max((_TBX + 1) * _TBY * _TBZ, _TBX * (_TBY + 1) * _TBZ,
 # (BULKV off) is bit-identical to the historic path (x − 0 ≡ x).
 @inline function _tld(Wt, lx::Int32, ly::Int32, lz::Int32,
                       dsc::Float32, gsc::Float32,
-                      vb1::Float32, vb2::Float32, vb3::Float32)
-    q = _wsi(lx, ly, lz) * Int32(5)
+                      vb1::Float32, vb2::Float32, vb3::Float32,
+                      wsx::Int32 = Int32(_WSX), wsy::Int32 = Int32(_WSY))
+    q = _wsi(lx, ly, lz, wsx, wsy) * Int32(5)
     # lane 5 is the internal energy hat, lifted by gsc/dsc (its OWN scale).
     # vacuum (ρ̂ ≤ 0) keeps v ≡ 0 exactly (the phase-0 gate staged w = −vb there).
     ρ̂ = @inbounds Float32(Wt[q+1])
@@ -435,18 +455,23 @@ end
         @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
         @Const(Vb),
         λ::Float32, γ::Float32, η::Float32, scap::Float32, pdv::Float32, tpb::Int32,
-        B::Int32, ng::Int32, nd::Int32, stride::Int32, ::Val{NS}) where {NS}
-    Wt  = @localmem Float16 (_WS3 * 5)
-    Xt  = @localmem UInt16 (_WS3 * max(NS, 1))
-    dUs = @localmem Float32 (_DS3 * (5 + NS))
-    Fs  = @localmem Float32 (_FSMX * (7 + NS))         # lanes: 5 flux + ge + Ss(+NS)
+        B::Int32, ng::Int32, nd::Int32, stride::Int32, ::Val{NS},
+        dimv::Val{DIM}) where {NS,DIM}
+    Wt  = @localmem Float16 (_ws3(dimv) * 5)
+    Xt  = @localmem UInt16 (_ws3(dimv) * max(NS, 1))
+    dUs = @localmem Float32 (_ds3(dimv) * (5 + NS))
+    Fs  = @localmem Float32 (_fsmx(dimv) * (7 + NS))  # lanes: 5 flux + ge + Ss(+NS)
+    TBX, TBY, TBZ, hz = _tgeom(dimv)                   # 3-D: 8,8,4,1 · 2-D: 16,16,1,0
+    WSX = TBX + Int32(4); WSY = TBY + Int32(4); WS3 = WSX * WSY * (TBZ + Int32(4) * hz)
+    DSX = TBX + Int32(2); DSY = TBY + Int32(2); DS3 = DSX * DSY * (TBZ + Int32(2) * hz)
+    NT  = TBX * TBY * TBZ
     tid = Int32(@index(Local, Linear)) - Int32(1)              # 0-based
     g   = Int32(@index(Group, Linear)) - Int32(1)
     bi  = g ÷ tpb; tile = g % tpb
-    ntx = B ÷ Int32(_TBX); nty = B ÷ Int32(_TBY)
-    tx0 = (tile % ntx) * Int32(_TBX)                           # tile origin, active frame
-    ty0 = ((tile ÷ ntx) % nty) * Int32(_TBY)
-    tz0 = (tile ÷ (ntx * nty)) * Int32(_TBZ)
+    ntx = B ÷ TBX; nty = B ÷ TBY
+    tx0 = (tile % ntx) * TBX                                   # tile origin, active frame
+    ty0 = ((tile ÷ ntx) % nty) * TBY
+    tz0 = (tile ÷ (ntx * nty)) * TBZ
     slot = @inbounds live_d[bi + Int32(1)]
     base = (slot - Int32(1)) * stride
     dsc = @inbounds Dsc[slot]; ssc = @inbounds Ssc[slot]; esc = @inbounds Esc[slot]; gsc = @inbounds Gsc[slot]
@@ -456,11 +481,11 @@ end
     NL = Int32(5 + NS)
     # ── phase 0: pool U → physical prims → f16 hat tile (+ u16 species) ──────
     let t = tid
-        while t < Int32(_WS3)
-            lx = t % Int32(_WSX); ly = (t ÷ Int32(_WSX)) % Int32(_WSY)
-            lz = t ÷ Int32(_WSX * _WSY)
+        while t < WS3
+            lx = t % WSX; ly = (t ÷ WSX) % WSY
+            lz = t ÷ (WSX * WSY)
             idx = base + _lidx(tx0 + lx + ng - Int32(2), ty0 + ly + ng - Int32(2),
-                               tz0 + lz + ng - Int32(2), nd)
+                               tz0 + lz + hz * (ng - Int32(2)), nd)
             U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
             # vacuum gate (see _prim_de): stored ρ ≤ 0 ⇒ v = 0, ê = 0 — never
             # divide quantization-noise momenta by the density floor.
@@ -480,71 +505,71 @@ end
                     Xt[t*Int32(NS)+Int32(s)] = spin[s][idx]
                 end
             end
-            t += Int32(_NT)
+            t += NT
         end
     end
     @synchronize
     # ── phase 1: predictor dU per (+1)-halo cell, f32 shared ─────────────────
     let t = tid
-        while t < Int32(_DS3)
-            dx = t % Int32(_DSX); dy = (t ÷ Int32(_DSX)) % Int32(_DSY)
-            dz = t ÷ Int32(_DSX * _DSY)
-            lx = dx + Int32(1); ly = dy + Int32(1); lz = dz + Int32(1)  # W coords
-            xc = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3)
-            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3)
-            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3)
-            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, gsc, vb1, vb2, vb3)
-            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, gsc, vb1, vb2, vb3)
-            zm = _tld(Wt, lx, ly, lz - Int32(1), dsc, gsc, vb1, vb2, vb3)
-            zp = _tld(Wt, lx, ly, lz + Int32(1), dsc, gsc, vb1, vb2, vb3)
+        while t < DS3
+            dx = t % DSX; dy = (t ÷ DSX) % DSY
+            dz = t ÷ (DSX * DSY)
+            lx = dx + Int32(1); ly = dy + Int32(1); lz = dz + hz        # W coords
+            xc = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            zm = _tld(Wt, lx, ly, lz - hz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+            zp = _tld(Wt, lx, ly, lz + hz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
             dU = _ctu_dU5(xm, xc, xp, ym, yp, zm, zp, λ, γ)
             q = t * NL
             @inbounds begin
                 dUs[q+1] = dU[1]; dUs[q+2] = dU[2]; dUs[q+3] = dU[3]
                 dUs[q+4] = dU[4]; dUs[q+5] = dU[5]
                 for s in 1:NS
-                    w0 = _wsi(lx, ly, lz)
+                    w0 = _wsi(lx, ly, lz, WSX, WSY)
                     dUs[q+Int32(5)+Int32(s)] = _ctu_dUX(xm, xc, xp, ym, yp, zm, zp,
-                        _xld(Xt, _wsi(lx - Int32(1), ly, lz), s, NS),
+                        _xld(Xt, _wsi(lx - Int32(1), ly, lz, WSX, WSY), s, NS),
                         _xld(Xt, w0, s, NS),
-                        _xld(Xt, _wsi(lx + Int32(1), ly, lz), s, NS),
-                        _xld(Xt, _wsi(lx, ly - Int32(1), lz), s, NS),
-                        _xld(Xt, _wsi(lx, ly + Int32(1), lz), s, NS),
-                        _xld(Xt, _wsi(lx, ly, lz - Int32(1)), s, NS),
-                        _xld(Xt, _wsi(lx, ly, lz + Int32(1)), s, NS), λ, γ)
+                        _xld(Xt, _wsi(lx + Int32(1), ly, lz, WSX, WSY), s, NS),
+                        _xld(Xt, _wsi(lx, ly - Int32(1), lz, WSX, WSY), s, NS),
+                        _xld(Xt, _wsi(lx, ly + Int32(1), lz, WSX, WSY), s, NS),
+                        _xld(Xt, _wsi(lx, ly, lz - hz, WSX, WSY), s, NS),
+                        _xld(Xt, _wsi(lx, ly, lz + hz, WSX, WSY), s, NS), λ, γ)
                 end
             end
-            t += Int32(_NT)
+            t += NT
         end
     end
     @synchronize
     # ── phase 2: three face-plane sweeps, ΔF per target cell in registers ────
-    tx = tid % Int32(_TBX); ty = (tid ÷ Int32(_TBX)) % Int32(_TBY)
-    tz = tid ÷ Int32(_TBX * _TBY)
+    tx = tid % TBX; ty = (tid ÷ TBX) % TBY
+    tz = tid ÷ (TBX * TBY)
     a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
     aU = 0.0f0                                         # Σ_ax (Ss_hi − Ss_lo): pdV face-velocity div
     aX1 = 0.0f0; aX2 = 0.0f0
-    for dir in Int32(1):Int32(3)
+    for dir in Int32(1):Int32(DIM)                    # 2-D: no z face sweep
         ex = dir == Int32(1) ? Int32(1) : Int32(0)
         ey = dir == Int32(2) ? Int32(1) : Int32(0)
         ez = dir == Int32(3) ? Int32(1) : Int32(0)
-        nfx = Int32(_TBX) + ex; nfy = Int32(_TBY) + ey; nfz = Int32(_TBZ) + ez
+        nfx = TBX + ex; nfy = TBY + ey; nfz = TBZ + ez
         nf  = nfx * nfy * nfz
         let p = tid
             while p < nf
                 fx = p % nfx; fy = (p ÷ nfx) % nfy; fz = p ÷ (nfx * nfy)
-                lx = fx + Int32(2) - ex; ly = fy + Int32(2) - ey; lz = fz + Int32(2) - ez
+                lx = fx + Int32(2) - ex; ly = fy + Int32(2) - ey; lz = fz + Int32(2) * hz - ez
                 mx = lx + ex; my = ly + ey; mz = lz + ez
-                dL = _dsi(lx - Int32(1), ly - Int32(1), lz - Int32(1)) * NL
-                dR = _dsi(mx - Int32(1), my - Int32(1), mz - Int32(1)) * NL
+                dL = _dsi(lx - Int32(1), ly - Int32(1), lz - hz, DSX, DSY) * NL
+                dR = _dsi(mx - Int32(1), my - Int32(1), mz - hz, DSX, DSY) * NL
                 @inbounds begin
                     dUL = (dUs[dL+1], dUs[dL+2], dUs[dL+3], dUs[dL+4], dUs[dL+5])
                     dUR = (dUs[dR+1], dUs[dR+2], dUs[dR+3], dUs[dR+4], dUs[dR+5])
                 end
-                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, gsc, vb1, vb2, vb3)
-                cL = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3)
-                cR = _tld(Wt, mx, my, mz, dsc, gsc, vb1, vb2, vb3)
-                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, gsc, vb1, vb2, vb3)
+                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+                cL = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+                cR = _tld(Wt, mx, my, mz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
+                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
                 L = _ctu_predicted(cm, cL, cR, dUL, 1.0f0)
                 R = _ctu_predicted(cL, cR, cp, dUR, -1.0f0)
                 F, Fge, Fm, Ssf = _ctu_face(L, R, γ, dir)
@@ -558,15 +583,15 @@ end
                         ρfR = _recon_one(cL, cR, cp, -1.0f0)[1]
                         for s in 1:NS
                             Fs[q+Int32(7)+Int32(s)] = _ctu_faceX(Fm, L[1], R[1], ρfL, ρfR,
-                                _xld(Xt, _wsi(lx - ex, ly - ey, lz - ez), s, NS),
-                                _xld(Xt, _wsi(lx, ly, lz), s, NS),
-                                _xld(Xt, _wsi(mx, my, mz), s, NS),
-                                _xld(Xt, _wsi(mx + ex, my + ey, mz + ez), s, NS),
+                                _xld(Xt, _wsi(lx - ex, ly - ey, lz - ez, WSX, WSY), s, NS),
+                                _xld(Xt, _wsi(lx, ly, lz, WSX, WSY), s, NS),
+                                _xld(Xt, _wsi(mx, my, mz, WSX, WSY), s, NS),
+                                _xld(Xt, _wsi(mx + ex, my + ey, mz + ez, WSX, WSY), s, NS),
                                 dUs[dL+Int32(5)+Int32(s)], dUs[dR+Int32(5)+Int32(s)])
                         end
                     end
                 end
-                p += Int32(_NT)
+                p += NT
             end
         end
         @synchronize
@@ -583,12 +608,12 @@ end
         @synchronize
     end
     # ── epilogue ──────────────────────────────────────────────────────────────
-    i = tx0 + tx + ng; j = ty0 + ty + ng; k = tz0 + tz + ng
+    i = tx0 + tx + ng; j = ty0 + ty + ng; k = tz0 + tz + hz * ng
     idx = base + _lidx(i, j, k, nd)
     @inbounds begin
         U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
-        wx = tx + Int32(2); wy = ty + Int32(2); wz = tz + Int32(2)
-        Wc = _tld(Wt, wx, wy, wz, dsc, gsc, vb1, vb2, vb3)
+        wx = tx + Int32(2); wy = ty + Int32(2); wz = tz + Int32(2) * hz
+        Wc = _tld(Wt, wx, wy, wz, dsc, gsc, vb1, vb2, vb3, WSX, WSY)
         # pdV work from the HLLC face contact-speed divergence aU (Enzo
         # flux_twoshock: ges = qc·pcent·(ub_i − ub_{i+1}); the RK2 kernel's
         # Sshi−Sslo).  The former CENTERED cell-velocity divv read C/F ghost
@@ -602,7 +627,7 @@ end
         nT  = U0[5] - λ * a5
         nG  = U0[6] - λ * (a6 + pdv * P_c * aU)       # pdv: BAM_NO_PDV diag (0 zeros pdV work)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        demax = _demax6(Tau, base, i, j, k, nd, esc, hz)
         (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
         # extreme-frontier safety: a degenerate Riemann state can still emit a
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
@@ -669,15 +694,16 @@ end
 # SAME computed array).
 @kernel function _blockvsum_k!(sums, @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                @Const(live_d),
-                               B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                               dimv::Val{DIM}) where {DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         idx = base + _lidx(i, j, k, nd)
         d = Float32(D[idx])
         if d > 0.0f0
@@ -742,7 +768,10 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     # but over Metal's usual 32 KB limit, so it must be OPTED IN per backend
     # (`_TILING`, populated by each GPU extension once validated).  The per-cell
     # oracle runs on every backend; `tiled=true`/`false` force either path.
-    tilecap = hier.besym != :cpu && B % _TBX == 0 && B % _TBY == 0 && B % _TBZ == 0
+    # tile: 8×8×4 (3-D) or 16×16×1 (2-D); B must tile it
+    tilecap = hier.besym != :cpu && (lev.dim == 3 ?
+              (B % _TBX == 0 && B % _TBY == 0 && B % _TBZ == 0) :
+              (B % _TBX2 == 0 && B % _TBY2 == 0))
     prefer  = hier.besym in _TILING
     # BAM_CTU_TILED=0: force the per-cell oracle on GPU (tiled-kernel bisect)
     get(ENV, "BAM_CTU_TILED", "1") == "0" && (prefer = false)
@@ -759,24 +788,25 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
         sums = device_zeros(lev.be, Float32, (4 * lev.cap,))
         _blockvsum_k!(lev.be)(sums, lev.D, lev.S1, lev.S2, lev.S3, lev.live_d,
                               Int32(B), Int32(lev.ng), Int32(lev.nd),
-                              Int32(lev.stride); ndrange = nb * B^3)
+                              Int32(lev.stride), Val(lev.dim); ndrange = nb * _nact(lev))
         _blockvb_k!(lev.be)(vbt, sums, lev.live_d, lev.Dsc, lev.Ssc; ndrange = nb)
     end
     if usetile
-        tpb = (B ÷ _TBX) * (B ÷ _TBY) * (B ÷ _TBZ)
-        n = length(lev.live) * tpb * _NT
+        tpb = lev.dim == 3 ? (B ÷ _TBX) * (B ÷ _TBY) * (B ÷ _TBZ) :
+                             (B ÷ _TBX2) * (B ÷ _TBY2)
+        n = length(lev.live) * tpb * _NT                      # _NT = 256 in both
         _ctu_step_k!(lev.be, _NT)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_, sres_,
                                   lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, vbt,
                                   λ, Float32(hier.gamma), η, scap, pdv, Int32(tpb),
                                   Int32(B), Int32(lev.ng), Int32(lev.nd),
-                                  Int32(lev.stride), Val(NS); ndrange = n)
+                                  Int32(lev.stride), Val(NS), Val(lev.dim); ndrange = n)
     else
-        n = length(lev.live) * B^3
+        n = length(lev.live) * _nact(lev)
         _ctu_cell_k!(lev.be)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_, sres_,
                              lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, vbt,
                              λ, Float32(hier.gamma), η, scap, pdv,
                              Int32(B), Int32(lev.ng), Int32(lev.nd),
-                             Int32(lev.stride), Val(NS); ndrange = n)
+                             Int32(lev.stride), Val(NS), Val(lev.dim); ndrange = n)
     end
     return nothing
 end

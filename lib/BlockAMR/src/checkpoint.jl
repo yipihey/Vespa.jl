@@ -27,9 +27,10 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
         end
         origins = [lev.meta[s].origin for s in lev.live]
         offsets = [lev.meta[s].offset for s in lev.live]
-        gf = ntuple(_ -> Array{T}(undef, B^3, nl), 6)
-        fsp = [Array{UInt16}(undef, B^3, nl) for _ in 1:lev.nsp]
-        fphi = Array{Float32}(undef, B^3, nl)
+        na = _nact(lev); Bz = _Bax(lev, 3); kg = _ngax(lev, 3)
+        gf = ntuple(_ -> Array{T}(undef, na, nl), 6)
+        fsp = [Array{UInt16}(undef, na, nl) for _ in 1:lev.nsp]
+        fphi = Array{Float32}(undef, na, nl)
         hostf = map(Array, gasfields(lev))
         hsp = map(Array, lev.sp)
         hphi = Array(lev.phi)
@@ -40,8 +41,8 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
             s = live[i]
             base = (Int(s) - 1) * lev.stride
             q = 0
-            for k in 1:B, j in 1:B, ii in 1:B
-                idx = base + ((ng+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
+            for k in 1:Bz, j in 1:B, ii in 1:B
+                idx = base + ((kg+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
                 for f in 1:6
                     @inbounds gf[f][q, i] = hostf[f][idx]
@@ -62,7 +63,10 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
     return (; nbase = hier.nbase, B = hier.B, ng = hier.ng, box = hier.box,
             Lcap = hier.Lcap, gamma = hier.gamma, cfl = hier.cfl,
             scheme = hier.scheme, T = eltype(hier.levels[1].D),
-            nsp = hier.levels[1].nsp, nstep = copy(hier.nstep), levels, extra)
+            nsp = hier.levels[1].nsp, nstep = copy(hier.nstep), levels, extra,
+            dim = hier.dim, bc = hier.bc,
+            inflow = Dict((d, s == 1 ? :lo : :hi) => hier.inflow[d][s]
+                          for d in 1:3, s in 1:2 if hier.bc[d][s] === :inflow))
 end
 
 """
@@ -98,10 +102,16 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
     # T override: widen an f16 checkpoint into an f32 hierarchy (the per-cell host
     # scatter converts on assignment).  Restored scales stay valid (stored=phys/scale).
     Tp = T === nothing ? ck.T : T
-    hier = AMRHierarchy(; nbase = ck.nbase, B = ck.B, ng = ck.ng, box = ck.box,
+    # pre-2-D checkpoints carry no dim/bc: 3-D, fully periodic
+    dim = hasproperty(ck, :dim) ? ck.dim : 3
+    hier = AMRHierarchy(; nbase = dim == 3 ? ck.nbase : (ck.nbase[1], ck.nbase[2]),
+                        B = ck.B, ng = ck.ng, box = ck.box,
                         backend, T = Tp, nsp = ck.nsp,
                         Lcap = Lcap === nothing ? ck.Lcap : Lcap,
-                        gamma = ck.gamma, cfl = ck.cfl, scheme = ck.scheme)
+                        gamma = ck.gamma, cfl = ck.cfl, scheme = ck.scheme,
+                        bc = hasproperty(ck, :bc) ? ck.bc[1:dim] : :periodic,
+                        inflow = hasproperty(ck, :inflow) ? ck.inflow :
+                                 Dict{Tuple{Int,Symbol},NTuple{5,Float64}}())
     init_base_level!(hier)
     slotmaps = Vector{Vector{Int32}}()
     push!(slotmaps, Int32[hier.levels[1].byorigin[org] for org in ck.levels[1].origins])
@@ -123,6 +133,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
     for l in 0:length(ck.levels)-1
         lev = hier.levels[l + 1]; ckl = ck.levels[l + 1]
         T = eltype(lev.D); B = lev.B; ng = lev.ng; nd = lev.nd
+        Bz = _Bax(lev, 3); kg = _ngax(lev, 3)
         n = lev.cap * lev.stride
         hosts = ntuple(_ -> zeros(T, n), 6)
         hsp = [zeros(UInt16, n) for _ in 1:lev.nsp]
@@ -143,8 +154,8 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             base = (Int(s) - 1) * lev.stride
             hDsc[s] = ckl.Dsc[i]; hSsc[s] = ckl.Ssc[i]; hEsc[s] = ckl.Esc[i]; hGsc[s] = ckGsc[i]
             q = 0
-            for k in 1:B, j in 1:B, ii in 1:B
-                idx = base + ((ng+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
+            for k in 1:Bz, j in 1:B, ii in 1:B
+                idx = base + ((kg+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
                 for f in 1:6
                     @inbounds hosts[f][idx] = ckf[f][q, i]

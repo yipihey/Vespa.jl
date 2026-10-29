@@ -29,4 +29,5 @@ const BACKENDS = (:cpu,
     include("test_gravsolve.jl")
     include("test_collapse.jl")
     include("test_particles.jl")
+    include("test_2d.jl")          # 2-D blocks + non-periodic domain faces (any face)
 end

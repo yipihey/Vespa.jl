@@ -76,6 +76,20 @@ function _finish(a::_JobAcc)
     return RectJobTable(a.n, a.tot, a.jobs, a.cs)
 end
 
+# ── non-periodic domain helpers ──────────────────────────────────────────────
+"True when an image triple crosses a NON-periodic domain axis through the wrap."
+@inline _wrapped_out(lev::Level, i1, i2, i3) =
+    (!lev.per[1] && i1[3] != 0) || (!lev.per[2] && i2[3] != 0) ||
+    (!lev.per[3] && i3[3] != 0)
+
+"Clip a level-cell rectangle to [0, P) along the non-periodic axes of `lev`."
+function _clip_domain(lev::Level, lo::NTuple{3,Int128}, ext::NTuple{3,Int})
+    nlo = ntuple(d -> lev.per[d] ? lo[d] : max(lo[d], Int128(0)), 3)
+    nhi = ntuple(d -> lev.per[d] ? lo[d] + ext[d] :
+                      min(lo[d] + ext[d], Int128(lev.P[d])), 3)
+    return nlo, ntuple(d -> max(Int(nhi[d] - nlo[d]), 0), 3)
+end
+
 # ── same-level sibling ghost copies ──────────────────────────────────────────
 """
     build_sibling_jobs(lev) -> RectJobTable (host)
@@ -87,25 +101,30 @@ block's own interior and is skipped.  Same-level blocks are disjoint, so every
 emitted destination cell is a ghost cell.
 """
 function build_sibling_jobs(lev::Level)
-    acc = _JobAcc(26 * length(lev.live)); B = lev.B; ng = lev.ng
+    acc = _JobAcc(26 * length(lev.live)); B = lev.B
+    ngv = ntuple(d -> _ngax(lev, d), 3); ndv = ntuple(d -> _ndax(lev, d), 3)
+    Bv  = ntuple(d -> _Bax(lev, d), 3)
     cands = Int32[]                                        # reused across blocks
     for s in lev.live
         m = lev.meta[s]
-        lo  = ntuple(d -> Int128(m.origin[d]) - ng, 3)     # stored-frame global lo
+        lo  = ntuple(d -> Int128(m.origin[d]) - ngv[d], 3) # stored-frame global lo
         lattice_neighbors!(cands, lev, m.origin, B)        # O(1) hits, lattice-aligned
         for c in cands
             cm = lev.meta[c]
-            r1 = axis_images3(lo[1], lev.nd, Int128(cm.origin[1]), B, Int128(lev.P[1]))
-            r2 = axis_images3(lo[2], lev.nd, Int128(cm.origin[2]), B, Int128(lev.P[2]))
-            r3 = axis_images3(lo[3], lev.nd, Int128(cm.origin[3]), B, Int128(lev.P[3]))
+            r1 = axis_images3(lo[1], ndv[1], Int128(cm.origin[1]), Bv[1], Int128(lev.P[1]))
+            r2 = axis_images3(lo[2], ndv[2], Int128(cm.origin[2]), Bv[2], Int128(lev.P[2]))
+            r3 = axis_images3(lo[3], ndv[3], Int128(cm.origin[3]), Bv[3], Int128(lev.P[3]))
             for k1 in 1:r1[1], k2 in 1:r2[1], k3 in 1:r3[1]
                 i1 = img_get(r1, k1); i2 = img_get(r2, k2); i3 = img_get(r3, k3)
                 c == s && i1[3] == 0 && i2[3] == 0 && i3[3] == 0 && continue
+                # non-periodic domain axis: no data crosses the edge through the
+                # wrap (the boundary fill synthesizes those ghosts)
+                _wrapped_out(lev, i1, i2, i3) && continue
                 glo  = (i1[1], i2[1], i3[1])
                 ext  = (i1[2], i2[2], i3[2])
                 doff = ntuple(d -> Int(glo[d] - lo[d]), 3)
                 soff = ntuple(d -> Int(glo[d] - (i1, i2, i3)[d][3] -
-                                       (Int128(cm.origin[d]) - ng)), 3)
+                                       (Int128(cm.origin[d]) - ngv[d])), 3)
                 _push_job!(acc, s, c, doff, soff, ext)
             end
         end
@@ -124,28 +143,30 @@ particle gather) must run one full `:sib` exchange after the sweep loop.
 """
 function build_sibling_face_jobs(lev::Level)
     acc = _JobAcc(12 * length(lev.live)); B = lev.B; ng = lev.ng
+    ngv = ntuple(d -> _ngax(lev, d), 3); Bv = ntuple(d -> _Bax(lev, d), 3)
     cands = Int32[]                                        # reused across blocks
     for s in lev.live
         m = lev.meta[s]
-        lo = ntuple(d -> Int128(m.origin[d]) - ng, 3)
+        lo = ntuple(d -> Int128(m.origin[d]) - ngv[d], 3)
         lattice_neighbors!(cands, lev, m.origin, B)
-        for ax in 1:3, side in (0, 1)
+        for ax in 1:lev.dim, side in (0, 1)
             slo = ntuple(d -> d == ax ?
                 (side == 0 ? lo[d] : Int128(m.origin[d]) + B) :
                 Int128(m.origin[d]), 3)
-            sext = ntuple(d -> d == ax ? ng : B, 3)
+            sext = ntuple(d -> d == ax ? ng : Bv[d], 3)
             for c in cands
                 cm = lev.meta[c]
-                r1 = axis_images3(slo[1], sext[1], Int128(cm.origin[1]), B, Int128(lev.P[1]))
-                r2 = axis_images3(slo[2], sext[2], Int128(cm.origin[2]), B, Int128(lev.P[2]))
-                r3 = axis_images3(slo[3], sext[3], Int128(cm.origin[3]), B, Int128(lev.P[3]))
+                r1 = axis_images3(slo[1], sext[1], Int128(cm.origin[1]), Bv[1], Int128(lev.P[1]))
+                r2 = axis_images3(slo[2], sext[2], Int128(cm.origin[2]), Bv[2], Int128(lev.P[2]))
+                r3 = axis_images3(slo[3], sext[3], Int128(cm.origin[3]), Bv[3], Int128(lev.P[3]))
                 for k1 in 1:r1[1], k2 in 1:r2[1], k3 in 1:r3[1]
                     i1 = img_get(r1, k1); i2 = img_get(r2, k2); i3 = img_get(r3, k3)
+                    _wrapped_out(lev, i1, i2, i3) && continue
                     glo  = (i1[1], i2[1], i3[1])
                     ext  = (i1[2], i2[2], i3[2])
                     doff = ntuple(d -> Int(glo[d] - lo[d]), 3)
                     soff = ntuple(d -> Int(glo[d] - (i1, i2, i3)[d][3] -
-                                           (Int128(cm.origin[d]) - ng)), 3)
+                                           (Int128(cm.origin[d]) - ngv[d])), 3)
                     _push_job!(acc, s, c, doff, soff, ext)
                 end
             end
@@ -173,26 +194,32 @@ function build_prolong_jobs(lev::Level, plev::Level; interior::Bool = false,
     ovb = Int32[]                                         # reused overlap buffer
     for s in slots
         m = lev.meta[s]
-        lo = ntuple(d -> Int128(m.origin[d]) - ng, 3)
+        lo = ntuple(d -> Int128(m.origin[d]) - _ngax(lev, d), 3)
         rects = if interior
-            [(ntuple(d -> Int128(m.origin[d]), 3), ntuple(_ -> B, 3))]
+            [(ntuple(d -> Int128(m.origin[d]), 3), ntuple(d -> _Bax(lev, d), 3))]
         else
-            _ghost_shell_rects(m.origin, B, ng)
+            _ghost_shell_rects(m.origin, B, ng, lev.dim)
         end
-        for (rlo, rext) in rects
+        for (rlo0, rext0) in rects
+            # clip at non-periodic domain faces: ghosts beyond the edge come
+            # from the boundary fill, never from a wrapped parent image
+            rlo, rext = _clip_domain(lev, rlo0, rext0)
+            all(rext .> 0) || continue
             _emit_prolong!(acc, s, rlo, rext, lo, plev, ovb)
         end
     end
     return _finish(acc)
 end
 
-"The 26 ghost-shell rectangles of a block (3×3×3 segment lattice minus the core)."
-function _ghost_shell_rects(origin::Origin, B::Int, ng::Int)
+"""The 26 ghost-shell rectangles of a block (3×3×3 segment lattice minus the
+core); in 2-D the 8 rectangles of the 3×3×1 lattice (flat z: one segment)."""
+function _ghost_shell_rects(origin::Origin, B::Int, ng::Int, dim::Int = 3)
     seg(d) = ((Int128(origin[d]) - ng, ng), (Int128(origin[d]), B),
               (Int128(origin[d]) + B, ng))
     out = Tuple{NTuple{3,Int128},NTuple{3,Int}}[]
-    s1, s2, s3 = seg(1), seg(2), seg(3)
-    for k in 1:3, j in 1:3, i in 1:3
+    s1, s2 = seg(1), seg(2)
+    s3 = dim == 3 ? seg(3) : ((Int128(0), 0), (Int128(origin[3]), 1), (Int128(0), 0))
+    for k in (dim == 3 ? (1:3) : (2:2)), j in 1:3, i in 1:3
         (i == 2 && j == 2 && k == 2) && continue
         lo  = (s1[i][1], s2[j][1], s3[k][1])
         ext = (s1[i][2], s2[j][2], s3[k][2])
@@ -204,18 +231,20 @@ end
 function _emit_prolong!(acc::_JobAcc, s::Int32, rlo::NTuple{3,Int128},
                         rext::NTuple{3,Int}, dlo::NTuple{3,Int128}, plev::Level,
                         ovb::Vector{Int32} = Int32[])
-    # parent-cell footprint of the fine rectangle
+    # parent-cell footprint of the fine rectangle (the flat z axis of a 2-D
+    # level is z ≡ 0 at every level: fld/cld by 2 of [0,1) stay [0,1))
     plo  = ntuple(d -> fld(rlo[d], 2), 3)
     phi  = ntuple(d -> cld(rlo[d] + rext[d], 2), 3)
     plen = ntuple(d -> Int(phi[d] - plo[d]), 3)
     covered = 0
     for ps in overlapping_blocks!(ovb, plev, plo, plen)
         pm = plev.meta[ps]
-        r1 = axis_images3(plo[1], plen[1], Int128(pm.origin[1]), plev.B, Int128(plev.P[1]))
-        r2 = axis_images3(plo[2], plen[2], Int128(pm.origin[2]), plev.B, Int128(plev.P[2]))
-        r3 = axis_images3(plo[3], plen[3], Int128(pm.origin[3]), plev.B, Int128(plev.P[3]))
+        r1 = axis_images3(plo[1], plen[1], Int128(pm.origin[1]), _Bax(plev, 1), Int128(plev.P[1]))
+        r2 = axis_images3(plo[2], plen[2], Int128(pm.origin[2]), _Bax(plev, 2), Int128(plev.P[2]))
+        r3 = axis_images3(plo[3], plen[3], Int128(pm.origin[3]), _Bax(plev, 3), Int128(plev.P[3]))
         for k1 in 1:r1[1], k2 in 1:r2[1], k3 in 1:r3[1]
             i1 = img_get(r1, k1); i2 = img_get(r2, k2); i3 = img_get(r3, k3)
+            _wrapped_out(plev, i1, i2, i3) && continue
             img = (i1, i2, i3)
             # fine cells whose parent lies in this image, clipped to the rectangle
             flo = ntuple(d -> max(rlo[d], 2 * img[d][1]), 3)
@@ -225,7 +254,7 @@ function _emit_prolong!(acc::_JobAcc, s::Int32, rlo::NTuple{3,Int128},
             doff = ntuple(d -> Int(flo[d] - dlo[d]), 3)
             # src stored-frame offset of parent cell fld(flo,2) (shift back the image)
             soff = ntuple(d -> Int(fld(flo[d], 2) - img[d][3] -
-                                   (Int128(pm.origin[d]) - plev.ng)), 3)
+                                   (Int128(pm.origin[d]) - _ngax(plev, d))), 3)
             par  = ntuple(d -> Int(mod(flo[d], 2)), 3)
             _push_job!(acc, s, ps, doff, soff, ext, par)
             covered += prod(ext)
@@ -249,9 +278,9 @@ function build_restrict_jobs(lev::Level, plev::Level)
     Bh = lev.B ÷ 2
     for s in lev.live
         m = lev.meta[s]
-        doff = ntuple(d -> plev.ng + Int(m.offset[d]), 3)
-        _push_job!(acc, m.parent, s, doff, ntuple(_ -> lev.ng, 3),
-                   ntuple(_ -> Bh, 3))
+        doff = ntuple(d -> _ngax(plev, d) + Int(m.offset[d]), 3)
+        _push_job!(acc, m.parent, s, doff, ntuple(d -> _ngax(lev, d), 3),
+                   ntuple(d -> d <= lev.dim ? Bh : 1, 3))
     end
     return _finish(acc)
 end

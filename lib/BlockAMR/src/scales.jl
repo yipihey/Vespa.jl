@@ -18,16 +18,16 @@
 @kernel function _blockmax_k!(maxD, maxS, maxE, maxG,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
                               @Const(Tau), @Const(Ge), @Const(live_d),
-                              nd::Int32, stride::Int32)
+                              ncs::Int32, ch::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    K = (nd * nd * nd) ÷ Int32(32)
+    K = ncs ÷ ch                     # ch = 32 in 3-D (nd³ ≡ 0 mod 64); see _chunk
     bi = t0 ÷ K; r = t0 % K
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         mD = 0.0f0; mS = 0.0f0; mE = 0.0f0; mG = 0.0f0
-        for k in Int32(0):Int32(31)
+        for k in Int32(0):ch - Int32(1)
             idx = base + r + k * K + Int32(1)
             mD = max(mD, abs(Float32(D[idx])))
             mS = max(mS, max(abs(Float32(S1[idx])),
@@ -44,10 +44,10 @@ end
 
 # multiply one field of flagged blocks by a per-slot power-of-two ratio (exact)
 @kernel function _rescale_k!(F, @Const(ratio), @Const(live_d),
-                             nd::Int32, stride::Int32)
+                             ncs::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    n3 = nd * nd * nd
+    n3 = ncs                         # stored cells per block (nd^dim)
     @inbounds begin
         slot = live_d[t0 ÷ n3 + Int32(1)]
         r = ratio[slot]
@@ -56,6 +56,14 @@ end
             F[idx] = _narrow(eltype(F), Float32(F[idx]) * r)
         end
     end
+end
+
+"Cells per thread in `_blockmax_k!`: the largest of 32,16,…,1 dividing nd^dim."
+function _chunk(ncs::Int)
+    for c in (32, 16, 8, 4, 2)
+        ncs % c == 0 && return c
+    end
+    return 1
 end
 
 """
@@ -73,16 +81,17 @@ function update_scales!(hier::AMRHierarchy, l::Int; hyst::Int = 1)
     maxS = device_zeros(lev.be, UInt32, (lev.cap,))
     maxE = device_zeros(lev.be, UInt32, (lev.cap,))
     maxG = device_zeros(lev.be, UInt32, (lev.cap,))
+    ncs = _ncs(lev); ch = _chunk(ncs)
     _blockmax_k!(lev.be)(maxD, maxS, maxE, maxG, gasfields(lev)..., lev.live_d,
-                         Int32(lev.nd), Int32(lev.stride);
-                         ndrange = nb * (lev.nd^3 ÷ 32))
+                         Int32(ncs), Int32(ch), Int32(lev.stride);
+                         ndrange = nb * (ncs ÷ ch))
     hmx = (reinterpret(Float32, Array(maxD)), reinterpret(Float32, Array(maxS)),
            reinterpret(Float32, Array(maxE)), reinterpret(Float32, Array(maxG)))
     scs = (lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc)
     # class 3 = Tau (total energy), class 4 = Ge (internal energy) — separate windows
     fieldsets = ((lev.D, lev.Do), (lev.S1, lev.S2, lev.S3, lev.S1o, lev.S2o, lev.S3o),
                  (lev.Tau, lev.Tauo), (lev.Ge, lev.Geo))
-    n = nb * lev.nd^3
+    n = nb * _ncs(lev)
     for cl in 1:4
         hsc = Array(scs[cl])
         ratio = ones(Float32, lev.cap)
@@ -100,7 +109,7 @@ function update_scales!(hier::AMRHierarchy, l::Int; hyst::Int = 1)
         dirty || continue
         drat = to_device(lev.be, ratio, Float32)
         for f in fieldsets[cl]
-            _rescale_k!(lev.be)(f, drat, lev.live_d, Int32(lev.nd),
+            _rescale_k!(lev.be)(f, drat, lev.live_d, Int32(_ncs(lev)),
                                 Int32(lev.stride); ndrange = n)
         end
         copyto!(scs[cl], hsc)
@@ -125,7 +134,7 @@ function encode_from_host!(lev::Level, hD, hS1, hS2, hS3, hTau, hGe)
     hsc  = (ones(Float32, lev.cap), ones(Float32, lev.cap), ones(Float32, lev.cap), ones(Float32, lev.cap))
     for s in lev.live
         base = (Int(s) - 1) * lev.stride
-        rng = base+1:base+lev.nd^3
+        rng = base+1:base+_ncs(lev)
         if f16
             for cl in 1:4
                 m = 0.0

@@ -24,46 +24,54 @@ level `plev`: fine-block outer faces not covered by same-level siblings, grouped
 function build_cf_faces(lev::Level, plev::Level)
     ent = Int32[]
     B = lev.B; ng = lev.ng
+    B2 = lev.dim == 3 ? B : 1                          # t2 extent (flat z in 2-D)
+    g2 = lev.dim == 3 ? 2 : 1                          # fine group along t2
     for s in lev.live
         m = lev.meta[s]
-        for ax in 1:3, side in (Int32(-1), Int32(1))
+        for ax in 1:lev.dim, side in (Int32(-1), Int32(1))
             t1, t2 = ax == 1 ? (2, 3) : ax == 2 ? (1, 3) : (1, 2)
             slab_lo = ntuple(d -> d == ax ?
                 (side == 1 ? Int128(m.origin[d]) + B : Int128(m.origin[d]) - 1) :
                 Int128(m.origin[d]), 3)
-            slab_len = ntuple(d -> d == ax ? 1 : B, 3)
-            covered = falses(B, B)                      # transverse (t1, t2), 1-based
+            # a face ON a non-periodic domain edge has no coarse neighbour
+            (!lev.per[ax] && !(0 <= slab_lo[ax] < Int128(lev.P[ax]))) && continue
+            covered = falses(B, B2)                     # transverse (t1, t2), 1-based
             for c in lattice_neighbors(lev, m.origin, B)
                 cm = lev.meta[c]
-                isempty(axis_images(slab_lo[ax], 1, Int128(cm.origin[ax]), B,
-                                    Int128(lev.P[ax]))) && continue
+                ia = filter(im -> lev.per[ax] || im[3] == 0,
+                            axis_images(slab_lo[ax], 1, Int128(cm.origin[ax]), B,
+                                        Int128(lev.P[ax])))
+                isempty(ia) && continue
                 for a1 in axis_images(slab_lo[t1], B, Int128(cm.origin[t1]), B, Int128(lev.P[t1])),
-                    a2 in axis_images(slab_lo[t2], B, Int128(cm.origin[t2]), B, Int128(lev.P[t2]))
+                    a2 in axis_images(slab_lo[t2], B2, Int128(cm.origin[t2]), _Bax(lev, t2),
+                                      Int128(lev.P[t2]))
+                    (!lev.per[t1] && a1[3] != 0) && continue
+                    (!lev.per[t2] && a2[3] != 0) && continue
                     r1 = Int(a1[1] - slab_lo[t1]); r2 = Int(a2[1] - slab_lo[t2])
                     covered[r1+1:r1+a1[2], r2+1:r2+a2[2]] .= true
                 end
             end
-            for f2 in 0:2:B-2, f1 in 0:2:B-2            # 2×2 fine groups (t1=f1, t2=f2)
+            for f2 in 0:g2:B2-g2, f1 in 0:2:B-2         # 2×2 (2-D: 2×1) fine groups
                 cov = covered[f1+1, f2+1]
-                # even origins/extents ⇒ coverage is uniform over each 2×2 group
-                @assert all(covered[f1+i, f2+j] == cov for i in 1:2, j in 1:2)
+                # even origins/extents ⇒ coverage is uniform over each fine group
+                @assert all(covered[f1+i, f2+j] == cov for i in 1:2, j in 1:g2)
                 cov && continue
                 # outside coarse cell (global coarse coords)
                 q = Vector{Int128}(undef, 3)
                 q[ax] = side == 1 ? (Int128(m.origin[ax]) + B) >> 1 :
                                     (Int128(m.origin[ax]) >> 1) - 1
                 q[t1] = (Int128(m.origin[t1]) + f1) >> 1
-                q[t2] = (Int128(m.origin[t2]) + f2) >> 1
+                q[t2] = t2 <= lev.dim ? (Int128(m.origin[t2]) + f2) >> 1 : Int128(0)
                 qw = ntuple(d -> wrapc(q[d], plev.P[d]), 3)
                 own = lattice_owner(plev, qw, B)
                 own != 0 ||
                     error("C/F face target not owned (nesting violation?)")
                 po = plev.meta[own]
                 cc = ntuple(d -> Int32(Int(mod(Int128(qw[d]) - Int128(po.origin[d]),
-                                               Int128(plev.P[d]))) + plev.ng), 3)
+                                               Int128(plev.P[d]))) + _ngax(plev, d)), 3)
                 fc = Vector{Int32}(undef, 3)
                 fc[ax] = side == 1 ? Int32(ng + B - 1) : Int32(ng)
-                fc[t1] = Int32(ng + f1); fc[t2] = Int32(ng + f2)
+                fc[t1] = Int32(ng + f1); fc[t2] = Int32(_ngax(lev, t2) + f2)
                 append!(ent, Int32[own, cc..., ax, side, s, fc..., 0, 0, 0, 0, 0, 0])
             end
         end
@@ -191,7 +199,7 @@ end
                                         @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                         @Const(Vb),
                                         wc::Float32, λ::Float32, γ::Float32,
-                                        nd::Int32, stride::Int32, nspreg::Int32)
+                                        nd::Int32, stride::Int32, nspreg::Int32, kz::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -206,7 +214,7 @@ end
         j = cj + (ax == Int32(2) ? sh : Int32(0))
         k = ck + (ax == Int32(3) ? sh : Int32(0))
         F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                           dsc, ssc, esc, gsc, vb1, vb2, vb3)
+                           dsc, ssc, esc, gsc, vb1, vb2, vb3, kz)
         ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
              isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
         # TODO(ctu-species-reflux): species lanes left ZERO on the CTU path —
@@ -228,7 +236,7 @@ end
                                       @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                       @Const(Vb),
                                       wf::Float32, λ::Float32, γ::Float32,
-                                      nd::Int32, stride::Int32, nspreg::Int32)
+                                      nd::Int32, stride::Int32, nspreg::Int32, kz::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -246,12 +254,12 @@ end
         t2i = Int32(0)
         t2j = ax == Int32(3) ? Int32(1) : Int32(0)
         t2k = ax == Int32(3) ? Int32(0) : Int32(1)
-        for s2 in Int32(0):Int32(1), s1 in Int32(0):Int32(1)
+        for s2 in Int32(0):kz, s1 in Int32(0):Int32(1)   # 2-D: t2 is the flat z
             i = fi + (ax == Int32(1) ? sh : Int32(0)) + s1 * t1i + s2 * t2i
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
             F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                               dsc, ssc, esc, gsc, vb1, vb2, vb3)
+                               dsc, ssc, esc, gsc, vb1, vb2, vb3, kz)
             ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
                  isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
             a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
@@ -260,7 +268,7 @@ end
         end
         # TODO(ctu-species-reflux): see the coarse CTU capture note.
         r = (Int32(e) - Int32(1)) * (Int32(6) + nspreg)
-        q = 0.25f0 * wf
+        q = (kz == Int32(1) ? 0.25f0 : 0.5f0) * wf     # mean over the 2² (2-D: 2) sub-faces
         reg[r+1] += q * a1; reg[r+2] += q * a2; reg[r+3] += q * a3
         reg[r+4] += q * a4; reg[r+5] += q * a5; reg[r+6] += q * a6
     end
@@ -272,7 +280,7 @@ end
                                   @Const(Tau), @Const(Ge), spin,
                                   @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                   wf::Float32, γ::Float32, nd::Int32, stride::Int32,
-                                  ::Val{NS}) where {NS}
+                                  ::Val{NS}, kz::Int32) where {NS}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -294,7 +302,7 @@ end
         t2i = Int32(0)                                             # transverse unit 2
         t2j = ax == Int32(3) ? Int32(1) : Int32(0)
         t2k = ax == Int32(3) ? Int32(0) : Int32(1)
-        for s2 in Int32(0):Int32(1), s1 in Int32(0):Int32(1)
+        for s2 in Int32(0):kz, s1 in Int32(0):Int32(1)   # 2-D: t2 is the flat z
             i = fi + (ax == Int32(1) ? sh : Int32(0)) + s1 * t1i + s2 * t2i
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
@@ -318,7 +326,7 @@ end
             end
         end
         r = (Int32(e) - Int32(1)) * (Int32(6) + Int32(NS))
-        q = 0.25f0 * wf
+        q = (kz == Int32(1) ? 0.25f0 : 0.5f0) * wf     # mean over the 2² (2-D: 2) sub-faces
         reg[r+1] += q * a1; reg[r+2] += q * a2; reg[r+3] += q * a3
         reg[r+4] += q * a4; reg[r+5] += q * a5; reg[r+6] += q * a6
         NS >= 1 && (reg[r+7] += q * aXa)
@@ -439,12 +447,12 @@ function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
                                      lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, _vbtab(lev),
                                      w, λ,
                                      Float32(hier.gamma), Int32(lev.nd),
-                                     Int32(lev.stride), Int32(NS); ndrange = n)
+                                     Int32(lev.stride), Int32(NS), _kz(lev); ndrange = n)
     else
         _capture_fine_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff..., sf,
                                  lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, w,
                                  Float32(hier.gamma), Int32(lev.nd),
-                                 Int32(lev.stride), Val(NS); ndrange = n)
+                                 Int32(lev.stride), Val(NS), _kz(lev); ndrange = n)
     end
     return nothing
 end
@@ -468,7 +476,7 @@ function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
                                        plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                                        _vbtab(plev), w, λ,
                                        Float32(hier.gamma), Int32(plev.nd),
-                                       Int32(plev.stride), Int32(NS); ndrange = n)
+                                       Int32(plev.stride), Int32(NS), _kz(plev); ndrange = n)
     else
         _capture_coarse_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc..., sc,
                                    plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc, w,

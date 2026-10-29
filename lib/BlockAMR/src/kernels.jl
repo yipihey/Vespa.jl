@@ -23,6 +23,19 @@ import ChemistryKernels: encode_log2sp, decode_log2sp
 
 @inline _lidx(i::Int32, j::Int32, k::Int32, nd::Int32) = (k * nd + j) * nd + i + Int32(1)
 
+# Dimension-generic active-cell decode (DIM is a compile-time Val, so the 3-D
+# instantiation is the historic code).  2-D blocks are B×B×1 with the flat z
+# index k ≡ 0 (no z ghosts): `_lidx` then reduces to j·nd + i + 1.
+@inline _nblk(B::Int32, ::Val{3}) = B * B * B
+@inline _nblk(B::Int32, ::Val{2}) = B * B
+@inline _cell_ijk(c::Int32, B::Int32, ng::Int32, ::Val{3}) =
+    (c % B + ng, (c ÷ B) % B + ng, c ÷ (B * B) + ng)
+@inline _cell_ijk(c::Int32, B::Int32, ng::Int32, ::Val{2}) =
+    (c % B + ng, c ÷ B + ng, Int32(0))
+"z-neighbour offset: 1 in 3-D; 0 in 2-D (z taps read the cell itself ⇒ zero z flux)."
+@inline _kzv(::Val{3}) = Int32(1)
+@inline _kzv(::Val{2}) = Int32(0)
+
 # σΔ u16 species store: add the per-cell carried remainder, encode, carry the new
 # remainder.  Without this, any sub-quantum update re-encodes to the UNCHANGED
 # code — the stored species mass becomes X_old·ρ_new, which under compression at
@@ -171,6 +184,12 @@ end
     return Flo, Fhi, dge, Sshi - Sslo, Uc
 end
 
+# the flat z axis of a 2-D block: no faces, zero flux difference
+@inline function _zero_axis()
+    z = (0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)
+    return z, z, 0.0f0, 0.0f0
+end
+
 # ── the fused SSP-RK2 stage kernel ────────────────────────────────────────────
 # OUT = w_old·OLD + (1−w_old)·(IN − λ·ΔF(IN))   per active cell of every block.
 #   stage 1: OUT=O, IN=R, OLD=R, w=0        (O = R − λΔF(R))
@@ -183,19 +202,24 @@ end
                               @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                               λ::Float32, γ::Float32, η::Float32, scap::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
-                              ::Val{NS}) where {NS}
+                              ::Val{NS}, dimv::Val{DIM}) where {NS,DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
+    kz = _kzv(dimv)
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         Fx0, Fx1, dgex, dux, Uc = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(1), dsc, ssc, esc, gsc)
         Fy0, Fy1, dgey, duy, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(2), dsc, ssc, esc, gsc)
-        Fz0, Fz1, dgez, duz, _  = _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(3), dsc, ssc, esc, gsc)
+        Fz0, Fz1, dgez, duz = if DIM == 3
+            _axis_update(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, γ, Int32(3), dsc, ssc, esc, gsc)
+        else
+            _zero_axis()
+        end
         P_c = (γ - 1.0f0) * max(Uc[6], 1.0f-30)
         dU1 = (Fx1[1] - Fx0[1]) + (Fy1[1] - Fy0[1]) + (Fz1[1] - Fz0[1])
         dU2 = (Fx1[2] - Fx0[2]) + (Fy1[2] - Fy0[2]) + (Fz1[2] - Fz0[2])
@@ -232,7 +256,7 @@ end
         # reaches Ge when the gas decelerates — the deep-core T→CMB-floor collapse.
         nD = max(nD, 1.0f-30)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        demax = _demax6(Tau, base, i, j, k, nd, esc, kz)
         (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
         # extreme-frontier safety (PORT OF THE CTU EPILOGUE GATE — this kernel
         # historically had NONE, so a degenerate Riemann flux at the cooling-
@@ -270,7 +294,7 @@ end
             ρR = ρRold                                    # OLD physical density (R), pre-store copy
             ixm = base + _lidx(i - Int32(1), j, k, nd); ixp = base + _lidx(i + Int32(1), j, k, nd)
             iym = base + _lidx(i, j - Int32(1), k, nd); iyp = base + _lidx(i, j + Int32(1), k, nd)
-            izm = base + _lidx(i, j, k - Int32(1), nd); izp = base + _lidx(i, j, k + Int32(1), nd)
+            izm = base + _lidx(i, j, k - kz, nd); izp = base + _lidx(i, j, k + kz, nd)  # 2-D: self (Fz ≡ 0)
             for q in 1:NS
                 sq = spin[q]
                 Xc  = decode_log2sp(Float32, sq[idx])
@@ -311,16 +335,17 @@ end
 @kernel function _max_signal_k!(out, @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                 @Const(Ge), @Const(live_d),
                                 @Const(Dsc), @Const(Ssc), @Const(Gsc), γ::Float32,
-                                B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                                B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                dimv::Val{DIM}) where {DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         dsc = Dsc[slot]; ssc = Ssc[slot]; gsc = Gsc[slot]
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         idx = base + _lidx(i, j, k, nd)
         ρraw = Float32(D[idx]) * dsc
         # vacuum gate (see _prim_de): a stored-ρ≤0 cell carries no signal —
@@ -335,13 +360,13 @@ end
 
 "Max |v|+c_s over all active cells of a level (0 for an empty level)."
 function max_signal(lev::Level, γ::Real)
-    n = length(lev.live) * lev.B^3
+    n = length(lev.live) * _nact(lev)
     n == 0 && return 0.0f0
     out = device_zeros(lev.be, Float32, (n,))
     _max_signal_k!(lev.be)(out, lev.D, lev.S1, lev.S2, lev.S3, lev.Ge, lev.live_d,
                            lev.Dsc, lev.Ssc, lev.Gsc,
                            Float32(γ), Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
-                           Int32(lev.stride); ndrange = n)
+                           Int32(lev.stride), Val(lev.dim); ndrange = n)
     return maximum(out)                       # device reduction
 end
 
@@ -366,7 +391,7 @@ function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     sout_ = OUT === :R ? ntuple(q -> lev.sp[q], NS) : ntuple(q -> lev.spo[q], NS)
     sold_ = ntuple(q -> lev.sp[q], NS)
     sres_ = ntuple(q -> lev.spr[q], NS)
-    n = length(lev.live) * lev.B^3
+    n = length(lev.live) * _nact(lev)
     scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
     sd = OUT === :R ? Int32(1) : Int32(0)     # σΔ at the persistent store only
     ew = OUT === :R ? 0.0f0 : 0.5f0           # O-store error → carry, stage-2 wi
@@ -376,6 +401,6 @@ function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     _rk_stage_k!(lev.be)(fout..., sout_, fin..., sin_, fold..., sold_, sres_, sd, ew, w, lev.live_d,
                          lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, λ,
                          Float32(hier.gamma), η, scap, Int32(lev.B), Int32(lev.ng),
-                         Int32(lev.nd), Int32(lev.stride), Val(NS); ndrange = n)
+                         Int32(lev.nd), Int32(lev.stride), Val(NS), Val(lev.dim); ndrange = n)
     return nothing
 end

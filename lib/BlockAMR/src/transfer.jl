@@ -81,7 +81,7 @@ end
 
 # ── fine→coarse restriction (conservative 2³ mean) ───────────────────────────
 @kernel function _rect_restrict_k!(dst, @Const(src), @Const(jobs), @Const(cellstart),
-                                   njobs::Int32, nd::Int32, stride::Int32)
+                                   njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)   # r in COARSE cells
@@ -93,10 +93,11 @@ end
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
         acc = 0.0f0
-        for ck in Int32(0):Int32(1), cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+        for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
             acc += Float32(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
         end
-        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] = eltype(dst)(acc * 0.125f0)
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            eltype(dst)(acc * (kz == Int32(1) ? 0.125f0 : 0.25f0))
     end
 end
 
@@ -170,7 +171,7 @@ end
 @kernel function _rect_prolong_llsc_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
                                        @Const(scd), @Const(scs),
                                        @Const(jobs), @Const(cellstart),
-                                       njobs::Int32, nd::Int32, stride::Int32)
+                                       njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
@@ -190,7 +191,8 @@ end
         c  = S(si, sj, sk)
         sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
         sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
-        sz = _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1)))
+        # flat z (2-D, kz = 0): no z taps — they would leave the slot
+        sz = kz == Int32(1) ? _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1))) : 0.0f0
         phys = (c + f1 * sx + f2 * sy + f3 * sz) * scs[jobs[b+2]]
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
             _narrow(eltype(dst), phys / scd[jobs[b+1]])
@@ -208,7 +210,7 @@ end
                                     θ::Float32, @Const(scdGe), @Const(scsGe),
                                     @Const(scdD), @Const(scsD),
                                     @Const(jobs), @Const(cellstart),
-                                    njobs::Int32, nd::Int32, stride::Int32)
+                                    njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global); t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
     @inbounds begin
@@ -231,7 +233,7 @@ end
         c  = E(si, sj, sk)
         sx = _mm(E(si + Int32(1), sj, sk) - c, c - E(si - Int32(1), sj, sk))
         sy = _mm(E(si, sj + Int32(1), sk) - c, c - E(si, sj - Int32(1), sk))
-        sz = _mm(E(si, sj, sk + Int32(1)) - c, c - E(si, sj, sk - Int32(1)))
+        sz = kz == Int32(1) ? _mm(E(si, sj, sk + Int32(1)) - c, c - E(si, sj, sk - Int32(1))) : 0.0f0
         e_interp = c + f1 * sx + f2 * sy + f3 * sz
         didx = dbase + (dk * nd + dj) * nd + di + Int32(1)
         ρf = Float32(dstD[didx]) * scdD[jobs[b+1]]         # already-prolonged fine density
@@ -250,7 +252,7 @@ end
 # the in-run xe/fH2 fraction pump, ×10 per level era in the collapse).
 @kernel function _rect_prolong_llsp_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
                                        @Const(jobs), @Const(cellstart),
-                                       njobs::Int32, nd::Int32, stride::Int32)
+                                       njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
@@ -272,7 +274,8 @@ end
         c  = S(si, sj, sk)
         sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
         sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
-        sz = _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1)))
+        # flat z (2-D, kz = 0): no z taps — they would leave the slot
+        sz = kz == Int32(1) ? _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1))) : 0.0f0
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
             ChemistryKernels.encode_log2sp(max(c + f1 * sx + f2 * sy + f3 * sz, 0.0f0))
     end
@@ -280,7 +283,7 @@ end
 
 @kernel function _rect_restrict_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
                                       @Const(jobs), @Const(cellstart),
-                                      njobs::Int32, nd::Int32, stride::Int32)
+                                      njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
@@ -292,10 +295,10 @@ end
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
         acc = 0.0f0
-        for ck in Int32(0):Int32(1), cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+        for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
             acc += Float32(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
         end
-        phys = acc * 0.125f0 * scs[jobs[b+2]]
+        phys = acc * (kz == Int32(1) ? 0.125f0 : 0.25f0) * scs[jobs[b+2]]
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
             _narrow(eltype(dst), phys / scd[jobs[b+1]])
     end
@@ -305,7 +308,7 @@ end
 # fine block's density scale cancels in the ratio (one src slot per job).
 @kernel function _rect_restrict_sp_k!(spc, @Const(spf), @Const(Df),
                                       @Const(jobs), @Const(cellstart),
-                                      njobs::Int32, nd::Int32, stride::Int32)
+                                      njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
@@ -317,7 +320,7 @@ end
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
         num = 0.0f0; den = 0.0f0
-        for ck in Int32(0):Int32(1), cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+        for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
             sidx = sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)
             ρ̂ = Float32(Df[sidx])
             num += ρ̂ * ChemistryKernels.decode_log2sp(Float32, spf[sidx])
@@ -344,7 +347,8 @@ function _run_copy!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
 end
 
 function _run_prolong!(be, tab::RectJobTable, dst, srcR, srcO, θ::Float32,
-                       nd::Int, stride::Int, scd = nothing, scs = nothing)
+                       nd::Int, stride::Int, scd = nothing, scs = nothing;
+                       kz::Int32 = Int32(1))
     tab.total == 0 && return nothing
     if scd === nothing
         _rect_prolong_pc_k!(be)(dst, srcR, srcO, θ, tab.jobs, tab.cellstart,
@@ -355,20 +359,20 @@ function _run_prolong!(be, tab::RectJobTable, dst, srcR, srcO, θ::Float32,
         # take the scale-free PC path above
         _rect_prolong_llsc_k!(be)(dst, srcR, srcO, θ, scd, scs, tab.jobs,
                                   tab.cellstart, Int32(tab.njobs), Int32(nd),
-                                  Int32(stride); ndrange = tab.total)
+                                  Int32(stride), kz; ndrange = tab.total)
     end
     return nothing
 end
 
 function _run_restrict!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
-                        scd = nothing, scs = nothing)
+                        scd = nothing, scs = nothing; kz::Int32 = Int32(1))
     tab.total == 0 && return nothing
     if scd === nothing
         _rect_restrict_k!(be)(dst, src, tab.jobs, tab.cellstart, Int32(tab.njobs),
-                              Int32(nd), Int32(stride); ndrange = tab.total)
+                              Int32(nd), Int32(stride), kz; ndrange = tab.total)
     else
         _rect_restrict_sc_k!(be)(dst, src, scd, scs, tab.jobs, tab.cellstart,
-                                 Int32(tab.njobs), Int32(nd), Int32(stride);
+                                 Int32(tab.njobs), Int32(nd), Int32(stride), kz;
                                  ndrange = tab.total)
     end
     return nothing
@@ -446,6 +450,7 @@ function build_level_tables!(hier::AMRHierarchy, l::Int)
     # future slot-COMPACTION pass (physically reordering block data at regrid).
     lev.tabs[:sib]  = to_device_table(lev.be, build_sibling_jobs(lev))
     lev.tabs[:sibf] = to_device_table(lev.be, build_sibling_face_jobs(lev))
+    build_boundary_tables!(hier, l)                       # domain-face BC fill (boundary.jl)
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
     delete!(lev.tabs, :proint)                            # MG interior-prolong: lazy rebuild
@@ -496,13 +501,14 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
             (evar_int && fi == 5) && continue               # Tau rebuilt below
             (prolE && fi == 6) && continue                  # Ge via specific-e kernel
             _run_prolong!(lev.be, pro, dst[fi], srcR[fi], srcO[fi], Float32(θ),
-                          lev.nd, lev.stride, cf[fi], cc[fi])
+                          lev.nd, lev.stride, cf[fi], cc[fi]; kz = _kz(lev))
         end
         if prolE && pro.total > 0                           # Ge: needs fine D (field 1) prolonged first
             _rect_prolong_e_k!(lev.be)(dst[6], dst[1], srcR[6], srcO[6], srcR[1], srcO[1],
                                        Float32(θ), cf[6], cc[6], cf[1], cc[1],
                                        pro.jobs, pro.cellstart, Int32(pro.njobs),
-                                       Int32(lev.nd), Int32(lev.stride); ndrange = pro.total)
+                                       Int32(lev.nd), Int32(lev.stride), _kz(lev);
+                                       ndrange = pro.total)
         end
         if evar_int && pro.total > 0                        # ghost Tau = Ge + KE(D,S)
             _reconstruct_tau_k!(lev.be)(dst..., cf[1], cf[2], cf[5], cf[6],
@@ -522,8 +528,8 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
                     # limited-linear on decoded fractions (see _rect_prolong_llsp_k!)
                     _rect_prolong_llsp_k!(lev.be)(sd, sR, sO, Float32(θ), pro.jobs,
                                                   pro.cellstart, Int32(pro.njobs),
-                                                  Int32(lev.nd), Int32(lev.stride);
-                                                  ndrange = pro.total)
+                                                  Int32(lev.nd), Int32(lev.stride),
+                                                  _kz(lev); ndrange = pro.total)
                 end
             end
         end
@@ -535,6 +541,9 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     for sd in (buf === :R ? lev.sp : lev.spo)
         _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
     end
+    # non-periodic domain faces: synthesize the ghosts beyond the edge LAST
+    # (axis by axis, so edge/corner ghosts compose from already-filled ones)
+    fill_boundary!(hier, l; buf)
     return nothing
 end
 
@@ -550,13 +559,13 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
     res = _tabt(lev, :res)
     for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
                                   classes(plev), classes(lev))
-        _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs)
+        _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs; kz = _kz(lev))
     end
     for (sc, sf) in zip(plev.sp, lev.sp)                # mass-weighted X mean
         res.total == 0 && continue
         _rect_restrict_sp_k!(lev.be)(sc, sf, lev.D, res.jobs, res.cellstart,
                                      Int32(res.njobs), Int32(lev.nd),
-                                     Int32(lev.stride); ndrange = res.total)
+                                     Int32(lev.stride), _kz(lev); ndrange = res.total)
     end
     # re-derive coarse Tau = KE(S_r,D_r) + Ge_r on the restricted cells so the
     # dual-energy sync never converts the sub-cell velocity dispersion into heat.

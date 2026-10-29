@@ -296,7 +296,16 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         end
     end
     haskids = l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
+    # `fresh`: this level's R ghost ring is current for its R interior.  The
+    # children's C/F prolongation (limited-linear) reads ±1 parent taps that can
+    # sit in this ring — refreshed only in THIS level's own substep, i.e. AFTER
+    # the fine-first children ran, so they read the ring of the PREVIOUS root
+    # step (stale data; a restart, whose ghosts are not checkpointed, then
+    # diverged from the uninterrupted run).  Fill it first; the hydro below
+    # reuses it unless a gravity kick changes R in between.
+    fresh = false
     if haskids                                    # fine first (frozen parent state)
+        fill_ghosts!(hier, l; θ = 0.0f0, buf = :R); fresh = true
         # out-of-core: keep THIS (parent) level resident while its children run —
         # they read its φ/gas for C/F ghost prolongation + Dirichlet gravity BCs.
         prefetch_level!(lev)
@@ -402,8 +411,10 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         end
         _toc(lev.be, :grav_solve, l, _t)
         _t = _tic(lev.be); grav_kick_level_pool!(hier, l, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
+        fresh = false
     elseif φ !== nothing
         _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
+        fresh = false
     end
     _nanstage!(hier, l, :grav_K1)
     if hier.scheme === :ctu
@@ -411,7 +422,7 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         # the intact R, then swap.  Single-stage weights: fine ½/substep (time
         # average over the 2:1 pair), coarse 1 — same per-coarse-step totals as
         # the RK2 path's (¼,½)×2.
-        _t = _tic(lev.be); fill_ghosts!(hier, l; θ = 0.0f0, buf = :R); _toc(lev.be, :ghost, l, _t)
+        _t = _tic(lev.be); fresh || fill_ghosts!(hier, l; θ = 0.0f0, buf = :R); _toc(lev.be, :ghost, l, _t)
         _t = _tic(lev.be); ctu_level!(hier, l, λ); _toc(lev.be, :hydro, l, _t)
         _t = _tic(lev.be)
         l >= 1   && capture_fine!(hier, l, :R, 0.5f0; λ)
@@ -419,7 +430,7 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         swap_buffers!(lev)
         _toc(lev.be, :capture, l, _t)
     else
-        fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
+        fresh || fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
         _spwatch(hier, l, :ghost1)
         stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
         l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
@@ -478,6 +489,8 @@ recursive fine-first advance.  Level l takes exactly 2^l substeps of λ·dx_l.
 """
 function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing,
                             selfgrav = nothing)
+    hier.dim == 3 || (φ === nothing && chem === nothing && selfgrav === nothing) ||
+        error("BlockAMR 2-D supports hydro only (gravity / chemistry are 3-D)")
     λ = compute_lambda!(hier)
     selfgrav !== nothing && φ !== nothing && phi_from_global!(hier, φ)
     advance_level_w!(hier, 0, λ; φ, chem, selfgrav)
@@ -507,7 +520,7 @@ function total_conserved(hier::AMRHierarchy)
     for l in 0:length(hier.levels)-1
         lev = hier.levels[l+1]
         isempty(lev.live) && continue
-        dV = level_dx(hier, l)^3
+        dV = level_dx(hier, l)^hier.dim             # cell area in 2-D
         flev = l + 1 <= length(hier.levels) - 1 ? hier.levels[l+2] : nothing
         hD  = Array(lev.D); hS1 = Array(lev.S1); hS2 = Array(lev.S2)
         hS3 = Array(lev.S3); hT = Array(lev.Tau)
@@ -516,15 +529,16 @@ function total_conserved(hier::AMRHierarchy)
             m = lev.meta[s]; base = (Int(s) - 1) * lev.stride
             dsc = Float64(hdsc[s]); ssc = Float64(hssc[s]); esc = Float64(hesc[s])
             # per-cell covered mask from the fine level (host, test-grade)
-            for k in 0:lev.B-1, j in 0:lev.B-1, i in 0:lev.B-1
+            kg = _ngax(lev, 3); r3 = hier.dim == 3 ? 2 : 1
+            for k in 0:_Bax(lev, 3)-1, j in 0:lev.B-1, i in 0:lev.B-1
                 if flev !== nothing && !isempty(flev.live)
                     g = (Int128(m.origin[1]) + i, Int128(m.origin[2]) + j,
                          Int128(m.origin[3]) + k)
-                    gf = ntuple(d -> Int128(2) * g[d], 3)
-                    covered = !isempty(overlapping_blocks(flev, gf, (2, 2, 2)))
+                    gf = ntuple(d -> Int128(d == 3 ? r3 : 2) * g[d], 3)
+                    covered = !isempty(overlapping_blocks(flev, gf, (2, 2, r3)))
                     covered && continue
                 end
-                idx = base + ((k + lev.ng) * lev.nd + (j + lev.ng)) * lev.nd +
+                idx = base + ((k + kg) * lev.nd + (j + lev.ng)) * lev.nd +
                       (i + lev.ng) + 1
                 tot[1] += Float64(hD[idx])  * dsc * dV
                 tot[2] += Float64(hS1[idx]) * ssc * dV

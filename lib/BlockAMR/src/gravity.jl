@@ -576,6 +576,7 @@ step-213 K1 detonation).
 function refresh_phi_ghosts!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
+    lev.dim == 3 || return nothing          # gravity is 3-D only (2-D: no φ ring)
     if l >= 1
         plev = hier.levels[l]
         pro = _tabt(lev, :pro)

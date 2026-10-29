@@ -121,15 +121,16 @@ end
                           dmmul::Float32,
                           jcoef::Float32, jdx2::Float32, jfloor::Float32, efix::Float32,
                           jfloor2::Float32,
-                          B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                          B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                          dimv::Val{DIM}) where {DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         idx = base + _lidx(i, j, k, nd)
         # ADDITIVE criteria: gas density vs gthresh OR total matter (gas +
         # CIC-deposited DM, dmmul=1) vs thresh.  Either may be Inf32 (off):
@@ -167,17 +168,19 @@ end
 # the sibling exchange, so spill crosses block boundaries and the periodic
 # wrap), writes interior only.  Requires nbuf ≤ ng.
 @kernel function _dilate_flags_k!(out, @Const(fin), @Const(live_d), nbuf::Int32,
-                                  B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                                  B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                  dimv::Val{DIM}) where {DIM}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    B3 = B * B * B
+    B3 = _nblk(B, dimv)
     bi = t0 ÷ B3; c = t0 % B3
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        i, j, k = _cell_ijk(c, B, ng, dimv)
         v = UInt8(0)
-        for dk in -nbuf:nbuf, dj in -nbuf:nbuf, di in -nbuf:nbuf
+        kb = nbuf * _kzv(dimv)                       # flat z: no z dilation
+        for dk in -kb:kb, dj in -nbuf:nbuf, di in -nbuf:nbuf
             v |= fin[base + _lidx(i + di, j + dj, k + dk, nd)]
         end
         out[base + _lidx(i, j, k, nd)] = v
@@ -185,25 +188,47 @@ end
 end
 
 # one thread per (block, octant): any-flag over the Bh³ interior cells of the
-# octant — the entire per-cell → per-child-tile clustering reduction.
+# octant — the entire per-cell → per-child-tile clustering reduction.  2-D
+# (kz = 0): 4 quadrants of Bh² cells; the octant bit layout is shared (bit 2,
+# the z half, is never set).
 @kernel function _octant_any_k!(oct, @Const(flags), @Const(live_d),
-                                B::Int32, ng::Int32, nd::Int32, stride::Int32)
+                                B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                kz::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
-    bi = t0 ÷ Int32(8); o = t0 % Int32(8)
+    no = kz == Int32(1) ? Int32(8) : Int32(4)
+    bi = t0 ÷ no; o = t0 % no
     Bh = B ÷ Int32(2)
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         oi = (o & Int32(1)) * Bh + ng
         oj = ((o >> 0x01) & Int32(1)) * Bh + ng
-        ok = ((o >> 0x02) & Int32(1)) * Bh + ng
+        ok = kz * (((o >> 0x02) & Int32(1)) * Bh + ng)
         v = UInt8(0)
-        for k in Int32(0):Bh-Int32(1), j in Int32(0):Bh-Int32(1), i in Int32(0):Bh-Int32(1)
+        for k in Int32(0):kz * (Bh - Int32(1)), j in Int32(0):Bh-Int32(1), i in Int32(0):Bh-Int32(1)
             v |= flags[base + _lidx(oi + i, oj + j, ok + k, nd)]
         end
         oct[t0 + Int32(1)] = v
     end
+end
+
+"""Tile origin (level cells, multiples of Bh) of tile index `ti` per axis — wrapped
+on periodic axes, `nothing` if outside the domain on a non-periodic one; the flat
+z of 2-D is 0."""
+function _tile_in_domain(ti::NTuple{3,<:Integer}, Bh::Int, P::Origin,
+                         per::NTuple{3,Bool}, dim::Int)
+    out = (Int128(0), Int128(0), Int128(0))
+    for d in 1:dim
+        x = Int128(ti[d]) * Bh
+        if per[d]
+            x = Int128(wrapc(x, P[d]))
+        elseif !(0 <= x < Int128(P[d]))
+            return nothing
+        end
+        out = Base.setindex(out, x, d)
+    end
+    return out
 end
 
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
@@ -252,6 +277,7 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     # the deposit) — and the deposit's block lookup hard-errors past the key
     # (the fs16/fs16r L17-era crash, the first runs to survive that deep).
     usedm = pol.dm_criterion && dparts !== nothing && l <= particle_lmax(hier)
+    usedm && hier.dim != 3 && error("BlockAMR 2-D: the DM refinement criterion is 3-D only")
     additive = usedm && pol.dm_thresh > 0
     if usedm
         deposit_particles_level!(hier, l, dparts; mass_code = dmcode)  # fills lev.dm
@@ -281,8 +307,8 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc, gearr, escarr,
                      thr, gthr, dmmul, jcoef, jdx2, jfloor, Float32(jeans_efix),
                      Float32(pol.jeans_rho_floor2),
-                     Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                     ndrange = length(lev.live) * lev.B^3)
+                     Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
+                     Val(lev.dim); ndrange = length(lev.live) * _nact(lev))
     return flags, Array(count)
 end
 
@@ -374,6 +400,8 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"
     R  = 2 + cld(nbuf, 2)                  # projection rim (nesting margin)
     Bh = hier.B ÷ 2
+    dim = hier.dim; per = periodic_axes(hier)
+    nO = dim == 3 ? 8 : 4                  # child octants (2-D: quadrants) per block
     ltop = min(Ltarget - 1, length(hier.levels) - 1)   # deepest level that clusters
     _t0 = time()
     # 1) criterion flags on device, levels 0..Ltarget−1 (the deepest level's
@@ -402,13 +430,13 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             end
         end
         if haskey(T, lf + 1)
-            Pp = level_period(hier.nbase, lf - 1)
+            Pp = level_period(hier.nbase, lf - 1, dim)
             for t in T[lf + 1]             # box [t−R, t+Bh+R) in level-lf cells
-                rng = ntuple(d -> fld(fld(t[d] - R, 2), Bh):fld(fld(t[d] + Bh + R - 1, 2), Bh), 3)
+                rng = ntuple(d -> d > dim ? (0:0) :
+                             fld(fld(t[d] - R, 2), Bh):fld(fld(t[d] + Bh + R - 1, 2), Bh), 3)
                 for tk in rng[3], tj in rng[2], ti in rng[1]
-                    push!(tset, (Int128(wrapc(Int128(ti) * Bh, Pp[1])),
-                                 Int128(wrapc(Int128(tj) * Bh, Pp[2])),
-                                 Int128(wrapc(Int128(tk) * Bh, Pp[3]))))
+                    τ = _tile_in_domain((ti, tj, tk), Bh, Pp, per, dim)
+                    τ === nothing || push!(tset, τ)
                 end
             end
         end
@@ -426,16 +454,16 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         _run_copy!(lev.be, _tabt(lev, :sib), F, F, lev.nd, lev.stride)
         G = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
         _dilate_flags_k!(lev.be)(G, F, lev.live_d, Int32(nbuf), Int32(lev.B),
-                                 Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                                 ndrange = length(lev.live) * lev.B^3)
+                                 Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
+                                 Val(lev.dim); ndrange = length(lev.live) * _nact(lev))
         nb = length(lev.live)
-        o = device_zeros(lev.be, UInt8, (8 * nb,))
+        o = device_zeros(lev.be, UInt8, (nO * nb,))
         _octant_any_k!(lev.be)(o, G, lev.live_d, Int32(lev.B), Int32(lev.ng),
-                               Int32(lev.nd), Int32(lev.stride); ndrange = 8 * nb)
+                               Int32(lev.nd), Int32(lev.stride), _kz(lev); ndrange = nO * nb)
         ho = Array(o)
         bits = zeros(UInt8, nb)
-        for bi in 1:nb, oo in 0:7
-            ho[8 * (bi - 1) + oo + 1] != 0 && (bits[bi] |= UInt8(1) << oo)
+        for bi in 1:nb, oo in 0:nO-1
+            ho[nO * (bi - 1) + oo + 1] != 0 && (bits[bi] |= UInt8(1) << oo)
         end
         oct[l] = (Origin[lev.meta[s].origin for s in lev.live], bits)
         delete!(Fd, l)                     # release the flag pools eagerly
@@ -449,7 +477,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     changed = falses(Ltarget + 2)          # sized by TARGET (ensure_level! grows hier.levels)
     for lc in 1:Ltarget
         plev = hier.levels[lc]
-        Pc = level_period(hier.nbase, lc)
+        Pc = level_period(hier.nbase, lc, dim)
         want = Dict{Origin,Tuple{Int32,NTuple{3,Int16}}}()
         if haskey(oct, lc - 1)             # criterion octants, parents by origin
             origins, bits = oct[lc - 1]
@@ -466,13 +494,16 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         end
         if haskey(T, lc)                   # projection boxes → parent lattice tiles
             g = R + nbuf                   # painted boxes were dilated by nbuf too
-            Pp = level_period(hier.nbase, lc - 1)
+            Pp = level_period(hier.nbase, lc - 1, dim)
             for t in T[lc]
-                rng = ntuple(d -> fld(t[d] - g, Bh):fld(t[d] + Bh + g - 1, Bh), 3)
+                rng = ntuple(d -> d > dim ? (0:0) :
+                             fld(t[d] - g, Bh):fld(t[d] + Bh + g - 1, Bh), 3)
                 for tk in rng[3], tj in rng[2], ti in rng[1]
-                    τ = (wrapc(Int128(ti) * Bh, Pp[1]), wrapc(Int128(tj) * Bh, Pp[2]),
-                         wrapc(Int128(tk) * Bh, Pp[3]))
-                    porg = ntuple(d -> (τ[d] ÷ UInt128(hier.B)) * UInt128(hier.B), 3)
+                    τi = _tile_in_domain((ti, tj, tk), Bh, Pp, per, dim)
+                    τi === nothing && continue
+                    τ = ntuple(d -> UInt128(τi[d]), 3)
+                    porg = ntuple(d -> d > dim ? UInt128(0) :
+                                       (τ[d] ÷ UInt128(hier.B)) * UInt128(hier.B), 3)
                     s = get(plev.byorigin, porg, Int32(0))
                     s == Int32(0) && continue          # unowned space → dropped
                     off = ntuple(d -> Int16(Int(τ[d] - porg[d])), 3)
@@ -524,7 +555,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             filter!(want) do kv
                 org = kv.first
                 d2 = 0.0
-                for d in 1:3
+                for d in 1:dim
                     x = (Float64(org[d]) + hier.B / 2) / Float64(Pc[d])
                     δx = abs(x - pol.zoom_center[d])
                     δx = min(δx, 1.0 - δx)         # periodic
@@ -546,7 +577,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
             filter!(want) do kv
                 org = kv.first
                 d2 = 0.0
-                for d in 1:3
+                for d in 1:dim
                     x = (Float64(org[d]) + hier.B / 2) / Float64(Pc[d])
                     δx = abs(x - pol.zoom_center[d]); δx = min(δx, 1.0 - δx)
                     d2 += δx * δx
@@ -643,15 +674,16 @@ function grow_level!(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
     _run_copy!(lev.be, _tabt(lev, :sib), F, F, lev.nd, lev.stride)
     G = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
     _dilate_flags_k!(lev.be)(G, F, lev.live_d, Int32(nbuf), Int32(lev.B),
-                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
-                             ndrange = length(lev.live) * lev.B^3)
+                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
+                             Val(lev.dim); ndrange = length(lev.live) * _nact(lev))
     nb = length(lev.live)
-    o = device_zeros(lev.be, UInt8, (8 * nb,))
+    nO = lev.dim == 3 ? 8 : 4
+    o = device_zeros(lev.be, UInt8, (nO * nb,))
     _octant_any_k!(lev.be)(o, G, lev.live_d, Int32(lev.B), Int32(lev.ng),
-                           Int32(lev.nd), Int32(lev.stride); ndrange = 8 * nb)
+                           Int32(lev.nd), Int32(lev.stride), _kz(lev); ndrange = nO * nb)
     ho = Array(o)
     Bh = hier.B ÷ 2
-    Pc = level_period(hier.nbase, l + 1)
+    Pc = level_period(hier.nbase, l + 1, hier.dim)
     clev = l + 2 <= length(hier.levels) ? hier.levels[l + 2] : nothing
     # zoom-sphere radii with the standard depth-shrinking nesting margins
     reff2 = Inf
@@ -671,7 +703,7 @@ function grow_level!(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
     insphere(corg, r2) = begin
         r2 === Inf && return true
         d2 = 0.0
-        for d in 1:3
+        for d in 1:hier.dim
             x = (Float64(corg[d]) + hier.B / 2) / Float64(Pc[d])
             δx = abs(x - pol.zoom_center[d]); δx = min(δx, 1.0 - δx)
             d2 += δx * δx
@@ -682,12 +714,12 @@ function grow_level!(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
     nnew = 0
     for (bi, s) in enumerate(lev.live)
         bits = UInt8(0)
-        for oo in 0:7
-            ho[8 * (bi - 1) + oo + 1] != 0 && (bits |= UInt8(1) << oo)
+        for oo in 0:nO-1
+            ho[nO * (bi - 1) + oo + 1] != 0 && (bits |= UInt8(1) << oo)
         end
         bits == 0x00 && continue
         org = lev.meta[s].origin
-        for oo in 0:7
+        for oo in 0:nO-1
             (bits >> oo) & 0x01 == 0x01 || continue
             off = ntuple(d -> Int16(((oo >> (d - 1)) & 1) * Bh), 3)
             corg = child_origin(org, off, Pc)
@@ -696,9 +728,11 @@ function grow_level!(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
             # margin: the child's ghost-grown footprint (±2 level-l cells around
             # [org+off, org+off+Bh)) must be lattice-covered at level l
             ok = true
-            for ck in (-2, Bh + 1), cj in (-2, Bh + 1), ci in (-2, Bh + 1)
-                q = ntuple(d -> UInt128(wrapc(Int128(org[d]) + Int128(off[d]) +
-                                              Int128((ci, cj, ck)[d]), lev.P[d])), 3)
+            for ck in (lev.dim == 3 ? (-2, Bh + 1) : (0,)), cj in (-2, Bh + 1), ci in (-2, Bh + 1)
+                qr = ntuple(d -> Int128(org[d]) + Int128(off[d]) + Int128((ci, cj, ck)[d]), 3)
+                # beyond a non-periodic domain face nothing needs covering
+                any(d -> !lev.per[d] && !(0 <= qr[d] < Int128(lev.P[d])), 1:3) && continue
+                q = ntuple(d -> UInt128(wrapc(qr[d], lev.P[d])), 3)
                 if lattice_owner(lev, q, hier.B) == Int32(0)
                     ok = false; break
                 end
@@ -790,7 +824,8 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
                                                       classes(lev), classes(plev)))
             isempty(fd) && continue     # gravity_only: unused hydro pool (zero-size) — skip
             (evar_int && fi == 5) && continue
-            _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride, scd, scs)
+            _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride, scd, scs;
+                          kz = _kz(lev))
         end
         if evar_int && tab.total > 0
             _reconstruct_tau_k!(lev.be)(gasfields(lev)..., lev.Dsc, lev.Ssc,

@@ -8,6 +8,13 @@
 # Kernels never see UInt128 — the table builders (tables.jl) reduce everything to
 # small Int32 rectangle jobs on the host.
 #
+# Dimensionality: `dim = 3` (B³ blocks) or `dim = 2` (B×B×1 blocks: the z axis
+# is flat — extent 1, no ghosts, period 1, refinement ratio 1 — so every z
+# coordinate is 0 and the 3-D index math `(k·nd + j)·nd + i` degenerates to 2-D
+# with k ≡ 0).  Non-periodic domain axes keep the same integer topology; the
+# table builders drop wrap images (shift ≠ 0) along them and the boundary fill
+# (boundary.jl) synthesizes the ghosts beyond the domain edge.
+#
 # Periodic wrap is handled two ways, both exact:
 #   * O(1) wrapped-interval overlap test (`overlap1`) for tilemap queries;
 #   * shift-image enumeration (`axis_images`, s ∈ {−P,0,+P}) when actual
@@ -42,9 +49,12 @@ BlockMeta() = BlockMeta((UInt128(0), UInt128(0), UInt128(0)), Int32(0),
 isalive(m::BlockMeta) = (m.flags & FLAG_ALIVE) != 0
 
 # ── period / origin arithmetic ────────────────────────────────────────────────
-"Level-l period (cells per axis): P_l = nbase·2^l, as UInt128."
-level_period(nbase::NTuple{3,Int}, l::Int)::Origin =
-    ntuple(d -> UInt128(nbase[d]) << l, 3)
+"""
+Level-l period (cells per axis): P_l = nbase·2^l, as UInt128.  In 2-D (`dim = 2`)
+the z axis is FLAT — one cell thick at every level, never refined — so P_z ≡ 1.
+"""
+level_period(nbase::NTuple{3,Int}, l::Int, dim::Int = 3)::Origin =
+    ntuple(d -> d <= dim ? UInt128(nbase[d]) << l : UInt128(1), 3)
 
 "Child origin (level-l cells) from a level-(l−1) parent origin + integer offset."
 child_origin(porigin::Origin, off::NTuple{3,Int16}, P::Origin)::Origin =

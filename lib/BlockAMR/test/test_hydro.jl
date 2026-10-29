@@ -15,13 +15,14 @@ function set_ic!(hier, l, prof)
     n = lev.cap * lev.stride
     h = Dict(f => zeros(Float64, n) for f in (:D, :S1, :S2, :S3, :Tau, :Ge))
     γ = hier.gamma
+    Bz = BA._Bax(lev, 3); kg = BA._ngax(lev, 3)       # 2-D: flat z (1 cell, no ghosts)
     for s in lev.live
         m = lev.meta[s]; base = (Int(s) - 1) * lev.stride
-        for k in 1:lev.B, j in 1:lev.B, i in 1:lev.B
+        for k in 1:Bz, j in 1:lev.B, i in 1:lev.B
             g = ntuple(d -> BA.wrapc(Int128(m.origin[d]) + (i, j, k)[d] - 1, lev.P[d]), 3)
             x = ntuple(d -> (Float64(g[d]) + 0.5) * dx, 3)
             ρ, u, v, w, P = prof(x)
-            idx = base + ((lev.ng+k-1) * lev.nd + (lev.ng+j-1)) * lev.nd + (lev.ng+i-1) + 1
+            idx = base + ((kg+k-1) * lev.nd + (lev.ng+j-1)) * lev.nd + (lev.ng+i-1) + 1
             ge = P / (γ - 1)
             h[:D][idx] = ρ; h[:S1][idx] = ρ*u; h[:S2][idx] = ρ*v; h[:S3][idx] = ρ*w
             h[:Ge][idx] = ge

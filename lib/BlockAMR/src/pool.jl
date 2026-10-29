@@ -11,8 +11,8 @@
 # Per-block f32 scale tables (Dsc/Ssc/Esc) live here from day one but stay 1.0
 # until the f16 phase — the f32 validation phases run through the same code path.
 
-"Aligned slot stride (elements): (B+2ng)³ rounded up to a multiple of 64."
-_slot_stride(nd::Int) = ((nd^3 + 63) ÷ 64) * 64
+"Aligned slot stride (elements): (B+2ng)^dim rounded up to a multiple of 64."
+_slot_stride(nd::Int, dim::Int = 3) = ((nd^dim + 63) ÷ 64) * 64
 
 mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
                      F<:AbstractVector{Float32},I<:AbstractVector{Int32}}
@@ -56,7 +56,22 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     phi::F; rhs::F; dm::F
     live_d   :: I                        # device copy of `live`
     tabs     :: Dict{Symbol,Any}         # device RectJobTables; rebuilt at regrid only
+    # ── dimensionality + domain periodicity (see topology.jl) ──
+    dim      :: Int                      # 3 (B³ blocks) or 2 (B×B×1, flat z)
+    per      :: NTuple{3,Bool}           # periodic domain axis? (wrap images allowed)
 end
+
+# per-axis block geometry: the flat z axis of a 2-D level has extent 1, no ghosts
+@inline _Bax(lev::Level, d::Int)  = d <= lev.dim ? lev.B  : 1
+@inline _ngax(lev::Level, d::Int) = d <= lev.dim ? lev.ng : 0
+@inline _ndax(lev::Level, d::Int) = d <= lev.dim ? lev.nd : 1
+@inline _thax(lev::Level, d::Int) = d <= lev.dim ? lev.th : 1
+"Stored cells per block (nd^dim, ghosts included)."
+_ncs(lev::Level)  = lev.nd^lev.dim
+"Active cells per block (B^dim)."
+_nact(lev::Level) = lev.B^lev.dim
+"z-neighbour offset for kernels: 1 in 3-D, 0 in 2-D (z taps read the cell itself)."
+_kz(lev::Level) = Int32(lev.dim == 3 ? 1 : 0)
 
 # typed table accessors: `tabs` is Dict{Symbol,Any}, so bare lookups make every
 # downstream kernel launch a dynamic dispatch (~1 ms/launch measured on the
@@ -83,11 +98,14 @@ end
 
 function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
                  T::Type = Float32, nsp::Int = 0, cap0::Int = 8,
-                 gravity_only::Bool = false)
+                 gravity_only::Bool = false, dim::Int = 3,
+                 per::NTuple{3,Bool} = (true, true, true))
+    @assert dim in (2, 3) "dim must be 2 or 3"
     @assert B % 2 == 0 && B >= 2ng "B must be even and ≥ 2ng"
-    @assert all(nbase .% B .== 0) "nbase must be divisible by B"
-    nd = B + 2ng; stride = _slot_stride(nd)
-    P  = level_period(nbase, l); th = B ÷ 2
+    @assert all(nbase[d] % B == 0 for d in 1:dim) "nbase must be divisible by B"
+    @assert dim == 3 || nbase[3] == 1 "2-D levels need nbase[3] == 1"
+    nd = B + 2ng; stride = _slot_stride(nd, dim)
+    P  = level_period(nbase, l, dim); th = B ÷ 2
     zed() = device_zeros(be, T, (cap0 * stride,))
     # gravity_only (DM/gravity runs): the 5 momentum/energy R fields + all 6 O-twins
     # are NEVER touched (no hydro advance) — allocate them ZERO-SIZE so they never
@@ -109,7 +127,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
-        to_device(be, Int32[], Int32), Dict{Symbol,Any}())
+        to_device(be, Int32[], Int32), Dict{Symbol,Any}(), dim, per)
     # out-of-core: pools are born host-preferred so allocation + checkpoint
     # restore land in host RAM (not device) — prefetch_level! pulls the working
     # set to the GPU per advance.  No-op unless memory_mode() === :managed.
@@ -174,11 +192,11 @@ sync_live!(lev::Level) = (lev.live_d = to_device(lev.be, lev.live, Int32); nothi
 # ── tilemap registration ─────────────────────────────────────────────────────
 "Tiles (wrapped) covered by the ghost-grown bbox [origin−ng, origin+B+ng)."
 function _covered_tiles(f, lev::Level, origin::Origin)
-    nt = ntuple(d -> Int(lev.P[d] ÷ lev.th), 3)          # tiles per axis (P divisible by th)
+    nt = ntuple(d -> Int(lev.P[d] ÷ _thax(lev, d)), 3)   # tiles per axis (P divisible by th)
     rng = ntuple(3) do d
-        lo = Int128(origin[d]) - lev.ng
-        hi = Int128(origin[d]) + lev.B + lev.ng - 1
-        fld(lo, lev.th):fld(hi, lev.th)
+        lo = Int128(origin[d]) - _ngax(lev, d)
+        hi = Int128(origin[d]) + _Bax(lev, d) + _ngax(lev, d) - 1
+        fld(lo, _thax(lev, d)):fld(hi, _thax(lev, d))
     end
     for tk in rng[3], tj in rng[2], ti in rng[1]
         f((wrapc(Int128(ti), UInt128(nt[1])), wrapc(Int128(tj), UInt128(nt[2])),
@@ -222,7 +240,8 @@ lattice_neighbors(lev::Level, origin::Origin, B::Int) =
 sibling builders' per-block loop to avoid a Vector alloc per block)."""
 function lattice_neighbors!(out::Vector{Int32}, lev::Level, origin::Origin, B::Int)
     empty!(out)
-    for dk in -1:1, dj in -1:1, di in -1:1
+    kr = lev.dim == 3 ? 1 : 0                 # flat z (2-D): the k = 0 layer only
+    for dk in -kr:kr, dj in -1:1, di in -1:1
         o = (wrapc(Int128(origin[1]) + di * B, lev.P[1]),
              wrapc(Int128(origin[2]) + dj * B, lev.P[2]),
              wrapc(Int128(origin[3]) + dk * B, lev.P[3]))
@@ -234,7 +253,8 @@ end
 
 "O(1) owner of the block-lattice cell containing level cell `q` (0 if none)."
 lattice_owner(lev::Level, q::NTuple{3,UInt128}, B::Int) =
-    get(lev.byorigin, ntuple(d -> (q[d] ÷ UInt128(B)) * UInt128(B), 3), Int32(0))
+    get(lev.byorigin, ntuple(d -> d <= lev.dim ? (q[d] ÷ UInt128(B)) * UInt128(B) :
+                                                 UInt128(0), 3), Int32(0))
 
 """
     overlapping_blocks(lev, lo, len) -> Vector{Int32}
@@ -253,8 +273,8 @@ overlapping_blocks(lev::Level, lo::NTuple{3,Int128}, len::NTuple{3,Int}) =
 function overlapping_blocks!(out::Vector{Int32}, lev::Level,
                              lo::NTuple{3,Int128}, len::NTuple{3,Int})
     empty!(out)
-    nt  = ntuple(d -> Int(lev.P[d] ÷ lev.th), 3)
-    rng = ntuple(d -> fld(lo[d], lev.th):fld(lo[d] + len[d] - 1, lev.th), 3)
+    nt  = ntuple(d -> Int(lev.P[d] ÷ _thax(lev, d)), 3)
+    rng = ntuple(d -> fld(lo[d], _thax(lev, d)):fld(lo[d] + len[d] - 1, _thax(lev, d)), 3)
     low = ntuple(d -> wrapc(lo[d], lev.P[d]), 3)
     for tk in rng[3], tj in rng[2], ti in rng[1]
         key = (wrapc(Int128(ti), UInt128(nt[1])), wrapc(Int128(tj), UInt128(nt[2])),
@@ -264,7 +284,7 @@ function overlapping_blocks!(out::Vector{Int32}, lev::Level,
             m = lev.meta[s]
             ok = true
             for d in 1:3
-                overlap1(low[d], len[d], m.origin[d], lev.B, lev.P[d]) || (ok = false; break)
+                overlap1(low[d], len[d], m.origin[d], _Bax(lev, d), lev.P[d]) || (ok = false; break)
             end
             ok && push!(out, s)
         end
@@ -287,21 +307,79 @@ mutable struct AMRHierarchy{L<:Level}
     λ      :: Float32
     nstep  :: Vector{Int64}              # per-level substep counters (exact time)
     scheme :: Symbol                     # hydro integrator: :rk2 (oracle) | :ctu (perf)
+    dim    :: Int                        # 3 or 2 (flat z; see topology.jl)
+    bc     :: NTuple{3,NTuple{2,Symbol}} # per-axis (lo, hi) domain BC (boundary.jl)
+    inflow :: NTuple{3,NTuple{2,NTuple{5,Float64}}}  # (ρ,u,v,w,P) per :inflow face
 end
 
+"""
+`box` is the physical length of the x axis; cells are cubic (square in 2-D), so
+an elongated domain is `nbase = (Nx, Ny)` with y length `box·Ny/Nx`.
+"""
 level_dx(hier::AMRHierarchy, l::Int) = hier.box / (hier.nbase[1] * exp2(l))
 lmax(hier::AMRHierarchy) = findlast(lv -> !isempty(lv.live), hier.levels) - 1
+"Per-axis domain periodicity of a hierarchy (both faces :periodic)."
+periodic_axes(hier::AMRHierarchy) = ntuple(d -> hier.bc[d][1] === :periodic, 3)
 
-function AMRHierarchy(; nbase::NTuple{3,Int}, box::Real = 1.0, B::Int = 16,
-                        ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
+"""
+    AMRHierarchy(; nbase, box = 1, B = 16, ng = 2, backend = :cpu, T = Float32,
+                   bc = :periodic, inflow = Dict(), scheme = :rk2, …)
+
+`nbase` is `(Nx, Ny, Nz)` for 3-D or `(Nx, Ny)` for 2-D (B×B×1 blocks, flat z).
+`bc` sets the domain boundary per face: one Symbol for every face, or a tuple
+with one entry per active axis, each a Symbol or a `(lo, hi)` pair, from
+`:periodic` (both faces of an axis), `:outflow` (zero gradient), `:reflecting`
+(mirror, normal momentum flipped) and `:inflow` (fixed state).  `inflow` maps
+`(axis, :lo | :hi) => (ρ, u, v, w, P)` (physical units) for every `:inflow` face.
+"""
+function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1.0,
+                        B::Int = 16, ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
                         nsp::Int = 0, Lcap::Int = 60, gamma::Real = 5/3,
                         cfl::Real = 0.4, cap0::Int = 8, scheme::Symbol = :rk2,
-                        gravity_only::Bool = false)
+                        gravity_only::Bool = false, bc = :periodic,
+                        inflow = Dict{Tuple{Int,Symbol},NTuple{5,Float64}}())
     @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
+    dim = length(nbase)
+    nb3 = dim == 3 ? nbase : (nbase[1], nbase[2], 1)
+    bct = _parse_bc(bc, dim)
+    inf = _parse_inflow(inflow, bct)
+    per = ntuple(d -> bct[d][1] === :periodic, 3)
     be = BlockAMR.backend(backend)
-    lev0 = Level(; l = 0, B, ng, nbase, be, T, nsp, cap0, gravity_only)
-    AMRHierarchy{typeof(lev0)}([lev0], B, ng, nbase, Float64(box), Lcap, be, backend,
-                               Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme)
+    lev0 = Level(; l = 0, B, ng, nbase = nb3, be, T, nsp, cap0, gravity_only, dim, per)
+    AMRHierarchy{typeof(lev0)}([lev0], B, ng, nb3, Float64(box), Lcap, be, backend,
+                               Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme,
+                               dim, bct, inf)
+end
+
+const _BCKINDS = (:periodic, :outflow, :reflecting, :inflow)
+
+function _parse_bc(bc, dim::Int)
+    ax(x) = x isa Symbol ? (x, x) : (Symbol(x[1]), Symbol(x[2]))
+    spec = bc isa Symbol ? ntuple(_ -> (bc, bc), dim) :
+           (length(bc) == dim || error("bc needs $dim axis entries (got $(length(bc)))");
+            ntuple(d -> ax(bc[d]), dim))
+    out = ntuple(d -> d <= dim ? spec[d] : (:periodic, :periodic), 3)
+    for d in 1:3, s in 1:2
+        out[d][s] in _BCKINDS || error("unknown BC $(out[d][s]) (have $(_BCKINDS))")
+    end
+    for d in 1:3
+        (out[d][1] === :periodic) == (out[d][2] === :periodic) ||
+            error("axis $d: :periodic must be set on BOTH faces (got $(out[d]))")
+    end
+    return out
+end
+
+function _parse_inflow(inflow, bct)
+    z = (0.0, 0.0, 0.0, 0.0, 0.0)
+    out = ntuple(d -> ntuple(s -> begin
+        bct[d][s] === :inflow || return z
+        key = (d, s == 1 ? :lo : :hi)
+        haskey(inflow, key) || error("inflow face $key needs a state in `inflow`")
+        w = inflow[key]
+        length(w) == 5 || error("inflow state must be (ρ, u, v, w, P)")
+        ntuple(q -> Float64(w[q]), 5)
+    end, 2), 3)
+    return out
 end
 
 "Extend `hier.levels` (and `nstep`) so AMR level `l` exists."
@@ -313,18 +391,19 @@ function ensure_level!(hier::AMRHierarchy, l::Int)
                                    nbase = hier.nbase, be = hier.be,
                                    T = eltype(hier.levels[1].D),
                                    nsp = hier.levels[1].nsp, cap0 = 8,
-                                   gravity_only = isempty(hier.levels[1].Do)))  # inherit from base
+                                   gravity_only = isempty(hier.levels[1].Do),  # inherit from base
+                                   dim = hier.dim, per = hier.levels[1].per))
         push!(hier.nstep, 0)
     end
     return hier.levels[l + 1]
 end
 
-"Tile all of level 0 with (nbase÷B)³ base blocks (standalone runs; topgrid shadow later)."
+"Tile all of level 0 with (nbase÷B)^dim base blocks (standalone runs; topgrid shadow later)."
 function init_base_level!(hier::AMRHierarchy)
     lev = hier.levels[1]
-    nb  = hier.nbase .÷ hier.B
+    nb  = ntuple(d -> hier.nbase[d] ÷ _Bax(lev, d), 3)
     for k in 0:nb[3]-1, j in 0:nb[2]-1, i in 0:nb[1]-1
-        org = (UInt128(i * hier.B), UInt128(j * hier.B), UInt128(k * hier.B))
+        org = (UInt128(i * hier.B), UInt128(j * hier.B), UInt128(k * _Bax(lev, 3)))
         s = alloc_slot!(lev)
         lev.meta[s] = BlockMeta(org, Int32(0), (Int16(0), Int16(0), Int16(0)), FLAG_ALIVE)
         push!(lev.live, s); _register!(lev, s)
@@ -347,6 +426,7 @@ function add_block!(hier::AMRHierarchy, l::Int, parent_slot::Integer,
     plev = hier.levels[l]
     Bh   = hier.B - hier.B ÷ 2
     all(0 .<= offset .<= Bh) || error("offset $offset outside 0:$Bh")
+    hier.dim == 3 || offset[3] == 0 || error("2-D blocks have z offset 0 (got $offset)")
     pm  = plev.meta[Int32(parent_slot)]
     @assert isalive(pm) "parent slot $parent_slot is not alive"
     off = ntuple(d -> Int16(offset[d]), 3)
@@ -375,11 +455,11 @@ function remove_block!(hier::AMRHierarchy, l::Int, slot::Integer;
 end
 
 # ── views + nesting validator ─────────────────────────────────────────────────
-"3-D view of one block's field (`:D`, `:S1`, …, `:Ge`, `:Do`, …) — host or device."
+"3-D view (nd×nd×1 in 2-D) of one block's field (`:D`, `:S1`, …, `:Do`, …) — host or device."
 function blockview(lev::Level, slot::Integer, f::Symbol)
     a = getfield(lev, f)
     r = (Int(slot) - 1) * lev.stride
-    reshape(view(a, r+1:r+lev.nd^3), lev.nd, lev.nd, lev.nd)
+    reshape(view(a, r+1:r+_ncs(lev)), lev.nd, lev.nd, _ndax(lev, 3))
 end
 
 """
@@ -394,15 +474,22 @@ function check_nesting(hier::AMRHierarchy; verbose::Bool = false)
         lev = hier.levels[l + 1]; plev = hier.levels[l]
         for s in lev.live
             m = lev.meta[s]
-            lo = ntuple(d -> fld(Int128(m.origin[d]), 2) - 1, 3)
-            hi = ntuple(d -> cld(Int128(m.origin[d]) + lev.B, 2) + 1, 3)
+            # grown by 1 parent cell per refined side, clipped at non-periodic
+            # domain faces (nothing beyond the domain needs parent coverage)
+            lo = ntuple(d -> d > lev.dim ? Int128(0) :
+                        (fld(Int128(m.origin[d]), 2) - 1), 3)
+            hi = ntuple(d -> d > lev.dim ? Int128(1) :
+                        (cld(Int128(m.origin[d]) + lev.B, 2) + 1), 3)
+            lo = ntuple(d -> plev.per[d] ? lo[d] : max(lo[d], Int128(0)), 3)
+            hi = ntuple(d -> plev.per[d] ? hi[d] : min(hi[d], Int128(plev.P[d])), 3)
             boxes = IBox[(lo, hi)]
             plen  = ntuple(d -> Int(hi[d] - lo[d]), 3)
             for ps in overlapping_blocks(plev, lo, plen)
                 pm = plev.meta[ps]
                 # subtract every periodic image of the parent's active region
-                imgs = ntuple(d -> axis_images(lo[d], plen[d], Int128(pm.origin[d]),
-                                               plev.B, Int128(plev.P[d])), 3)
+                imgs = ntuple(d -> filter(im -> plev.per[d] || im[3] == 0,
+                                          axis_images(lo[d], plen[d], Int128(pm.origin[d]),
+                                                      _Bax(plev, d), Int128(plev.P[d]))), 3)
                 for i1 in imgs[1], i2 in imgs[2], i3 in imgs[3]
                     blo = (i1[1], i2[1], i3[1])
                     bhi = (i1[1] + i1[2], i2[1] + i2[2], i3[1] + i3[2])
