@@ -45,7 +45,7 @@ export BlockMeta, Level, AMRHierarchy
 export add_block!, remove_block!, init_base_level!, overlapping_blocks, check_nesting
 export build_sibling_jobs, build_prolong_jobs, build_restrict_jobs, RectJobTable
 export fill_ghosts!, restrict_level!, blockview
-export stage_level!, max_signal, hierarchy_rk2_step!, compute_dt, total_conserved
+export stage_level!, max_signal, max_accel, hierarchy_rk2_step!, compute_dt, total_conserved
 export ctu_level!
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
 export BlockRefinementPolicy, regrid!, compact_level!
@@ -105,8 +105,8 @@ end
 #              reads it in `device_zeros`. No effect on the CPU backend.
 const _MEMMODE = Ref(:device)
 memory_mode() = _MEMMODE[]
-"CUDA ext overrides this: kill CUDA.jl's per-launch UM prefetch (see the ext docstring)."
-disable_kernel_prefetch!() = nothing
+"CUDA ext adds the () method: kill CUDA.jl's per-launch UM prefetch (see the ext docstring)."
+disable_kernel_prefetch!(args...) = nothing   # varargs fallback — ext () method specializes, no overwrite
 set_memory_mode!(m::Symbol) =
     (m in (:device, :managed) || error("memory mode must be :device or :managed");
      _MEMMODE[] = m)

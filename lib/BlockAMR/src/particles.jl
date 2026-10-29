@@ -49,6 +49,20 @@ function ptile_ranges(np::Integer)
     return (i:min(i + t - 1, np) for i in 1:t:np)
 end
 
+"""
+    particle_lmax(hier) -> Int
+
+Deepest level the particle machinery couples to: the 21-bit lattice-key bound
+l ≤ 21 − log2(nbase/B) (nbase=512, B=16 → 16).  Deeper levels see DM through
+their Dirichlet boundaries and covering-level φ — the design-intended treatment
+of topgrid-mass particles far below native resolution (f32 positions give out
+at a similar depth anyway).  The gather/level loops CLAMP here; the error in
+build_block_lookup! remains as the backstop against uncapped callers (it fired
+the first time any run survived into the L17 era — firststar16, Aug 2026).
+"""
+particle_lmax(hier::AMRHierarchy) =
+    Int(21 - ceil(Int, log2(maximum(hier.nbase) / hier.B)))
+
 "Build the per-level device block-lookup (sorted packed lattice keys + slots)."
 function build_block_lookup!(hier::AMRHierarchy, l::Int)
     lev = hier.levels[l + 1]
@@ -121,9 +135,19 @@ end
 # per-particle-MASS variant (multi-mass DM, e.g. a MUSIC/CAMB zoom IC): pm[p] is
 # the particle's mass in code units, scaled to a density by invdx3 = 1/dx_l³.
 # Identical CIC registration to _pdeposit_k! otherwise.
+#
+# ADAPTIVE CLOUD (invmb > 0): a particle whose tier spacing d_p = ∛(m_p/ρ̄_dm)
+# exceeds the cell (w = d_p·N > 1) deposits as a WIDTH-w TOP-HAT (CIC-registered,
+# w capped at 3 → 4-cell span, which the ng=2 ring exactly accommodates) instead
+# of a point CIC.  A heavy zoom-boundary particle then never deposits denser
+# than its OWN tier's mean density (up to the cap) — the m_p/dx³ point-mass φ
+# wells (the L2/L3 ∇φ spikes 20× the collapse core's; the kick ratchet) are
+# removed AT THE SOURCE while the DM source stays complete at every level.
+# invmb = 1/ρ̄_dm(code); 0 disables (exact old CIC — the BAM_PSPREAD gate).
 @kernel function _pdeposit_mm_k!(dm, @Const(px), @Const(py), @Const(pz), @Const(pm),
                                  @Const(pkey), @Const(pslot), nkey::Int32,
-                                 invdx3::Float32, N::Float32, B::Int32, ng::Int32,
+                                 invdx3::Float32, invmb::Float32, N::Float32,
+                                 B::Int32, ng::Int32,
                                  nd::Int32, stride::Int32)
     p = @index(Global)
     @inbounds begin
@@ -134,16 +158,42 @@ end
         if slot != Int32(0)
             m = pm[p] * invdx3
             base = (slot - Int32(1)) * stride
-            hx = gx - 0.5f0; hy = gy - 0.5f0; hz = gz - 0.5f0
-            i0 = unsafe_trunc(Int32, floor(hx)); fx = hx - Float32(i0)
-            j0 = unsafe_trunc(Int32, floor(hy)); fy = hy - Float32(j0)
-            k0 = unsafe_trunc(Int32, floor(hz)); fz = hz - Float32(k0)
-            li = i0 - (cx ÷ B) * B + ng; lj = j0 - (cy ÷ B) * B + ng; lk = k0 - (cz ÷ B) * B + ng
-            for c3 in Int32(0):Int32(1), c2 in Int32(0):Int32(1), c1 in Int32(0):Int32(1)
-                w = (c1 == 0 ? 1.0f0 - fx : fx) * (c2 == 0 ? 1.0f0 - fy : fy) *
-                    (c3 == 0 ? 1.0f0 - fz : fz)
-                idx = base + _lidx(li + c1, lj + c2, lk + c3, nd)
-                KA.@atomic dm[idx] += m * w
+            wcl = invmb > 0.0f0 ? cbrt(max(pm[p] * invmb, 1.0f-30)) * N : 1.0f0
+            if wcl <= 1.0f0
+                hx = gx - 0.5f0; hy = gy - 0.5f0; hz = gz - 0.5f0
+                i0 = unsafe_trunc(Int32, floor(hx)); fx = hx - Float32(i0)
+                j0 = unsafe_trunc(Int32, floor(hy)); fy = hy - Float32(j0)
+                k0 = unsafe_trunc(Int32, floor(hz)); fz = hz - Float32(k0)
+                li = i0 - (cx ÷ B) * B + ng; lj = j0 - (cy ÷ B) * B + ng; lk = k0 - (cz ÷ B) * B + ng
+                for c3 in Int32(0):Int32(1), c2 in Int32(0):Int32(1), c1 in Int32(0):Int32(1)
+                    w = (c1 == 0 ? 1.0f0 - fx : fx) * (c2 == 0 ? 1.0f0 - fy : fy) *
+                        (c3 == 0 ? 1.0f0 - fz : fz)
+                    idx = base + _lidx(li + c1, lj + c2, lk + c3, nd)
+                    KA.@atomic dm[idx] += m * w
+                end
+            else
+                w = min(wcl, 3.0f0); invw = 1.0f0 / w
+                # per-axis overlap of the width-w top-hat [g−w/2, g+w/2] (cell
+                # units, cell c spans [c, c+1]) — span ≤ 4 cells for w ≤ 3
+                xlo = gx - 0.5f0 * w; ylo = gy - 0.5f0 * w; zlo = gz - 0.5f0 * w
+                i0 = unsafe_trunc(Int32, floor(xlo))
+                j0 = unsafe_trunc(Int32, floor(ylo))
+                k0 = unsafe_trunc(Int32, floor(zlo))
+                li = i0 - (cx ÷ B) * B + ng; lj = j0 - (cy ÷ B) * B + ng; lk = k0 - (cz ÷ B) * B + ng
+                for c3 in Int32(0):Int32(3)
+                    wz = (min(zlo + w, Float32(k0 + c3 + 1)) - max(zlo, Float32(k0 + c3))) * invw
+                    wz <= 0.0f0 && continue
+                    for c2 in Int32(0):Int32(3)
+                        wy = (min(ylo + w, Float32(j0 + c2 + 1)) - max(ylo, Float32(j0 + c2))) * invw
+                        wy <= 0.0f0 && continue
+                        for c1 in Int32(0):Int32(3)
+                            wx = (min(xlo + w, Float32(i0 + c1 + 1)) - max(xlo, Float32(i0 + c1))) * invw
+                            wx <= 0.0f0 && continue
+                            idx = base + _lidx(li + c1, lj + c2, lk + c3, nd)
+                            KA.@atomic dm[idx] += m * wx * wy * wz
+                        end
+                    end
+                end
             end
         end
     end
@@ -165,6 +215,9 @@ end
         v != 0.0f0 && (KA.@atomic F[aidx] += v)
     end
 end
+
+# ρ̄_dm(code) cache for the adaptive-cloud deposit (mass_code is run-constant)
+const _RHODM = Ref(0.0)
 
 """
     deposit_particles_level!(hier, l, parts; mass_code) -> nothing
@@ -191,8 +244,16 @@ function deposit_particles_level!(hier::AMRHierarchy, l::Int, parts; mass_code)
         pxr = view(parts.px, r); pyr = view(parts.py, r); pzr = view(parts.pz, r)
         if mass_code isa AbstractVector                   # multi-mass DM (per particle)
             invdx3 = Float32(1.0 / level_dx(hier, l)^3)
+            # BAM_PSPREAD=1: adaptive top-hat cloud for heavy particles (see
+            # _pdeposit_mm_k!); invmb = 1/ρ̄_dm(code) (box volume = 1)
+            invmb = 0.0f0
+            if get(ENV, "BAM_PSPREAD", "0") == "1"
+                _RHODM[] == 0.0 && (_RHODM[] = Float64(sum(mass_code)))
+                invmb = Float32(_RHODM[] > 0 ? 1.0 / _RHODM[] : 0.0)
+            end
             _pdeposit_mm_k!(lev.be)(lev.dm, pxr, pyr, pzr, view(mass_code, r),
-                                    lev.tabs[:pkey], lev.tabs[:pslot], nkey, invdx3, N,
+                                    lev.tabs[:pkey], lev.tabs[:pslot], nkey, invdx3,
+                                    invmb, N,
                                     Int32(hier.B), Int32(lev.ng), Int32(lev.nd),
                                     Int32(lev.stride); ndrange = cnt)
         else
@@ -322,7 +383,7 @@ function gather_accel_particles!(hier::AMRHierarchy, parts, ax, ay, az;
                                  lmax_dm::Int = length(hier.levels) - 1)
     np = length(parts.px)
     done = device_zeros(hier.be, UInt8, (np,))            # np bytes — cheap, stays resident
-    for l in min(lmax_dm, length(hier.levels) - 1):-1:0
+    for l in min(lmax_dm, length(hier.levels) - 1, particle_lmax(hier)):-1:0
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
         haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)
@@ -410,7 +471,7 @@ function particle_levels!(hier::AMRHierarchy, parts, plev;
                           lmax_dm::Int = length(hier.levels) - 1)
     fill!(plev, 0xff)
     np = length(parts.px)
-    for l in min(lmax_dm, length(hier.levels) - 1):-1:0
+    for l in min(lmax_dm, length(hier.levels) - 1, particle_lmax(hier)):-1:0
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
         haskey(lev.tabs, :pkey) || build_block_lookup!(hier, l)

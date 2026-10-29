@@ -122,12 +122,13 @@ end
     return (U1, U2 * inv, U3 * inv, U4 * inv, U5 * inv)
 end
 
-"corrector face flux: HLLC on the predicted prims + the ge lane on the mass flux."
+"corrector face flux: HLLC on the predicted prims + the ge lane on the mass flux
++ the contact speed Ss (the pdV face velocity — Enzo flux_twoshock's ub)."
 @inline function _ctu_face(L::NTuple{5,Float32}, R::NTuple{5,Float32},
                            γ::Float32, ax::Int32)
-    F, _ = _hllc(_W5(L, γ), _W5(R, γ), γ, ax)
+    F, Ss = _hllc(_W5(L, γ), _W5(R, γ), γ, ax)
     ge = F[1] >= 0.0f0 ? L[5] : R[5]
-    return F, F[1] * ge, F[1]
+    return F, F[1] * ge, F[1], Ss
 end
 
 "the species corrector lane: predicted-face X = (ρ_face·X_face + dUX)/ρ_pred, upwinded."
@@ -140,17 +141,42 @@ end
     return Fm * (Fm >= 0.0f0 ? XfL : XfR)
 end
 
+# Enzo pgas2d_dual `demax`: the max total-energy density over the cell and its 6
+# face neighbours (input R-buffer, physical units).  The dual-energy resync
+# Ge ← Tau−KE is gated on (Tau−KE) > η₂·demax with η₂ ~ 0.1 — only a thermal
+# energy that is a significant fraction of the LOCAL energy scale (a resolved
+# shock) may overwrite the advected internal energy.  Unresolved sub-grid
+# velocity dispersion (restriction/C-F noise, ~1% of E) must NOT become heat —
+# the old local gate ((Tau−KE) > 1e-3·Tau) let exactly that through and drove
+# the static-level runaway (uncovered coarse cells ×172 in 10 steps).
+@inline function _demax6(Tau, base::Int32, i::Int32, j::Int32, k::Int32,
+                         nd::Int32, esc::Float32)
+    m = abs(Float32(Tau[base + _lidx(i, j, k, nd)]))
+    m = max(m, abs(Float32(Tau[base + _lidx(i - Int32(1), j, k, nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i + Int32(1), j, k, nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j - Int32(1), k, nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j + Int32(1), k, nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k - Int32(1), nd)])))
+    m = max(m, abs(Float32(Tau[base + _lidx(i, j, k + Int32(1), nd)])))
+    return m * esc
+end
+
 # ── pool gather with the f16 hat-tile rounding (oracle + capture path) ────────
 "tile-rounded physical (ρ,u,v,w,e): the EXACT value the f16 hat tile yields."
 @inline function _ctu_prims_pool(D, S1, S2, S3, Tau, Ge, idx::Int32,
-                                 dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
+                                 dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32,
+                                 vb1::Float32 = 0.0f0, vb2::Float32 = 0.0f0,
+                                 vb3::Float32 = 0.0f0)
     U = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
     # vacuum gate — must mirror the tiled kernel's phase-0 load bit-exactly.
     ρ = max(U[1], 1.0f-30)
     inv = ifelse(U[1] > 0.0f0, 1.0f0 / ρ, 0.0f0)
     ρ̂ = Float32(Float16(U[1] / dsc))
-    u = Float32(Float16(U[2] * inv)); v = Float32(Float16(U[3] * inv))
-    w = Float32(Float16(U[4] * inv))
+    live = ρ̂ > 0.0f0
+    # bulk-frame f16 rounding + lab lift — replicates the tile (_tld) exactly
+    u = ifelse(live, Float32(Float16(U[2] * inv - vb1)) + vb1, 0.0f0)
+    v = ifelse(live, Float32(Float16(U[3] * inv - vb2)) + vb2, 0.0f0)
+    w = ifelse(live, Float32(Float16(U[4] * inv - vb3)) + vb3, 0.0f0)
     # internal energy rides ITS OWN scale gsc (U[6]=Ge·gsc) — the tile lift factor
     # is gsc/dsc so the f16 tile windows the true internal energy, not Tau's.
     ê = Float32(Float16(ifelse(U[1] > 0.0f0,
@@ -164,12 +190,15 @@ end
 @inline function _ctu_face6(D, S1, S2, S3, Tau, Ge, base::Int32,
                             i::Int32, j::Int32, k::Int32, nd::Int32,
                             λ::Float32, γ::Float32, ax::Int32,
-                            dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
+                            dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32,
+                            vb1::Float32 = 0.0f0, vb2::Float32 = 0.0f0,
+                            vb3::Float32 = 0.0f0)
     di = ax == Int32(1) ? Int32(1) : Int32(0)
     dj = ax == Int32(2) ? Int32(1) : Int32(0)
     dk = ax == Int32(3) ? Int32(1) : Int32(0)
     P(ii, jj, kk) = _ctu_prims_pool(D, S1, S2, S3, Tau, Ge,
-                                    base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc)
+                                    base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc,
+                                    vb1, vb2, vb3)
     cL = P(i, j, k); cR = P(i + di, j + dj, k + dk)
     dUL = _ctu_dU5(P(i - Int32(1), j, k), cL, P(i + Int32(1), j, k),
                    P(i, j - Int32(1), k), P(i, j + Int32(1), k),
@@ -189,9 +218,11 @@ end
 # the tiled kernel uses (redundantly — this is the correctness path, not perf).
 @kernel function _ctu_cell_k!(Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
-                              @Const(Tau), @Const(Ge), spin,
+                              @Const(Tau), @Const(Ge), spin, spres,
                               @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                              @Const(Vb),
                               λ::Float32, γ::Float32, η::Float32, scap::Float32,
+                              pdv::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
                               ::Val{NS}) where {NS}
     t = @index(Global)
@@ -202,11 +233,16 @@ end
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
+        vb1 = Vb[3*(slot-Int32(1))+Int32(1)]           # per-block bulk velocity (BAM_BULKV; 0 = off)
+        vb2 = Vb[3*(slot-Int32(1))+Int32(2)]
+        vb3 = Vb[3*(slot-Int32(1))+Int32(3)]
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
         P(ii, jj, kk) = _ctu_prims_pool(D, S1, S2, S3, Tau, Ge,
-                                        base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc)
+                                        base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc,
+                                        vb1, vb2, vb3)
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
+        aU = 0.0f0                                    # Σ_ax (Ss_hi − Ss_lo): pdV face-velocity div
         aX1 = 0.0f0; aX2 = 0.0f0
         for ax in Int32(1):Int32(3)
             di = ax == Int32(1) ? Int32(1) : Int32(0)
@@ -216,7 +252,7 @@ end
             # SAME rounding order the tiled kernel's plane sweep uses
             # (a1 += Fs[hi] − Fs[lo]); two signed adds round differently.
             F1l = 0.0f0; F2l = 0.0f0; F3l = 0.0f0; F4l = 0.0f0; F5l = 0.0f0
-            F6l = 0.0f0; fX1l = 0.0f0; fX2l = 0.0f0
+            F6l = 0.0f0; Ssl = 0.0f0; fX1l = 0.0f0; fX2l = 0.0f0
             for s in (Int32(-1), Int32(0))                    # lo face (cell−1,cell), hi face
                 fi = i + s * di; fj = j + s * dj; fk = k + s * dk
                 cL = P(fi, fj, fk); cR = P(fi + di, fj + dj, fk + dk)
@@ -229,13 +265,14 @@ end
                                P(gi, gj, gk - Int32(1)), P(gi, gj, gk + Int32(1)), λ, γ)
                 L = _ctu_predicted(P(fi - di, fj - dj, fk - dk), cL, cR, dUL, 1.0f0)
                 R = _ctu_predicted(cL, cR, P(gi + di, gj + dj, gk + dk), dUR, -1.0f0)
-                F, Fge, Fm = _ctu_face(L, R, γ, ax)
+                F, Fge, Fm, Ssf = _ctu_face(L, R, γ, ax)
                 if s == Int32(-1)
                     F1l = F[1]; F2l = F[2]; F3l = F[3]; F4l = F[4]; F5l = F[5]
-                    F6l = Fge
+                    F6l = Fge; Ssl = Ssf
                 else
                     a1 += F[1] - F1l; a2 += F[2] - F2l; a3 += F[3] - F3l
                     a4 += F[4] - F4l; a5 += F[5] - F5l; a6 += Fge - F6l
+                    aU += Ssf - Ssl
                 end
                 if NS > 0
                     ρfL = _recon_one(P(fi - di, fj - dj, fk - dk), cL, cR, 1.0f0)[1]
@@ -280,21 +317,21 @@ end
                 end
             end
         end
-        # epilogue (shared with the tiled kernel by construction)
+        # epilogue (shared with the tiled kernel by construction).  pdV work
+        # from the HLLC face contact-speed divergence aU (Enzo flux_twoshock /
+        # the RK2 kernel's Sshi−Sslo) — see the tiled epilogue comment.
         U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
         Wc = P(i, j, k)
-        divv = 0.5f0 * ((P(i + Int32(1), j, k)[2] - P(i - Int32(1), j, k)[2]) +
-                        (P(i, j + Int32(1), k)[3] - P(i, j - Int32(1), k)[3]) +
-                        (P(i, j, k + Int32(1))[4] - P(i, j, k - Int32(1))[4]))
         P_c = (γ - 1.0f0) * max(Wc[1] * Wc[5], 1.0f-30)
         nD  = max(U0[1] - λ * a1, 1.0f-30)
         nS1 = U0[2] - λ * a2
         nS2 = U0[3] - λ * a3
         nS3 = U0[4] - λ * a4
         nT  = U0[5] - λ * a5
-        nG  = U0[6] - λ * (a6 + P_c * divv)
+        nG  = U0[6] - λ * (a6 + pdv * P_c * aU)       # pdv: BAM_NO_PDV diag (0 zeros pdV work)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        (nT - KE) > η * nT && (nG = nT - KE)
+        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
         # extreme-frontier safety: a degenerate Riemann state can still emit a
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
         # the OLD state for that cell/substep instead of poisoning the level.
@@ -321,11 +358,15 @@ end
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
         end
-        # reconstruct total energy Tau ≡ KE + Ge (FVGK fv_run_ctus_de, both branches) —
-        # keeps Tau consistent with the evolved internal energy in the kinetic-dominated
-        # core so the conservative Tau flux carries the shock heat into Ge on deceleration.
+        # Enzo eta1 (pgas2d_dual eslice update): keep the CONSERVATIVE total where
+        # the thermal part is locally resolved ((nT−KE) > η1·nT); rebuild
+        # Tau ≡ KE + Ge only in KE-dominated cells, where the stored Tau−KE is
+        # cancellation noise.  Exact conservation through resolved shocks; the
+        # (deliberate, Enzo-matching) non-conservation is confined to cells with
+        # thermal fraction < η1 = 1e-3.
         nG = max(nG, 1.0f-30)
-        nT = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30) + nG
+        KEn = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30)
+        nT = ifelse(nT - KEn > 1.0f-3 * nT, nT, KEn + nG)
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
@@ -334,13 +375,17 @@ end
         Geo_[idx]  = _narrow(eltype(Geo_), nG / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
-            spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
-                                 spin[1][idx]
+            spout[1][idx] = ok ?
+                _sd_spstore!(spres[1], idx, max(Xc * U0[1] - λ * aX1, 0.0f0),
+                             max(nD, 1.0f-30)) :
+                spin[1][idx]
         end
         if NS >= 2
             Xc = decode_log2sp(Float32, spin[2][idx])
-            spout[2][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD) :
-                                 spin[2][idx]
+            spout[2][idx] = ok ?
+                _sd_spstore!(spres[2], idx, max(Xc * U0[1] - λ * aX2, 0.0f0),
+                             max(nD, 1.0f-30)) :
+                spin[2][idx]
         end
     end
 end
@@ -360,13 +405,25 @@ const _FSMX = max((_TBX + 1) * _TBY * _TBZ, _TBX * (_TBY + 1) * _TBZ,
 @inline _dsi(lx::Int32, ly::Int32, lz::Int32) =
     (lz * Int32(_DSY) + ly) * Int32(_DSX) + lx        # 0-based
 
-# physical 5-lane state of W-tile cell (lx,ly,lz) from the f16 hat tile
+# physical 5-lane state of W-tile cell (lx,ly,lz) from the f16 hat tile.
+# BAM_BULKV: the tile stores velocities in the per-block BULK FRAME (u − vb) so
+# the f16 quantum applies to the small residual velocity, not the supersonic
+# bulk (2⁻¹¹·|v_bulk| was ~3× the internal energy at KE/e ~ 2900); the lift adds
+# vb back, so everything downstream is in the lab frame as before.  vb = 0
+# (BULKV off) is bit-identical to the historic path (x − 0 ≡ x).
 @inline function _tld(Wt, lx::Int32, ly::Int32, lz::Int32,
-                      dsc::Float32, gsc::Float32)
+                      dsc::Float32, gsc::Float32,
+                      vb1::Float32, vb2::Float32, vb3::Float32)
     q = _wsi(lx, ly, lz) * Int32(5)
-    # lane 5 is the internal energy hat, lifted by gsc/dsc (its OWN scale)
-    @inbounds (max(Float32(Wt[q+1]) * dsc, 1.0f-30), Float32(Wt[q+2]),
-               Float32(Wt[q+3]), Float32(Wt[q+4]), Float32(Wt[q+5]) * (gsc / dsc))
+    # lane 5 is the internal energy hat, lifted by gsc/dsc (its OWN scale).
+    # vacuum (ρ̂ ≤ 0) keeps v ≡ 0 exactly (the phase-0 gate staged w = −vb there).
+    ρ̂ = @inbounds Float32(Wt[q+1])
+    live = ρ̂ > 0.0f0
+    @inbounds (max(ρ̂ * dsc, 1.0f-30),
+               ifelse(live, Float32(Wt[q+2]) + vb1, 0.0f0),
+               ifelse(live, Float32(Wt[q+3]) + vb2, 0.0f0),
+               ifelse(live, Float32(Wt[q+4]) + vb3, 0.0f0),
+               Float32(Wt[q+5]) * (gsc / dsc))
 end
 
 @inline _xld(Xt, w0::Int32, s::Int, NS::Int) =
@@ -374,14 +431,15 @@ end
 
 @kernel cpu=false function _ctu_step_k!(
         Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
-        @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), @Const(Ge), spin,
+        @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(Tau), @Const(Ge), spin, spres,
         @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-        λ::Float32, γ::Float32, η::Float32, scap::Float32, tpb::Int32,
+        @Const(Vb),
+        λ::Float32, γ::Float32, η::Float32, scap::Float32, pdv::Float32, tpb::Int32,
         B::Int32, ng::Int32, nd::Int32, stride::Int32, ::Val{NS}) where {NS}
     Wt  = @localmem Float16 (_WS3 * 5)
     Xt  = @localmem UInt16 (_WS3 * max(NS, 1))
     dUs = @localmem Float32 (_DS3 * (5 + NS))
-    Fs  = @localmem Float32 (_FSMX * (6 + NS))
+    Fs  = @localmem Float32 (_FSMX * (7 + NS))         # lanes: 5 flux + ge + Ss(+NS)
     tid = Int32(@index(Local, Linear)) - Int32(1)              # 0-based
     g   = Int32(@index(Group, Linear)) - Int32(1)
     bi  = g ÷ tpb; tile = g % tpb
@@ -392,6 +450,9 @@ end
     slot = @inbounds live_d[bi + Int32(1)]
     base = (slot - Int32(1)) * stride
     dsc = @inbounds Dsc[slot]; ssc = @inbounds Ssc[slot]; esc = @inbounds Esc[slot]; gsc = @inbounds Gsc[slot]
+    vb1 = @inbounds Vb[3*(slot-Int32(1))+Int32(1)]     # per-block bulk velocity (BAM_BULKV; 0 = off)
+    vb2 = @inbounds Vb[3*(slot-Int32(1))+Int32(2)]
+    vb3 = @inbounds Vb[3*(slot-Int32(1))+Int32(3)]
     NL = Int32(5 + NS)
     # ── phase 0: pool U → physical prims → f16 hat tile (+ u16 species) ──────
     let t = tid
@@ -408,9 +469,9 @@ end
             q = t * Int32(5)
             @inbounds begin
                 Wt[q+1] = Float16(U[1] / dsc)
-                Wt[q+2] = Float16(U[2] * inv)
-                Wt[q+3] = Float16(U[3] * inv)
-                Wt[q+4] = Float16(U[4] * inv)
+                Wt[q+2] = Float16(U[2] * inv - vb1)    # bulk frame (see _tld)
+                Wt[q+3] = Float16(U[3] * inv - vb2)
+                Wt[q+4] = Float16(U[4] * inv - vb3)
                 # internal energy hat on gsc (U[6]=Ge·gsc) → full f16 tile precision
                 Wt[q+5] = Float16(ifelse(U[1] > 0.0f0,
                                          max(U[6], 1.0f-30) / gsc /
@@ -429,13 +490,13 @@ end
             dx = t % Int32(_DSX); dy = (t ÷ Int32(_DSX)) % Int32(_DSY)
             dz = t ÷ Int32(_DSX * _DSY)
             lx = dx + Int32(1); ly = dy + Int32(1); lz = dz + Int32(1)  # W coords
-            xc = _tld(Wt, lx, ly, lz, dsc, gsc)
-            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, gsc)
-            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, gsc)
-            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, gsc)
-            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, gsc)
-            zm = _tld(Wt, lx, ly, lz - Int32(1), dsc, gsc)
-            zp = _tld(Wt, lx, ly, lz + Int32(1), dsc, gsc)
+            xc = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3)
+            xm = _tld(Wt, lx - Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3)
+            xp = _tld(Wt, lx + Int32(1), ly, lz, dsc, gsc, vb1, vb2, vb3)
+            ym = _tld(Wt, lx, ly - Int32(1), lz, dsc, gsc, vb1, vb2, vb3)
+            yp = _tld(Wt, lx, ly + Int32(1), lz, dsc, gsc, vb1, vb2, vb3)
+            zm = _tld(Wt, lx, ly, lz - Int32(1), dsc, gsc, vb1, vb2, vb3)
+            zp = _tld(Wt, lx, ly, lz + Int32(1), dsc, gsc, vb1, vb2, vb3)
             dU = _ctu_dU5(xm, xc, xp, ym, yp, zm, zp, λ, γ)
             q = t * NL
             @inbounds begin
@@ -461,6 +522,7 @@ end
     tx = tid % Int32(_TBX); ty = (tid ÷ Int32(_TBX)) % Int32(_TBY)
     tz = tid ÷ Int32(_TBX * _TBY)
     a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
+    aU = 0.0f0                                         # Σ_ax (Ss_hi − Ss_lo): pdV face-velocity div
     aX1 = 0.0f0; aX2 = 0.0f0
     for dir in Int32(1):Int32(3)
         ex = dir == Int32(1) ? Int32(1) : Int32(0)
@@ -479,22 +541,23 @@ end
                     dUL = (dUs[dL+1], dUs[dL+2], dUs[dL+3], dUs[dL+4], dUs[dL+5])
                     dUR = (dUs[dR+1], dUs[dR+2], dUs[dR+3], dUs[dR+4], dUs[dR+5])
                 end
-                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, gsc)
-                cL = _tld(Wt, lx, ly, lz, dsc, gsc)
-                cR = _tld(Wt, mx, my, mz, dsc, gsc)
-                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, gsc)
+                cm = _tld(Wt, lx - ex, ly - ey, lz - ez, dsc, gsc, vb1, vb2, vb3)
+                cL = _tld(Wt, lx, ly, lz, dsc, gsc, vb1, vb2, vb3)
+                cR = _tld(Wt, mx, my, mz, dsc, gsc, vb1, vb2, vb3)
+                cp = _tld(Wt, mx + ex, my + ey, mz + ez, dsc, gsc, vb1, vb2, vb3)
                 L = _ctu_predicted(cm, cL, cR, dUL, 1.0f0)
                 R = _ctu_predicted(cL, cR, cp, dUR, -1.0f0)
-                F, Fge, Fm = _ctu_face(L, R, γ, dir)
-                q = p * (Int32(6) + Int32(NS))
+                F, Fge, Fm, Ssf = _ctu_face(L, R, γ, dir)
+                q = p * (Int32(7) + Int32(NS))
                 @inbounds begin
                     Fs[q+1] = F[1]; Fs[q+2] = F[2]; Fs[q+3] = F[3]
                     Fs[q+4] = F[4]; Fs[q+5] = F[5]; Fs[q+6] = Fge
+                    Fs[q+7] = Ssf                      # contact speed (pdV face velocity)
                     if NS > 0
                         ρfL = _recon_one(cm, cL, cR, 1.0f0)[1]
                         ρfR = _recon_one(cL, cR, cp, -1.0f0)[1]
                         for s in 1:NS
-                            Fs[q+Int32(6)+Int32(s)] = _ctu_faceX(Fm, L[1], R[1], ρfL, ρfR,
+                            Fs[q+Int32(7)+Int32(s)] = _ctu_faceX(Fm, L[1], R[1], ρfL, ρfR,
                                 _xld(Xt, _wsi(lx - ex, ly - ey, lz - ez), s, NS),
                                 _xld(Xt, _wsi(lx, ly, lz), s, NS),
                                 _xld(Xt, _wsi(mx, my, mz), s, NS),
@@ -507,14 +570,15 @@ end
             end
         end
         @synchronize
-        flo = ((tz * nfy + ty) * nfx + tx) * (Int32(6) + Int32(NS))
-        fhi = (((tz + ez) * nfy + (ty + ey)) * nfx + (tx + ex)) * (Int32(6) + Int32(NS))
+        flo = ((tz * nfy + ty) * nfx + tx) * (Int32(7) + Int32(NS))
+        fhi = (((tz + ez) * nfy + (ty + ey)) * nfx + (tx + ex)) * (Int32(7) + Int32(NS))
         @inbounds begin
             a1 += Fs[fhi+1] - Fs[flo+1]; a2 += Fs[fhi+2] - Fs[flo+2]
             a3 += Fs[fhi+3] - Fs[flo+3]; a4 += Fs[fhi+4] - Fs[flo+4]
             a5 += Fs[fhi+5] - Fs[flo+5]; a6 += Fs[fhi+6] - Fs[flo+6]
-            NS >= 1 && (aX1 += Fs[fhi+7] - Fs[flo+7])
-            NS >= 2 && (aX2 += Fs[fhi+8] - Fs[flo+8])
+            aU += Fs[fhi+7] - Fs[flo+7]
+            NS >= 1 && (aX1 += Fs[fhi+8] - Fs[flo+8])
+            NS >= 2 && (aX2 += Fs[fhi+9] - Fs[flo+9])
         end
         @synchronize
     end
@@ -524,22 +588,22 @@ end
     @inbounds begin
         U0 = _loadU(D, S1, S2, S3, Tau, Ge, idx, dsc, ssc, esc, gsc)
         wx = tx + Int32(2); wy = ty + Int32(2); wz = tz + Int32(2)
-        Wc = _tld(Wt, wx, wy, wz, dsc, gsc)
-        divv = 0.5f0 * ((_tld(Wt, wx + Int32(1), wy, wz, dsc, gsc)[2] -
-                         _tld(Wt, wx - Int32(1), wy, wz, dsc, gsc)[2]) +
-                        (_tld(Wt, wx, wy + Int32(1), wz, dsc, gsc)[3] -
-                         _tld(Wt, wx, wy - Int32(1), wz, dsc, gsc)[3]) +
-                        (_tld(Wt, wx, wy, wz + Int32(1), dsc, gsc)[4] -
-                         _tld(Wt, wx, wy, wz - Int32(1), dsc, gsc)[4]))
+        Wc = _tld(Wt, wx, wy, wz, dsc, gsc, vb1, vb2, vb3)
+        # pdV work from the HLLC face contact-speed divergence aU (Enzo
+        # flux_twoshock: ges = qc·pcent·(ub_i − ub_{i+1}); the RK2 kernel's
+        # Sshi−Sslo).  The former CENTERED cell-velocity divv read C/F ghost
+        # prims — prolonged-skin velocity error → spurious compression heating
+        # of uncovered coarse cells (the sync-independent runaway channel).
         P_c = (γ - 1.0f0) * max(Wc[1] * Wc[5], 1.0f-30)
         nD  = max(U0[1] - λ * a1, 1.0f-30)
         nS1 = U0[2] - λ * a2
         nS2 = U0[3] - λ * a3
         nS3 = U0[4] - λ * a4
         nT  = U0[5] - λ * a5
-        nG  = U0[6] - λ * (a6 + P_c * divv)
+        nG  = U0[6] - λ * (a6 + pdv * P_c * aU)       # pdv: BAM_NO_PDV diag (0 zeros pdV work)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        (nT - KE) > η * nT && (nG = nT - KE)
+        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
         # extreme-frontier safety: a degenerate Riemann state can still emit a
         # nonfinite lane (~1 cell/Mcell-step at the collapse frontier).  Keep
         # the OLD state for that cell/substep instead of poisoning the level.
@@ -566,11 +630,15 @@ end
             nD = U0[1]; nS1 = U0[2]; nS2 = U0[3]; nS3 = U0[4]
             nT = U0[5]; nG = U0[6]
         end
-        # reconstruct total energy Tau ≡ KE + Ge (FVGK fv_run_ctus_de, both branches) —
-        # keeps Tau consistent with the evolved internal energy in the kinetic-dominated
-        # core so the conservative Tau flux carries the shock heat into Ge on deceleration.
+        # Enzo eta1 (pgas2d_dual eslice update): keep the CONSERVATIVE total where
+        # the thermal part is locally resolved ((nT−KE) > η1·nT); rebuild
+        # Tau ≡ KE + Ge only in KE-dominated cells, where the stored Tau−KE is
+        # cancellation noise.  Exact conservation through resolved shocks; the
+        # (deliberate, Enzo-matching) non-conservation is confined to cells with
+        # thermal fraction < η1 = 1e-3.
         nG = max(nG, 1.0f-30)
-        nT = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30) + nG
+        KEn = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30)
+        nT = ifelse(nT - KEn > 1.0f-3 * nT, nT, KEn + nG)
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
@@ -579,19 +647,82 @@ end
         Geo_[idx]  = _narrow(eltype(Geo_), nG / gsc)
         if NS >= 1
             Xc = decode_log2sp(Float32, spin[1][idx])
-            spout[1][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX1, 0.0f0) / nD) :
-                                 spin[1][idx]
+            spout[1][idx] = ok ?
+                _sd_spstore!(spres[1], idx, max(Xc * U0[1] - λ * aX1, 0.0f0),
+                             max(nD, 1.0f-30)) :
+                spin[1][idx]
         end
         if NS >= 2
             Xc = decode_log2sp(Float32, spin[2][idx])
-            spout[2][idx] = ok ? encode_log2sp(max(Xc * U0[1] - λ * aX2, 0.0f0) / nD) :
-                                 spin[2][idx]
+            spout[2][idx] = ok ?
+                _sd_spstore!(spres[2], idx, max(Xc * U0[1] - λ * aX2, 0.0f0),
+                             max(nD, 1.0f-30)) :
+                spin[2][idx]
         end
     end
 end
 
+# ── per-block bulk velocity (BAM_BULKV) ──────────────────────────────────────
+# Mass-weighted mean velocity per block, accumulated over ACTIVE cells (f32
+# atomics; order round-off is harmless — vb is a rounding-frame offset, any
+# nearby value works, and tiled/per-cell parity holds because both read the
+# SAME computed array).
+@kernel function _blockvsum_k!(sums, @Const(D), @Const(S1), @Const(S2), @Const(S3),
+                               @Const(live_d),
+                               B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        idx = base + _lidx(i, j, k, nd)
+        d = Float32(D[idx])
+        if d > 0.0f0
+            r = 4 * (slot - Int32(1))
+            KA.@atomic sums[r+1] += d
+            KA.@atomic sums[r+2] += Float32(S1[idx])
+            KA.@atomic sums[r+3] += Float32(S2[idx])
+            KA.@atomic sums[r+4] += Float32(S3[idx])
+        end
+    end
+end
+
+@kernel function _blockvb_k!(Vb, @Const(sums), @Const(live_d),
+                             @Const(Dsc), @Const(Ssc))
+    b = @index(Global)
+    @inbounds begin
+        slot = live_d[b]
+        r = 4 * (slot - Int32(1)); q = 3 * (slot - Int32(1))
+        sd = sums[r+1]
+        f = ifelse(sd > 0.0f0, Ssc[slot] / (Dsc[slot] * max(sd, 1.0f-30)), 0.0f0)
+        Vb[q+1] = sums[r+2] * f
+        Vb[q+2] = sums[r+3] * f
+        Vb[q+3] = sums[r+4] * f
+    end
+end
+
+"Get-or-create the per-block bulk-velocity table (zeros ⇒ lab frame, bit-identical)."
+function _vbtab(lev::Level)
+    vbt = get(lev.tabs, :vb, nothing)
+    if !(vbt isa AbstractVector{Float32}) || length(vbt) != 3 * lev.cap
+        vbt = device_zeros(lev.be, Float32, (3 * lev.cap,))
+        lev.tabs[:vb] = vbt
+    end
+    return vbt
+end
+
 """
-    ctu_level!(hier, l, λ; η = 1e-3, tiled = nothing)
+    ctu_level!(hier, l, λ; η = 0.1, tiled = nothing)
+
+`η` is the ENZO eta2 dual-energy selection threshold (`BAM_DE_ETA2`, default 0.1,
+Bryan et al. 1995 / pgas2d_dual.F): Ge ← Tau−KE only where the implied thermal
+energy exceeds η × the MAX total-energy density over the cell + 6 face
+neighbours (`_demax6`).  Only a resolved shock passes; unresolved sub-grid
+velocity dispersion (~1% of E from restriction / C-F transfer) does not — the
+old LOCAL gate at 1e-3 let it through and drove the static-level runaway.
 
 One full CTU substep of level `l`: R → O in one launch (the caller swaps
 buffers).  `tiled = nothing` auto-selects: the shared-memory kernel on GPU
@@ -599,10 +730,12 @@ backends when `B` is (8,8,4)-tileable and `nsp ≤ 2`, the per-cell oracle
 otherwise (always on CPU).
 """
 function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
-                    η::Float32 = 1.0f-3, tiled::Union{Nothing,Bool} = nothing)
+                    η::Float32 = Float32(parse(Float64, get(ENV, "BAM_DE_ETA2", "0.1"))),
+                    tiled::Union{Nothing,Bool} = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
+    pdv  = get(ENV, "BAM_NO_PDV", "0") == "1" ? 0.0f0 : 1.0f0   # diag: zero the pdV work source
     B = lev.B; NS = lev.nsp
     @assert NS <= 2 "the CTU kernels carry ≤ 2 species lanes (got $NS)"
     # the tiled kernel needs ~42 KB threadgroup memory at NS=2 — fine on CUDA,
@@ -611,22 +744,37 @@ function ctu_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     # oracle runs on every backend; `tiled=true`/`false` force either path.
     tilecap = hier.besym != :cpu && B % _TBX == 0 && B % _TBY == 0 && B % _TBZ == 0
     prefer  = hier.besym in _TILING
+    # BAM_CTU_TILED=0: force the per-cell oracle on GPU (tiled-kernel bisect)
+    get(ENV, "BAM_CTU_TILED", "1") == "0" && (prefer = false)
     usetile = (tiled === nothing ? prefer : tiled) && tilecap
     sin_  = ntuple(q -> lev.sp[q], NS)
     sout_ = ntuple(q -> lev.spo[q], NS)
+    sres_ = ntuple(q -> lev.spr[q], NS)
+    # BAM_BULKV=1: refresh the per-block bulk velocity from the R state; the
+    # f16 tile then quantizes the RESIDUAL velocity (see _tld).  Off ⇒ zeros
+    # (bit-identical to the historic lab-frame path).
+    vbt = _vbtab(lev)
+    if get(ENV, "BAM_BULKV", "0") == "1"
+        nb = length(lev.live)
+        sums = device_zeros(lev.be, Float32, (4 * lev.cap,))
+        _blockvsum_k!(lev.be)(sums, lev.D, lev.S1, lev.S2, lev.S3, lev.live_d,
+                              Int32(B), Int32(lev.ng), Int32(lev.nd),
+                              Int32(lev.stride); ndrange = nb * B^3)
+        _blockvb_k!(lev.be)(vbt, sums, lev.live_d, lev.Dsc, lev.Ssc; ndrange = nb)
+    end
     if usetile
         tpb = (B ÷ _TBX) * (B ÷ _TBY) * (B ÷ _TBZ)
         n = length(lev.live) * tpb * _NT
-        _ctu_step_k!(lev.be, _NT)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
-                                  lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                                  λ, Float32(hier.gamma), η, scap, Int32(tpb),
+        _ctu_step_k!(lev.be, _NT)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_, sres_,
+                                  lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, vbt,
+                                  λ, Float32(hier.gamma), η, scap, pdv, Int32(tpb),
                                   Int32(B), Int32(lev.ng), Int32(lev.nd),
                                   Int32(lev.stride), Val(NS); ndrange = n)
     else
         n = length(lev.live) * B^3
-        _ctu_cell_k!(lev.be)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_,
-                             lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                             λ, Float32(hier.gamma), η, scap,
+        _ctu_cell_k!(lev.be)(gasfields_o(lev)..., sout_, gasfields(lev)..., sin_, sres_,
+                             lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, vbt,
+                             λ, Float32(hier.gamma), η, scap, pdv,
                              Int32(B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), Val(NS); ndrange = n)
     end

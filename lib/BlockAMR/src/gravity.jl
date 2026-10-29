@@ -416,6 +416,46 @@ function grav_kick_level_pool!(hier::AMRHierarchy, l::Int, halfdt::Real)
     return nothing
 end
 
+# ── acceleration timestep criterion (Enzo dt_accel analog) ───────────────────
+# Max |∇φ| (∞-norm over components, central difference — the SAME operator the
+# kick applies) over a level's active cells.  Used for dτ_acc = k·√(2·dx/|g|):
+# the kick Δv = g·dt is UNGATED, so a deep φ well (deposit spike or physical
+# collapse) can accelerate a cell past the CFL assumption within one substep —
+# the λ-ratchet that crawled the old runs and NaNs the fixed (faster-dτ) code.
+@kernel function _max_accel_k!(out, @Const(φ), @Const(live_d), inv2h::Float32,
+                               B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        gx = (Float32(φ[base + _lidx(i + Int32(1), j, k, nd)]) -
+              Float32(φ[base + _lidx(i - Int32(1), j, k, nd)])) * inv2h
+        gy = (Float32(φ[base + _lidx(i, j + Int32(1), k, nd)]) -
+              Float32(φ[base + _lidx(i, j - Int32(1), k, nd)])) * inv2h
+        gz = (Float32(φ[base + _lidx(i, j, k + Int32(1), nd)]) -
+              Float32(φ[base + _lidx(i, j, k - Int32(1), nd)])) * inv2h
+        m = max(abs(gx), max(abs(gy), abs(gz)))
+        out[Int32(t)] = ifelse(isfinite(m), m, 0.0f0)
+    end
+end
+
+"Max |∇φ| (code accel) over level `l`'s active cells from its own φ pool (0 if empty)."
+function max_accel(hier::AMRHierarchy, l::Int)
+    lev = hier.levels[l + 1]
+    (isempty(lev.live) || isempty(lev.phi)) && return 0.0
+    inv2h = Float32(1.0 / (2.0 * level_dx(hier, l)))
+    n = length(lev.live) * lev.B^3
+    out = device_zeros(lev.be, Float32, (n,))
+    _max_accel_k!(lev.be)(out, lev.phi, lev.live_d, inv2h, Int32(lev.B),
+                          Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
+                          ndrange = n)
+    return Float64(maximum(out))
+end
+
 # scatter a level-0 pool field (D by default, scale-decoded) into a global
 # nbase³ f32 array — the gas side of the topgrid FFT source.  Level-0 blocks
 # tile disjointly: no atomics.
@@ -945,18 +985,70 @@ function solve_gravity_level_mg!(hier::AMRHierarchy, l::Int; source_coef::Real,
             defect = max(defect, r0)
             continue
         end
-        for _ in 1:ncycle
-            _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
+        # ITERATE-UNTIL-TOLERANCE (the Enzo/RAMSES-standard convergence contract;
+        # mgeps > 0): cycle in batches of `ncycle` until the residual contracts
+        # below mgeps·max|rhs|, capped at BAM_MGMAXCYC total cycles.  A fixed
+        # under-converged cycle count leaves residual-dominated φ whose GRADIENTS
+        # can anti-correlate between levels (measured slope −2.4 at L1/L2, z=13)
+        # — a persistent force piston at every refinement boundary (the hot
+        # underdense C/F rims).  mgeps = 0 keeps the historic single fixed batch.
+        # MONOTONICITY GUARD (contract-or-freeze) checked every batch.
+        maxcyc = mgeps > 0 ? parse(Int, get(ENV, "BAM_MGMAXCYC", "60")) : ncycle
+        tol = mgeps > 0 ? Float32(mgeps) * maximum(abs, rhsd) : 0.0f0
+        # RAMSES-conform per-solve economics (rteyssie/mini-ramses 8fafc20 +
+        # multigrid_fine_commons.f90):
+        # (a) TEYSSIER L2/RHS criterion (BAM_MGEPS2 > 0): converged when
+        #     ‖r‖₂/‖rhs‖₂ ≤ ε₂ (his ε = 1e-4).  RHS-anchored — the solution
+        #     error obeys ‖δφ‖/‖φ‖ ≤ κ(A)·‖r‖/‖rhs‖, so the target is solve-
+        #     invariant: warm starts already below it exit at ZERO cycles, and
+        #     unlike a relative-to-r0 exit a cold post-regrid solve cannot
+        #     stop early ("MG needs now less V-cycle on fine levels").
+        # (b) convergence checked EVERY `mgchk` cycles (default 1, RAMSES-
+        #     style) instead of after a 20-cycle batch — the batch paid ≥20
+        #     ν=6 cycles whenever the entry test missed (L3 13 s/call, 63% of
+        #     firststar7 wall time).
+        # The ∞-norm mgeps tol stays available as an absolute backstop; the
+        # rim-piston contract is untouched (solves CONVERGE — the piston came
+        # from solves that never converged).
+        eps2 = Float32(parse(Float64, get(ENV, "BAM_MGEPS2", "0")))
+        # WARM-CHAIN relative leg (BAM_MGEPSREL, measured slope 1.0000/0.9998 at
+        # 2.7×): per-substep solves contract THIS solve's defect εrel×; defects
+        # don't accumulate — the next substep re-attacks the remainder.  The
+        # absolute legs (∞ and L2/RHS) bound cold post-regrid solves.
+        εrel = Float32(parse(Float64, get(ENV, "BAM_MGEPSREL", "0")))
+        rhs2 = eps2 > 0.0f0 ?
+               mapreduce((r, m) -> m > 0.0f0 ? abs2(r) : 0.0f0, +, rhsd, maskd) : 0.0f0
+        tol2 = eps2 * eps2 * rhs2                # compare against ‖r‖₂² (no sqrt)
+        conv = (ri, r2i) -> (mgeps > 0 && ri <= tol) || (eps2 > 0.0f0 && r2i <= tol2) ||
+                            (εrel > 0.0f0 && ri <= εrel * r0)
+        r0_2 = eps2 > 0.0f0 ? mapreduce(abs2, +, rd) : Inf32
+        if (mgeps > 0 && r0 <= tol) || (eps2 > 0.0f0 && r0_2 <= tol2)   # entry: absolute legs only
+            defect = max(defect, r0)
+            continue
         end
-        # MONOTONICITY GUARD (contract-or-freeze; see the divergence note
-        # above): with r0 always in hand, check every cycled solve.
-        mxφ = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φd; init = 0.0f0)
-        okc = mxφ < 1.0f8                       # nonfinite folded to Inf → fails
-        r1 = 0.0f0
-        if okc
+        mgchk = max(parse(Int, get(ENV, "BAM_MGCHECK", "1")), 1)
+        tolmode = mgeps > 0 || eps2 > 0.0f0 || εrel > 0.0f0
+        ndone = 0
+        r1 = r0; okc = true; mxφ = 0.0f0
+        while ndone < maxcyc
+            for _ in 1:(tolmode ? mgchk : ncycle)
+                _mgd_vcycle!(lev.be, pyr, 1, nu1, nu2, nub; ω = Float32(ω))
+                ndone += 1
+            end
+            mxφ = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φd; init = 0.0f0)
+            okc = mxφ < 1.0f8                   # nonfinite folded to Inf → fails
+            okc || break
             _mgd_resid_k!(lev.be)(rd, φd, rhsd, maskd, nx, ny, nz; ndrange = prod(dims))
             r1 = maximum(abs, rd)
-            okc = isfinite(r1) && r1 <= r0 * 1.001f0
+            # accept at/below tol; NO wider grace — the fs15 lesson: a 10×tol
+            # acceptance loosened production deep φ into the rim-piston regime
+            # (hot-core census at L16-17, medT 37 kK).  At-tol-unachievable
+            # deep states cycle to the cap and keep the best φ (the REVERT is
+            # conservative and correct — fs13's slopes measured 1.0006 so).
+            okc = isfinite(r1) && (r1 <= r0 * 1.001f0 || (mgeps > 0 && r1 <= tol))
+            okc || break
+            r1_2 = eps2 > 0.0f0 ? mapreduce(abs2, +, rd) : Inf32
+            (tolmode && !conv(r1, r1_2)) || break   # converged (or fixed-cycle mode)
         end
         if okc
             defect = max(defect, r1)
@@ -1177,19 +1269,63 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
         _run_copy!(lev.be, sibf, lev.phi, lev.phi, lev.nd, lev.stride)
     end
     defect = 0.0f0
+    # Teyssier L2/RHS convergence (see the dense-path twin): ‖r‖₂/‖rhs‖₂ ≤ ε₂
+    # (BAM_MGEPS2), checked at ENTRY (warm starts exit at zero cycles) and after
+    # EVERY cycle — `ncycle` becomes a cap, not a fixed workload (the driver's
+    # ncycle=20 previously ran 20 unconditional cycles per solve).  The ∞-norm
+    # `mgeps` entry test stays as the absolute backstop.
+    eps2 = Float32(parse(Float64, get(ENV, "BAM_MGEPS2", "0")))
+    εrel = Float32(parse(Float64, get(ENV, "BAM_MGEPSREL", "0")))
+    tolmode = mgeps > 0 || eps2 > 0.0f0 || εrel > 0.0f0
+    # CONTRACT GUARD (the m2r lesson: an in-place solver that returns silently
+    # unconverged/expanded φ poisons the kicks → dτ collapse; the standalone
+    # cycles are healthy at every level, so the guard is a backstop, not a
+    # crutch): snapshot φ at entry; on exit REQUIRE finite, contracted
+    # residual — else RESTORE the snapshot and redo the solve on the proven
+    # dense path.  BAM_MG2GUARD=0 disables (bit-exact old behavior).
+    guard = get(ENV, "BAM_MG2GUARD", "1") == "1"
+    φsnap = guard ? copy(lev.phi) : nothing
+    rn = 0.0f0; rhs2 = 0.0f0
+    if tolmode
+        _absrhs_k!(lev.be)(resb, lev.rhs, lev.live_d, B, ng, ndv, st; ndrange = n)
+        rn = maximum(resb)
+        eps2 > 0.0f0 && (rhs2 = mapreduce(abs2, +, resb))
+    end
+    tol2 = eps2 * eps2 * rhs2
+    r0ref = Ref(Inf32)          # this solve's entry defect (εrel leg + guard)
+    mg2conv = (userel) -> begin
+        _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
+                               ndrange = n)
+        ri = maximum(abs, resb)
+        isfinite(r0ref[]) || (r0ref[] = ri)
+        r2 = eps2 > 0.0f0 ? mapreduce(abs2, +, resb) : Inf32
+        (ri, (mgeps > 0 && ri <= mgeps * rn) || (eps2 > 0.0f0 && r2 <= tol2) ||
+             (userel && εrel > 0.0f0 && ri <= εrel * r0ref[]))
+    end
+    # SMOOTH-MODE-AWARE stopping (the fs11 lesson: every residual-based exit —
+    # ∞, L2/RHS, εrel — is BLIND to smooth φ error, r = −∇²e ~ e/L², and MG2's
+    # stunted coarse side contracts exactly those modes slowest ⇒ "converged"
+    # solves left coherent 1-2% large-scale φ bias ⇒ tilted forces, faster
+    # infall, no shocks).  The COARSE CORRECTION is the carrier of the smooth
+    # modes, so its per-cycle increment IS the smooth-error decrement: require
+    # max_cluster|Δφ_coarse| ≤ εφ·max|φ| in ADDITION to a residual leg before
+    # exiting.  εφ = 3e-4 with contraction ~0.5/cycle bounds the retained
+    # smooth error ≲ 6e-4·|φ| (the broken era measured 2.4e-2).
+    εφ = Float32(parse(Float64, get(ENV, "BAM_MG2EPSC", "3e-4")))
+    corr_ok = Ref(false)
     for cyc in 1:ncycle
-        if mgeps > 0 && cyc == 1
-            _absrhs_k!(lev.be)(resb, lev.rhs, lev.live_d, B, ng, ndv, st; ndrange = n)
-            rn = maximum(resb)
-            _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
-                                   ndrange = n)
-            defect = maximum(abs, resb)
-            defect <= mgeps * rn && return defect
+        if tolmode
+            # entry (cyc=1): absolute legs only — a cold solve must not exit
+            # on a relative contraction it hasn't performed yet; correction
+            # gate requires at least one cycle's correction measured
+            defect, cv = mg2conv(cyc > 1)
+            cv && (εφ <= 0.0f0 || corr_ok[]) && return defect
         end
         for _ in 1:nsm; smooth!(); end
         _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
                                ndrange = n)
         anyadd = false
+        mxcorr = 0.0f0
         for (rel0_d, gpos_d, liv_d, mblk, dc, pyr) in clusters
             nx, ny, nz = Int32.(dc)
             φc, rc, mc, _, _ = pyr[1]
@@ -1197,8 +1333,21 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
             _mg2_restrict_k!(lev.be)(rc, mc, resb, rel0_d, gpos_d,
                                      Float32(1 / cfac), Int32(cfac),
                                      nx, ny, B; ndrange = mblk * lev.B^3)
-            _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
-            _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+            # coarse-solve-TO-TOLERANCE (was 2 fixed V-cycles: the per-cycle
+            # smooth-mode contraction was bounded by an unconverged coarse
+            # solve): cycle the small cluster pyramid until ITS residual
+            # contracts 100×, cap 12 (grids are bbox/cfac³ — cheap).
+            r0c = Inf32
+            for cc in 1:12
+                _mgd_vcycle!(lev.be, pyr, 1, 2, 2, nub)
+                rcv = pyr[1][2]
+                # cluster residual: recompute on the coarse grid
+                _mgd_resid_k!(lev.be)(pyr[1][4], φc, rcv, mc, nx, ny, nz;
+                                      ndrange = Int(nx) * Int(ny) * Int(nz))
+                rc1 = maximum(abs, pyr[1][4])
+                cc == 1 && (r0c = rc1)
+                (isfinite(rc1) && rc1 > 0.01f0 * r0c && cc < 12) || break
+            end
             # absolute correction guard (the anti-runaway backstop; RB smoothing
             # is non-expansive, so this is the only injection point to bound)
             mxe = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, φc; init = 0.0f0)
@@ -1207,13 +1356,40 @@ function solve_gravity_level_mg2!(hier::AMRHierarchy, l::Int; source_coef::Real,
                                            nx, ny, nz, B, ng, ndv, st;
                                            ndrange = mblk * lev.B^3)
                 anyadd = true
+                mxcorr = max(mxcorr, mxe)
             end
         end
         anyadd && _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
         for _ in 1:nsm; smooth!(); end
+        if εφ > 0.0f0
+            mxφ = mapreduce(x -> isfinite(x) ? abs(x) : 0.0f0, max, lev.phi; init = 0.0f0)
+            corr_ok[] = mxcorr <= εφ * mxφ
+        end
     end
     _run_copy!(lev.be, sib, lev.phi, lev.phi, lev.nd, lev.stride)
     _residual_s_k!(lev.be)(resb, lev.phi, lev.rhs, lev.live_d, B, ng, ndv, st;
                            ndrange = n)
-    return maximum(abs, resb)
+    rend = mapreduce(x -> isfinite(x) ? abs(x) : Inf32, max, resb; init = 0.0f0)
+    # exit-side contract: the cycle-capped path must leave a FINITE residual
+    # that CONTRACTED from entry; anything else restores φ and redoes the
+    # solve on the proven dense path (which carries its own guards).
+    # absolute floor: a residual ≤ 1e-7·max|rhs| is converged regardless of its
+    # jitter history — without this, deep warm solves at the f32 residual FLOOR
+    # (r ~ 1e-10) fail the bare 1.001-contraction test on round-off noise and
+    # fire the guard thousands of times (the mg2b13 bench: 4101 fires, each
+    # paying snapshot+dense — slower than dense alone).
+    # graceful cap-exit: within 10× of the (f32-achievable) tolerance is a GOOD
+    # solve — the RAMSES epsilon_base lesson; only genuinely-failed states fall
+    # back (the mg2b13b storm: tol sat AT the f32 floor, unreachable ⇒ every
+    # cap-exit read as failure)
+    gtol = 10.0f0 * Float32(mgeps > 0 ? mgeps : 1e-5) * rn
+    if guard && !(rend <= max(max(r0ref[], rn) * 1.001f0, gtol))
+        copyto!(lev.phi, φsnap)
+        get(ENV, "BAM_NANSTAGE", "0") == "1" &&
+            (println("MG2GUARD FALLBACK l=$l: r0=$(r0ref[]) rend=$rend → dense"); flush(stdout))
+        return solve_gravity_level_mg!(hier, l; source_coef, rho_mean, use_dm,
+                                       rho_ext, bc_phi, ncycle = 20, nu1 = 6, nu2 = 6,
+                                       nub = 80, mgeps = mgeps > 0 ? mgeps : 1e-6)
+    end
+    return rend
 end

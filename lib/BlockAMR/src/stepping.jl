@@ -163,14 +163,22 @@ coarse stage; the apply multiplies the single global λ.
             nb = count(x -> !isfinite(Float32(x)), arr)
             nb > 0 && println("NANSTAGE   field $nm: $nb nonfinite (pool-wide)")
         end
-        # block forensics: which blocks, what scales, what stored cell values
+        # block forensics: which LIVE blocks, what scales, R (output) AND O
+        # (input) values — a dead/freed slot's stale garbage must not misdirect
+        # the hunt, and R-NaN with O-finite proves the stage CREATED it while
+        # R-NaN with O-NaN proves it PREDATES the stage (input side).
         hge = Array(lev.Ge); htau = Array(lev.Tau); hd = Array(lev.D)
+        hgeo = Array(lev.Geo); htauo = Array(lev.Tauo); hdo = Array(lev.Do)
         hDsc = Array(lev.Dsc); hSsc = Array(lev.Ssc)
         hEsc = Array(lev.Esc); hGsc = Array(lev.Gsc)
-        seen = Set{Int}()
+        vbt = get(lev.tabs, :vb, nothing)
+        hvb = vbt === nothing ? nothing : Array(vbt)
+        liveset = Set(Int.(lev.live))
+        seen = Set{Int}(); ndead = 0
         for ii in eachindex(hge)
             (isfinite(Float32(hge[ii])) && isfinite(Float32(htau[ii]))) && continue
             slot = (ii - 1) ÷ lev.stride + 1
+            slot in liveset || (ndead += 1; continue)
             slot in seen && continue
             push!(seen, slot)
             length(seen) > 6 && break
@@ -178,10 +186,56 @@ coarse stage; the apply multiplies the single global λ.
             i_ = c % lev.nd; j_ = (c ÷ lev.nd) % lev.nd; k_ = c ÷ (lev.nd * lev.nd)
             inint = all(x -> lev.ng <= x < lev.B + lev.ng, (i_, j_, k_))
             m = lev.meta[slot]
-            println("NANSTAGE   slot $slot origin $(Int128.(m.origin)) ",
+            vbs = hvb === nothing ? "n/a" :
+                  string((hvb[3(slot-1)+1], hvb[3(slot-1)+2], hvb[3(slot-1)+3]))
+            println("NANSTAGE   LIVE slot $slot origin $(Int128.(m.origin)) ",
                     inint ? "INTERIOR" : "GHOST", " cell ($i_,$j_,$k_)  scales: ",
                     "Dsc=$(hDsc[slot]) Ssc=$(hSsc[slot]) Esc=$(hEsc[slot]) Gsc=$(hGsc[slot])",
-                    "  stored: D=$(Float32(hd[ii])) Ge=$(Float32(hge[ii])) Tau=$(Float32(htau[ii]))")
+                    "  vb=$vbs")
+            println("NANSTAGE     R(out): D=$(Float32(hd[ii])) Ge=$(Float32(hge[ii])) Tau=$(Float32(htau[ii]))",
+                    "   O(in): D=$(Float32(hdo[ii])) Ge=$(Float32(hgeo[ii])) Tau=$(Float32(htauo[ii]))")
+            # LAUNCH-COVERAGE forensics: over this block's ACTIVE cells, how many
+            # R cells are (a) nonfinite, (b) bitwise-IDENTICAL to the pre-launch
+            # output buffer's content?  A kernel-processed block has R ≠ stale-R
+            # nearly everywhere; R≡stale on a swath ⇒ those cells were NEVER
+            # WRITTEN by the launch (live_d/coverage bug, not arithmetic).
+            base_ = (slot - 1) * lev.stride
+            nnf = 0; nact = 0
+            for kk in 1:lev.B, jj in 1:lev.B, ii2 in 1:lev.B
+                q_ = base_ + ((lev.ng+kk-1)*lev.nd + (lev.ng+jj-1))*lev.nd + (lev.ng+ii2-1) + 1
+                nact += 1
+                isfinite(Float32(hge[q_])) || (nnf += 1)
+            end
+            println("NANSTAGE     block actives: $nact  nonfinite-Ge: $nnf")
+        end
+        ndead > 0 && println("NANSTAGE   (+$ndead nonfinite in DEAD/freed slots — stale, ignored)")
+        # live vs live_d consistency (stale device list ⇒ launch skipped blocks)
+        hlv = Array(lev.live_d)
+        println("NANSTAGE   live(host)=$(length(lev.live))  live_d(dev)=$(length(hlv))  ",
+                "same=$(length(lev.live) == length(hlv) && all(Int.(lev.live) .== Int.(hlv[1:length(lev.live)])))")
+        println("NANSTAGE   tabs keys: ", sort(collect(keys(lev.tabs))))
+        # full-state dump for offline CPU replay (BAM_NANDUMP=path prefix)
+        dpre = get(ENV, "BAM_NANDUMP", "")
+        if dpre != ""
+            dump = (l = l, stage = stage, substep = hier.nstep[l + 1],
+                    λ = hier.λ, B = lev.B, ng = lev.ng, nd = lev.nd,
+                    stride = lev.stride, cap = lev.cap, nsp = lev.nsp,
+                    live = copy(lev.live),
+                    origins = [lev.meta[s].origin for s in lev.live],
+                    D = Array(lev.D), S1 = Array(lev.S1), S2 = Array(lev.S2),
+                    S3 = Array(lev.S3), Tau = Array(lev.Tau), Ge = Array(lev.Ge),
+                    Do = Array(lev.Do), S1o = Array(lev.S1o), S2o = Array(lev.S2o),
+                    S3o = Array(lev.S3o), Tauo = Array(lev.Tauo), Geo = Array(lev.Geo),
+                    sp = [Array(s) for s in lev.sp], spo = [Array(s) for s in lev.spo],
+                    Dsc = Array(lev.Dsc), Ssc = Array(lev.Ssc),
+                    Esc = Array(lev.Esc), Gsc = Array(lev.Gsc),
+                    vb = get(lev.tabs, :vb, nothing) === nothing ? nothing :
+                         Array(lev.tabs[:vb]))
+            fn = dpre * "_L$(l)_$(stage)_ss$(hier.nstep[l+1]).jls"
+            open(fn, "w") do io
+                Serialization.serialize(io, dump)
+            end
+            println("NANSTAGE   dumped $fn")
         end
         flush(stdout)
         error("NANSTAGE: level $l nonfinite after :$stage (substep $(hier.nstep[l + 1]))")
@@ -189,10 +243,58 @@ coarse stage; the apply multiplies the single global λ.
     return nothing
 end
 
+# BAM_SPWATCH=<level>: print the watched level's max species codes (decoded)
+# after every W-cycle operation — the codec is monotonic, so one device
+# reduction per species suffices.  The first jump names the guilty operation.
+function _spwatch(hier::AMRHierarchy, l::Int, tag::Symbol)
+    wl = parse(Int, get(ENV, "BAM_SPWATCH", "-1"))
+    wl < 0 && return nothing
+    lev = hier.levels[wl + 1]
+    isempty(lev.live) && return nothing
+    m1 = decode_log2sp(Float64, maximum(lev.sp[1]))
+    m2 = decode_log2sp(Float64, maximum(lev.sp[2]))
+    o1 = isempty(lev.spo) ? 0.0 : decode_log2sp(Float64, maximum(lev.spo[1]))
+    o2 = isempty(lev.spo) ? 0.0 : decode_log2sp(Float64, maximum(lev.spo[2]))
+    @printf("SPWATCH L%d after %s(l=%d ss=%d): R %.5e %.5e | O %.5e %.5e\n",
+            wl, tag, l, Int(hier.nstep[l + 1]), m1, m2, o1, o2)
+    flush(stdout)
+    return nothing
+end
+
+# Enzo/RAMSES-style per-substep refinement (see grow_level!): the driver stores
+# (pol = policy, jc = jeans_coef) here each root step; nothing = disabled.  A
+# Ref because advance_level_w! recurses — the policy travels with the hierarchy
+# walk without threading another kwarg through every call site.
+const GROWREGRID = Ref{Any}(nothing)
+
 function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                           φ = nothing, chem = nothing, selfgrav = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
+    # per-substep GROW-ONLY refinement: refinement latency = one substep of the
+    # level that wants it (Enzo RebuildHierarchy / RAMSES refine_fine cadence) —
+    # kills the Truelove-wall over-heating built by root-cadence regridding.
+    # The recursion grows l+2 at the child's own entry, so a fast collapse can
+    # cascade multiple new levels within one root step.
+    g = GROWREGRID[]
+    if g !== nothing
+        _t = _tic(lev.be)
+        na = grow_level!(hier, l, g.pol; jeans_coef = g.jc, jeans_efix = g.ef,
+                         on_newlevel = get(g, :dump, nothing))
+        _toc(lev.be, :growregrid, l, _t)
+        na > 0 && get(ENV, "BAM_GROWVERB", "0") == "1" &&
+            (println("GROW L$(l + 1) +$na blocks (substep $(Int(hier.nstep[l + 1])) of L$l)"); flush(stdout))
+        # Enzo "outputNow" analog: touch the trigger file in the run directory
+        # and the NEXT level substep anywhere in the W-cycle writes an output
+        # immediately — investigate a long run whenever you want, without
+        # waiting hours for a root-step checkpoint.  The file is removed BEFORE
+        # dumping (single-threaded walk ⇒ exactly one dump per touch).
+        fpath = get(g, :force, nothing)
+        if fpath !== nothing && get(g, :dump, nothing) !== nothing && isfile(fpath)
+            rm(fpath; force = true)
+            g.dump("forced")
+        end
+    end
     haskids = l + 2 <= length(hier.levels) && !isempty(hier.levels[l + 2].live)
     if haskids                                    # fine first (frozen parent state)
         # out-of-core: keep THIS (parent) level resident while its children run —
@@ -223,7 +325,13 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     dosolve = true
     if selfgrav !== nothing
         gravk = get(selfgrav, :gravk, 0)
-        if gravk > 1 && l >= get(selfgrav, :gravk_lmin, 6)
+        # cadence band [gravk_lmin, gravk_lmax]: the original out-of-core use
+        # capped traffic at DEEP levels (lmin=6, lmax=∞); the shallow-static-
+        # union case (DM-criterion runs: L1-L3 = 90+% of wall time in full-MG
+        # every substep) wants the OPPOSITE band — cadence the big shallow
+        # unions, keep every-substep converged solves at the collapse levels
+        # (stale φ at the free-fall-capped finest level = central-mass pile-up).
+        if gravk > 1 && get(selfgrav, :gravk_lmin, 6) <= l <= get(selfgrav, :gravk_lmax, 999)
             dosolve = hier.nstep[l + 1] % gravk == 0
         end
     end
@@ -249,7 +357,13 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
                                  rho_mean = get(selfgrav, :rho_mean, 0),
                                  use_dm = get(selfgrav, :use_dm, false),
                                  residual = false)
-        elseif l >= 1 && get(selfgrav, :mg2, false)
+        elseif l >= max(1, get(selfgrav, :mg2_lmin, 3)) && get(selfgrav, :mg2, false)
+            # MG2's coarse correction carries a Dirichlet-0 halo — valid only for
+            # unions COMPACT relative to the periodic domain.  The shallow static
+            # levels (L1/L2 zoom sphere) span the box → the correction's long-
+            # wavelength part diverges (measured rend up to 1e9×r0; all 23 guard
+            # fires in the m2g bench were l ≤ 2).  They stay on the dense masked
+            # path (cheap there); mg2_lmin gates the handoff.
             # block-topology MG (MG2): resident-pool smoothing + one SMALL dense
             # coarse grid (bbox÷cfac) — no per-substep giant-pyramid traffic
             solve_gravity_level_mg2!(hier, l; source_coef = selfgrav.coef,
@@ -306,11 +420,14 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         _toc(lev.be, :capture, l, _t)
     else
         fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
+        _spwatch(hier, l, :ghost1)
         stage_level!(hier, l, λ; w = 0.0f0, IN = :R, OUT = :O)
         l >= 1   && capture_fine!(hier, l, :R, 0.25f0)
         haskids  && capture_coarse!(hier, l + 1, :R, 0.5f0)
         fill_ghosts!(hier, l; θ = 0.0f0, buf = :O)
+        _spwatch(hier, l, :ghost2)
         stage_level!(hier, l, λ; w = 0.5f0, IN = :O, OUT = :R)
+        _spwatch(hier, l, :stage2)
         l >= 1   && capture_fine!(hier, l, :O, 0.25f0)
         haskids  && capture_coarse!(hier, l + 1, :O, 0.5f0)
     end
@@ -339,7 +456,9 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
     if haskids
         _t = _tic(lev.be)
         restrict_level!(hier, l + 1)
+        _spwatch(hier, l, :restrict)
         reflux_apply!(hier, l + 1, λ)
+        _spwatch(hier, l, :reflux)
         _toc(lev.be, :restrict_reflux, l, _t)
         _nanstage!(hier, l, :restrict_reflux)
         # out-of-core: the child level is now fully advanced AND consumed by this

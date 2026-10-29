@@ -23,6 +23,25 @@ import ChemistryKernels: encode_log2sp, decode_log2sp
 
 @inline _lidx(i::Int32, j::Int32, k::Int32, nd::Int32) = (k * nd + j) * nd + i + Int32(1)
 
+# σΔ u16 species store: add the per-cell carried remainder, encode, carry the new
+# remainder.  Without this, any sub-quantum update re-encodes to the UNCHANGED
+# code — the stored species mass becomes X_old·ρ_new, which under compression at
+# an X-peak rectifies into systematic species-mass creation ∝ λ·F·∇X (the fH2/xe
+# pump; the applied/captured species flux contract broke at 1.0832 while the
+# no-encode host replication was exact).  The carry is bounded to ~2 codec quanta
+# of the stored value (clamp-to-zero / floor-code transients must not poison it).
+# The carry is in MASS units (ρX), NOT fraction units: a fraction remainder
+# recorded at ρ₁ and reinjected later at ρ₂ > ρ₁ is amplified by the compression
+# in between — still a pump.  Mass in, mass out, exact ledger.
+@inline function _sd_spstore!(res, idx::Int32, ρx::Float32, ρ::Float32)
+    want = ρx + res[idx]
+    code = encode_log2sp(max(want, 0.0f0) / ρ)
+    got  = decode_log2sp(Float32, code) * ρ
+    bnd  = 2.4f-3 * got + 1.0f-30
+    res[idx] = clamp(want - got, -bnd, bnd)
+    return code
+end
+
 # load one cell's conserved state as PHYSICAL f32 (per-block class scales un-lift)
 @inline function _loadU(D, S1, S2, S3, Tau, Ge, idx::Int32,
                         dsc::Float32, ssc::Float32, esc::Float32, gsc::Float32)
@@ -91,7 +110,10 @@ end
     ρL = WL[1]; ρR = WR[1]; PL = WL[5]; PR = WR[5]
     uL = ax == Int32(1) ? WL[2] : (ax == Int32(2) ? WL[3] : WL[4])
     uR = ax == Int32(1) ? WR[2] : (ax == Int32(2) ? WR[3] : WR[4])
-    cL = sqrt(γ * PL / ρL); cR = sqrt(γ * PR / ρR)
+    # DIAG(bisect): throw-free sqrt — if the deep-collapse DomainError vanishes
+    # with this clamp, _hllc is the thrower (upstream negative P or ρ).
+    cL = sqrt(ifelse(γ * PL / ρL < 0.0f0, 0.0f0, γ * PL / ρL))
+    cR = sqrt(ifelse(γ * PR / ρR < 0.0f0, 0.0f0, γ * PR / ρR))
     SL = @fastmath min(uL - cL, uR - cR)
     SR = @fastmath max(uL + cL, uR + cR)
     Ss = (PR - PL + ρL * uL * (SL - uL) - ρR * uR * (SR - uR)) /
@@ -156,10 +178,10 @@ end
 @kernel function _rk_stage_k!(Do_, S1o_, S2o_, S3o_, Tauo_, Geo_, spout,
                               @Const(D), @Const(S1), @Const(S2), @Const(S3),
                               @Const(Tau), @Const(Ge), spin,
-                              OldD, OldS1, OldS2, OldS3, OldTau, OldGe, spold,
-                              w::Float32, @Const(live_d),
+                              OldD, OldS1, OldS2, OldS3, OldTau, OldGe, spold, spres,
+                              sd::Int32, ew::Float32, w::Float32, @Const(live_d),
                               @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-                              λ::Float32, γ::Float32, η::Float32,
+                              λ::Float32, γ::Float32, η::Float32, scap::Float32,
                               B::Int32, ng::Int32, nd::Int32, stride::Int32,
                               ::Val{NS}) where {NS}
     t = @index(Global)
@@ -189,7 +211,15 @@ end
         nT  = Uc[5] - λ * dU5
         nG  = Uc[6] - λ * dU6
         wo = w; wi = 1.0f0 - w
-        nD  = wo * Float32(OldD[idx])   * dsc + wi * nD
+        # capture the OLD (step-start) physical density NOW: at stage 2 the Old*
+        # arrays ALIAS the output arrays (in-place R), so any OldD[idx] read
+        # placed after the gas stores below is ambiguous under alias analysis —
+        # CUDA reloaded the freshly-stored NEW density there while CPU LLVM
+        # reused this earlier load.  The species ρX_old = X_old·ρ_NEW variant
+        # skips the compression dilution of the old-mass term: the fH2/xe
+        # max-fraction pump, growing ½·(Δρ/ρ) per substep at the collapse core.
+        ρRold = Float32(OldD[idx]) * dsc
+        nD  = wo * ρRold + wi * nD
         nS1 = wo * Float32(OldS1[idx])  * ssc + wi * nS1
         nS2 = wo * Float32(OldS2[idx])  * ssc + wi * nS2
         nS3 = wo * Float32(OldS3[idx])  * ssc + wi * nS3
@@ -202,9 +232,32 @@ end
         # reaches Ge when the gas decelerates — the deep-core T→CMB-floor collapse.
         nD = max(nD, 1.0f-30)
         KE = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / nD
-        (nT - KE) > η * nT && (nG = nT - KE)
+        demax = _demax6(Tau, base, i, j, k, nd, esc)
+        (nT - KE) > η * demax && (nG = nT - KE)   # Enzo eta2 gate (η vs NEIGHBOR-MAX total)
+        # extreme-frontier safety (PORT OF THE CTU EPILOGUE GATE — this kernel
+        # historically had NONE, so a degenerate Riemann flux at the cooling-
+        # collapse frontier stored NaN directly: the firststar step-84 crash):
+        # nonfinite / positivity-violating / CFL-inconsistent updates keep the
+        # step-start state for this cell/substep instead of poisoning the level.
+        ok = isfinite(nD) & isfinite(nS1) & isfinite(nS2) & isfinite(nS3) &
+             isfinite(nT) & isfinite(nG) & (nD > 1.0f-30) & (nT > 0.0f0)
+        invD = 1.0f0 / max(nD, 1.0f-30)
+        vm = max(abs(nS1), max(abs(nS2), abs(nS3))) * invD
+        cn = sqrt(γ * (γ - 1.0f0) * max(nG, 1.0f-30) * invD)
+        ok &= (vm + cn) * λ < 1.0f0
+        ok &= (scap <= 0.0f0) | (vm + cn < scap)
+        if !ok
+            nD  = max(Float32(OldD[idx]) * dsc, 1.0f-30)
+            nS1 = Float32(OldS1[idx]) * ssc; nS2 = Float32(OldS2[idx]) * ssc
+            nS3 = Float32(OldS3[idx]) * ssc
+            nT  = Float32(OldTau[idx]) * esc
+            nG  = Float32(OldGe[idx]) * gsc
+        end
         nG = max(nG, 1.0f-30)
-        nT = KE + nG                                # reconstruct total energy (Tau ≡ KE + Ge)
+        # Enzo eta1: conservative total where thermal locally resolved; rebuild
+        # Tau = KE + Ge only in KE-dominated cells (see the CTU epilogue twin).
+        KEn = 0.5f0 * (nS1 * nS1 + nS2 * nS2 + nS3 * nS3) / max(nD, 1.0f-30)
+        nT = ifelse(nT - KEn > 1.0f-3 * nT, nT, KEn + nG)
         Do_[idx]   = _narrow(eltype(Do_), nD / dsc)
         S1o_[idx]  = _narrow(eltype(S1o_), nS1 / ssc)
         S2o_[idx]  = _narrow(eltype(S2o_), nS2 / ssc)
@@ -214,7 +267,7 @@ end
         # ── species CMA: X rides the six HLLC mass fluxes, upwinded per face; the
         # conserved quantity is ρX (fractions decode from the absolute u16 codec) ──
         if NS > 0
-            ρR = Float32(OldD[idx]) * dsc                 # OLD physical density (R)
+            ρR = ρRold                                    # OLD physical density (R), pre-store copy
             ixm = base + _lidx(i - Int32(1), j, k, nd); ixp = base + _lidx(i + Int32(1), j, k, nd)
             iym = base + _lidx(i, j - Int32(1), k, nd); iyp = base + _lidx(i, j + Int32(1), k, nd)
             izm = base + _lidx(i, j, k - Int32(1), nd); izp = base + _lidx(i, j, k + Int32(1), nd)
@@ -229,7 +282,26 @@ end
                       Fz0[1] * (Fz0[1] >= 0.0f0 ? decode_log2sp(Float32, sq[izm]) : Xc)
                 ρXold = decode_log2sp(Float32, spold[q][idx]) * ρR
                 ρXnew = wo * ρXold + wi * (Xc * Uc[1] - λ * aX)
-                spout[q][idx] = encode_log2sp(max(ρXnew, 0.0f0) / max(nD, 1.0f-30))
+                if ok
+                    ρxq = max(ρXnew, 0.0f0); ρq = max(nD, 1.0f-30)
+                    if sd == Int32(1)
+                        # σΔ carry consumed only at the PERSISTENT (R) store:
+                        # consuming it at the intermediate O store too double-
+                        # counts a frozen cell's stage-1 increment.
+                        spout[q][idx] = _sd_spstore!(spres[q], idx, ρxq, ρq)
+                    else
+                        code = encode_log2sp(ρxq / ρq)
+                        # intermediate (O) store: deposit its quantization error
+                        # into the carry, weighted by the NEXT stage's wi (SSP-
+                        # RK2: ½) — stage 2's own-cell mass term reads the coded
+                        # O, so this exactly restores the stage-1 loss.
+                        ew > 0.0f0 &&
+                            (spres[q][idx] += ew * (ρxq - decode_log2sp(Float32, code) * ρq))
+                        spout[q][idx] = code
+                    end
+                else
+                    spout[q][idx] = spold[q][idx]
+                end
             end
         end
     end
@@ -282,7 +354,8 @@ always the R buffers (SSP-RK2's U^n; stage 2 writes R in place, which is safe �
 only the cell's own R value is read).
 """
 function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
-                      w::Float32, IN::Symbol, OUT::Symbol, η::Float32 = 1.0f-3)
+                      w::Float32, IN::Symbol, OUT::Symbol,
+                      η::Float32 = Float32(parse(Float64, get(ENV, "BAM_DE_ETA2", "0.1"))))
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     fin  = IN === :R ? gasfields(lev) : gasfields_o(lev)
@@ -292,10 +365,17 @@ function stage_level!(hier::AMRHierarchy, l::Int, λ::Float32;
     sin_  = IN === :R ? ntuple(q -> lev.sp[q], NS)  : ntuple(q -> lev.spo[q], NS)
     sout_ = OUT === :R ? ntuple(q -> lev.sp[q], NS) : ntuple(q -> lev.spo[q], NS)
     sold_ = ntuple(q -> lev.sp[q], NS)
+    sres_ = ntuple(q -> lev.spr[q], NS)
     n = length(lev.live) * lev.B^3
-    _rk_stage_k!(lev.be)(fout..., sout_, fin..., sin_, fold..., sold_, w, lev.live_d,
+    scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
+    sd = OUT === :R ? Int32(1) : Int32(0)     # σΔ at the persistent store only
+    ew = OUT === :R ? 0.0f0 : 0.5f0           # O-store error → carry, stage-2 wi
+    if get(ENV, "BAM_NO_SPSD", "0") == "1"    # diag: plain encode (pre-σΔ behavior)
+        sd = Int32(0); ew = 0.0f0
+    end
+    _rk_stage_k!(lev.be)(fout..., sout_, fin..., sin_, fold..., sold_, sres_, sd, ew, w, lev.live_d,
                          lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, λ,
-                         Float32(hier.gamma), η, Int32(lev.B), Int32(lev.ng),
+                         Float32(hier.gamma), η, scap, Int32(lev.B), Int32(lev.ng),
                          Int32(lev.nd), Int32(lev.stride), Val(NS); ndrange = n)
     return nothing
 end

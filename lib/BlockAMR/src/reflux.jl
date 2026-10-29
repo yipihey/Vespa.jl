@@ -77,7 +77,13 @@ function build_cf_register!(hier::AMRHierarchy, l::Int)
     n, ent = build_cf_faces(lev, plev)
     lev.tabs[:cfn]   = n
     lev.tabs[:cf]    = to_device(lev.be, ent, Int32)
-    lev.tabs[:cfreg] = device_zeros(lev.be, Float32, (max(6n, 1),))
+    # 6 + nsp lanes: 5 conserved + ge + the SPECIES ρX CMA lanes.  Without the
+    # species lanes the fine and coarse sides disagree about the species mass
+    # crossing every C/F face and the mismatch is never reconciled — measured
+    # ΣρX creation at C/F rings (the in-run xe/fH2 fraction pump: species mass
+    # made at every level's boundary ring around the collapsing core, ×10 per
+    # new level; gas mass exact, max-X bounded, single-level CMA exact).
+    lev.tabs[:cfreg] = device_zeros(lev.be, Float32, (max((6 + lev.nsp) * n, 1),))
     # group entries by unique target coarse cell → atomic-free apply
     keyof(i) = (ent[16(i-1)+1], ent[16(i-1)+2], ent[16(i-1)+3], ent[16(i-1)+4])
     perm = sort!(collect(Int32, 1:n); by = keyof)
@@ -89,6 +95,12 @@ function build_cf_register!(hier::AMRHierarchy, l::Int)
     lev.tabs[:cfng]   = max(length(gs) - 1, 0)
     lev.tabs[:cfperm] = to_device(lev.be, perm, Int32)
     lev.tabs[:cfgs]   = to_device(lev.be, gs, Int32)
+    # per-target-cell f32 species-correction RESIDUAL: the u16 codec quantum
+    # (~8e-4 relative) is 60-300× the per-apply ρX correction, so a naive
+    # encode drops EVERY correction (measured: reflux lanes bit-inert).  Carry
+    # the unrepresentable remainder across applies so corrections integrate.
+    lev.tabs[:cfres] = device_zeros(lev.be, Float32,
+                                    (max(lev.nsp * max(length(gs) - 1, 0), 1),))
     return nothing
 end
 
@@ -118,12 +130,16 @@ end
     return F, gf
 end
 
-# reg −= wc · F_coarse   (the flux the coarse sweep applied at the interface)
+# reg −= wc · F_coarse   (the flux the coarse sweep applied at the interface).
+# Species lanes 7..6+NS: ρX = F_mass·X_upwind — the SAME CMA upwinding the RK2
+# kernel applied; without these lanes the fine/coarse species-mass mismatch at
+# every C/F face is never reconciled (the measured ΣρX creation → xe/fH2 pump).
 @kernel function _capture_coarse_k!(reg, @Const(ent),
                                     @Const(D), @Const(S1), @Const(S2), @Const(S3),
-                                    @Const(Tau), @Const(Ge),
+                                    @Const(Tau), @Const(Ge), spin,
                                     @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-                                    wc::Float32, γ::Float32, nd::Int32, stride::Int32)
+                                    wc::Float32, γ::Float32, nd::Int32, stride::Int32,
+                                    ::Val{NS}) where {NS}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -143,13 +159,26 @@ end
         # register contribution is ZERO — never let NaN into the register.
         ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
              isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
-        r = (Int32(e) - Int32(1)) * Int32(6)
+        r = (Int32(e) - Int32(1)) * (Int32(6) + Int32(NS))
         reg[r+1] -= wc * ifelse(ok, F[1], 0.0f0)
         reg[r+2] -= wc * ifelse(ok, F[2], 0.0f0)
         reg[r+3] -= wc * ifelse(ok, F[3], 0.0f0)
         reg[r+4] -= wc * ifelse(ok, F[4], 0.0f0)
         reg[r+5] -= wc * ifelse(ok, F[5], 0.0f0)
         reg[r+6] -= wc * ifelse(ok, gf,   0.0f0)
+        if NS > 0
+            di = ax == Int32(1) ? Int32(1) : Int32(0)
+            dj = ax == Int32(2) ? Int32(1) : Int32(0)
+            dk = ax == Int32(3) ? Int32(1) : Int32(0)
+            iL = base + _lidx(i, j, k, nd)
+            iR = base + _lidx(i + di, j + dj, k + dk, nd)
+            for q in 1:NS
+                XL = decode_log2sp(Float32, spin[q][iL])
+                XR = decode_log2sp(Float32, spin[q][iR])
+                fX = F[1] * (F[1] >= 0.0f0 ? XL : XR)
+                reg[r+Int32(6)+Int32(q)] -= wc * ifelse(ok & isfinite(fX), fX, 0.0f0)
+            end
+        end
     end
 end
 
@@ -160,13 +189,16 @@ end
                                         @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                         @Const(Tau), @Const(Ge),
                                         @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                                        @Const(Vb),
                                         wc::Float32, λ::Float32, γ::Float32,
-                                        nd::Int32, stride::Int32)
+                                        nd::Int32, stride::Int32, nspreg::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+1] - Int32(1)) * stride
         dsc = Dsc[ent[b+1]]; ssc = Ssc[ent[b+1]]; esc = Esc[ent[b+1]]; gsc = Gsc[ent[b+1]]
+        vq = 3 * (ent[b+1] - Int32(1))
+        vb1 = Vb[vq+1]; vb2 = Vb[vq+2]; vb3 = Vb[vq+3]   # block's bulk frame (BAM_BULKV)
         ci = ent[b+2]; cj = ent[b+3]; ck = ent[b+4]
         ax = ent[b+5]; side = ent[b+6]
         sh = side == Int32(1) ? Int32(-1) : Int32(0)
@@ -174,10 +206,13 @@ end
         j = cj + (ax == Int32(2) ? sh : Int32(0))
         k = ck + (ax == Int32(3) ? sh : Int32(0))
         F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                           dsc, ssc, esc, gsc)
+                           dsc, ssc, esc, gsc, vb1, vb2, vb3)
         ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
              isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
-        r = (Int32(e) - Int32(1)) * Int32(6)
+        # TODO(ctu-species-reflux): species lanes left ZERO on the CTU path —
+        # register stride is (6+NS) for layout compatibility (nsp passed via
+        # the launch's nspreg).  Production scheme is :rk2, which has them.
+        r = (Int32(e) - Int32(1)) * (Int32(6) + nspreg)
         reg[r+1] -= wc * ifelse(ok, F[1], 0.0f0)
         reg[r+2] -= wc * ifelse(ok, F[2], 0.0f0)
         reg[r+3] -= wc * ifelse(ok, F[3], 0.0f0)
@@ -191,13 +226,16 @@ end
                                       @Const(D), @Const(S1), @Const(S2), @Const(S3),
                                       @Const(Tau), @Const(Ge),
                                       @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                                      @Const(Vb),
                                       wf::Float32, λ::Float32, γ::Float32,
-                                      nd::Int32, stride::Int32)
+                                      nd::Int32, stride::Int32, nspreg::Int32)
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
         base = (ent[b+7] - Int32(1)) * stride
         dsc = Dsc[ent[b+7]]; ssc = Ssc[ent[b+7]]; esc = Esc[ent[b+7]]; gsc = Gsc[ent[b+7]]
+        vq = 3 * (ent[b+7] - Int32(1))
+        vb1 = Vb[vq+1]; vb2 = Vb[vq+2]; vb3 = Vb[vq+3]   # block's bulk frame (BAM_BULKV)
         fi = ent[b+8]; fj = ent[b+9]; fk = ent[b+10]
         ax = ent[b+5]; side = ent[b+6]
         sh = side == Int32(1) ? Int32(0) : Int32(-1)
@@ -213,26 +251,28 @@ end
             j = fj + (ax == Int32(2) ? sh : Int32(0)) + s1 * t1j + s2 * t2j
             k = fk + (ax == Int32(3) ? sh : Int32(0)) + s1 * t1k + s2 * t2k
             F, gf = _ctu_face6(D, S1, S2, S3, Tau, Ge, base, i, j, k, nd, λ, γ, ax,
-                               dsc, ssc, esc, gsc)
+                               dsc, ssc, esc, gsc, vb1, vb2, vb3)
             ok = isfinite(F[1]) & isfinite(F[2]) & isfinite(F[3]) &
                  isfinite(F[4]) & isfinite(F[5]) & isfinite(gf)
             a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
             a3 += ifelse(ok, F[3], 0.0f0); a4 += ifelse(ok, F[4], 0.0f0)
             a5 += ifelse(ok, F[5], 0.0f0); a6 += ifelse(ok, gf,   0.0f0)
         end
-        r = (Int32(e) - Int32(1)) * Int32(6)
+        # TODO(ctu-species-reflux): see the coarse CTU capture note.
+        r = (Int32(e) - Int32(1)) * (Int32(6) + nspreg)
         q = 0.25f0 * wf
         reg[r+1] += q * a1; reg[r+2] += q * a2; reg[r+3] += q * a3
         reg[r+4] += q * a4; reg[r+5] += q * a5; reg[r+6] += q * a6
     end
 end
 
-# reg += wf · ¼ Σ_{2×2 subfaces} F_fine
+# reg += wf · ¼ Σ_{2×2 subfaces} F_fine  (+ species ρX lanes, as in the coarse capture)
 @kernel function _capture_fine_k!(reg, @Const(ent),
                                   @Const(D), @Const(S1), @Const(S2), @Const(S3),
-                                  @Const(Tau), @Const(Ge),
+                                  @Const(Tau), @Const(Ge), spin,
                                   @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-                                  wf::Float32, γ::Float32, nd::Int32, stride::Int32)
+                                  wf::Float32, γ::Float32, nd::Int32, stride::Int32,
+                                  ::Val{NS}) where {NS}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -244,6 +284,10 @@ end
         # lo face for side=−1 (window at cell−1)
         sh = side == Int32(1) ? Int32(0) : Int32(-1)
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
+        aXa = 0.0f0; aXb = 0.0f0
+        di = ax == Int32(1) ? Int32(1) : Int32(0)
+        dj = ax == Int32(2) ? Int32(1) : Int32(0)
+        dk = ax == Int32(3) ? Int32(1) : Int32(0)
         t1i = ax == Int32(1) ? Int32(0) : Int32(1)                 # transverse unit 1
         t1j = ax == Int32(1) ? Int32(1) : Int32(0)
         t1k = Int32(0)
@@ -260,32 +304,51 @@ end
             a1 += ifelse(ok, F[1], 0.0f0); a2 += ifelse(ok, F[2], 0.0f0)
             a3 += ifelse(ok, F[3], 0.0f0); a4 += ifelse(ok, F[4], 0.0f0)
             a5 += ifelse(ok, F[5], 0.0f0); a6 += ifelse(ok, gf,   0.0f0)
+            if NS > 0
+                iL = base + _lidx(i, j, k, nd)
+                iR = base + _lidx(i + di, j + dj, k + dk, nd)
+                for q in 1:NS
+                    XL = decode_log2sp(Float32, spin[q][iL])
+                    XR = decode_log2sp(Float32, spin[q][iR])
+                    fX = F[1] * (F[1] >= 0.0f0 ? XL : XR)
+                    okX = ok & isfinite(fX)
+                    q == 1 && (aXa += ifelse(okX, fX, 0.0f0))
+                    q == 2 && (aXb += ifelse(okX, fX, 0.0f0))
+                end
+            end
         end
-        r = (Int32(e) - Int32(1)) * Int32(6)
+        r = (Int32(e) - Int32(1)) * (Int32(6) + Int32(NS))
         q = 0.25f0 * wf
         reg[r+1] += q * a1; reg[r+2] += q * a2; reg[r+3] += q * a3
         reg[r+4] += q * a4; reg[r+5] += q * a5; reg[r+6] += q * a6
+        NS >= 1 && (reg[r+7] += q * aXa)
+        NS >= 2 && (reg[r+8] += q * aXb)
     end
 end
 
 # U_coarse += λ_c · side · reg, GROUPED by target cell (one thread per unique
 # coarse cell sums all its face entries) — atomic-free (f16 has no atomics) and
 # scale-aware (physical correction ÷ the target block's class scale on store).
-@kernel function _reflux_apply_k!(D, S1, S2, S3, Tau, Ge,
+@kernel function _reflux_apply_k!(D, S1, S2, S3, Tau, Ge, sp, res,
                                   @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                   @Const(ent), @Const(reg), @Const(perm), @Const(gs),
-                                  λc::Float32, γ::Float32, scap::Float32,
-                                  nd::Int32, stride::Int32)
+                                  λc::Float32, γ::Float32, scap::Float32, geref::Float32,
+                                  spref::Float32,
+                                  taurecon::Float32, nd::Int32, stride::Int32,
+                                  ::Val{NS}) where {NS}
     g = @index(Global)
     @inbounds begin
         a1 = 0.0f0; a2 = 0.0f0; a3 = 0.0f0; a4 = 0.0f0; a5 = 0.0f0; a6 = 0.0f0
+        aXa = 0.0f0; aXb = 0.0f0
         for ii in gs[g]:gs[Int32(g)+Int32(1)] - Int32(1)
             e = perm[ii]
             b = (e - Int32(1)) * Int32(16)
             w = λc * Float32(ent[b+6])
-            r = (e - Int32(1)) * Int32(6)
+            r = (e - Int32(1)) * (Int32(6) + Int32(NS))
             a1 += w * reg[r+1]; a2 += w * reg[r+2]; a3 += w * reg[r+3]
             a4 += w * reg[r+4]; a5 += w * reg[r+5]; a6 += w * reg[r+6]
+            NS >= 1 && (aXa += w * reg[r+7])
+            NS >= 2 && (aXb += w * reg[r+8])
         end
         e0 = perm[gs[g]]
         b = (e0 - Int32(1)) * Int32(16)
@@ -298,7 +361,14 @@ end
         nS2 = Float32(S2[idx])  + a3 / ssc
         nS3 = Float32(S3[idx])  + a4 / ssc
         nT  = Float32(Tau[idx]) + a5 / esc
-        nG  = Float32(Ge[idx])  + a6 / gsc
+        nG  = Float32(Ge[idx])  + geref * a6 / gsc   # geref: BAM_NO_GEREFLUX diag (0 skips Ge reflux)
+        # taurecon (BAM_TAU_RECON, default on): re-derive Tau = KE(S,D)+Ge from the
+        # refluxed momenta/density/internal energy instead of the independent a5
+        # total-energy flux correction — same phantom-dispersion cure as the
+        # restriction reconstruct, so the sync can't heat this C/F coarse cell.
+        ρp = max(nD * dsc, 1.0f-30)
+        keR = 0.5f0 * ((nS1*ssc)^2 + (nS2*ssc)^2 + (nS3*ssc)^2) / ρp
+        nT  = ifelse(taurecon > 0.5f0, (keR + max(nG,1.0f-30) * gsc) / esc, nT)
         # keep-old-state safety (the hydro-epilogue twin): a nonfinite,
         # positivity-violating, or CFL-inconsistent correction must never
         # overwrite a finite coarse cell (see the CTU epilogue cap).
@@ -312,6 +382,34 @@ end
         # absolute signal cap (BAM_SMAXCAP) — see the CTU epilogue twin: the
         # λ-relative bound alone ratchets under a hot-cell/shrinking-λ feedback
         ok &= (scap <= 0.0f0) | (vm + cn < scap)
+        # species: apply the ρX correction consistently with the ρ correction.
+        # The u16 quantum is far larger than a single apply's correction, so we
+        # accumulate into the per-target f32 residual `res` and encode the
+        # TARGET value; whatever the codec cannot represent stays in `res` for
+        # the next apply (first-order sigma-delta — corrections integrate
+        # instead of being rounded away every substep).
+        ρold = max(Float32(D[idx]) * dsc, 1.0f-30)
+        ρnew = max(nD * dsc, 1.0f-30)
+        if NS >= 1 && spref > 0.0f0
+            Xo = decode_log2sp(Float32, sp[1][idx])
+            want = Xo * ρold + aXa + res[(Int32(g)-Int32(1))*Int32(NS)+Int32(1)]
+            if ok
+                code = encode_log2sp(max(want, 0.0f0) / ρnew)
+                got = decode_log2sp(Float32, code) * ρnew
+                sp[1][idx] = code
+                res[(Int32(g)-Int32(1))*Int32(NS)+Int32(1)] = want - got
+            end
+        end
+        if NS >= 2 && spref > 0.0f0
+            Xo = decode_log2sp(Float32, sp[2][idx])
+            want = Xo * ρold + aXb + res[(Int32(g)-Int32(1))*Int32(NS)+Int32(2)]
+            if ok
+                code = encode_log2sp(max(want, 0.0f0) / ρnew)
+                got = decode_log2sp(Float32, code) * ρnew
+                sp[2][idx] = code
+                res[(Int32(g)-Int32(1))*Int32(NS)+Int32(2)] = want - got
+            end
+        end
         D[idx]   = ok ? _narrow(eltype(D),   nD)  : D[idx]
         S1[idx]  = ok ? _narrow(eltype(S1),  nS1) : S1[idx]
         S2[idx]  = ok ? _narrow(eltype(S2),  nS2) : S2[idx]
@@ -334,16 +432,19 @@ function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
     ff = buf === :R ? gasfields(lev) : gasfields_o(lev)
+    NS = lev.nsp
+    sf = buf === :R ? ntuple(q -> lev.sp[q], NS) : ntuple(q -> lev.spo[q], NS)
     if hier.scheme === :ctu
         _capture_fine_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
-                                     lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, w, λ,
+                                     lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, _vbtab(lev),
+                                     w, λ,
                                      Float32(hier.gamma), Int32(lev.nd),
-                                     Int32(lev.stride); ndrange = n)
+                                     Int32(lev.stride), Int32(NS); ndrange = n)
     else
-        _capture_fine_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff...,
+        _capture_fine_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), ff..., sf,
                                  lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, w,
                                  Float32(hier.gamma), Int32(lev.nd),
-                                 Int32(lev.stride); ndrange = n)
+                                 Int32(lev.stride), Val(NS); ndrange = n)
     end
     return nothing
 end
@@ -360,16 +461,19 @@ function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
     fc = buf === :R ? gasfields(plev) : gasfields_o(plev)
+    NS = lev.nsp
+    sc = buf === :R ? ntuple(q -> plev.sp[q], NS) : ntuple(q -> plev.spo[q], NS)
     if hier.scheme === :ctu
         _capture_coarse_ctu_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
-                                       plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc, w, λ,
+                                       plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
+                                       _vbtab(plev), w, λ,
                                        Float32(hier.gamma), Int32(plev.nd),
-                                       Int32(plev.stride); ndrange = n)
+                                       Int32(plev.stride), Int32(NS); ndrange = n)
     else
-        _capture_coarse_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc...,
+        _capture_coarse_k!(lev.be)(_tabf(lev, :cfreg), _tabi(lev, :cf), fc..., sc,
                                    plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc, w,
                                    Float32(hier.gamma), Int32(plev.nd),
-                                   Int32(plev.stride); ndrange = n)
+                                   Int32(plev.stride), Val(NS); ndrange = n)
     end
     return nothing
 end
@@ -394,11 +498,17 @@ function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
     ng_ = lev.tabs[:cfng]::Int
     ng_ == 0 && return nothing
     scap = Float32(parse(Float64, get(ENV, "BAM_SMAXCAP", "0")))
-    _reflux_apply_k!(lev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
+    geref = get(ENV, "BAM_NO_GEREFLUX", "0") == "1" ? 0.0f0 : 1.0f0   # diag: skip Ge-lane reflux
+    spref = get(ENV, "BAM_NO_SPREFLUX", "0") == "1" ? 0.0f0 : 1.0f0   # diag: skip species-lane reflux
+    taurecon = get(ENV, "BAM_TAU_RECON", "0") == "1" ? 1.0f0 : 0.0f0  # re-derive Tau=KE+Ge post-reflux (opt-in; breaks shock conservation)
+    NS = lev.nsp
+    spc = ntuple(q -> plev.sp[q], NS)
+    _reflux_apply_k!(lev.be)(gasfields(plev)..., spc, _tabf(lev, :cfres),
+                             plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                              _tabi(lev, :cf), _tabf(lev, :cfreg),
                              _tabi(lev, :cfperm), _tabi(lev, :cfgs), λc,
-                             Float32(hier.gamma), scap,
-                             Int32(plev.nd), Int32(plev.stride); ndrange = ng_)
+                             Float32(hier.gamma), scap, geref, spref, taurecon,
+                             Int32(plev.nd), Int32(plev.stride), Val(NS); ndrange = ng_)
     fill!(_tabf(lev, :cfreg), 0.0f0)
     return nothing
 end

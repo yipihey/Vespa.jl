@@ -37,6 +37,15 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     Do::V; S1o::V; S2o::V; S3o::V; Tauo::V; Geo::V
     sp       :: Vector{U}
     spo      :: Vector{U}
+    # per-cell f32 sigma-delta residuals for the u16 species stores (X units):
+    # every encode carries the sub-quantum remainder forward, so slow advective /
+    # chemical X changes are never FROZEN by the codec quantum.  (The freeze was
+    # the fH2/xe pump: a sub-quantum update re-encodes to the unchanged code, so
+    # the stored species mass becomes X_old·ρ_new — under compression at an
+    # X-peak that rectifies into systematic species-mass creation ∝ λ·F·∇X.)
+    # ONE accumulator per cell per species, shared by all writers; NOT ping-
+    # ponged in swap_buffers! — it follows the cell, not the R/O buffer.
+    spr      :: Vector{F}
     # ── per-block power-of-two f32 scales (identity until the f16 phase) ──
     # Dsc=D, Ssc=S1..S3, Esc=Tau (TOTAL energy), Gsc=Ge (internal energy).  Ge has
     # its OWN scale (not shared with Tau): in a cold kinetic-dominated core Tau≫Ge,
@@ -86,6 +95,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
     # regrid/compact/prolong paths skip zero-length gas fields (isempty guards).
     gz() = gravity_only ? device_zeros(be, T, (0,)) : zed()
     zu()  = (gravity_only ? device_zeros(be, UInt16, (0,)) : device_zeros(be, UInt16, (cap0 * stride,)))
+    zf()  = (gravity_only ? device_zeros(be, Float32, (0,)) : device_zeros(be, Float32, (cap0 * stride,)))
     ones32(n) = to_device(be, ones(Float32, n), Float32)
     lev = Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
         l, B, ng, nd, stride, P, th, cap0, nsp, be,
@@ -94,6 +104,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         zed(), gz(), gz(), gz(), gz(), gz(),
         gz(), gz(), gz(), gz(), gz(), gz(),
         [zu() for _ in 1:nsp], [zu() for _ in 1:nsp],
+        [zf() for _ in 1:nsp],
         ones32(cap0), ones32(cap0), ones32(cap0), ones32(cap0),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
@@ -125,6 +136,7 @@ function _grow!(lev::Level, newcap::Int)
     lev.S3o = grow(lev.S3o); lev.Tauo = grow(lev.Tauo); lev.Geo = grow(lev.Geo)
     lev.sp  = [grow(a) for a in lev.sp]
     lev.spo = [grow(a) for a in lev.spo]
+    lev.spr = [grow(a) for a in lev.spr]
     growsc(a) = (b = to_device(lev.be, ones(Float32, newcap), Float32);
                  copyto!(view(b, 1:lev.cap), view(a, 1:lev.cap)); b)
     lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc); lev.Gsc = growsc(lev.Gsc)
@@ -443,6 +455,10 @@ function zero_slots!(lev::Level, slots::Vector{Int32})
     for A in lev.spo
         _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
     end
+    for A in lev.spr
+        length(A) == 0 && continue
+        _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
+    end
     return nothing
 end
 
@@ -451,7 +467,8 @@ end
 function level_bytes(lev::Level)
     b(a) = length(a) * sizeof(eltype(a))
     gas  = sum(b, gasfields(lev)) + sum(b, gasfields_o(lev))     # 12 f16 pools
-    spb  = sum(b, lev.sp; init = 0) + sum(b, lev.spo; init = 0)  # 2·nsp u16 pools
+    spb  = sum(b, lev.sp; init = 0) + sum(b, lev.spo; init = 0) +  # 2·nsp u16 pools
+           sum(b, lev.spr; init = 0)                               # + nsp f32 σΔ residuals
     grav = b(lev.phi) + b(lev.rhs) + b(lev.dm)                   # f32 phi/rhs/dm
     sc   = b(lev.Dsc) + b(lev.Ssc) + b(lev.Esc) + b(lev.Gsc) + b(lev.live_d)  # per-block, tiny
     tabs = sum((t isa RectJobTable ? b(t.jobs) + b(t.cellstart) : 0
@@ -493,7 +510,7 @@ end
 # All field pools of a level, in one tuple (dm/sp/spo may be empty).
 _field_pools(lev::Level) = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge,
                             lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo,
-                            lev.phi, lev.rhs, lev.dm, lev.sp..., lev.spo...)
+                            lev.phi, lev.rhs, lev.dm, lev.sp..., lev.spo..., lev.spr...)
 
 "Prefetch a level's field pools + device tables onto the GPU (managed mode only)."
 function prefetch_level!(lev::Level)
@@ -558,6 +575,7 @@ function evict_gas_pools!(hier::AMRHierarchy)
         for a in gasfields_o(lev); prefetch_host!(a); end
         for a in lev.sp;  prefetch_host!(a); end
         for a in lev.spo; prefetch_host!(a); end
+        for a in lev.spr; prefetch_host!(a); end
     end
     return hier
 end

@@ -89,12 +89,21 @@ end
             # sub-CMB) — unphysical (gas can't Compton-cool below the CMB).  efloor is
             # the code specific-energy at T_CMB(z); 0 disables (library default).
             en = e32[Int32(t)]
-            en < efloor && (en = efloor)
-            ge_new = en * rho32[Int32(t)]
-            Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
-            Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
-            sp1[idx] = h16[Int32(t)]
-            sp2[idx] = m16[Int32(t)]
+            ρn = rho32[Int32(t)]
+            # NONFINITE GATE (keep-old-state, the hydro-epilogue philosophy): a
+            # solver edge case returning NaN/Inf must never leave the scratch
+            # buffers — `NaN < efloor` is FALSE, so without this check the NaN
+            # sailed through the floor into Ge AND Tau (the firststar1 z≈24
+            # stochastic crash: deposit-atomics jitter shifts which cells hit
+            # the evolve_cell_analytic corners run-to-run).
+            if isfinite(en) && isfinite(ρn) && ρn > 0.0f0
+                en < efloor && (en = efloor)
+                ge_new = en * ρn
+                Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
+                Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
+                sp1[idx] = h16[Int32(t)]
+                sp2[idx] = m16[Int32(t)]
+            end
         end
     end
 end
@@ -155,6 +164,49 @@ end
     end
 end
 
+# :full_f32 scatter: identical gating to _chem_scatter_k!, but the species come
+# back as f32 MASS DENSITIES and the u16 encode happens HERE, through the σΔ
+# residual (_sd_spstore!).  Without the carry, a slow process (e.g. IGM H₂
+# formation) whose per-call change is below the codec quantum re-freezes to the
+# same code every call and never advances — the chem twin of the advective
+# fH2/xe pump fixed in _rk_stage_k!.
+@kernel function _chem_scatter_f32_k!(Ge, Tau, sp1, sp2, spr1, spr2,
+                                  @Const(rho32), @Const(e32), @Const(hf), @Const(mf),
+                                  @Const(D), @Const(cov), @Const(live_d), @Const(Dsc), @Const(Esc), @Const(Gsc),
+                                  B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                                  efloor::Float32, ecap::Float32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B3 = B * B * B
+    bi = t0 ÷ B3; c = t0 % B3
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        base = (slot - Int32(1)) * stride
+        i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
+        idx = base + _lidx(i, j, k, nd)
+        d16s = Float32(D[idx])
+        ehot = ecap > 0.0f0 &&
+               Float32(Ge[idx]) * Gsc[slot] > ecap * max(d16s * Dsc[slot], 1.0f-30)
+        if d16s > 6.103515625f-5 && !ehot && cov[idx] == 0x00
+            esc = Esc[slot]; gsc = Gsc[slot]
+            ge_old = Float32(Ge[idx]) * gsc
+            en = e32[Int32(t)]
+            ρn = rho32[Int32(t)]
+            if isfinite(en) && isfinite(ρn) && ρn > 0.0f0
+                en < efloor && (en = efloor)
+                ge_new = en * ρn
+                Ge[idx]  = _narrow(eltype(Ge), ge_new / gsc)
+                Tau[idx] = _narrow(eltype(Tau), (Float32(Tau[idx]) * esc + (ge_new - ge_old)) / esc)
+                ρq = max(ρn, 1.0f-30)
+                m1 = hf[Int32(t)]
+                m2 = mf[Int32(t)]
+                isfinite(m1) && (sp1[idx] = _sd_spstore!(spr1, idx, max(m1, 0.0f0), ρq))
+                isfinite(m2) && (sp2[idx] = _sd_spstore!(spr2, idx, max(m2, 0.0f0), ρq))
+            end
+        end
+    end
+end
+
 # LEAF-ONLY chem (RAMSES cooling-on-leaves): cells covered by a child level
 # are overwritten by restriction every substep — chem iterations there are
 # discarded work, and at a stiff collapse core EVERY level except the deepest
@@ -200,6 +252,18 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     _chem_gather_k!(lev.be)(rho32, e32, h16, m16, lev.D, lev.Ge, lev.sp[1], lev.sp[2],
                             cov, lev.live_d, lev.Dsc, lev.Gsc, Int32(lev.B), Int32(lev.ng),
                             Int32(lev.nd), Int32(lev.stride), hfloor, ecap; ndrange = n)
+    # BAM_CHEMTRACE=<level>: per-call trace of the densest cell's chem in/out
+    # (the in-situ state-history probe — 0-D reconstructions of the fH2 pump all
+    # came out clean, so record what states the run ACTUALLY feeds the solver).
+    trl = parse(Int, get(ENV, "BAM_CHEMTRACE", "-1"))
+    if trl == l
+        im = argmax(Array(rho32)[1:n])
+        ρi = Array(view(rho32, im:im))[1]; ei = Array(view(e32, im:im))[1]
+        xi = ChemistryKernels.decode_log2sp(Float32, Array(view(h16, im:im))[1])
+        mi = ChemistryKernels.decode_log2sp(Float32, Array(view(m16, im:im))[1])
+        @printf("CHEMTRACE L%d IN : dt=%.3e rho=%.4e e=%.4e T=%.1fK xHII=%.4e fH2=%.4e\n",
+                l, dt, ρi, ei, ei*(hier.gamma-1)*1.22*T2K, xi/fh, mi/fh)
+    end
     dbg = get(ENV, "BAM_CHEMDBG", "0") == "1"
     local rin, ein, hin, min_
     if dbg
@@ -218,11 +282,15 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     ckw = (; a_value, dt, density_units, length_units, time_units,
            hubble, Om, OL, fh, dtfrac, itcap, rate_tables, cool_tables,
            backend = hier.besym, precision = Float32)
+    local hf32, mf32
     if mode === :full_f32
         hf, mf = _chembufs_f32(lev); hf = view(hf, 1:n); mf = view(mf, 1:n)
         _sp_u16_to_massdens_k!(lev.be)(hf, mf, h16, m16, rho32; ndrange = n)
         ChemistryKernels.solve_chem_device!(rho32, e32, hf, mf; ckw...)
-        _sp_massdens_to_u16_k!(lev.be)(h16, m16, hf, mf, rho32; ndrange = n)
+        # NO re-encode into h16/m16 here: the u16 encode happens in the σΔ
+        # scatter below (it knows the cell index, so it can carry the per-cell
+        # sub-quantum remainder in lev.spr).
+        hf32 = hf; mf32 = mf
     elseif mode === :full_u16
         ChemistryKernels.solve_chem_device_u16!(rho32, e32, h16, m16; ckw...)
     elseif rho_switch > 0 || mode === :hybrid
@@ -274,17 +342,42 @@ function chem_level!(hier::AMRHierarchy, l::Int, dt::Real;
     end
     # CMB specific-energy floor (code units) at the current redshift, μ=1.22
     # (neutral primordial).  T_CMB = 2.725·(1+z) = 2.725/a; T2 = (l/t)²·mH/kB.
-    # Gated by BAM_TCMB_FLOOR (multiple of T_CMB; unset/0 ⇒ disabled).
-    tcmb_mult = parse(Float64, get(ENV, "BAM_TCMB_FLOOR", "0"))
+    # Primordial gas cannot Compton- or H₂-cool below the CMB (the H₂ cooling
+    # function is CMB-pumped → 0 at T_CMB), so the floor is ON by default at
+    # exactly T_CMB.  BAM_TCMB_FLOOR overrides the multiple (0 ⇒ disable, e.g.
+    # for a non-cosmological chem test where a_value is a dummy).
+    tcmb_mult = parse(Float64, get(ENV, "BAM_TCMB_FLOOR", "1"))
     efloor = 0.0f0
     if tcmb_mult > 0
         T_cmb = tcmb_mult * 2.725 / a_value
         T2 = (length_units / time_units)^2 * 1.21148e-8   # K per code specific-energy
         efloor = Float32(T_cmb / ((hier.gamma - 1) * 1.22 * T2))
     end
-    _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
+    if trl == l
+        im = argmax(Array(rho32)[1:n])
+        ρi = Array(view(rho32, im:im))[1]; ei = Array(view(e32, im:im))[1]
+        if mode === :full_f32
+            xi = Array(view(hf32, im:im))[1] / max(ρi, 1.0f-30)
+            mi = Array(view(mf32, im:im))[1] / max(ρi, 1.0f-30)
+        else
+            xi = ChemistryKernels.decode_log2sp(Float32, Array(view(h16, im:im))[1])
+            mi = ChemistryKernels.decode_log2sp(Float32, Array(view(m16, im:im))[1])
+        end
+        @printf("CHEMTRACE L%d OUT: dt=%.3e rho=%.4e e=%.4e T=%.1fK xHII=%.4e fH2=%.4e\n",
+                l, dt, ρi, ei, ei*(hier.gamma-1)*1.22*T2K, xi/fh, mi/fh)
+        flush(stdout)
+    end
+    if mode === :full_f32
+        _chem_scatter_f32_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
+                             lev.spr[1], lev.spr[2],
+                             rho32, e32, hf32, mf32, lev.D, cov, lev.live_d, lev.Dsc, lev.Esc, lev.Gsc,
+                             Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                             Int32(lev.stride), efloor, ecap; ndrange = n)
+    else
+        _chem_scatter_k!(lev.be)(lev.Ge, lev.Tau, lev.sp[1], lev.sp[2],
                              rho32, e32, h16, m16, lev.D, cov, lev.live_d, lev.Dsc, lev.Esc, lev.Gsc,
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                              Int32(lev.stride), efloor, ecap; ndrange = n)
+    end
     return nothing
 end

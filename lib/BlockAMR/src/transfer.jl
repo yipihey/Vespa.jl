@@ -197,6 +197,87 @@ end
     end
 end
 
+# Specific-energy prolongation for the dual-energy Ge lane: limited-linear on the
+# SPECIFIC internal energy e = Ge/D at the coarse source, then Ge_fine = D_fine·e.
+# Prolonging the ρe product directly gives fine-ghost e = interp(ρe)/interp(ρ) ≠
+# interp(e) where ρ varies → the static-C/F-boundary temperature edges.  Requires
+# the fine D to be prolonged FIRST (fill_ghosts! orders D before Ge) — reads it
+# back from dstD at the destination cell so e_fine = Ge_fine/D_fine = e_interp.
+@kernel function _rect_prolong_e_k!(dstGe, @Const(dstD),
+                                    @Const(GeR), @Const(GeO), @Const(DR), @Const(DO),
+                                    θ::Float32, @Const(scdGe), @Const(scsGe),
+                                    @Const(scdD), @Const(scsD),
+                                    @Const(jobs), @Const(cellstart),
+                                    njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global); t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        geS = scsGe[jobs[b+2]]; dSc = scsD[jobs[b+2]]
+        E(ii, jj, kk) = begin                              # physical specific e at a source cell
+            q = sbase + (kk * nd + jj) * nd + ii + Int32(1)
+            ge = ((1.0f0 - θ) * Float32(GeR[q]) + θ * Float32(GeO[q])) * geS
+            ρ  = ((1.0f0 - θ) * Float32(DR[q])  + θ * Float32(DO[q]))  * dSc
+            ge / max(ρ, 1.0f-30)
+        end
+        c  = E(si, sj, sk)
+        sx = _mm(E(si + Int32(1), sj, sk) - c, c - E(si - Int32(1), sj, sk))
+        sy = _mm(E(si, sj + Int32(1), sk) - c, c - E(si, sj - Int32(1), sk))
+        sz = _mm(E(si, sj, sk + Int32(1)) - c, c - E(si, sj, sk - Int32(1)))
+        e_interp = c + f1 * sx + f2 * sy + f3 * sz
+        didx = dbase + (dk * nd + dj) * nd + di + Int32(1)
+        ρf = Float32(dstD[didx]) * scdD[jobs[b+1]]         # already-prolonged fine density
+        dstGe[didx] = _narrow(eltype(dstGe), max(ρf * e_interp, 0.0f0) / scdGe[jobs[b+1]])
+    end
+end
+
+# limited-LINEAR species prolongation on the DECODED fractions (u16 codes have
+# no scales; decode → minmod slopes → ±¼-offset sample → encode).  Species
+# ghosts were PIECEWISE-CONSTANT while the gas used limited-linear: the fine
+# C/F INFLOW then carries the parent-CENTER fraction instead of the interface
+# fraction — with X correlated to ρ (denser ⇒ more evolved chemistry) the
+# inflow systematically imports too much X while outflow is unbiased, and a
+# converging flow rectifies this into monotonic species-mass creation at every
+# C/F ring (measured: ΣρX +1.4%/200 steps, gas mass exact, uniform-X exact —
+# the in-run xe/fH2 fraction pump, ×10 per level era in the collapse).
+@kernel function _rect_prolong_llsp_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
+                                       @Const(jobs), @Const(cellstart),
+                                       njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        dbase = (jobs[b+1] - Int32(1)) * stride
+        sbase = (jobs[b+2] - Int32(1)) * stride
+        S(ii, jj, kk) = begin
+            q = sbase + (kk * nd + jj) * nd + ii + Int32(1)
+            (1.0f0 - θ) * ChemistryKernels.decode_log2sp(Float32, srcR[q]) +
+            θ * ChemistryKernels.decode_log2sp(Float32, srcO[q])
+        end
+        c  = S(si, sj, sk)
+        sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
+        sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
+        sz = _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1)))
+        dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
+            ChemistryKernels.encode_log2sp(max(c + f1 * sx + f2 * sy + f3 * sz, 0.0f0))
+    end
+end
+
 @kernel function _rect_restrict_sc_k!(dst, @Const(src), @Const(scd), @Const(scs),
                                       @Const(jobs), @Const(cellstart),
                                       njobs::Int32, nd::Int32, stride::Int32)
@@ -293,6 +374,34 @@ function _run_restrict!(be, tab::RectJobTable, dst, src, nd::Int, stride::Int,
     return nothing
 end
 
+# After conservative restriction, coarse Tau_r = mean(fine Tau) keeps the full
+# sub-cell KE, but coarse KE(S_r,D_r) drops the velocity DISPERSION (Jensen) — so
+# Tau_r − KE_r = Ge_r + dispersion, and the dual-energy sync then converts that
+# dispersion into spurious internal energy (a runaway in diffuse KE-dominated
+# levels).  Re-derive Tau ≡ KE(S_r,D_r) + Ge_r on the restricted coarse cells so
+# the sync sees no phantom dispersion.  Ge (the trusted internal energy) is
+# unchanged; only the diagnostic total is made self-consistent (standard DE).
+@kernel function _reconstruct_tau_k!(@Const(D), @Const(S1), @Const(S2), @Const(S3),
+                                     Tau, @Const(Ge),
+                                     @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                                     @Const(jobs), @Const(cellstart),
+                                     njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        slot = jobs[b+1]
+        idx = (slot - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)
+        ρ  = Float32(D[idx])  * Dsc[slot]
+        s1 = Float32(S1[idx]) * Ssc[slot]; s2 = Float32(S2[idx]) * Ssc[slot]
+        s3 = Float32(S3[idx]) * Ssc[slot]
+        ge = Float32(Ge[idx]) * Gsc[slot]
+        ke = 0.5f0 * (s1*s1 + s2*s2 + s3*s3) / max(ρ, 1.0f-30)
+        Tau[idx] = _narrow(eltype(Tau), (ke + ge) / Esc[slot])
+    end
+end
+
 "Interleave the low 21 bits of the block-lattice coords (locality sort key)."
 function _morton(m::BlockMeta, B::Int)
     k = ntuple(d -> UInt64(m.origin[d] ÷ UInt128(B)) & 0x1fffff, 3)
@@ -372,14 +481,51 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     if l >= 1
         plev = hier.levels[l]
         pro  = _tabt(lev, :pro)
-        for (fd, fR, fO, scd, scs) in zip(dst, gasfields(plev), gasfields_o(plev),
-                                          classes(lev), classes(plev))
-            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
-                          scd, scs)
+        srcR = gasfields(plev); srcO = gasfields_o(plev)
+        cf = classes(lev); cc = classes(plev)
+        # BAM_EVAR=internal (RAMSES interpol_hydro `interpol_var=1`, the
+        # recommended cosmology setting): transfer the INTERNAL energy across
+        # C/F — prolong D, S, Ge and REBUILD the ghost Tau = Ge + KE(D,S) from
+        # the prolonged fields, instead of interpolating the KE-dominated total
+        # (whose parent-KE interpolation error swamps the internal energy).
+        # Deliberately non-conservative in E, like RAMSES.  Default: total.
+        evar_int = get(ENV, "BAM_EVAR", "total") == "internal"
+        # BAM_PROLONG_E: experimental specific-e Ge interpolation (2nd-order small)
+        prolE = get(ENV, "BAM_PROLONG_E", "0") == "1"
+        for fi in 1:6
+            (evar_int && fi == 5) && continue               # Tau rebuilt below
+            (prolE && fi == 6) && continue                  # Ge via specific-e kernel
+            _run_prolong!(lev.be, pro, dst[fi], srcR[fi], srcO[fi], Float32(θ),
+                          lev.nd, lev.stride, cf[fi], cc[fi])
+        end
+        if prolE && pro.total > 0                           # Ge: needs fine D (field 1) prolonged first
+            _rect_prolong_e_k!(lev.be)(dst[6], dst[1], srcR[6], srcO[6], srcR[1], srcO[1],
+                                       Float32(θ), cf[6], cc[6], cf[1], cc[1],
+                                       pro.jobs, pro.cellstart, Int32(pro.njobs),
+                                       Int32(lev.nd), Int32(lev.stride); ndrange = pro.total)
+        end
+        if evar_int && pro.total > 0                        # ghost Tau = Ge + KE(D,S)
+            _reconstruct_tau_k!(lev.be)(dst..., cf[1], cf[2], cf[5], cf[6],
+                                        pro.jobs, pro.cellstart, Int32(pro.njobs),
+                                        Int32(lev.nd), Int32(lev.stride); ndrange = pro.total)
         end
         spdst = buf === :R ? lev.sp : lev.spo
+        sp_pc = get(ENV, "BAM_SP_PCGHOST", "0") == "1"   # diag: PC species ghosts
         for (sd, sR, sO) in zip(spdst, plev.sp, plev.spo)
-            _run_prolong!(lev.be, pro, sd, sR, sO, Float32(θ), lev.nd, lev.stride)
+            if pro.total > 0
+                if sp_pc
+                    _rect_prolong_pc_k!(lev.be)(sd, sR, sO, Float32(θ), pro.jobs,
+                                                pro.cellstart, Int32(pro.njobs),
+                                                Int32(lev.nd), Int32(lev.stride);
+                                                ndrange = pro.total)
+                else
+                    # limited-linear on decoded fractions (see _rect_prolong_llsp_k!)
+                    _rect_prolong_llsp_k!(lev.be)(sd, sR, sO, Float32(θ), pro.jobs,
+                                                  pro.cellstart, Int32(pro.njobs),
+                                                  Int32(lev.nd), Int32(lev.stride);
+                                                  ndrange = pro.total)
+                end
+            end
         end
     end
     sib = _tabt(lev, :sib)
@@ -411,6 +557,18 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
         _rect_restrict_sp_k!(lev.be)(sc, sf, lev.D, res.jobs, res.cellstart,
                                      Int32(res.njobs), Int32(lev.nd),
                                      Int32(lev.stride); ndrange = res.total)
+    end
+    # re-derive coarse Tau = KE(S_r,D_r) + Ge_r on the restricted cells so the
+    # dual-energy sync never converts the sub-cell velocity dispersion into heat.
+    # Fires under BAM_EVAR=internal (the RAMSES-style mode; restriction twin of
+    # the ghost-Tau rebuild) or legacy BAM_TAU_RECON=1.  Default off (exact
+    # E-conservation, tests green).
+    if res.total > 0 && (get(ENV, "BAM_EVAR", "total") == "internal" ||
+                         get(ENV, "BAM_TAU_RECON", "0") == "1")
+        _reconstruct_tau_k!(plev.be)(gasfields(plev)..., plev.Dsc, plev.Ssc,
+                                     plev.Esc, plev.Gsc, res.jobs, res.cellstart,
+                                     Int32(res.njobs), Int32(plev.nd),
+                                     Int32(plev.stride); ndrange = res.total)
     end
     return nothing
 end

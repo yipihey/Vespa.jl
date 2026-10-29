@@ -62,6 +62,7 @@ const LFAC    = parse(Float64, get(ENV, "BAM_LFAC", "4.0"))   # threshold ×lfac
 # below their native resolution (gas dominates collapsed cores anyway).
 const LDM     = parse(Int, get(ENV, "BAM_LDM", "1"))
 const DTFF    = parse(Float64, get(ENV, "BAM_DTFF", "0.25"))   # free-fall dτ cap
+const DTACC   = parse(Float64, get(ENV, "BAM_DTACC", "0.5"))   # acceleration dτ cap k·√(2dx/|g|) (Enzo dt_accel; 0=off)
 const MEMMODE = Symbol(get(ENV, "BAM_MEM", "device"))          # device | managed (out-of-core)
 const DMCRIT  = get(ENV, "BAM_DMCRIT", "0") == "1"             # refine on TOTAL matter (gas+DM)
 const MREFINE = parse(Float64, get(ENV, "BAM_MREFINE", "8.0")) # DMCRIT: particles/base-cell
@@ -75,7 +76,15 @@ const MREFINE = parse(Float64, get(ENV, "BAM_MREFINE", "8.0")) # DMCRIT: particl
 # baryon density max each time a new deepest level is triggered (default on if Jeans).
 const JEANS   = parse(Float64, get(ENV, "BAM_JEANS", "0.0"))
 const JEANSRHO = parse(Float64, get(ENV, "BAM_JEANS_RHO", "100.0"))  # gas overdensity floor (×gas mean) for Jeans — confines it to collapsing cores
-const LDMAX    = parse(Int, get(ENV, "BAM_LDMAX", "99"))  # deepest raw DM CIC deposit level (Enzo MaximumGravityRefinementLevel); deeper levels PC-inject the parent dm
+# deepest raw DM CIC deposit level (Enzo MaximumGravityRefinementLevel): deeper
+# levels PC-inject the parent's SMOOTH dm.  DEFAULT = the IC finest level (MRLMAX,
+# the deepest level where the fine tier is still ≳1 particle/cell) so raw CIC
+# never spikes below the DM sampling scale — a coarse/fine particle in a deep
+# gas-refined cell is a point-mass comb (ρ_spike = m_p/dx_l³ ×8 per level) whose
+# ∇φ two-body kick bypasses every hydro guard → the deep-core garbage-T cells.
+# 99 (or explicit BAM_LDMAX) restores the old deposit-everywhere behaviour.
+const LDMAX    = parse(Int, get(ENV, "BAM_LDMAX",
+                                let m = parse(Int, get(ENV, "BAM_MRLMAX", "0")); m > 0 ? string(m) : "99" end))
 const VPCAP    = parse(Float64, get(ENV, "BAM_VPCAP", "0"))  # absolute particle |v| cap per component (code units; 0=off) — the particle twin of BAM_SMAXCAP
 const ZTRACK  = get(ENV, "BAM_ZOOM_TRACK", "0") == "1"
 const ZOOMDM  = get(ENV, "BAM_ZOOM_DM", "")   # multi-mass DM binary → 5-level zoom (fine halo DM); gas still from BAM_MUSIC_DIR base level
@@ -90,6 +99,16 @@ const OMEGAM  = parse(Float64, get(ENV, "CIC_OMEGAM", "0.27"))
 const OMEGAB  = parse(Float64, get(ENV, "CIC_OMEGAB", "0.046"))
 const HCONST  = parse(Float64, get(ENV, "CIC_H0", "71.0"))
 const GAMMA   = 5.0 / 3.0
+# Enzo JeansRefinementColdTemperature analog: evaluate λ_J at this FIXED T [K]
+# instead of the cell temperature — the Jeans criterion becomes monotone in
+# density, so shock/wall heating can never relax refinement (0 = live T).
+const JEANSTFIX = parse(Float64, get(ENV, "BAM_JEANS_TFIX", "0"))
+# code specific internal energy at T = JEANSTFIX (a-dependent: supercomoving units)
+function jeans_efix_code(c, a)
+    u = MultiCode.cosmo_units(c, a)
+    T2K = (u.l / u.t)^2 * 1.21148e-8
+    return JEANSTFIX / ((GAMMA - 1) * 1.22 * T2K)
+end
 const DODRAG  = get(ENV, "CIC_COMPTON_DRAG", "1") == "1"
 const TAG     = get(ENV, "CIC_TAG", "_bamr$(NGRID)")
 const REPORTS = MultiCode.run_dir("bamr")
@@ -252,14 +271,53 @@ function main()
     zr = length(zoomspec) >= 4 ? parse(Float64, zoomspec[4]) : 0.0
     zc = zr > 0 ? ntuple(d -> parse(Float64, zoomspec[d]), 3) : (0.0, 0.0, 0.0)
     zl = length(zoomspec) >= 5 ? parse(Int, zoomspec[5]) : 3
-    # DM criterion flags on TOTAL matter (mean 1) with a quasi-Lagrangian ×8/level
-    # threshold — dthresh = MREFINE is the particles-per-base-cell trigger (RAMSES
-    # m_refine); the gas-only criterion flags on gas density (mean fb) so it's ×fb.
-    mkpol(center) = BlockRefinementPolicy(; dthresh = DMCRIT ? MREFINE : DTHRESH * c.fb,
+    # ENZO MustRefineRegion: confine ADAPTIVE refinement (l ≥ MRLMAX) to STRICTLY
+    # INSIDE the IC high-res (finest-tier) Lagrangian region, minus a buffer, so a
+    # gas-Jeans-refined cell never reaches the coarse-particle boundary (a massive
+    # particle CIC-deposited into a fine cell spikes ρ → over-accel → shock-heated
+    # garbage).  This is the TIGHT/DEEP sphere (zr2/zl2); the primary BAM_ZOOM
+    # sphere still confines the SHALLOW levels (whose block+ghost margin is larger
+    # than the small IC region).  BAM_REFINE_IC=0 disables it.
+    zr2 = 0.0; zl2 = 999
+    if get(ENV, "BAM_REFINE_IC", "1") == "1" && ZOOMDM != "" && MRLMAX > 0 && @isdefined(zfh)
+        fx = mod.(Float64.(zic.px[zfh]) .+ Float64(zshf[1]), 1.0)
+        fy = mod.(Float64.(zic.py[zfh]) .+ Float64(zshf[2]), 1.0)
+        fz = mod.(Float64.(zic.pz[zfh]) .+ Float64(zshf[3]), 1.0)
+        # periodic-safe centroid: unwrap each dim around the first fine particle
+        uw(v) = (r = v[1]; v .+ ifelse.(v .- r .> 0.5, -1.0, ifelse.(v .- r .< -0.5, 1.0, 0.0)))
+        fx = uw(fx); fy = uw(fy); fz = uw(fz)
+        ctr = (sum(fx)/length(fx), sum(fy)/length(fy), sum(fz)/length(fz))
+        dist = sort(sqrt.((fx .- ctr[1]).^2 .+ (fy .- ctr[2]).^2 .+ (fz .- ctr[3]).^2))
+        rmax = dist[clamp(ceil(Int, 0.995 * length(dist)), 1, length(dist))]  # fine-tier boundary
+        buf  = parse(Float64, get(ENV, "BAM_REFINE_IC_BUF", "0.003"))         # box units inside the edge
+        zc = mod.(ctr, 1.0); zr2 = max(rmax - buf, 0.0)
+        # deep sphere applies only where its depth-shrinking nesting margin
+        # (≈ 2√3(B+ng+nbuf)·dx_zl2 = MRG/2^zl2) fits inside zr2; shallower levels are
+        # held near the core by the primary BAM_ZOOM sphere + density-gated Jeans.
+        MRG = 2 * sqrt(3.0) * (hier.B + hier.ng + 2) / NGRID
+        zl2 = clamp(max(MRLMAX, ceil(Int, log2(MRG / max(0.5 * zr2, 1e-6)))), MRLMAX, LMAX - 1)
+        # a broad primary sphere is REQUIRED so shallow levels don't refine box-wide;
+        # default one (generous, fits the L1 margin) if BAM_ZOOM was not given.
+        if zr <= 0
+            zr = max(rmax + MRG, 3 * rmax); zc = mod.(ctr, 1.0); zl = 1
+        end
+        @printf("REFINE REGION: broad r=%.4f (l>=%d) + IC-tight r=%.4f (l>=%d, margin=%.4f), center (%.4f,%.4f,%.4f), %d fine pts\n",
+                zr, zl, zr2, zl2, MRG/2.0^zl2, zc[1], zc[2], zc[3], length(zfh)); flush(stdout)
+    end
+    # ADDITIVE criteria (BAM_DMCRIT=1): gas overdensity (dthresh = DTHRESH·fb,
+    # ×lfac/level) OR total-matter quasi-Lagrangian (dm_thresh = MREFINE
+    # particles-per-base-cell, ×8/level — RAMSES m_refine / Enzo per-level-
+    # adjusted overdensity).  DMCRIT=0: gas-only, as before.
+    mkpol(center) = BlockRefinementPolicy(; dthresh = DTHRESH * c.fb,
+                                dm_thresh = DMCRIT ? MREFINE : 0.0,
                                 nbuf = 2, every = REGRIDN, lmax = LMAX, lfac = LFAC,
                                 zoom_center = center, zoom_r = zr, zoom_lmin = zl,
+                                zoom_r2 = zr2, zoom_lmin2 = zl2,
                                 dm_criterion = DMCRIT, jeans_ncells = JEANS,
                                 jeans_rho_floor = JEANS > 0 ? JEANSRHO * c.fb : 0.0,
+                                # cold-T insurance floor (BAM_JEANS_RHO2, ×gas-mean):
+                                jeans_rho_floor2 = JEANS > 0 ?
+                                    parse(Float64, get(ENV, "BAM_JEANS_RHO2", "10000")) * c.fb : 0.0,
                                 newlev_delay = parse(Int, get(ENV, "BAM_NEWLEV_DELAY", "0")),
                                 must_refine_lmax = MRLMAX)
     pol = mkpol(zc)
@@ -268,6 +326,8 @@ function main()
     maxlevel_seen = curlevel()
     JEANS > 0 && @printf("JEANS refinement ON: %.0f cells/λ_J, ρ_floor=%.1f×gas-mean, zoom_r=%.4f track=%s profiles=%s lmax=%d\n",
                          JEANS, JEANSRHO, zr, ZTRACK, PROFLV, LMAX)
+    get(ENV, "BAM_GROWREGRID", "0") == "1" &&
+        (println("FORCE-OUTPUT trigger armed: touch $(joinpath(REPORTS, "output"))"); flush(stdout))
     ρg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     φg = BlockAMR.device_zeros(hier.be, Float32, (NGRID^3,))
     pax = BlockAMR.device_zeros(hier.be, Float32, (Np,))
@@ -314,6 +374,7 @@ function main()
         # per level: subcycling gives level l a 2^-l shorter kick dt, so the
         # root-step bound from a peak living at level l relaxes by 2^l
         dτ_ff = Inf
+        dτ_acc = Inf     # acceleration criterion: kick Δv=g·dt must stay resolved
         for l in 0:length(hier.levels)-1
             lv = hier.levels[l + 1]
             isempty(lv.live) && continue
@@ -322,10 +383,32 @@ function main()
             for s in lv.live
                 ρl = max(ρl, 2.0 * Float64(hd[s]))       # window top = 2·Dsc
             end
-            dτ_ff = min(dτ_ff, exp2(l) * DTFF / sqrt(1.5 * c.Om * a * ρl))
+            # RAMSES-conform (mini-ramses courant_fine): the free-fall bound must
+            # see the TOTAL density — the DM deposit (spikes included), not gas
+            # alone.  A contaminated/deep-well cell then forces SMALL steps
+            # instead of letting the ungated kicks ratchet v (last step's dm —
+            # the same one-step lag as the dτ_acc criterion).
+            ρdm = 0.0
+            if length(lv.dm) >= lv.cap * lv.stride && l <= LDMAX
+                ρdm = Float64(maximum(lv.dm))
+                isfinite(ρdm) || (ρdm = 0.0)
+            end
+            dτ_ff = min(dτ_ff, exp2(l) * DTFF / sqrt(1.5 * c.Om * a * (ρl + ρdm)))
+            # Enzo dt_accel analog: level-l kick dt = dτ/2^l ≤ k·√(2·dx_l/|g|_l)
+            # (|g| from LAST step's φ pool — standard one-step lag).  Without it
+            # the ungated kick ratchets v at deep φ wells (deposit spikes /
+            # collapse) → the λ-ratchet crawl (old) or NaN (fixed, faster dτ).
+            if DTACC > 0
+                gmax = BlockAMR.max_accel(hier, l)
+                gmax > 1e-30 && (dτ_acc = min(dτ_acc,
+                    exp2(l) * DTACC * sqrt(2.0 * BlockAMR.level_dx(hier, l) / gmax)))
+            end
         end
         dτ = min(Float64(λ) * dx0, 0.3 * dx0 / max(vp, 1e-30),
-                 MultiCode.dtau_for_dlna(c, a, MAXEXP), dτ_ff)
+                 MultiCode.dtau_for_dlna(c, a, MAXEXP), dτ_ff, dτ_acc)
+        # BAM_DTSCALE: uniform dτ shrink (diag: λ-threshold effects like the 3D
+        # unsplit-CMA overshoot die superlinearly with λ; pure slowdowns don't)
+        dτ *= parse(Float64, get(ENV, "BAM_DTSCALE", "1"))
         hier.λ = Float32(dτ / dx0)
         if get(ENV, "BAM_TRACE", "0") == "1"
             @printf("TRACE step %d PRE : dτ=%.3e ff=%.3e", nstep + 1, dτ, dτ_ff)
@@ -512,20 +595,55 @@ function main()
             hier.nstep[1] += 1
             error("DISSECT complete at step $(nstep + 1)")
         end
+        # per-substep grow-only refinement (BAM_GROWREGRID=1): Enzo/RAMSES-style
+        # refine-as-soon-as-wanted at every level's own substep cadence — the
+        # Truelove-wall/ionization-relic fix.  jcoef is a-dependent → refresh
+        # here each root step; ZTRACK peak recentering stays at regrid cadence.
+        if get(ENV, "BAM_GROWREGRID", "0") == "1" && JEANS > 0
+            # Enzo-style interpolated output: a viz dump fires just BEFORE each
+            # new level's first block is added (grow_level! on_newlevel).  The
+            # closure captures THIS root step's a/particle state; the z tag is
+            # exact to within one root dτ.  Restart ckpts stay at BAM_CKPT
+            # root cadence — these are output products (BAM_VIZDUMP=0 disables).
+            a_now = a
+            vizdump = get(ENV, "BAM_VIZDUMP", "1") == "1" ? (tag -> begin
+                zt = round(1/a_now - 1, digits = 2)
+                ckf = joinpath(REPORTS, "bamr_viz$(TAG)_$(tag)_z$(zt).jls")
+                # extra inlined (NOT ckextra(): that closure is defined later in
+                # the loop body — undefined on the iteration a level first births)
+                BlockAMR.save_checkpoint(ckf, hier;
+                    extra = (a = a_now, xe_mean = xe_mean,
+                             mass_code = mass_code isa AbstractVector ?
+                                         Array(mass_code) : mass_code,
+                             px = Array(parts.px), py = Array(parts.py),
+                             pz = Array(parts.pz), vx = Array(parts.vx),
+                             vy = Array(parts.vy), vz = Array(parts.vz)))
+                @printf("  ▸ VIZ dump (%s) z=%.2f → %s\n", tag, zt, ckf)
+                flush(stdout)
+            end) : nothing
+            BlockAMR.GROWREGRID[] = (pol = pol,
+                jc = 8π^2 * GAMMA * (GAMMA - 1) / (3 * c.Om * a),
+                ef = JEANSTFIX > 0 ? jeans_efix_code(c, a) : 0.0,
+                dump = vizdump,
+                force = joinpath(REPORTS, "output"))   # Enzo outputNow: touch this file
+        end
         BlockAMR.advance_level_w!(hier, 0, hier.λ;
             selfgrav = (coef = 1.5 * c.Om * a, nsweep = NSWEEP, nsweep0 = 0,
                         rho_mean = 1.0, use_dm = true,
                         mg = get(ENV, "BAM_MG", "1") == "1",     # masked-MG level solves
                         mg2 = get(ENV, "BAM_MG2", "0") == "1",   # block-topology MG (resident pools + small dense coarse)
+                        mg2_lmin = parse(Int, get(ENV, "BAM_MG2LMIN", "3")),  # dense below (domain-spanning unions)
                         nsm = parse(Int, get(ENV, "BAM_MGSM", "4")),
                         cfac = parse(Int, get(ENV, "BAM_MGCF", "4")),
-                        ncycle = parse(Int, get(ENV, "BAM_MGCYC", "4")),
-                        nu1 = parse(Int, get(ENV, "BAM_MGNU1", "3")),
-                        nu2 = parse(Int, get(ENV, "BAM_MGNU2", "3")),
+                        ncycle = parse(Int, get(ENV, "BAM_MGCYC", "20")),
+                        nu1 = parse(Int, get(ENV, "BAM_MGNU1", "6")),
+                        nu2 = parse(Int, get(ENV, "BAM_MGNU2", "6")),
                         nub = parse(Int, get(ENV, "BAM_MGNUB", "80")),
-                        mgeps = parse(Float64, get(ENV, "BAM_MGEPS", "0")),
+                        mgeps = parse(Float64, get(ENV, "BAM_MGEPS", "1e-6")),   # converge-to-tolerance (0 = legacy fixed cycles),
                         gravk = parse(Int, get(ENV, "BAM_GRAVK", "0")),
-                        gravk_lmin = parse(Int, get(ENV, "BAM_GRAVKLMIN", "6"))),
+                        gravk_lmin = parse(Int, get(ENV, "BAM_GRAVKLMIN", "6")),
+                        gravk_lmax = parse(Int, get(ENV, "BAM_GRAVKLMAX", "999")),
+                        gravk_nsweep = parse(Int, get(ENV, "BAM_GRAVK_NSWEEP", "8"))),
             chem = get(ENV, "BAM_NOCHEM", "0") == "1" ? nothing :
                    (a_value = a, density_units = u.d, length_units = u.l,
                     time_units = u.t, hubble = c.h0, Om = c.Om, OL = c.OL,
@@ -533,7 +651,11 @@ function main()
                     itcap = parse(Int, get(ENV, "BAM_CHEM_ITCAP", "5000")),
                     tmax = parse(Float64, get(ENV, "BAM_CHEM_TMAX", "0")),
                     chemk = parse(Int, get(ENV, "BAM_CHEMK", "1")),
-                    mode = Symbol(get(ENV, "BAM_CHEM_MODE", "full_u16")),
+                    # full_f32 default: same network, but species stage as f32 mass
+                    # densities and the u16 encode runs through the σΔ residual in
+                    # the scatter — sub-quantum chem changes accumulate instead of
+                    # re-freezing to the same code every call.
+                    mode = Symbol(get(ENV, "BAM_CHEM_MODE", "full_f32")),
                     rate_tables = rtab, cool_tables = ctab))
         # level 0 uses the FFT φ pool directly (nsweep0=0 keeps its Dirichlet-free
         # RB pass a no-op refinement of the FFT solution)
@@ -549,13 +671,48 @@ function main()
 
         # ── particles: KDK from the finest covering level's φ ──
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
+            anybad = false
             for l in 0:length(hier.levels)-1
                 isempty(hier.levels[l+1].live) && continue
                 sm2 = BlockAMR.max_signal(hier.levels[l+1], hier.gamma)
-                isfinite(sm2) ||
-                    (@printf("PHUNT step %d: GAS nonfinite at level %d POST-advance (smax=%s)\n",
-                             nstep, l, string(sm2)); flush(stdout); error("gas post-advance"))
+                isfinite(sm2) || begin
+                    anybad = true
+                    lev_ = hier.levels[l+1]
+                    hD = Array(lev_.D); hG = Array(lev_.Ge); hT = Array(lev_.Tau); hS = Array(lev_.S1)
+                    @printf("PHUNT step %d: GAS nonfinite L%d POST-advance smax=%s  nonfinite D=%d Ge=%d Tau=%d S1=%d (blocks=%d)\n",
+                            nstep, l, string(sm2),
+                            count(x -> !isfinite(Float32(x)), hD), count(x -> !isfinite(Float32(x)), hG),
+                            count(x -> !isfinite(Float32(x)), hT), count(x -> !isfinite(Float32(x)), hS),
+                            length(lev_.live))
+                    shown = 0
+                    flev = l + 2 <= length(hier.levels) ? hier.levels[l + 2] : nothing
+                    for s_ in lev_.live
+                        shown >= 6 && break
+                        m_ = lev_.meta[s_]; base_ = (Int(s_) - 1) * lev_.stride
+                        for kk in 1:lev_.B, jj in 1:lev_.B, ii in 1:lev_.B
+                            idx_ = base_ + ((lev_.ng+kk-1)*lev_.nd + (lev_.ng+jj-1))*lev_.nd + (lev_.ng+ii-1) + 1
+                            if !isfinite(Float32(hG[idx_])) || !isfinite(Float32(hT[idx_])) ||
+                               !isfinite(Float32(hS[idx_])) || !isfinite(Float32(hD[idx_]))
+                                g_ = (Int(m_.origin[1]) + ii - 1, Int(m_.origin[2]) + jj - 1,
+                                      Int(m_.origin[3]) + kk - 1)
+                                cov = flev !== nothing && !isempty(flev.live) &&
+                                      !isempty(overlapping_blocks(flev,
+                                          (Int128(2g_[1]), Int128(2g_[2]), Int128(2g_[3])), (2,2,2)))
+                                nbcf = flev !== nothing && !isempty(flev.live) &&
+                                       !isempty(overlapping_blocks(flev,
+                                          (Int128(2g_[1]-2), Int128(2g_[2]-2), Int128(2g_[3]-2)), (6,6,6)))
+                                @printf("  L%d cell %s D=%s Ge=%s Tau=%s S1=%s cov=%s nearCF=%s\n",
+                                        l, string(g_), string(Float32(hD[idx_])), string(Float32(hG[idx_])),
+                                        string(Float32(hT[idx_])), string(Float32(hS[idx_])),
+                                        string(cov), string(nbcf))
+                                shown += 1; shown >= 6 && break
+                            end
+                        end
+                    end
+                    flush(stdout)
+                end
             end
+            anybad && error("gas post-advance")
         end
         gather_accel_particles!(hier, parts, pax, pay, paz)
         if get(ENV, "BAM_CHECKNAN", "0") == "1"
@@ -608,6 +765,22 @@ function main()
         k1 = MultiCode.dadtau(c, a); amid = a + 0.5 * k1 * dτ
         a = min(a + MultiCode.dadtau(c, amid) * dτ, a_end)
         nstep += 1
+        # BAM_SPPROBE=1: per-step per-level max species fractions (the u16 codec is
+        # MONOTONIC in the code, so maxX = decode(maximum(codes)) — one device
+        # reduction per level per species).  Growth of a max fraction between
+        # probes localizes the transport pump: jumps at regrid steps → regrid
+        # path; every step → stage/reflux path.
+        if get(ENV, "BAM_SPPROBE", "0") == "1"
+            @printf("SPPROBE step %d post-step ", nstep)
+            for l in 0:length(hier.levels)-1
+                lv = hier.levels[l + 1]
+                isempty(lv.live) && continue
+                m1 = ChemistryKernels.decode_log2sp(Float64, maximum(lv.sp[1]))
+                m2 = ChemistryKernels.decode_log2sp(Float64, maximum(lv.sp[2]))
+                @printf("L%d:%.3e/%.3e ", l, m1, m2)
+            end
+            println(); flush(stdout)
+        end
         if nstep % 10 == 0                             # refresh the mean x_e estimate
             h1s = Array(hier.levels[1].sp[1])
             acc = 0.0; cnt = 0
@@ -625,6 +798,7 @@ function main()
         if nstep % REGRIDN == 0
             # Jeans coefficient (a-dependent): λ_J² = [8π²γ(γ-1)/(3Ωm a)]·Ge·Esc/ρ²
             jcoef = JEANS > 0 ? 8π^2 * GAMMA * (GAMMA - 1) / (3 * c.Om * a) : 0.0
+            jefix = JEANSTFIX > 0 ? jeans_efix_code(c, a) : 0.0
             # retarget the high-res sphere onto the current baryon peak (track the halo)
             if ZTRACK && zr > 0
                 pk, _, _ = JeansProfile.find_baryon_peak(hier); pol = mkpol(pk)
@@ -635,13 +809,14 @@ function main()
                 # static_parts(l) is consulted while flagging level l (children → l+1):
                 # frozen set j = l+1 covers MUSIC tier (base+1+l); deeper → nothing (live)
                 regrid!(hier, pol; compact = COMPACT, parts = gfz,
-                        mass_code = zoom_fine_mass, jeans_coef = jcoef,
+                        mass_code = zoom_fine_mass, jeans_coef = jcoef, jeans_efix = jefix,
                         static_parts = lz -> (0 <= lz < length(zoom_static_sf)) ?
                                              zoom_static_sf[lz + 1] : nothing,
                         static_mass_code = lz -> (0 <= lz < length(zoom_static_sm)) ?
                                                  zoom_static_sm[lz + 1] : 0.0f0)
             else
-                regrid!(hier, pol; compact = COMPACT, parts, mass_code, jeans_coef = jcoef)
+                regrid!(hier, pol; compact = COMPACT, parts, mass_code,
+                        jeans_coef = jcoef, jeans_efix = jefix)
             end
             MEMMODE === :managed && BlockAMR.advise_all_host!(hier)  # new blocks → host home
             # NEW LEVEL → radial profile around the baryon density maximum
@@ -662,6 +837,17 @@ function main()
                             Lnow, zz, ρmax, npts, basename(pth)); flush(stdout)
                 end
             end
+        end
+        if get(ENV, "BAM_SPPROBE", "0") == "1" && nstep % REGRIDN == 0
+            @printf("SPPROBE step %d post-regrid ", nstep)
+            for l in 0:length(hier.levels)-1
+                lv = hier.levels[l + 1]
+                isempty(lv.live) && continue
+                m1 = ChemistryKernels.decode_log2sp(Float64, maximum(lv.sp[1]))
+                m2 = ChemistryKernels.decode_log2sp(Float64, maximum(lv.sp[2]))
+                @printf("L%d:%.3e/%.3e ", l, m1, m2)
+            end
+            println(); flush(stdout)
         end
         # save mass_code host-side (portable: load needs no CUDA) — vector for
         # multi-mass zoom, scalar for uniform mass.

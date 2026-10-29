@@ -58,6 +58,12 @@ Base.@kwdef struct BlockRefinementPolicy
     zoom_center :: NTuple{3,Float64} = (0.0, 0.0, 0.0)
     zoom_r      :: Float64 = 0.0     # 0 = zoom disabled
     zoom_lmin   :: Int = 3
+    # SECOND, TIGHTER sphere (Enzo nested MustRefineRegion): for levels ≥ zoom_lmin2,
+    # ALSO require the block center within zoom_r2 of zoom_center — confines DEEP
+    # refinement strictly inside the IC high-res region while the (broader) primary
+    # sphere handles the coarse levels whose block+ghost margin exceeds that region.
+    zoom_r2     :: Float64 = 0.0     # 0 = second sphere disabled
+    zoom_lmin2  :: Int = 999
     # dm_criterion: refine on the TOTAL matter density (gas + CIC-deposited DM)
     # instead of gas alone, so DM-dominated minihalos refine on their own
     # overdensity.  The DM path uses a QUASI-LAGRANGIAN per-level threshold
@@ -65,6 +71,13 @@ Base.@kwdef struct BlockRefinementPolicy
     # base-cell count that triggers (RAMSES m_refine, ~8), robust to CIC shot
     # noise at depth.  Needs `parts` + `mass_code` passed to regrid!.
     dm_criterion :: Bool = false
+    # ADDITIVE gas+DM mode (dm_thresh > 0 with dm_criterion=true): the GAS
+    # criterion `D > dthresh·lfac^l` stays active AND the DM criterion flags on
+    # total matter > dm_thresh·8^l (dm_thresh = particles per base cell, the
+    # RAMSES m_refine / Enzo per-level-adjusted overdensity).  dm_thresh = 0
+    # keeps the historical REPLACE semantics (dthresh is the DM threshold, gas
+    # term off) for compatibility.
+    dm_thresh :: Float64 = 0.0
     # ZOOM STATIC MESH (Enzo MustRefineParticles / RAMSES mass_cut_refine):
     # for levels l < must_refine_lmax, flag cells by PRESENCE of the (fine, zoom-
     # region) particles — density > must_refine_thr·(mean) — NOT by overdensity.
@@ -82,6 +95,11 @@ Base.@kwdef struct BlockRefinementPolicy
     # cell target.  OR'd with the density/DM criterion, so halos still form on
     # overdensity while cooling cores go deep on Jeans.  0 = disabled.
     jeans_ncells :: Float64 = 0.0
+    # COLD-T Jeans density floor (code gas density): the fixed-T insurance term
+    # applies only above this (the live-T term uses jeans_rho_floor).  Keep it
+    # at the runaway threshold (~1e4× gas mean) so the virialization era stays
+    # on live-T + ladders (fs14 lesson).
+    jeans_rho_floor2 :: Float64 = 0.0
     # Jeans DENSITY FLOOR (gas code density): apply the Jeans test ONLY where
     # ρ_gas > jeans_rho_floor.  In super-comoving units the smooth high-z IGM is
     # itself Jeans-"under-resolved" at 256 cells (cold gas, small c_s in these
@@ -99,8 +117,10 @@ Base.@kwdef struct BlockRefinementPolicy
 end
 
 @kernel function _flag_k!(flags, count, @Const(D), @Const(dm), @Const(live_d), @Const(Dsc),
-                          @Const(Ge), @Const(Gsc), thresh::Float32, dmmul::Float32,
-                          jcoef::Float32, jdx2::Float32, jfloor::Float32,
+                          @Const(Ge), @Const(Gsc), thresh::Float32, gthresh::Float32,
+                          dmmul::Float32,
+                          jcoef::Float32, jdx2::Float32, jfloor::Float32, efix::Float32,
+                          jfloor2::Float32,
                           B::Int32, ng::Int32, nd::Int32, stride::Int32)
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -111,16 +131,32 @@ end
         base = (slot - Int32(1)) * stride
         i = c % B + ng; j = (c ÷ B) % B + ng; k = c ÷ (B * B) + ng
         idx = base + _lidx(i, j, k, nd)
-        # dmmul=0 ⇒ gas-only (dm is a dummy array); dmmul=1 ⇒ TOTAL matter
-        # (gas + CIC-deposited DM), the physical collapse criterion.
-        dens = Float32(D[idx]) * Dsc[slot] + dmmul * Float32(dm[idx])
-        f = dens > thresh
+        # ADDITIVE criteria: gas density vs gthresh OR total matter (gas +
+        # CIC-deposited DM, dmmul=1) vs thresh.  Either may be Inf32 (off):
+        # gas-only runs disable the dm term, historical replace-mode DM runs
+        # disable the gas term.
+        ρg = Float32(D[idx]) * Dsc[slot]
+        dens = ρg + dmmul * Float32(dm[idx])
+        f = (ρg > gthresh) | (dens > thresh)
+        # THREE-TERM criterion (the fs14 lesson: replacing live-T Jeans with a
+        # high-floor cold-T term removed ALL virial-era Jeans refinement — the
+        # density ladders top out at L4-L5 on a minihalo, ~65k× overdensity
+        # would be needed for L7):
+        #   density ladders (above) ⊕ LIVE-T Jeans at jfloor (morphology/
+        #   interior resolution — what carried fs9/fs13's approved virial era)
+        #   ⊕ COLD-T Jeans (efix at T_J, Enzo JeansRefinementColdTemperature)
+        #   at the HIGHER jfloor2 (wall insurance: monotone in density, so
+        #   pileup heating can never relax it — the live-T feedback that
+        #   rebuilt the walls in fs13).
         # Jeans (jcoef>0): refine if λ_J < N_J·dx, i.e. λ_J² < (N_J·dx)².
         # λ_J² = jcoef·(Ge·Esc)/ρ²  ⇒  jcoef·Ge·Esc < jdx2·ρ² (ρ = gas density).
         if jcoef > 0.0f0
-            ρg = Float32(D[idx]) * Dsc[slot]
-            # gate by the density floor: only refine on Jeans in dense/collapsing gas
-            f |= (ρg > jfloor) && ((jcoef * Float32(Ge[idx]) * Gsc[slot]) < (jdx2 * ρg * ρg))
+            # live-T term (floor jfloor): interior resolution, tracks the physics
+            f |= (ρg > jfloor) &&
+                 ((jcoef * Float32(Ge[idx]) * Gsc[slot]) < (jdx2 * ρg * ρg))
+            # cold-T term (floor jfloor2): heat-proof deep-collapse insurance
+            (efix > 0.0f0 && ρg > jfloor2) &&
+                (f |= (jcoef * efix * ρg) < (jdx2 * ρg * ρg))
         end
         flags[idx] = UInt8(f)
         f && (KA.@atomic count[slot] += Int32(1))
@@ -173,6 +209,7 @@ end
 "Criterion flags for level l: device UInt8 (interior of live blocks) + host counts."
 function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
                           parts = nothing, mass_code = 0.0, jeans_coef = 0.0,
+                          jeans_efix = 0.0,
                           static_parts = nothing, static_mass_code = 0.0)
     lev = hier.levels[l + 1]
     flags = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
@@ -209,7 +246,13 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     # particle-per-(base-)cell count that triggers, unchanged across levels,
     # exactly RAMSES's mass criterion relative to the (level) mean density.  The
     # gas-only path keeps its own `lfac` (gas density is smooth, not shot-noisy).
-    usedm = pol.dm_criterion && dparts !== nothing
+    # DM criterion capped at the particle-machinery depth (21-bit lattice key,
+    # l ≤ 16 at 512/B16): deep levels' total-matter flags are meaningless anyway
+    # (the particle tier saturates its resolution far shallower; PSPREAD caps
+    # the deposit) — and the deposit's block lookup hard-errors past the key
+    # (the fs16/fs16r L17-era crash, the first runs to survive that deep).
+    usedm = pol.dm_criterion && dparts !== nothing && l <= particle_lmax(hier)
+    additive = usedm && pol.dm_thresh > 0
     if usedm
         deposit_particles_level!(hier, l, dparts; mass_code = dmcode)  # fills lev.dm
         dmarr = lev.dm; dmmul = 1.0f0
@@ -218,10 +261,14 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
         # kept refined to must_refine_lmax and never de-refines (Enzo/RAMSES
         # must-refine).  At/above it, the adaptive overdensity threshold.
         thr = is_mustref ? Float32(pol.must_refine_thr) :
-                           Float32(pol.dthresh * 8.0^l)  # 8 = RefineBy^ndim
+              Float32((additive ? pol.dm_thresh : pol.dthresh) * 8.0^l)  # 8 = RefineBy^ndim
+        # additive mode: the gas criterion runs alongside the DM one; replace
+        # mode (dm_thresh=0, historical): gas term disabled.
+        gthr = additive ? Float32(pol.dthresh * pol.lfac^l) : Inf32
     else
         dmarr = lev.D; dmmul = 0.0f0                                 # gas-only (dummy)
-        thr = Float32(pol.dthresh * pol.lfac^l)
+        thr = Inf32
+        gthr = Float32(pol.dthresh * pol.lfac^l)
     end
     # Jeans: enabled only for a gas run (Ge allocated) with a positive coefficient
     # and cell target.  jdx2 = (N_J·dx_l)²; the a-dependent physics is in jeans_coef.
@@ -232,7 +279,8 @@ function _criterion_flags(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy
     jdx2   = usejeans ? Float32((pol.jeans_ncells * level_dx(hier, l))^2) : 0.0f0
     jfloor = Float32(pol.jeans_rho_floor)
     _flag_k!(lev.be)(flags, count, lev.D, dmarr, lev.live_d, lev.Dsc, gearr, escarr,
-                     thr, dmmul, jcoef, jdx2, jfloor,
+                     thr, gthr, dmmul, jcoef, jdx2, jfloor, Float32(jeans_efix),
+                     Float32(pol.jeans_rho_floor2),
                      Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                      ndrange = length(lev.live) * lev.B^3)
     return flags, Array(count)
@@ -268,6 +316,13 @@ function compact_level!(hier::AMRHierarchy, l::Int)
             _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
         end
         swap_buffers!(lev)                         # permuted O twins become R
+        # species σΔ residuals follow their cells (permute through the rhs
+        # scratch; leaving them behind would inject wrong-cell remainders)
+        for q in eachindex(lev.spr)
+            isempty(lev.spr[q]) && continue
+            _permute_slots!(lev.be, lev.rhs, lev.spr[q], perm_d, n, lev.stride)
+            lev.spr[q], lev.rhs = lev.rhs, lev.spr[q]
+        end
     end
     _permute_slots!(lev.be, lev.rhs, lev.phi, perm_d, n, lev.stride)
     lev.phi, lev.rhs = lev.rhs, lev.phi
@@ -312,7 +367,7 @@ conservatively prolonged from their parents; vanished blocks are freed.  All
 tables and C/F registers are rebuilt.
 """
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
-                 parts = nothing, mass_code = 0.0, jeans_coef = 0.0,
+                 parts = nothing, mass_code = 0.0, jeans_coef = 0.0, jeans_efix = 0.0,
                  static_parts = nothing, static_mass_code = 0.0)
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
@@ -329,7 +384,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
         Fd[l], cnt[l] = _criterion_flags(hier, l, pol; parts, mass_code, jeans_coef,
-                                         static_parts, static_mass_code)
+                                         jeans_efix, static_parts, static_mass_code)
     end
     # 2) tile cascade fine→coarse: T[lf] = forced level-lf child footprints as
     #    level-(lf−1)-cell tile origins (multiples of Bh; every block spans
@@ -478,6 +533,27 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
                 d2 <= r2
             end
         end
+        # SECOND (tighter, deep) sphere — same depth-shrinking nesting margin,
+        # measured from zoom_lmin2, so DEEP refinement stays inside the IC high-res
+        # region.  Composes with the primary sphere (a want must pass BOTH).
+        if pol.zoom_r2 > 0 && lc >= pol.zoom_lmin2
+            margin2 = 0.0
+            for k in (pol.zoom_lmin2 + 1):lc
+                margin2 += sqrt(3.0) * (hier.B + hier.ng + pol.nbuf) /
+                           (hier.nbase[1] * 2.0^(k - 1))
+            end
+            r2b = max(pol.zoom_r2 - margin2, 0.0)^2
+            filter!(want) do kv
+                org = kv.first
+                d2 = 0.0
+                for d in 1:3
+                    x = (Float64(org[d]) + hier.B / 2) / Float64(Pc[d])
+                    δx = abs(x - pol.zoom_center[d]); δx = min(δx, 1.0 - δx)
+                    d2 += δx * δx
+                end
+                d2 <= r2b
+            end
+        end
         # cascade rate-limit (policy newlev_delay): gate the CREATION of a new
         # level on its parent's age; existing levels are never touched.  At
         # restart the birth registry is empty → all pre-existing levels count
@@ -529,6 +605,138 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     return nothing
 end
 
+"""
+    grow_level!(hier, l, pol; jeans_coef = 0.0) -> nadded
+
+Enzo/RAMSES-style PER-SUBSTEP refinement (`RebuildHierarchy` in every
+`EvolveLevel` step / `refine_fine` in every `amr_step`): flag level `l` on the
+gas + Jeans criteria and immediately add any missing level-`l+1` child blocks —
+GROW-ONLY, so deeper levels stay nested by construction and no data is ever
+destroyed mid-W-cycle.  This closes the refinement-latency gap that builds the
+Truelove-wall: with root-cadence regridding the deepest level evolves up to
+`REGRIDN` root steps (2^l substeps each) of pileup before the next level can
+appear — a free-fall time of over-compression, grid-scale shocking to 10⁵-10⁶ K
+and collisional-ionization relics (the super-ceiling xe zones).  Called at the
+top of every `advance_level_w!` substep, the latency drops to ONE substep of
+the flagging level, and a collapse can cascade several new levels within a
+single root step (the recursion grows `l+2` at the child's own entry).
+
+Deliberately NOT here (root-cadence `regrid!` keeps them): derefinement, the
+DM criterion (walls are gas-driven; per-substep deposits are wasted work),
+cross-parent flag projection, and compaction.  New children are accepted only
+where the level-`l` lattice covers their ghost-grown footprint (always true at
+the collapse interior where walls form); edge candidates wait for `regrid!`.
+"""
+function grow_level!(hier::AMRHierarchy, l::Int, pol::BlockRefinementPolicy;
+                     jeans_coef::Real = 0.0, jeans_efix::Real = 0.0,
+                     on_newlevel = nothing)
+    Ltarget = min(pol.lmax, hier.Lcap)
+    l + 1 <= Ltarget || return 0
+    l >= pol.must_refine_lmax || return 0     # static IC mesh: root cadence only
+    lev = hier.levels[l + 1]
+    isempty(lev.live) && return 0
+    # gas + Jeans flags (parts = nothing ⇒ the DM term is off in _criterion_flags)
+    F, cnt = _criterion_flags(hier, l, pol; parts = nothing, mass_code = 0.0,
+                              jeans_coef, jeans_efix)
+    sum(cnt) == 0 && return 0
+    nbuf = pol.nbuf
+    _run_copy!(lev.be, _tabt(lev, :sib), F, F, lev.nd, lev.stride)
+    G = device_zeros(lev.be, UInt8, (lev.cap * lev.stride,))
+    _dilate_flags_k!(lev.be)(G, F, lev.live_d, Int32(nbuf), Int32(lev.B),
+                             Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
+                             ndrange = length(lev.live) * lev.B^3)
+    nb = length(lev.live)
+    o = device_zeros(lev.be, UInt8, (8 * nb,))
+    _octant_any_k!(lev.be)(o, G, lev.live_d, Int32(lev.B), Int32(lev.ng),
+                           Int32(lev.nd), Int32(lev.stride); ndrange = 8 * nb)
+    ho = Array(o)
+    Bh = hier.B ÷ 2
+    Pc = level_period(hier.nbase, l + 1)
+    clev = l + 2 <= length(hier.levels) ? hier.levels[l + 2] : nothing
+    # zoom-sphere radii with the standard depth-shrinking nesting margins
+    reff2 = Inf
+    if pol.zoom_r > 0 && l + 1 >= pol.zoom_lmin
+        margin = sum(sqrt(3.0) * (hier.B + hier.ng + nbuf) /
+                     (hier.nbase[1] * 2.0^(k - 1)) for k in (pol.zoom_lmin + 1):(l + 1);
+                     init = 0.0)
+        reff2 = max(pol.zoom_r - margin, 0.0)^2
+    end
+    reff2b = Inf
+    if pol.zoom_r2 > 0 && l + 1 >= pol.zoom_lmin2
+        margin2 = sum(sqrt(3.0) * (hier.B + hier.ng + nbuf) /
+                      (hier.nbase[1] * 2.0^(k - 1)) for k in (pol.zoom_lmin2 + 1):(l + 1);
+                      init = 0.0)
+        reff2b = max(pol.zoom_r2 - margin2, 0.0)^2
+    end
+    insphere(corg, r2) = begin
+        r2 === Inf && return true
+        d2 = 0.0
+        for d in 1:3
+            x = (Float64(corg[d]) + hier.B / 2) / Float64(Pc[d])
+            δx = abs(x - pol.zoom_center[d]); δx = min(δx, 1.0 - δx)
+            d2 += δx * δx
+        end
+        d2 <= r2
+    end
+    want = Dict{Origin,Tuple{Int32,NTuple{3,Int16}}}()
+    nnew = 0
+    for (bi, s) in enumerate(lev.live)
+        bits = UInt8(0)
+        for oo in 0:7
+            ho[8 * (bi - 1) + oo + 1] != 0 && (bits |= UInt8(1) << oo)
+        end
+        bits == 0x00 && continue
+        org = lev.meta[s].origin
+        for oo in 0:7
+            (bits >> oo) & 0x01 == 0x01 || continue
+            off = ntuple(d -> Int16(((oo >> (d - 1)) & 1) * Bh), 3)
+            corg = child_origin(org, off, Pc)
+            clev !== nothing && haskey(clev.byorigin, corg) && continue
+            (insphere(corg, reff2) && insphere(corg, reff2b)) || continue
+            # margin: the child's ghost-grown footprint (±2 level-l cells around
+            # [org+off, org+off+Bh)) must be lattice-covered at level l
+            ok = true
+            for ck in (-2, Bh + 1), cj in (-2, Bh + 1), ci in (-2, Bh + 1)
+                q = ntuple(d -> UInt128(wrapc(Int128(org[d]) + Int128(off[d]) +
+                                              Int128((ci, cj, ck)[d]), lev.P[d])), 3)
+                if lattice_owner(lev, q, hier.B) == Int32(0)
+                    ok = false; break
+                end
+            end
+            ok || continue
+            want[corg] = (s, off)
+            nnew += 1
+        end
+    end
+    nnew == 0 && return 0
+    # Enzo-style INTERPOLATED OUTPUT hook: the deepest, most-informative state a
+    # run ever holds is the instant just BEFORE a new level is born (the old
+    # deepest level is fully evolved and NOT yet superseded by a wall-adjacent
+    # newcomer).  The callback fires exactly once per level birth, before any
+    # topology change; levels sit within one coarse substep of each other
+    # (fine-first W-cycle), which is the same skew Enzo's interpolated outputs
+    # carry.  Restart checkpoints stay at root cadence — this is for outputs.
+    if on_newlevel !== nothing && (clev === nothing || isempty(clev.live))
+        on_newlevel("preL$(l + 1)")
+    end
+    if clev !== nothing            # persistence: existing children must survive
+        for cs in clev.live
+            m = clev.meta[cs]
+            want[m.origin] = (m.parent, m.offset)
+        end
+    end
+    _rebuild_level!(hier, l + 1, want)
+    haskey(_LEV_BORN, l + 1) || (_LEV_BORN[l + 1] = Int(hier.nstep[1]))
+    build_level_tables!(hier, l + 1)
+    build_cf_register!(hier, l + 1)
+    if l + 3 <= length(hier.levels) && !isempty(hier.levels[l + 3].live)
+        build_level_tables!(hier, l + 2)   # child tables reference the grown parent
+        build_cf_register!(hier, l + 2)
+    end
+    refresh_phi_ghosts!(hier, l + 1)
+    return nnew
+end
+
 "Rebuild one level's block set from its `want` footprint map; returns adds+frees."
 function _rebuild_level!(hier::AMRHierarchy, lc::Int,
                          want::Dict{Origin,Tuple{Int32,NTuple{3,Int16}}})
@@ -574,10 +782,21 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
         copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc); copyto!(lev.Gsc, hGsc)
         tab = to_device_table(lev.be, build_prolong_jobs(lev, plev; interior = true,
                                                          only_slots = news))
-        for (fd, fR, scd, scs) in zip(gasfields(lev), gasfields(plev),
-                                      classes(lev), classes(plev))
+        # BAM_EVAR=internal: new blocks get Tau REBUILT from prolonged Ge+KE
+        # (RAMSES interpol_var=1), not interpolated as the KE-dominated total.
+        evar_int = get(ENV, "BAM_EVAR", "total") == "internal" &&
+                   !isempty(gasfields(lev)[5])
+        for (fi, (fd, fR, scd, scs)) in enumerate(zip(gasfields(lev), gasfields(plev),
+                                                      classes(lev), classes(plev)))
             isempty(fd) && continue     # gravity_only: unused hydro pool (zero-size) — skip
+            (evar_int && fi == 5) && continue
             _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride, scd, scs)
+        end
+        if evar_int && tab.total > 0
+            _reconstruct_tau_k!(lev.be)(gasfields(lev)..., lev.Dsc, lev.Ssc,
+                                        lev.Esc, lev.Gsc, tab.jobs, tab.cellstart,
+                                        Int32(tab.njobs), Int32(lev.nd),
+                                        Int32(lev.stride); ndrange = tab.total)
         end
         for (sd, sR) in zip(lev.sp, plev.sp)
             _run_prolong!(lev.be, tab, sd, sR, sR, 0.0f0, lev.nd, lev.stride)
