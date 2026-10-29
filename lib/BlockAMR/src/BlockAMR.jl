@@ -40,6 +40,12 @@ Design contract:
     `inflow`), in 2-D and 3-D.  2-D covers the hydro stack (RK2 + tiled CTU,
     dual energy, f16 scales, species, reflux, subcycling, regrid, checkpoint);
     gravity, chemistry and particles remain 3-D only.
+
+  * **MHD.** `physics = :mhd` evolves ideal GLM-MHD (Dedner cleaning; HLLD / HLL
+    / LLF) with the NestedMHD MUSCL-Hancock scheme (mhd.jl), 2-D and 3-D, every
+    domain BC, refluxed B/ψ, subcycling, regrid and checkpoints, CPU + GPU via
+    the same KernelAbstractions kernels.  f32/f64 storage; no species yet.
+    Constrained transport (face B) is the next step.
 """
 module BlockAMR
 
@@ -67,6 +73,7 @@ export deposit_particles_level!, dm_from_parent!, gather_accel_particles!, parti
 export set_particle_tile!, particle_tile, ptile_ranges
 export global_from_level0!, compton_drag!
 export save_checkpoint, load_checkpoint
+export mhd_level!, encode_mhd_from_host!, max_divb, total_bflux, mhd_max_signal
 export memory_mode, set_memory_mode!, memory_report
 export prefetch_level!, advise_level_host!, advise_all_host!, evict_level!, evict_gas_pools!,
        prefetch_grav!, evict_grav!, set_stream_grav!
@@ -169,5 +176,6 @@ include("gravity.jl")      # KDK half-kicks from the topgrid potential
 include("chem.jl")         # fast analytic H+H2 chemistry over block batches
 include("particles.jl")    # DM particles: per-level deposit + finest-level accel gather
 include("checkpoint.jl")   # root-boundary save/restore (topology+fields+scales+phi)
+include("mhd.jl")          # GLM-MHD (NestedMHD scheme) on the same blocks / W-cycle
 
 end # module BlockAMR

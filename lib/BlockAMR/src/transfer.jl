@@ -503,6 +503,13 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
             _run_prolong!(lev.be, pro, dst[fi], srcR[fi], srcO[fi], Float32(θ),
                           lev.nd, lev.stride, cf[fi], cc[fi]; kz = _kz(lev))
         end
+        # MHD: B and ψ limited-linear like the gas (identity scale class)
+        for (fd, fR, fO) in zip(buf === :R ? mfields(lev) : mfields_o(lev),
+                                mfields(plev), mfields_o(plev))
+            isempty(fd) && continue
+            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
+                          lev.Bsc, plev.Bsc; kz = _kz(lev))
+        end
         if prolE && pro.total > 0                           # Ge: needs fine D (field 1) prolonged first
             _rect_prolong_e_k!(lev.be)(dst[6], dst[1], srcR[6], srcO[6], srcR[1], srcO[1],
                                        Float32(θ), cf[6], cc[6], cf[1], cc[1],
@@ -541,6 +548,9 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     for sd in (buf === :R ? lev.sp : lev.spo)
         _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
     end
+    for fd in (buf === :R ? mfields(lev) : mfields_o(lev))
+        isempty(fd) || _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride)
+    end
     # non-periodic domain faces: synthesize the ghosts beyond the edge LAST
     # (axis by axis, so edge/corner ghosts compose from already-filled ones)
     fill_boundary!(hier, l; buf)
@@ -560,6 +570,9 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
     for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
                                   classes(plev), classes(lev))
         _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs; kz = _kz(lev))
+    end
+    for (fc, ff) in zip(mfields(plev), mfields(lev))    # MHD: B, ψ volume means
+        isempty(fc) || _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride; kz = _kz(lev))
     end
     for (sc, sf) in zip(plev.sp, lev.sp)                # mass-weighted X mean
         res.total == 0 && continue

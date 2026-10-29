@@ -61,6 +61,7 @@ One synchronous SSP-RK2 step of the whole hierarchy over `dt` (same dt on every
 level — the Phase-1/2 integrator).  Final state lands in the R buffers.
 """
 function hierarchy_rk2_step!(hier::AMRHierarchy, dt::Real; reflux::Bool = true)
+    hier.physics === :mhd && error("MHD advances through the W-cycle (advance_hierarchy!)")
     L = length(hier.levels) - 1
     λl(l) = Float32(dt / level_dx(hier, l))
     for l in 0:L                                     # ── stage 1: O = R − λΔF(R)
@@ -96,7 +97,7 @@ function compute_lambda!(hier::AMRHierarchy)
     smax = 0.0f0
     for l in 0:length(hier.levels)-1
         isempty(hier.levels[l+1].live) && continue
-        smax = max(smax, max_signal(hier.levels[l+1], hier.gamma))
+        smax = max(smax, _signal(hier, hier.levels[l+1]))
     end
     # BAM_SMAXCAP (absolute signal cap, code units; 0 = off): cells beyond the
     # cap are numerical garbage the epilogue/reflux guards keep frozen — they
@@ -423,7 +424,9 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         # average over the 2:1 pair), coarse 1 — same per-coarse-step totals as
         # the RK2 path's (¼,½)×2.
         _t = _tic(lev.be); fresh || fill_ghosts!(hier, l; θ = 0.0f0, buf = :R); _toc(lev.be, :ghost, l, _t)
-        _t = _tic(lev.be); ctu_level!(hier, l, λ); _toc(lev.be, :hydro, l, _t)
+        _t = _tic(lev.be)
+        hier.physics === :mhd ? mhd_level!(hier, l, λ) : ctu_level!(hier, l, λ)
+        _toc(lev.be, :hydro, l, _t)
         _t = _tic(lev.be)
         l >= 1   && capture_fine!(hier, l, :R, 0.5f0; λ)
         haskids  && capture_coarse!(hier, l + 1, :R, 1.0f0; λ)
@@ -497,12 +500,16 @@ function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing,
     return λ * level_dx(hier, 0)
 end
 
+"Level max signal speed: hydro |v|+c_s, MHD the unsplit Σ_d(|v_d|+c_f,d)."
+_signal(hier::AMRHierarchy, lev::Level) =
+    hier.physics === :mhd ? Float32(mhd_max_signal(hier, lev)) : max_signal(lev, hier.gamma)
+
 "CFL timestep from the finest occupied level: dt = cfl·dx_finest/max_signal."
 function compute_dt(hier::AMRHierarchy)
     smax = 0.0f0; lfin = 0
     for l in 0:length(hier.levels)-1
         isempty(hier.levels[l+1].live) && continue
-        smax = max(smax, max_signal(hier.levels[l+1], hier.gamma))
+        smax = max(smax, _signal(hier, hier.levels[l+1]))
         lfin = l
     end
     return hier.cfl * level_dx(hier, lfin) / max(Float64(smax), 1e-30)

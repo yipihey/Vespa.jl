@@ -341,6 +341,9 @@ function compact_level!(hier::AMRHierarchy, l::Int)
         for (r, o) in zip(lev.sp, lev.spo)
             _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
         end
+        for (r, o) in zip(mfields(lev), mfields_o(lev))
+            isempty(r) || _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
+        end
         swap_buffers!(lev)                         # permuted O twins become R
         # species σΔ residuals follow their cells (permute through the rhs
         # scratch; leaving them behind would inject wrong-cell remainders)
@@ -835,6 +838,10 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
         end
         for (sd, sR) in zip(lev.sp, plev.sp)
             _run_prolong!(lev.be, tab, sd, sR, sR, 0.0f0, lev.nd, lev.stride)
+        end
+        for (fd, fR) in zip(mfields(lev), mfields(plev))  # MHD: B, ψ limited-linear
+            isempty(fd) || _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride,
+                                         lev.Bsc, plev.Bsc; kz = _kz(lev))
         end
         # φ seed: recycled slots carry a DEAD block's stale potential — a
         # garbage warm start the RB sweeps cannot recover from regionally

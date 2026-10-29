@@ -59,6 +59,11 @@ mutable struct Level{V<:AbstractVector,U<:AbstractVector{UInt16},
     # ── dimensionality + domain periodicity (see topology.jl) ──
     dim      :: Int                      # 3 (B³ blocks) or 2 (B×B×1, flat z)
     per      :: NTuple{3,Bool}           # periodic domain axis? (wrap images allowed)
+    # ── MHD (physics = :mhd, mhd.jl): cell-centred B + GLM ψ, R/O twins.  Zero-size
+    #    in hydro runs.  Unscaled (identity class `Bsc`; MHD runs store f32/f64).
+    Bx::V; By::V; Bz::V; Psi::V
+    Bxo::V; Byo::V; Bzo::V; Psio::V
+    Bsc      :: F                        # ones(cap): the identity scale class
 end
 
 # per-axis block geometry: the flat z axis of a 2-D level has extent 1, no ghosts
@@ -83,6 +88,10 @@ _kz(lev::Level) = Int32(lev.dim == 3 ? 1 : 0)
 
 gasfields(lev::Level)   = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge)
 gasfields_o(lev::Level) = (lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo)
+"MHD pools (Bx, By, Bz, ψ) — zero-size in hydro runs; data motion skips empty pools."
+mfields(lev::Level)     = (lev.Bx, lev.By, lev.Bz, lev.Psi)
+mfields_o(lev::Level)   = (lev.Bxo, lev.Byo, lev.Bzo, lev.Psio)
+ismhd(lev::Level)       = !isempty(lev.Bx)
 "Per-field scale-class vectors, field order (D,S1,S2,S3,Tau,Ge)."
 classes(lev::Level)     = (lev.Dsc, lev.Ssc, lev.Ssc, lev.Ssc, lev.Esc, lev.Gsc)
 
@@ -93,13 +102,15 @@ function swap_buffers!(lev::Level)
     lev.S2, lev.S2o = lev.S2o, lev.S2; lev.S3, lev.S3o = lev.S3o, lev.S3
     lev.Tau, lev.Tauo = lev.Tauo, lev.Tau; lev.Ge, lev.Geo = lev.Geo, lev.Ge
     lev.sp, lev.spo = lev.spo, lev.sp
+    lev.Bx, lev.Bxo = lev.Bxo, lev.Bx; lev.By, lev.Byo = lev.Byo, lev.By
+    lev.Bz, lev.Bzo = lev.Bzo, lev.Bz; lev.Psi, lev.Psio = lev.Psio, lev.Psi
     return nothing
 end
 
 function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
                  T::Type = Float32, nsp::Int = 0, cap0::Int = 8,
                  gravity_only::Bool = false, dim::Int = 3,
-                 per::NTuple{3,Bool} = (true, true, true))
+                 per::NTuple{3,Bool} = (true, true, true), mhd::Bool = false)
     @assert dim in (2, 3) "dim must be 2 or 3"
     @assert B % 2 == 0 && B >= 2ng "B must be even and ≥ 2ng"
     @assert all(nbase[d] % B == 0 for d in 1:dim) "nbase must be divisible by B"
@@ -114,6 +125,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
     gz() = gravity_only ? device_zeros(be, T, (0,)) : zed()
     zu()  = (gravity_only ? device_zeros(be, UInt16, (0,)) : device_zeros(be, UInt16, (cap0 * stride,)))
     zf()  = (gravity_only ? device_zeros(be, Float32, (0,)) : device_zeros(be, Float32, (cap0 * stride,)))
+    mz()  = mhd ? zed() : device_zeros(be, T, (0,))
     ones32(n) = to_device(be, ones(Float32, n), Float32)
     lev = Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
         l, B, ng, nd, stride, P, th, cap0, nsp, be,
@@ -127,7 +139,8 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
-        to_device(be, Int32[], Int32), Dict{Symbol,Any}(), dim, per)
+        to_device(be, Int32[], Int32), Dict{Symbol,Any}(), dim, per,
+        (mz() for _ in 1:8)..., ones32(cap0))
     # out-of-core: pools are born host-preferred so allocation + checkpoint
     # restore land in host RAM (not device) — prefetch_level! pulls the working
     # set to the GPU per advance.  No-op unless memory_mode() === :managed.
@@ -155,9 +168,13 @@ function _grow!(lev::Level, newcap::Int)
     lev.sp  = [grow(a) for a in lev.sp]
     lev.spo = [grow(a) for a in lev.spo]
     lev.spr = [grow(a) for a in lev.spr]
+    lev.Bx = grow(lev.Bx); lev.By = grow(lev.By); lev.Bz = grow(lev.Bz); lev.Psi = grow(lev.Psi)
+    lev.Bxo = grow(lev.Bxo); lev.Byo = grow(lev.Byo); lev.Bzo = grow(lev.Bzo); lev.Psio = grow(lev.Psio)
+    delete!(lev.tabs, :mrec)                     # MHD scratch: lazy realloc at the new cap
     growsc(a) = (b = to_device(lev.be, ones(Float32, newcap), Float32);
                  copyto!(view(b, 1:lev.cap), view(a, 1:lev.cap)); b)
     lev.Dsc = growsc(lev.Dsc); lev.Ssc = growsc(lev.Ssc); lev.Esc = growsc(lev.Esc); lev.Gsc = growsc(lev.Gsc)
+    lev.Bsc = growsc(lev.Bsc)
     lev.phi = grow(lev.phi); lev.rhs = grow(lev.rhs)
     length(lev.dm) > 0 && (lev.dm = grow(lev.dm))      # dm is lazy (deposit levels only)
     append!(lev.meta, [BlockMeta() for _ in 1:(newcap - lev.cap)])
@@ -309,7 +326,9 @@ mutable struct AMRHierarchy{L<:Level}
     scheme :: Symbol                     # hydro integrator: :rk2 (oracle) | :ctu (perf)
     dim    :: Int                        # 3 or 2 (flat z; see topology.jl)
     bc     :: NTuple{3,NTuple{2,Symbol}} # per-axis (lo, hi) domain BC (boundary.jl)
-    inflow :: NTuple{3,NTuple{2,NTuple{5,Float64}}}  # (ρ,u,v,w,P) per :inflow face
+    inflow :: NTuple{3,NTuple{2,NTuple{8,Float64}}}  # (ρ,u,v,w,P,Bx,By,Bz) per :inflow face
+    physics :: Symbol                    # :hydro | :mhd (GLM-MHD, mhd.jl)
+    mhd    :: NamedTuple                 # MHD parameters (riemann, GLM c_h/c_p, floors)
 end
 
 """
@@ -330,25 +349,46 @@ periodic_axes(hier::AMRHierarchy) = ntuple(d -> hier.bc[d][1] === :periodic, 3)
 with one entry per active axis, each a Symbol or a `(lo, hi)` pair, from
 `:periodic` (both faces of an axis), `:outflow` (zero gradient), `:reflecting`
 (mirror, normal momentum flipped) and `:inflow` (fixed state).  `inflow` maps
-`(axis, :lo | :hi) => (ρ, u, v, w, P)` (physical units) for every `:inflow` face.
+`(axis, :lo | :hi) => (ρ, u, v, w, P)` — or `(ρ, u, v, w, P, Bx, By, Bz)` for
+MHD — (physical units) for every `:inflow` face.
+
+`physics = :mhd` evolves ideal GLM-MHD (mhd.jl; Dedner cleaning, HLLD/HLL/LLF
+via `riemann`, MUSCL-Hancock + MonCen PLM — the NestedMHD scheme) on the same
+blocks, BCs and W-cycle; `glm_ch_scale`/`glm_cp_coef` set the cleaning speed
+and damping, `smallr`/`smallc` the density / sound-speed floors.
 """
 function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1.0,
                         B::Int = 16, ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
                         nsp::Int = 0, Lcap::Int = 60, gamma::Real = 5/3,
                         cfl::Real = 0.4, cap0::Int = 8, scheme::Symbol = :rk2,
                         gravity_only::Bool = false, bc = :periodic,
-                        inflow = Dict{Tuple{Int,Symbol},NTuple{5,Float64}}())
+                        inflow = Dict{Tuple{Int,Symbol},NTuple{5,Float64}}(),
+                        physics::Symbol = :hydro, riemann::Symbol = :hlld,
+                        glm_ch_scale::Real = 0.25, glm_cp_coef::Real = 0.18,
+                        smallr::Real = 1e-6, smallc::Real = 1e-4, sigdims::Int = 0)
     @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
+    @assert physics in (:hydro, :mhd) "physics must be :hydro or :mhd"
+    if physics === :mhd
+        riemann in (:hll, :hlld, :llf) || error("riemann must be :hll, :hlld or :llf")
+        T in (Float32, Float64) || error("MHD stores B unscaled: T must be Float32 or Float64")
+        nsp == 0 || error("MHD does not carry species yet")
+        gravity_only && error("MHD needs gas pools")
+        scheme = :ctu                     # single-stage MUSCL-Hancock (the :ctu W-cycle path)
+    end
     dim = length(nbase)
     nb3 = dim == 3 ? nbase : (nbase[1], nbase[2], 1)
     bct = _parse_bc(bc, dim)
     inf = _parse_inflow(inflow, bct)
     per = ntuple(d -> bct[d][1] === :periodic, 3)
     be = BlockAMR.backend(backend)
-    lev0 = Level(; l = 0, B, ng, nbase = nb3, be, T, nsp, cap0, gravity_only, dim, per)
+    lev0 = Level(; l = 0, B, ng, nbase = nb3, be, T, nsp, cap0, gravity_only, dim, per,
+                   mhd = physics === :mhd)
+    mpar = (riemann = riemann, glm_ch_scale = Float64(glm_ch_scale),
+            glm_cp_coef = Float64(glm_cp_coef), smallr = Float64(smallr),
+            smallc = Float64(smallc), sigdims = sigdims == 0 ? dim : sigdims)
     AMRHierarchy{typeof(lev0)}([lev0], B, ng, nb3, Float64(box), Lcap, be, backend,
                                Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme,
-                               dim, bct, inf)
+                               dim, bct, inf, physics, mpar)
 end
 
 const _BCKINDS = (:periodic, :outflow, :reflecting, :inflow)
@@ -370,14 +410,14 @@ function _parse_bc(bc, dim::Int)
 end
 
 function _parse_inflow(inflow, bct)
-    z = (0.0, 0.0, 0.0, 0.0, 0.0)
+    z = ntuple(_ -> 0.0, 8)
     out = ntuple(d -> ntuple(s -> begin
         bct[d][s] === :inflow || return z
         key = (d, s == 1 ? :lo : :hi)
         haskey(inflow, key) || error("inflow face $key needs a state in `inflow`")
         w = inflow[key]
-        length(w) == 5 || error("inflow state must be (ρ, u, v, w, P)")
-        ntuple(q -> Float64(w[q]), 5)
+        length(w) in (5, 8) || error("inflow state must be (ρ, u, v, w, P) or (…, Bx, By, Bz)")
+        ntuple(q -> q <= length(w) ? Float64(w[q]) : 0.0, 8)
     end, 2), 3)
     return out
 end
@@ -392,7 +432,8 @@ function ensure_level!(hier::AMRHierarchy, l::Int)
                                    T = eltype(hier.levels[1].D),
                                    nsp = hier.levels[1].nsp, cap0 = 8,
                                    gravity_only = isempty(hier.levels[1].Do),  # inherit from base
-                                   dim = hier.dim, per = hier.levels[1].per))
+                                   dim = hier.dim, per = hier.levels[1].per,
+                                   mhd = hier.physics === :mhd))
         push!(hier.nstep, 0)
     end
     return hier.levels[l + 1]
@@ -532,7 +573,7 @@ function zero_slots!(lev::Level, slots::Vector{Int32})
     n = length(slots) * lev.stride
     for A in (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge,
               lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo,
-              lev.phi, lev.rhs, lev.dm)
+              lev.phi, lev.rhs, lev.dm, mfields(lev)..., mfields_o(lev)...)
         length(A) == 0 && continue
         _zero_slots_k!(lev.be)(A, sd, Int32(lev.stride); ndrange = n)
     end
@@ -553,7 +594,8 @@ end
 "Resident bytes of one level's field pools, broken out by class."
 function level_bytes(lev::Level)
     b(a) = length(a) * sizeof(eltype(a))
-    gas  = sum(b, gasfields(lev)) + sum(b, gasfields_o(lev))     # 12 f16 pools
+    gas  = sum(b, gasfields(lev)) + sum(b, gasfields_o(lev)) +   # 12 f16 pools
+           sum(b, mfields(lev)) + sum(b, mfields_o(lev))                # + MHD
     spb  = sum(b, lev.sp; init = 0) + sum(b, lev.spo; init = 0) +  # 2·nsp u16 pools
            sum(b, lev.spr; init = 0)                               # + nsp f32 σΔ residuals
     grav = b(lev.phi) + b(lev.rhs) + b(lev.dm)                   # f32 phi/rhs/dm
@@ -597,7 +639,8 @@ end
 # All field pools of a level, in one tuple (dm/sp/spo may be empty).
 _field_pools(lev::Level) = (lev.D, lev.S1, lev.S2, lev.S3, lev.Tau, lev.Ge,
                             lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo,
-                            lev.phi, lev.rhs, lev.dm, lev.sp..., lev.spo..., lev.spr...)
+                            lev.phi, lev.rhs, lev.dm, lev.sp..., lev.spo..., lev.spr...,
+                            mfields(lev)..., mfields_o(lev)...)
 
 "Prefetch a level's field pools + device tables onto the GPU (managed mode only)."
 function prefetch_level!(lev::Level)
@@ -660,6 +703,7 @@ function evict_gas_pools!(hier::AMRHierarchy)
     for lev in hier.levels
         for a in gasfields(lev);   prefetch_host!(a); end
         for a in gasfields_o(lev); prefetch_host!(a); end
+        for a in (mfields(lev)..., mfields_o(lev)...); prefetch_host!(a); end
         for a in lev.sp;  prefetch_host!(a); end
         for a in lev.spo; prefetch_host!(a); end
         for a in lev.spr; prefetch_host!(a); end

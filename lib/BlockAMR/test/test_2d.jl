@@ -33,8 +33,9 @@ end
 
 # static 2-level 2-D hierarchy; `kids` = [(parent base-block origin (x,y), offset (ox,oy))]
 function static2d(; nbase, B = 16, bc = :periodic, inflow = Dict(), scheme = :rk2,
-                  T = Float32, gamma = 5/3, kids = (), backend = :cpu, box = 1.0)
-    hier = AMRHierarchy(; nbase, B, backend, bc, inflow, scheme, T, gamma, box)
+                  T = Float32, gamma = 5/3, kids = (), backend = :cpu, box = 1.0,
+                  physics = :hydro, riemann = :hlld)
+    hier = AMRHierarchy(; nbase, B, backend, bc, inflow, scheme, T, gamma, box, physics, riemann)
     lev0 = init_base_level!(hier)
     for (po, off) in kids
         p = lev0.byorigin[(UInt128(po[1]), UInt128(po[2]), UInt128(0))]

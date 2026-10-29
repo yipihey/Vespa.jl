@@ -91,7 +91,9 @@ function build_cf_register!(hier::AMRHierarchy, l::Int)
     # ΣρX creation at C/F rings (the in-run xe/fH2 fraction pump: species mass
     # made at every level's boundary ring around the collapsing core, ×10 per
     # new level; gas mass exact, max-X bounded, single-level CMA exact).
-    lev.tabs[:cfreg] = device_zeros(lev.be, Float32, (max((6 + lev.nsp) * n, 1),))
+    # MHD (mhd.jl): 9 lanes (ρ, ρv, E, B, ψ) in the compute precision
+    lev.tabs[:cfreg] = ismhd(lev) ? device_zeros(lev.be, eltype(lev.D), (max(9n, 1),)) :
+                                    device_zeros(lev.be, Float32, (max((6 + lev.nsp) * n, 1),))
     # group entries by unique target coarse cell → atomic-free apply
     keyof(i) = (ent[16(i-1)+1], ent[16(i-1)+2], ent[16(i-1)+3], ent[16(i-1)+4])
     perm = sort!(collect(Int32, 1:n); by = keyof)
@@ -436,6 +438,7 @@ subcycling w=¼ per stage (the extra ½ is the dt_f/dt_c time average).
 """
 function capture_fine!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
                        λ::Float32 = hier.λ)
+    hier.physics === :mhd && return mhd_capture_fine!(hier, l, w, λ)
     lev = hier.levels[l + 1]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
@@ -465,6 +468,7 @@ buffer `buf` (w=½ per coarse RK stage in all integration modes).
 """
 function capture_coarse!(hier::AMRHierarchy, l::Int, buf::Symbol, w::Float32;
                          λ::Float32 = hier.λ)
+    hier.physics === :mhd && return mhd_capture_coarse!(hier, l, w, λ)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
@@ -500,6 +504,7 @@ Apply the accumulated (l−1, l) corrections to the coarse R buffers and zero th
 register.  `λc` = the coarse level's dt/dx for the completed step.
 """
 function reflux_apply!(hier::AMRHierarchy, l::Int, λc::Float32)
+    hier.physics === :mhd && return mhd_reflux_apply!(hier, l, λc)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing

@@ -63,13 +63,15 @@ function build_boundary_tables!(hier::AMRHierarchy, l::Int)
     end
     # inflow values per field (D,S1,S2,S3,Tau,Ge) per face id (6 faces), physical
     γ = hier.gamma
-    vals = ntuple(_ -> zeros(Float32, 6), 6)
+    vals = ntuple(_ -> zeros(Float32, 6), 10)        # gas (6) + MHD (Bx,By,Bz,ψ)
     for a in 1:3, side in 1:2
         hier.bc[a][side] === :inflow || continue
-        ρ, u, v, w, P = hier.inflow[a][side]
+        ρ, u, v, w, P, bx, by, bz = hier.inflow[a][side]
         ge = P / (γ - 1)
+        em = hier.physics === :mhd ? 0.5 * (bx^2 + by^2 + bz^2) : 0.0  # MHD: Tau is total E
         fid = 2 * (a - 1) + side
-        for (fi, x) in enumerate((ρ, ρ * u, ρ * v, ρ * w, ge + 0.5ρ * (u^2 + v^2 + w^2), ge))
+        for (fi, x) in enumerate((ρ, ρ * u, ρ * v, ρ * w, ge + 0.5ρ * (u^2 + v^2 + w^2) + em,
+                                  ge, bx, by, bz, 0.0))
             vals[fi][fid] = Float32(x)
         end
     end
@@ -122,14 +124,18 @@ Synthesize level-`l` ghosts beyond the non-periodic domain faces in buffer
 function fill_boundary!(hier::AMRHierarchy, l::Int; buf::Symbol = :R)
     lev = hier.levels[l + 1]
     all(lev.per) && return nothing
-    dst = buf === :R ? gasfields(lev) : gasfields_o(lev)
+    dst = buf === :R ? (gasfields(lev)..., mfields(lev)...) :
+                       (gasfields_o(lev)..., mfields_o(lev)...)
+    scs = (classes(lev)..., lev.Bsc, lev.Bsc, lev.Bsc, lev.Bsc)
     sps = buf === :R ? lev.sp : lev.spo
     vals = lev.tabs[:bcval]
-    flips = (Int32(0), Int32(1), Int32(2), Int32(3), Int32(0), Int32(0))
+    # normal momentum AND normal B flip at a reflecting face; ψ is even
+    flips = (Int32(0), Int32(1), Int32(2), Int32(3), Int32(0), Int32(0),
+             Int32(1), Int32(2), Int32(3), Int32(0))
     for a in 1:lev.dim
         tab = get(lev.tabs, Symbol(:bc, a), nothing)
         (tab === nothing || tab.total == 0) && continue
-        for (fi, (F, sc)) in enumerate(zip(dst, classes(lev)))
+        for (fi, (F, sc)) in enumerate(zip(dst, scs))
             isempty(F) && continue
             _bc_fill_k!(lev.be)(F, sc, vals[fi], tab.jobs, tab.cellstart,
                                 Int32(tab.njobs), Int32(lev.nd), Int32(lev.stride),

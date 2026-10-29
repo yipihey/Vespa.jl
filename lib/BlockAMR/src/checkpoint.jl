@@ -28,10 +28,11 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
         origins = [lev.meta[s].origin for s in lev.live]
         offsets = [lev.meta[s].offset for s in lev.live]
         na = _nact(lev); Bz = _Bax(lev, 3); kg = _ngax(lev, 3)
-        gf = ntuple(_ -> Array{T}(undef, na, nl), 6)
+        nf = ismhd(lev) ? 10 : 6                    # gas + (Bx, By, Bz, ψ)
+        gf = ntuple(_ -> Array{T}(undef, na, nl), nf)
         fsp = [Array{UInt16}(undef, na, nl) for _ in 1:lev.nsp]
         fphi = Array{Float32}(undef, na, nl)
-        hostf = map(Array, gasfields(lev))
+        hostf = map(Array, (gasfields(lev)..., (ismhd(lev) ? mfields(lev) : ())...))
         hsp = map(Array, lev.sp)
         hphi = Array(lev.phi)
         live = lev.live
@@ -44,7 +45,7 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
             for k in 1:Bz, j in 1:B, ii in 1:B
                 idx = base + ((kg+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
-                for f in 1:6
+                for f in 1:nf
                     @inbounds gf[f][q, i] = hostf[f][idx]
                 end
                 for t in 1:lev.nsp
@@ -57,6 +58,7 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
         push!(levels, (; origins, parents = pidx, offsets,
                        D = gf[1], S1 = gf[2], S2 = gf[3], S3 = gf[4],
                        Tau = gf[5], Ge = gf[6], sp = fsp, phi = fphi,
+                       M = nf == 10 ? gf[7:10] : (),
                        Dsc = Array(lev.Dsc)[li], Ssc = Array(lev.Ssc)[li],
                        Esc = Array(lev.Esc)[li], Gsc = Array(lev.Gsc)[li]))
     end
@@ -64,7 +66,7 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
             Lcap = hier.Lcap, gamma = hier.gamma, cfl = hier.cfl,
             scheme = hier.scheme, T = eltype(hier.levels[1].D),
             nsp = hier.levels[1].nsp, nstep = copy(hier.nstep), levels, extra,
-            dim = hier.dim, bc = hier.bc,
+            dim = hier.dim, bc = hier.bc, physics = hier.physics, mhd = hier.mhd,
             inflow = Dict((d, s == 1 ? :lo : :hi) => hier.inflow[d][s]
                           for d in 1:3, s in 1:2 if hier.bc[d][s] === :inflow))
 end
@@ -111,7 +113,11 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
                         gamma = ck.gamma, cfl = ck.cfl, scheme = ck.scheme,
                         bc = hasproperty(ck, :bc) ? ck.bc[1:dim] : :periodic,
                         inflow = hasproperty(ck, :inflow) ? ck.inflow :
-                                 Dict{Tuple{Int,Symbol},NTuple{5,Float64}}())
+                                 Dict{Tuple{Int,Symbol},NTuple{5,Float64}}(),
+                        (hasproperty(ck, :physics) && ck.physics === :mhd ?
+                         (physics = :mhd, riemann = ck.mhd.riemann,
+                          glm_ch_scale = ck.mhd.glm_ch_scale, glm_cp_coef = ck.mhd.glm_cp_coef,
+                          smallr = ck.mhd.smallr, smallc = ck.mhd.smallc) : (;))...)
     init_base_level!(hier)
     slotmaps = Vector{Vector{Int32}}()
     push!(slotmaps, Int32[hier.levels[1].byorigin[org] for org in ck.levels[1].origins])
@@ -135,12 +141,13 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         T = eltype(lev.D); B = lev.B; ng = lev.ng; nd = lev.nd
         Bz = _Bax(lev, 3); kg = _ngax(lev, 3)
         n = lev.cap * lev.stride
-        hosts = ntuple(_ -> zeros(T, n), 6)
+        nf = ismhd(lev) ? 10 : 6
+        hosts = ntuple(_ -> zeros(T, n), nf)
         hsp = [zeros(UInt16, n) for _ in 1:lev.nsp]
         hphi = zeros(Float32, n)
         hDsc = ones(Float32, lev.cap); hSsc = ones(Float32, lev.cap)
         hEsc = ones(Float32, lev.cap); hGsc = ones(Float32, lev.cap)
-        ckf = (ckl.D, ckl.S1, ckl.S2, ckl.S3, ckl.Tau, ckl.Ge)
+        ckf = (ckl.D, ckl.S1, ckl.S2, ckl.S3, ckl.Tau, ckl.Ge, (nf == 10 ? ckl.M : ())...)
         # backward-compat: pre-split checkpoints have no Gsc — Ge was encoded on
         # the shared Esc, so Gsc = Esc reproduces the old physical Ge exactly.
         ckGsc = hasproperty(ckl, :Gsc) ? ckl.Gsc : ckl.Esc
@@ -157,7 +164,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             for k in 1:Bz, j in 1:B, ii in 1:B
                 idx = base + ((kg+k-1) * nd + (ng+j-1)) * nd + (ng+ii-1) + 1
                 q += 1
-                for f in 1:6
+                for f in 1:nf
                     @inbounds hosts[f][idx] = ckf[f][q, i]
                 end
                 for t in 1:lev.nsp
@@ -169,7 +176,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         end
         dbg && (@printf("load: scattered L%d (%d blocks) in %.1fs\n", l, length(smap), _t()-ts); flush(stdout))
         tc = _t()
-        for (dev, hh) in zip(gasfields(lev), hosts)
+        for (dev, hh) in zip((gasfields(lev)..., (nf == 10 ? mfields(lev) : ())...), hosts)
             copyto!(dev, hh)
         end
         for (t, sp) in enumerate(lev.sp)

@@ -30,4 +30,5 @@ const BACKENDS = (:cpu,
     include("test_collapse.jl")
     include("test_particles.jl")
     include("test_2d.jl")          # 2-D blocks + non-periodic domain faces (any face)
+    include("test_mhd.jl")         # GLM-MHD (NestedMHD scheme), 2-D + 3-D
 end
