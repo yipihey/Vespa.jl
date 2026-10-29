@@ -104,6 +104,7 @@ function build_cf_register!(hier::AMRHierarchy, l::Int)
     push!(gs, Int32(n + 1))
     lev.tabs[:cfng]   = max(length(gs) - 1, 0)
     lev.tabs[:cfperm] = to_device(lev.be, perm, Int32)
+    isct(lev) && build_ct_tables!(hier, l)        # CT: E_z corners, face restriction
     lev.tabs[:cfgs]   = to_device(lev.be, gs, Int32)
     # per-target-cell f32 species-correction RESIDUAL: the u16 codec quantum
     # (~8e-4 relative) is 60-300× the per-apply ρX correction, so a naive

@@ -12,6 +12,12 @@
 @inline _narrow(::Type{T}, v::Float32) where {T} = T(v)
 @inline _narrow(::Type{Float16}, v::Float32) = Float16(clamp(v, -65504.0f0, 65504.0f0))
 @inline _narrow(::Type{UInt16}, v::Float32) = UInt16(unsafe_trunc(Int32, v + 0.5f0))
+@inline _narrow(::Type{Float64}, v::Float64) = v
+# working precision of the scaled transfer kernels: Float64 pools (f64 MHD runs)
+# stay f64 — a Float32 detour would make ghost copies differ from their source
+# (CT needs bitwise-identical ghosts); every other storage type works in Float32
+@inline _wt(::Type{Float64}) = Float64
+@inline _wt(::Type) = Float32
 
 # largest j (1-based) with cellstart[j] ≤ t0 (0-based cell id); cellstart[1] = 0.
 @inline function _job_of(cellstart, njobs::Int32, t0::Int32)
@@ -92,12 +98,13 @@ end
         sk = jobs[b+8] + Int32(2) * rk
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
-        acc = 0.0f0
+        W = _wt(eltype(dst))
+        acc = zero(W)
         for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
-            acc += Float32(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
+            acc += W(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
         end
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
-            eltype(dst)(acc * (kz == Int32(1) ? 0.125f0 : 0.25f0))
+            eltype(dst)(acc * (kz == Int32(1) ? W(0.125) : W(0.25)))
     end
 end
 
@@ -125,11 +132,12 @@ end
     @inbounds begin
         di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
         si = jobs[b+6] + ri; sj = jobs[b+7] + rj; sk = jobs[b+8] + rk
-        ratio = scs[jobs[b+2]] / scd[jobs[b+1]]
+        W = _wt(eltype(dst))
+        ratio = W(scs[jobs[b+2]]) / W(scd[jobs[b+1]])
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
-            _narrow(eltype(dst), Float32(src[sbase + (sk * nd + sj) * nd + si + Int32(1)]) * ratio)
+            _narrow(eltype(dst), W(src[sbase + (sk * nd + sj) * nd + si + Int32(1)]) * ratio)
     end
 end
 
@@ -165,8 +173,8 @@ end
 # one-sided difference), and EXACTLY zero-slope in uniform flow — the
 # uniform-flow C/F bit-cancellation gate is unaffected.  The ±1 slope taps stay
 # inside the parent frame (source rects sit ≥1 cell from the frame edge).
-@inline _mm(a::Float32, b::Float32) =
-    a * b > 0.0f0 ? (abs(a) < abs(b) ? a : b) : 0.0f0
+@inline _mm(a::T, b::T) where {T<:AbstractFloat} =
+    a * b > zero(T) ? (abs(a) < abs(b) ? a : b) : zero(T)
 
 @kernel function _rect_prolong_llsc_k!(dst, @Const(srcR), @Const(srcO), θ::Float32,
                                        @Const(scd), @Const(scs),
@@ -180,22 +188,24 @@ end
         si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
         sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
         sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
-        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
-        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
-        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -0.25f0 : 0.25f0
+        W = _wt(eltype(dst)); q4 = W(0.25)
+        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -q4 : q4
+        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -q4 : q4
+        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -q4 : q4
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
-        S(ii, jj, kk) = (1.0f0 - θ) *
-                        Float32(srcR[sbase + (kk * nd + jj) * nd + ii + Int32(1)]) +
-                        θ * Float32(srcO[sbase + (kk * nd + jj) * nd + ii + Int32(1)])
+        θw = W(θ)
+        @inline S(ii, jj, kk) = (one(W) - θw) *
+                        W(srcR[sbase + (kk * nd + jj) * nd + ii + Int32(1)]) +
+                        θw * W(srcO[sbase + (kk * nd + jj) * nd + ii + Int32(1)])
         c  = S(si, sj, sk)
         sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
         sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
         # flat z (2-D, kz = 0): no z taps — they would leave the slot
-        sz = kz == Int32(1) ? _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1))) : 0.0f0
-        phys = (c + f1 * sx + f2 * sy + f3 * sz) * scs[jobs[b+2]]
+        sz = kz == Int32(1) ? _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1))) : zero(W)
+        phys = (c + f1 * sx + f2 * sy + f3 * sz) * W(scs[jobs[b+2]])
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
-            _narrow(eltype(dst), phys / scd[jobs[b+1]])
+            _narrow(eltype(dst), phys / W(scd[jobs[b+1]]))
     end
 end
 
@@ -294,13 +304,14 @@ end
         sk = jobs[b+8] + Int32(2) * rk
         dbase = (jobs[b+1] - Int32(1)) * stride
         sbase = (jobs[b+2] - Int32(1)) * stride
-        acc = 0.0f0
+        W = _wt(eltype(dst))
+        acc = zero(W)
         for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
-            acc += Float32(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
+            acc += W(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
         end
-        phys = acc * (kz == Int32(1) ? 0.125f0 : 0.25f0) * scs[jobs[b+2]]
+        phys = acc * (kz == Int32(1) ? W(0.125) : W(0.25)) * W(scs[jobs[b+2]])
         dst[dbase + (dk * nd + dj) * nd + di + Int32(1)] =
-            _narrow(eltype(dst), phys / scd[jobs[b+1]])
+            _narrow(eltype(dst), phys / W(scd[jobs[b+1]]))
     end
 end
 
@@ -451,6 +462,10 @@ function build_level_tables!(hier::AMRHierarchy, l::Int)
     lev.tabs[:sib]  = to_device_table(lev.be, build_sibling_jobs(lev))
     lev.tabs[:sibf] = to_device_table(lev.be, build_sibling_face_jobs(lev))
     build_boundary_tables!(hier, l)                       # domain-face BC fill (boundary.jl)
+    if isct(lev)                                          # CT: authoritative-face exchange
+        lev.tabs[:sibfx] = to_device_table(lev.be, build_ct_face_sibling_jobs(lev, 1))
+        lev.tabs[:sibfy] = to_device_table(lev.be, build_ct_face_sibling_jobs(lev, 2))
+    end
     sync_block_geometry!(lev)
     delete!(lev.tabs, :pkey); delete!(lev.tabs, :pslot)   # particle lookup: lazy rebuild
     delete!(lev.tabs, :proint)                            # MG interior-prolong: lazy rebuild
@@ -551,6 +566,7 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
     for fd in (buf === :R ? mfields(lev) : mfields_o(lev))
         isempty(fd) || _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride)
     end
+    isct(lev) && ct_fill_face_ghosts!(hier, l; θ, buf)   # CT face pools (ct.jl)
     # non-periodic domain faces: synthesize the ghosts beyond the edge LAST
     # (axis by axis, so edge/corner ghosts compose from already-filled ones)
     fill_boundary!(hier, l; buf)

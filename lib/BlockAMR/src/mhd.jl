@@ -386,7 +386,6 @@ end
     end
 end
 
-@inline _narrow(::Type{Float64}, v::Float64) = v
 
 # ── CFL signal: Σ_d(|v_d| + c_f,d) per active cell ───────────────────────────
 @kernel function _mhd_signal_k!(out, @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
@@ -439,6 +438,7 @@ Requires current R ghosts (fill_ghosts!).  The scratch stays valid for the
 C/F captures that follow (capture_fine!/capture_coarse!).
 """
 function mhd_level!(hier::AMRHierarchy, l::Int, λ::Real)
+    hier.mhd.ct && return ct_level!(hier, l, λ)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     T = eltype(lev.D)
@@ -567,6 +567,7 @@ end
 end
 
 function mhd_capture_fine!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
+    hier.mhd.ct && return ct_capture_fine!(hier, l, w)
     lev = hier.levels[l + 1]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
@@ -579,6 +580,7 @@ function mhd_capture_fine!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
 end
 
 function mhd_capture_coarse!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
+    hier.mhd.ct && return ct_capture_coarse!(hier, l, w)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
@@ -591,6 +593,14 @@ function mhd_capture_coarse!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
 end
 
 function mhd_reflux_apply!(hier::AMRHierarchy, l::Int, λc::Real)
+    if hier.mhd.ct                     # cells (ρ, ρv, E, Bz), then the face coupling
+        _mhd_reflux_cells!(hier, l, λc)
+        return ct_sync!(hier, l, λc)
+    end
+    return _mhd_reflux_cells!(hier, l, λc)
+end
+
+function _mhd_reflux_cells!(hier::AMRHierarchy, l::Int, λc::Real)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     n = get(lev.tabs, :cfn, 0)::Int
     n == 0 && return nothing
@@ -633,6 +643,7 @@ divergence of the cell-centred field relative to the GLOBAL peak field (a local
 normalization is meaningless at field nulls).  Fills R ghosts first.
 """
 function max_divb(hier::AMRHierarchy)
+    hier.mhd.ct && return max_divb_ct(hier)
     worst = 0.0; bmax = 0.0
     for l in 0:length(hier.levels)-1
         lev = hier.levels[l + 1]

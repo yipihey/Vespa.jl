@@ -152,7 +152,7 @@ function encode_from_host!(lev::Level, hD, hS1, hS2, hS3, hTau, hGe)
             a = hin[fi]; o = hout[fi]
             sc = Float64(hsc[cls[fi]][s])
             @inbounds for idx in rng
-                o[idx] = _narrow(T, Float32(a[idx] / sc))
+                o[idx] = _narrow(T, _wt(T)(a[idx] / sc))   # f64 pools: no f32 detour
             end
         end
     end

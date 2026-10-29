@@ -59,6 +59,9 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
                        D = gf[1], S1 = gf[2], S2 = gf[3], S3 = gf[4],
                        Tau = gf[5], Ge = gf[6], sp = fsp, phi = fphi,
                        M = nf == 10 ? gf[7:10] : (),
+                       # CT faces: whole slots (B+1 faces per normal row)
+                       C = isct(lev) ? map(a -> reshape(Array(a)[1:lev.cap*lev.stride], lev.stride, lev.cap)[:, li],
+                                           cfields(lev)) : (),
                        Dsc = Array(lev.Dsc)[li], Ssc = Array(lev.Ssc)[li],
                        Esc = Array(lev.Esc)[li], Gsc = Array(lev.Gsc)[li]))
     end
@@ -116,6 +119,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
                                  Dict{Tuple{Int,Symbol},NTuple{5,Float64}}(),
                         (hasproperty(ck, :physics) && ck.physics === :mhd ?
                          (physics = :mhd, riemann = ck.mhd.riemann,
+                          divb = get(ck.mhd, :ct, false) ? :ct : :glm,
                           glm_ch_scale = ck.mhd.glm_ch_scale, glm_cp_coef = ck.mhd.glm_cp_coef,
                           smallr = ck.mhd.smallr, smallc = ck.mhd.smallc) : (;))...)
     init_base_level!(hier)
@@ -183,6 +187,15 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
             copyto!(sp, hsp[t])
         end
         copyto!(lev.phi, hphi)
+        if isct(lev) && hasproperty(ckl, :C) && !isempty(ckl.C)
+            for (dev, cols) in zip(cfields(lev), ckl.C)
+                h = zeros(T, lev.cap * lev.stride)
+                for (i, s) in enumerate(smap)
+                    h[(Int(s)-1)*lev.stride+1:Int(s)*lev.stride] .= cols[:, i]
+                end
+                copyto!(dev, h)
+            end
+        end
         copyto!(lev.Dsc, hDsc); copyto!(lev.Ssc, hSsc); copyto!(lev.Esc, hEsc); copyto!(lev.Gsc, hGsc)
         dbg && (@printf("load: uploaded L%d fields in %.1fs\n", l, _t()-tc); flush(stdout))
     end

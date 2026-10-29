@@ -341,7 +341,7 @@ function compact_level!(hier::AMRHierarchy, l::Int)
         for (r, o) in zip(lev.sp, lev.spo)
             _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
         end
-        for (r, o) in zip(mfields(lev), mfields_o(lev))
+        for (r, o) in zip((mfields(lev)..., cfields(lev)...), (mfields_o(lev)..., cfields_o(lev)...))
             isempty(r) || _permute_slots!(lev.be, o, r, perm_d, n, lev.stride)
         end
         swap_buffers!(lev)                         # permuted O twins become R
@@ -843,6 +843,7 @@ function _rebuild_level!(hier::AMRHierarchy, lc::Int,
             isempty(fd) || _run_prolong!(lev.be, tab, fd, fR, fR, 0.0f0, lev.nd, lev.stride,
                                          lev.Bsc, plev.Bsc; kz = _kz(lev))
         end
+        isct(lev) && ct_init_new!(hier, lc, news)          # CT: divergence-free faces
         # φ seed: recycled slots carry a DEAD block's stale potential — a
         # garbage warm start the RB sweeps cannot recover from regionally
         # (the bamr256L10 Tau runaway ~10 steps after heavy de-refinement:

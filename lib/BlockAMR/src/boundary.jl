@@ -55,15 +55,20 @@ function build_boundary_tables!(hier::AMRHierarchy, l::Int)
                 ext  = ntuple(d -> d == a ? ng : _ndax(lev, d), 3)
                 _push_job!(acc, s, s, doff, (0, 0, 0), ext,
                            (a, side, Int(kind)))
-                # the face id rides in the pad slot [15]
+                # the face id rides in the pad slot [15]; [16] flags a same-level
+                # (or beyond-domain) neighbour on the transverse lo (bit 0) / hi
+                # (bit 1) side — CT completes the hi-wall faces of the unsupplied
+                # transverse ghost rows (ct.jl)
                 acc.jobs[(acc.n - 1) * _JOB + 15] = Int32(2 * (a - 1) + side + 1)
+                acc.jobs[(acc.n - 1) * _JOB + 16] = _transverse_flags(lev, m.origin, a)
             end
         end
         lev.tabs[Symbol(:bc, a)] = to_device_table(lev.be, _finish(acc))
     end
     # inflow values per field (D,S1,S2,S3,Tau,Ge) per face id (6 faces), physical
     γ = hier.gamma
-    vals = ntuple(_ -> zeros(Float32, 6), 10)        # gas (6) + MHD (Bx,By,Bz,ψ)
+    VT = _wt(eltype(lev.D))                          # f64 runs keep f64 inflow states
+    vals = ntuple(_ -> zeros(VT, 6), 10)             # gas (6) + MHD (Bx,By,Bz,ψ)
     for a in 1:3, side in 1:2
         hier.bc[a][side] === :inflow || continue
         ρ, u, v, w, P, bx, by, bz = hier.inflow[a][side]
@@ -72,11 +77,28 @@ function build_boundary_tables!(hier::AMRHierarchy, l::Int)
         fid = 2 * (a - 1) + side
         for (fi, x) in enumerate((ρ, ρ * u, ρ * v, ρ * w, ge + 0.5ρ * (u^2 + v^2 + w^2) + em,
                                   ge, bx, by, bz, 0.0))
-            vals[fi][fid] = Float32(x)
+            vals[fi][fid] = VT(x)
         end
     end
-    lev.tabs[:bcval] = map(v -> to_device(lev.be, v, Float32), vals)
+    lev.tabs[:bcval] = map(v -> to_device(lev.be, v, VT), vals)
     return nothing
+end
+
+function _transverse_flags(lev::Level, origin, a::Int)
+    f = Int32(0)
+    for t in 1:lev.dim
+        t == a && continue
+        for (bit, sh) in ((0, -lev.B), (1, lev.B))
+            n = ntuple(d -> d == t ? Int128(origin[d]) + sh : Int128(origin[d]), 3)
+            ok = if !lev.per[t] && !(0 <= n[t] < Int128(lev.P[t]))
+                true                                 # beyond the domain: the other axis' BC
+            else
+                haskey(lev.byorigin, ntuple(d -> wrapc(n[d], lev.P[d]), 3))
+            end
+            ok && (f |= Int32(1) << bit)
+        end
+    end
+    return f
 end
 
 # One thread per ghost cell of the job's slab.  `flipax` = the axis whose normal
@@ -107,7 +129,7 @@ end
         base = (slot - Int32(1)) * stride
         didx = base + (dk * nd + dj) * nd + di + Int32(1)
         if kind == BC_INFLOW && useval == Int32(1)
-            F[didx] = _narrow(eltype(F), val[fid] / sc[slot])
+            F[didx] = _narrow(eltype(F), val[fid] / eltype(val)(sc[slot]))
         else
             v = F[base + (sk * nd + sj) * nd + si + Int32(1)]
             F[didx] = (kind == BC_REFLECTING && flipax == a) ? -v : v
@@ -149,5 +171,6 @@ function fill_boundary!(hier::AMRHierarchy, l::Int; buf::Symbol = :R)
                                 ndrange = tab.total)
         end
     end
+    isct(lev) && ct_fill_face_boundary!(hier, l; buf)   # CT face pools (ct.jl)
     return nothing
 end

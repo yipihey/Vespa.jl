@@ -133,6 +133,51 @@ function build_sibling_jobs(lev::Level)
 end
 
 """
+    build_ct_face_sibling_jobs(lev, ax) -> RectJobTable (host)
+
+CT face exchange for the `ax`-face pool (FBx[idx] = the LOWER face of cell idx).
+Copies only AUTHORITATIVE faces of each neighbour: its lower faces [o, o+B), plus
+its hi face o+B when no same-level block lies beyond it (a C/F or domain-edge
+face it owns) — the same owner rule the CT restriction / E_z correction write
+to.  A cell-keyed exchange would miss those owned hi faces, and the two sides of
+a C/F corner would then reconstruct from different face values.
+"""
+function build_ct_face_sibling_jobs(lev::Level, ax::Int)
+    acc = _JobAcc(26 * length(lev.live)); B = lev.B
+    ngv = ntuple(d -> _ngax(lev, d), 3); ndv = ntuple(d -> _ndax(lev, d), 3)
+    cands = Int32[]
+    hasbeyond(o) = begin
+        n = ntuple(d -> d == ax ? Int128(o[d]) + B : Int128(o[d]), 3)
+        (!lev.per[ax] && n[ax] >= Int128(lev.P[ax])) && return false
+        haskey(lev.byorigin, ntuple(d -> wrapc(n[d], lev.P[d]), 3))
+    end
+    for s in lev.live
+        m = lev.meta[s]
+        lo = ntuple(d -> Int128(m.origin[d]) - ngv[d], 3)
+        lattice_neighbors!(cands, lev, m.origin, B)
+        for c in cands
+            cm = lev.meta[c]
+            ext = ntuple(d -> d == ax ? B + (hasbeyond(cm.origin) ? 0 : 1) : _Bax(lev, d), 3)
+            r1 = axis_images3(lo[1], ndv[1], Int128(cm.origin[1]), ext[1], Int128(lev.P[1]))
+            r2 = axis_images3(lo[2], ndv[2], Int128(cm.origin[2]), ext[2], Int128(lev.P[2]))
+            r3 = axis_images3(lo[3], ndv[3], Int128(cm.origin[3]), ext[3], Int128(lev.P[3]))
+            for k1 in 1:r1[1], k2 in 1:r2[1], k3 in 1:r3[1]
+                i1 = img_get(r1, k1); i2 = img_get(r2, k2); i3 = img_get(r3, k3)
+                c == s && i1[3] == 0 && i2[3] == 0 && i3[3] == 0 && continue
+                _wrapped_out(lev, i1, i2, i3) && continue
+                glo  = (i1[1], i2[1], i3[1])
+                ex   = (i1[2], i2[2], i3[2])
+                doff = ntuple(d -> Int(glo[d] - lo[d]), 3)
+                soff = ntuple(d -> Int(glo[d] - (i1, i2, i3)[d][3] -
+                                       (Int128(cm.origin[d]) - ngv[d])), 3)
+                _push_job!(acc, s, c, doff, soff, ex)
+            end
+        end
+    end
+    return _finish(acc)
+end
+
+"""
     build_sibling_face_jobs(lev) -> RectJobTable (host)
 
 Faces-only sibling exchange: just the 6 face slabs (ng×B×B, no edge/corner
