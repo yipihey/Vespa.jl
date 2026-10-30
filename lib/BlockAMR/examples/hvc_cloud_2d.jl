@@ -230,7 +230,6 @@ open(joinpath(OUT, "params.toml"), "w") do io
     println(io, "box_radii = [$LX, $LY]\ncloud_x0_radii = $X0\nT_halo = $Th\nT_cloud = $Tc\nmu_halo = $μh\nmu_cloud = $μc")
     println(io, "chi = $χ\nP_over_k = $Pk\nv_wind_kms = $(vw/1e5)\nt_cc_Myr = $(TCC*TU/MYR)\nt_end_tcc = $TEND")
     println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)")
-    println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)")
     println(io, "smallr_halo = $SMALLR\ndthresh_halo = $DTHR\nfloat = \"$TT\"\nbackend = \"$BE\"\nunits = { length_pc = 100, velocity_kms = 100, density = \"m_H cm^-3\", time_Myr = $(TU/MYR) }")
 end
 ts = open(joinpath(OUT, "timeseries.csv"), "w")
