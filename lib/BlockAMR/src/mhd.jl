@@ -360,9 +360,11 @@ _mde(hier::AMRHierarchy) = (T = eltype(hier.levels[1].D);
 @inline _rget(rec, off::Int, g::Int, nt::Int) = ntuple(v -> _rr(rec, off + v, g, nt), 9)
 
 """Scratch lanes: half-step primitive (9) + half slopes per active direction (9·DIM)
-+ dual energy: the advected K and its slope per direction (1 + DIM)."""
-_mlanes(dim::Int) = 10 + 10dim
++ dual energy: the advected K and its slope per direction (1 + DIM) + the shock flag."""
+_mlanes(dim::Int) = 11 + 10dim
 _mklane(dim::Int) = 10 + 9dim                     # 1-based lane of K
+_mflane(dim::Int) = 11 + 10dim                    # 1-based lane of the shock flag
+_mfl(hier::AMRHierarchy, lev) = hier.mhd.sw ? _mflane(lev.dim) : 0
 
 function _mrec(lev::Level)
     T = eltype(lev.D)
@@ -382,6 +384,7 @@ end
                              @Const(Ge), @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
                              @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                              gamma::T, smallr::T, pfl::T, dtdx::T, eta1::T, dev::Val{DE},
+                             sw::Bool, seps::T,
                              B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int,
                              dimv::Val{DIM}) where {T,DIM,DE}
     t = @index(Global)
@@ -400,10 +403,14 @@ end
                                          base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc,
                                          eta1, dev), gamma, smallr, pfl)
         m0 = P(i, j, k)
-        sx = prim_slope(P(i - Int32(1), j, k), m0, P(i + Int32(1), j, k))
-        sy = prim_slope(P(i, j - Int32(1), k), m0, P(i, j + Int32(1), k))
+        xm = P(i - Int32(1), j, k); xp = P(i + Int32(1), j, k)
+        ym = P(i, j - Int32(1), k); yp = P(i, j + Int32(1), k)
+        zm = DIM == 3 ? P(i, j, k - kz) : m0; zp = DIM == 3 ? P(i, j, k + kz) : m0
+        shk = sw && _shock_flag(m0, xm, xp, ym, yp, zm, zp, DIM == 3, seps)
+        sx = shk ? prim_slope_mm(xm, m0, xp) : prim_slope(xm, m0, xp)
+        sy = shk ? prim_slope_mm(ym, m0, yp) : prim_slope(ym, m0, yp)
         if DIM == 3
-            sz = prim_slope(P(i, j, k - kz), m0, P(i, j, k + kz))
+            sz = shk ? prim_slope_mm(zm, m0, zp) : prim_slope(zm, m0, zp)
             mh = cons2prim(hancock(m0, sx, sy, sz, dtdx, gamma), gamma, smallr, pfl)
         else                                    # flat z: no z slope, no z flux pair
             sz = sx
@@ -432,27 +439,56 @@ end
             rec[(kl + 2) * nt + g] = sky
             DIM == 3 && (rec[(kl + 3) * nt + g] = skz)
         end
+        rec[(10 + 10DIM) * nt + g] = shk ? one(T) : zero(T)      # shock flag (_mflane)
     end
+end
+
+# ── shock switch (PLUTO's MULTID shock flattening) ────────────────────────────
+# A cell is flagged when ∇·v < 0 and Σ_d |p_{+1} − p_{−1}| > ε · min(p over the
+# cell and its face neighbours): its slopes are minmod, and every face touching
+# a flagged cell is solved with HLL instead of the configured solver.  HLLD/HLLC
+# resolve the contact and Alfvén waves exactly, so a strong grid-aligned shock has
+# no transverse dissipation and odd-even perturbations grow (the carbuncle;
+# measured here: Quirk Mach 6 at B = 0, transverse velocity 600× HLL's).  The
+# flag is a scratch lane (`fl`, 1-based; 0 = switch off).
+@inline _rflag(rec, fl::Int, g::Int, nt::Int) = fl > 0 && _rr(rec, fl, g, nt) > 0
+@inline function _riemann_sw(rec, fl::Int, gL::Int, gR::Int, nt::Int, rv::Val, L, Rq, d::Int,
+                             gamma::T, ch::T, smallr::T, pfl::T) where {T}
+    if _rflag(rec, fl, gL, nt) || _rflag(rec, fl, gR, nt)
+        return riemann_dir(Val(:hll), L, Rq, d, gamma, ch, smallr, pfl)
+    end
+    return riemann_dir(rv, L, Rq, d, gamma, ch, smallr, pfl)
+end
+@inline _mm(a::T, b::T) where {T} = a * b <= zero(T) ? zero(T) : (abs(a) < abs(b) ? a : b)
+@inline prim_slope_mm(L::NTuple{9,T}, M::NTuple{9,T}, R::NTuple{9,T}) where {T} =
+    ntuple(i -> T(0.5) * _mm(M[i] - L[i], R[i] - M[i]), 9)
+"Shock flag of a cell from its centred primitives and face neighbours (x, y[, z])."
+@inline function _shock_flag(m0::NTuple{9,T}, xm, xp, ym, yp, zm, zp, threed::Bool, eps::T) where {T}
+    div = (xp[2] - xm[2]) + (yp[3] - ym[3]) + (threed ? zp[4] - zm[4] : zero(T))
+    dp = abs(xp[5] - xm[5]) + abs(yp[5] - ym[5]) + (threed ? abs(zp[5] - zm[5]) : zero(T))
+    pmin = min(m0[5], xm[5], xp[5], ym[5], yp[5])
+    threed && (pmin = min(pmin, zm[5], zp[5]))
+    return (div < zero(T)) & (dp > eps * pmin)
 end
 
 # the GLM flux through the face between scratch cells gL (lower) and gR along `d`
 @inline function _mhd_face(rec, gL::Int, gR::Int, d::Int, nt::Int, rv::Val,
-                           gamma::T, ch::T, smallr::T, pfl::T) where {T}
+                           gamma::T, ch::T, smallr::T, pfl::T, fl::Int = 0) where {T}
     off = 9 * d                                         # slope lanes of direction d
     ml = _rget(rec, 0, gL, nt); mr = _rget(rec, 0, gR, nt)
     L = iflo(padd(ml, _rget(rec, off, gL, nt), one(T)), ml, smallr, pfl)
     Rq = iflo(padd(mr, _rget(rec, off, gR, nt), -one(T)), mr, smallr, pfl)
-    return riemann_dir(rv, L, Rq, d, gamma, ch, smallr, pfl)
+    return _riemann_sw(rec, fl, gL, gR, nt, rv, L, Rq, d, gamma, ch, smallr, pfl)
 end
 
 # the same face + the dual-energy entropy flux
 @inline function _mhd_face_de(rec, gL::Int, gR::Int, d::Int, nt::Int, rv::Val,
-                              gamma::T, ch::T, smallr::T, pfl::T, kl::Int) where {T}
+                              gamma::T, ch::T, smallr::T, pfl::T, kl::Int, fl::Int) where {T}
     off = 9 * d
     ml = _rget(rec, 0, gL, nt); mr = _rget(rec, 0, gR, nt)
     L = iflo(padd(ml, _rget(rec, off, gL, nt), one(T)), ml, smallr, pfl)
     Rq = iflo(padd(mr, _rget(rec, off, gR, nt), -one(T)), mr, smallr, pfl)
-    f = riemann_dir(rv, L, Rq, d, gamma, ch, smallr, pfl)
+    f = _riemann_sw(rec, fl, gL, gR, nt, rv, L, Rq, d, gamma, ch, smallr, pfl)
     return f, _de_flux(rec, kl, d, gL, gR, nt, f[1])
 end
 
@@ -463,7 +499,7 @@ end
                                 @Const(rec), @Const(live_d),
                                 @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                 gamma::T, ch::T, smallr::T, pfl::T, dtdx::T, glm_fac::T,
-                                eta1::T, eta2::T, dev::Val{DE},
+                                eta1::T, eta2::T, dev::Val{DE}, fl::Int,
                                 B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int,
                                 rv::Val, dimv::Val{DIM}) where {T,DIM,DE}
     t = @index(Global)
@@ -480,16 +516,16 @@ end
         u0 = _mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps, idx, dsc, ssc, esc)
         # flux differences (F_lo − F_hi) per direction, NestedMHD's update order
         sx = Int(base + _lidx(i + Int32(1), j, k, nd)) - g
-        fxl, gxl = _mhd_face_de(rec, g - sx, g, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
-        fxh, gxh = _mhd_face_de(rec, g, g + sx, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+        fxl, gxl = _mhd_face_de(rec, g - sx, g, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
+        fxh, gxh = _mhd_face_de(rec, g, g + sx, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
         sy = Int(base + _lidx(i, j + Int32(1), k, nd)) - g
-        fyl, gyl = _mhd_face_de(rec, g - sy, g, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
-        fyh, gyh = _mhd_face_de(rec, g, g + sy, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+        fyl, gyl = _mhd_face_de(rec, g - sy, g, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
+        fyh, gyh = _mhd_face_de(rec, g, g + sy, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
         dg = (gxl - gxh) + (gyl - gyh)
         r = if DIM == 3
             sz = Int(base + _lidx(i, j, k + Int32(1), nd)) - g
-            fzl, gzl = _mhd_face_de(rec, g - sz, g, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
-            fzh, gzh = _mhd_face_de(rec, g, g + sz, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+            fzl, gzl = _mhd_face_de(rec, g - sz, g, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
+            fzh, gzh = _mhd_face_de(rec, g, g + sz, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM), fl)
             dg += gzl - gzh
             ntuple(v -> u0[v] + dtdx * ((fxl[v] - fxh[v]) + (fyl[v] - fyh[v]) +
                                         (fzl[v] - fzh[v])), 9)
@@ -611,12 +647,13 @@ function mhd_level!(hier::AMRHierarchy, l::Int, λ::Real)
     dev, η1, η2 = _mde(hier)
     _mhd_rec_k!(lev.be)(rec, gasfields(lev)..., mfields(lev)..., lev.live_d,
                         lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, T(λ), η1, dev,
+                        hier.mhd.sw, T(hier.mhd.seps),
                         Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt,
                         Val(lev.dim); ndrange = nb * R^lev.dim)
     _mhd_update_k!(lev.be)(gasfields_o(lev)..., mfields_o(lev)...,
                            gasfields(lev)..., mfields(lev)..., rec, lev.live_d,
                            lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                           γ, T(ch), sr, pfl, T(λ), glm_fac, η1, η2, dev,
+                           γ, T(ch), sr, pfl, T(λ), glm_fac, η1, η2, dev, _mfl(hier, lev),
                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt,
                            Val(hier.mhd.riemann), Val(lev.dim); ndrange = nb * _nact(lev))
     return nothing
@@ -627,7 +664,7 @@ end
 # toward the fine block; fine: the 2² (2-D: 2) fine sub-faces of the fine block.
 @kernel function _mhd_capture_coarse_k!(reg, @Const(ent), @Const(rec), wc::T, gamma::T, ch::T,
                                         smallr::T, pfl::T, nd::Int32, stride::Int32, nt::Int,
-                                        rv::Val) where {T}
+                                        rv::Val, fl::Int) where {T}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -641,7 +678,7 @@ end
         so = Int(base + _lidx(ci + di, cj + dj, ck + dk, nd)) - gc
         # side=+1: the coarse cell's LOW face (fine block below); −1: its HIGH face
         gL = side == Int32(1) ? gc - so : gc
-        f = _mhd_face(rec, gL, gL + so, Int(ax), nt, rv, gamma, ch, smallr, pfl)
+        f = _mhd_face(rec, gL, gL + so, Int(ax), nt, rv, gamma, ch, smallr, pfl, fl)
         r = (Int(e) - 1) * 9
         Base.Cartesian.@nexprs 9 v -> (reg[r + v] -= wc * ifelse(isfinite(f[v]), f[v], zero(T)))
     end
@@ -649,7 +686,7 @@ end
 
 @kernel function _mhd_capture_fine_k!(reg, @Const(ent), @Const(rec), wf::T, gamma::T, ch::T,
                                       smallr::T, pfl::T, nd::Int32, stride::Int32, nt::Int,
-                                      kz::Int32, rv::Val) where {T}
+                                      kz::Int32, rv::Val, fl::Int) where {T}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
     @inbounds begin
@@ -671,7 +708,7 @@ end
             k = fk + sh * dk + s2 * t2k
             gL = Int(base + _lidx(i, j, k, nd))
             gR = Int(base + _lidx(i + di, j + dj, k + dk, nd))
-            f = _mhd_face(rec, gL, gR, Int(ax), nt, rv, gamma, ch, smallr, pfl)
+            f = _mhd_face(rec, gL, gR, Int(ax), nt, rv, gamma, ch, smallr, pfl, fl)
             acc = _acc9(acc, f, one(T))
         end
         q = (kz == Int32(1) ? T(0.25) : T(0.5)) * wf
@@ -752,7 +789,7 @@ function mhd_capture_fine!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
     _mhd_capture_fine_k!(lev.be)(_tabt_any(lev, :cfreg), _tabi(lev, :cf), _mrec(lev),
                                  T(w), γ, T(glm_ch(hier)), sr, pfl, Int32(lev.nd),
                                  Int32(lev.stride), lev.cap * lev.stride, _kz(lev),
-                                 Val(hier.mhd.riemann); ndrange = n)
+                                 Val(hier.mhd.riemann), _mfl(hier, lev); ndrange = n)
     return nothing
 end
 
@@ -765,7 +802,7 @@ function mhd_capture_coarse!(hier::AMRHierarchy, l::Int, w::Real, λ::Real)
     _mhd_capture_coarse_k!(lev.be)(_tabt_any(lev, :cfreg), _tabi(lev, :cf), _mrec(plev),
                                    T(w), γ, T(glm_ch(hier)), sr, pfl, Int32(plev.nd),
                                    Int32(plev.stride), plev.cap * plev.stride,
-                                   Val(hier.mhd.riemann); ndrange = n)
+                                   Val(hier.mhd.riemann), _mfl(hier, plev); ndrange = n)
     return nothing
 end
 

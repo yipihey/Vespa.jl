@@ -33,6 +33,7 @@ const BACKENDS = (:cpu,
     include("test_mhd.jl")         # GLM-MHD (NestedMHD scheme), 2-D + 3-D
     include("test_ct.jl")          # constrained-transport MHD, 2-D (∇·B at round-off)
     include("test_mhd_de.jl")      # MHD dual energy (entropy form), CT + GLM
+    include("test_mhd_shock.jl")   # MHD shock switch vs the carbuncle (Quirk)
     include("test_cooling.jl")     # tabulated Grackle cooling vs libgrackle (needs tables)
     include("test_movie.jl")       # movie output: GPU derived fields → 16-bit PNG, bundles
 end

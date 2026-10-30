@@ -20,7 +20,8 @@
 #   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save),
 #   HVC_MOVIE (movie frames per t_cc, 0 = off), HVC_MOVIE_LEVEL (image resolution
 #   level, default HVC_LMAX), HVC_MOVIE_FIELDS (comma list of MOVIE_CATALOG keys,
-#   default: all that apply).  Movie → HVC_OUT/movie (open with the player:
+#   default: all that apply), HVC_SHOCKSW (1: PLUTO-style shock switch,
+#   HLLD → HLL + minmod in flagged shock cells, against the carbuncle; default 0).  Movie → HVC_OUT/movie (open with the player:
 #   `python3 -m http.server -d HVC_OUT/movie`, or `movie_bundle` it for sharing).
 using BlockAMR, Printf, Serialization, Dates
 try; @eval using CUDA; catch; end
@@ -49,6 +50,7 @@ const SMALLR  = parse(Float64, env("HVC_SMALLR", 1e-6))
 const NMOVIE  = parse(Float64, env("HVC_MOVIE", 0.0))
 const LMOVIE  = parse(Int, env("HVC_MOVIE_LEVEL", LMAX))
 const FMOVIE  = env("HVC_MOVIE_FIELDS", "default")
+const SHOCKSW = env("HVC_SHOCKSW", "0") == "1"
 mkpath(OUT); mkpath(joinpath(OUT, "snap"))
 
 # ── units: length 100 pc (the cloud radius), velocity 100 km/s, density m_H cm⁻³ ──
@@ -93,7 +95,7 @@ inflow = Dict((1, :lo) => (RH, VW, 0.0, 0.0, PH, 0.0, B0, 0.0))
 hier = AMRHierarchy(; nbase = (NX, NY), B = 16, box = LX, backend = BE, T = TT, cap0 = 64,
                     physics = :mhd, divb = :ct, riemann = :hlld, cfl = 0.4,
                     bc = ((:inflow, :outflow), :periodic), inflow, Lcap = LMAX,
-                    smallr = SMALLR * RH, smallc = 1e-4)
+                    smallr = SMALLR * RH, smallc = 1e-4, shock_switch = SHOCKSW)
 init_base_level!(hier); build_level_tables!(hier, 0)
 pol = BlockRefinementPolicy(; dthresh = DTHR * RH, nbuf = 2, every = 1, lmax = LMAX)
 
@@ -227,6 +229,8 @@ open(joinpath(OUT, "params.toml"), "w") do io
     println(io, "beta = $(isinf(BETA) ? "\"inf\"" : BETA)\nB0_code = $B0\nNX = $NX\nNY = $NY\nLMAX = $LMAX")
     println(io, "box_radii = [$LX, $LY]\ncloud_x0_radii = $X0\nT_halo = $Th\nT_cloud = $Tc\nmu_halo = $μh\nmu_cloud = $μc")
     println(io, "chi = $χ\nP_over_k = $Pk\nv_wind_kms = $(vw/1e5)\nt_cc_Myr = $(TCC*TU/MYR)\nt_end_tcc = $TEND")
+    println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)")
+    println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)")
     println(io, "smallr_halo = $SMALLR\ndthresh_halo = $DTHR\nfloat = \"$TT\"\nbackend = \"$BE\"\nunits = { length_pc = 100, velocity_kms = 100, density = \"m_H cm^-3\", time_Myr = $(TU/MYR) }")
 end
 ts = open(joinpath(OUT, "timeseries.csv"), "w")

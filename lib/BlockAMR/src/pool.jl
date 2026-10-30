@@ -374,6 +374,9 @@ energy, stored as the internal energy Ge (dual-energy formalism, entropy form,
 Enzo's η1/η2 selection; mhd.jl): thermal energy from E − ½ρv² − ½B²
 only where it exceeds `de_eta1`·E, Ge reset from it where it exceeds `de_eta2`·
 (neighbour-max E), E rebuilt from Ge where the thermal fraction is below `de_eta1`.
+`shock_switch` (MHD; off by default) is PLUTO's MULTID shock flattening against the
+carbuncle: cells with ∇·v < 0 and a pressure jump > `shock_eps` × the local minimum
+pressure get minmod slopes, and faces touching them HLL instead of `riemann`.
 """
 function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1.0,
                         B::Int = 16, ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
@@ -385,7 +388,8 @@ function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1
                         glm_ch_scale::Real = 0.25, glm_cp_coef::Real = 0.18,
                         smallr::Real = 1e-6, smallc::Real = 1e-4, sigdims::Int = 0,
                         divb::Symbol = :glm, dual_energy::Bool = true,
-                        de_eta1::Real = 1e-3, de_eta2::Real = 0.1)
+                        de_eta1::Real = 1e-3, de_eta2::Real = 0.1,
+                        shock_switch::Bool = false, shock_eps::Real = 5.0)
     @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
     @assert physics in (:hydro, :mhd) "physics must be :hydro or :mhd"
     if physics === :mhd
@@ -410,7 +414,8 @@ function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1
             glm_cp_coef = Float64(glm_cp_coef), smallr = Float64(smallr),
             smallc = Float64(smallc), sigdims = sigdims == 0 ? dim : sigdims,
             ct = physics === :mhd && divb === :ct,
-            de = dual_energy, eta1 = Float64(de_eta1), eta2 = Float64(de_eta2))
+            de = dual_energy, eta1 = Float64(de_eta1), eta2 = Float64(de_eta2),
+            sw = shock_switch, seps = Float64(shock_eps))
     AMRHierarchy{typeof(lev0)}([lev0], B, ng, nb3, Float64(box), Lcap, be, backend,
                                Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme,
                                dim, bct, inf, physics, mpar)

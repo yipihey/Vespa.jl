@@ -79,7 +79,8 @@ end
 const _CL_MH, _CL_SX, _CL_SY, _CL_FX, _CL_FY = 0, 9, 18, 28, 37
 const _CL_ER, _CL_EZ = 28, 47
 const _CL_GX, _CL_GY, _CL_K = 48, 49, 50
-const _CLANES = 52
+const _CL_SH = 53                                   # shock flag (mhd.jl shock switch)
+const _CLANES = 53
 
 function _ctrec(lev::Level)
     T = eltype(lev.D)
@@ -99,6 +100,7 @@ end
                             @Const(Ge), @Const(Bx), @Const(By), @Const(Bz),
                             @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                             gamma::T, smallr::T, pfl::T, dtdx::T, eta1::T, dev::Val{DE},
+                            sw::Bool, seps::T,
                             B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int) where {T,DE}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
@@ -113,8 +115,10 @@ end
                                      base + _li2(ii, jj, nd), dsc, ssc, esc, gsc, gamma, smallr,
                                      pfl, eta1, dev)
         m0 = P(i, j)
-        sx = prim_slope(P(i - Int32(1), j), m0, P(i + Int32(1), j))
-        sy = prim_slope(P(i, j - Int32(1)), m0, P(i, j + Int32(1)))
+        xm = P(i - Int32(1), j); xp = P(i + Int32(1), j); ym = P(i, j - Int32(1)); yp = P(i, j + Int32(1))
+        shk = sw && _shock_flag(m0, xm, xp, ym, yp, m0, m0, false, seps)
+        sx = shk ? prim_slope_mm(xm, m0, xp) : prim_slope(xm, m0, xp)
+        sy = shk ? prim_slope_mm(ym, m0, yp) : prim_slope(ym, m0, yp)
         mh = cons2prim(hancock2(m0, sx, sy, dtdx, gamma), gamma, smallr, pfl)
         if mh[1] <= smallr || mh[5] <= pfl
             mh = m0
@@ -127,6 +131,7 @@ end
         end
         # E_z reference: predictor velocity × start-of-step field (sweep-fixes 7256715)
         rec[(_CL_ER - 1) * nt + g] = mh[3] * m0[6] - mh[2] * m0[7]
+        rec[(_CL_SH - 1) * nt + g] = shk ? one(T) : zero(T)
         if DE                                   # advected entropy: K_half + half slopes (mhd.jl)
             @inline Kc(ii, jj) = _de_Kc(T, D, Ge, base + _li2(ii, jj, nd), dsc, gsc, gamma)
             k0 = Kc(i, j)
@@ -141,7 +146,7 @@ end
 
 # ── pass 2: face fluxes (x: i ∈ [ng, ng+B], j ∈ [ng−1, ng+B]; y transposed) ───
 @kernel function _ct_flux_k!(rec, @Const(FBx), @Const(FBy), @Const(live_d),
-                             gamma::T, smallr::T, pfl::T,
+                             gamma::T, smallr::T, pfl::T, sw::Bool,
                              B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int,
                              rv::Val) where {T}
     t = @index(Global)
@@ -159,7 +164,9 @@ end
             ml = _rget(rec, _CL_MH, gl, nt)
             L = iflo(padd(ml, _rget(rec, _CL_SX, gl, nt), one(T)), ml, smallr, pfl)
             Rq = iflo(padd(mr, _rget(rec, _CL_SX, g, nt), -one(T)), mr, smallr, pfl)
-            f = _ct_riemann(rv, L, Rq, 1, gamma, smallr, pfl, T(FBx[gi]))
+            f = (sw && (_rl(rec, _CL_SH, gl, nt) + _rl(rec, _CL_SH, g, nt) > zero(T))) ?
+                _ct_riemann(Val(:hll), L, Rq, 1, gamma, smallr, pfl, T(FBx[gi])) :
+                _ct_riemann(rv, L, Rq, 1, gamma, smallr, pfl, T(FBx[gi]))
             Base.Cartesian.@nexprs 9 v -> (rec[(_CL_FX + v - 1) * nt + g] = f[v])
             rec[(_CL_GX - 1) * nt + g] = _de_flux(rec, _CL_K, 1, gl, g, nt, f[1])
         end
@@ -168,7 +175,9 @@ end
             ml = _rget(rec, _CL_MH, gl, nt)
             L = iflo(padd(ml, _rget(rec, _CL_SY, gl, nt), one(T)), ml, smallr, pfl)
             Rq = iflo(padd(mr, _rget(rec, _CL_SY, g, nt), -one(T)), mr, smallr, pfl)
-            f = _ct_riemann(rv, L, Rq, 2, gamma, smallr, pfl, T(FBy[gi]))
+            f = (sw && (_rl(rec, _CL_SH, gl, nt) + _rl(rec, _CL_SH, g, nt) > zero(T))) ?
+                _ct_riemann(Val(:hll), L, Rq, 2, gamma, smallr, pfl, T(FBy[gi])) :
+                _ct_riemann(rv, L, Rq, 2, gamma, smallr, pfl, T(FBy[gi]))
             Base.Cartesian.@nexprs 9 v -> (rec[(_CL_FY + v - 1) * nt + g] = f[v])
             rec[(_CL_GY - 1) * nt + g] = _de_flux(rec, _CL_K, 2, gl, g, nt, f[1])
         end
@@ -296,8 +305,10 @@ function ct_level!(hier::AMRHierarchy, l::Int, λ::Real)
     a = (Int32(B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt)
     g6 = gasfields(lev); dev, η1, η2 = _mde(hier)
     _ct_rec_k!(lev.be)(rec, g6..., mfields(lev)[1:3]..., lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
-                       lev.Gsc, γ, sr, pfl, T(λ), η1, dev, a...; ndrange = nb * (B + 2)^2)
-    _ct_flux_k!(lev.be)(rec, cfields(lev)..., lev.live_d, γ, sr, pfl, a..., Val(hier.mhd.riemann);
+                       lev.Gsc, γ, sr, pfl, T(λ), η1, dev, hier.mhd.sw, T(hier.mhd.seps), a...;
+                       ndrange = nb * (B + 2)^2)
+    _ct_flux_k!(lev.be)(rec, cfields(lev)..., lev.live_d, γ, sr, pfl, hier.mhd.sw, a...,
+                        Val(hier.mhd.riemann);
                         ndrange = nb * (B + 2)^2)
     _ct_emf_k!(lev.be)(rec, lev.live_d, a...; ndrange = nb * (B + 1)^2)
     _ct_update_k!(lev.be)(gasfields_o(lev)..., mfields_o(lev)[1:3]..., cfields_o(lev)...,
