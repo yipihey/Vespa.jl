@@ -516,19 +516,21 @@ read_movie_manifest(dir::AbstractString) = _jparse(read(joinpath(dir, "manifest.
 
 """
     movie_bundle(src, dst; fields = all, every = 1, frames = all, downsample = 1,
-                 maxfiles = 480, maxsheet = 8192, title = nothing)
+                 maxfiles = 480, maxsheet = 4096, title = nothing)
 
 Repack a movie directory for sharing (a claude.ai Artifact holds ≤ 511 files, each
 ≤ 15 MB): keep every `every`-th frame (or the frame indices `frames`, 0-based),
 optionally only `fields`, average `downsample`² pixel blocks (exact in the stored
 quantity; no-data pixels excluded), and tile several frames per PNG sheet so the
-whole bundle is ≤ `maxfiles` images with sheets ≤ `maxsheet` px a side.  Writes
+whole bundle is ≤ `maxfiles` images with sheets ≤ `maxsheet` px a side (4096: a sheet is a ≤ 64 MB
+texture in the viewer).  Warns when a sheet exceeds 15 MB or the bundle 256 MB
+(the Artifact limits) — then use `downsample`, `every` or fewer `fields`.  Writes
 `dst/manifest.json`, `dst/<field>/NNNNN.png`, the bare player `dst/player.html`
 (the Artifact page) and `dst/index.html` (for `python3 -m http.server -d dst`).
 Returns `(; nfiles, bytes, per, cols)`.
 """
 function movie_bundle(src::AbstractString, dst::AbstractString; fields = nothing, every::Int = 1,
-                      frames = nothing, downsample::Int = 1, maxfiles::Int = 480, maxsheet::Int = 8192,
+                      frames = nothing, downsample::Int = 1, maxfiles::Int = 480, maxsheet::Int = 4096,
                       title = nothing)
     m = read_movie_manifest(src)
     nf0 = m["nframes"]; W0 = m["nx"]; H0 = m["ny"]
@@ -546,7 +548,7 @@ function movie_bundle(src::AbstractString, dst::AbstractString; fields = nothing
                                   "use downsample, every, fewer fields or larger maxfiles")
     nsheet = cld(length(keep), per)
     mkpath(dst)
-    nbytes = Threads.Atomic{Int}(0)
+    nbytes = Threads.Atomic{Int}(0); biggest = Threads.Atomic{Int}(0)
     for f in fl
         d = joinpath(dst, f["dir"]); mkpath(d)
         Threads.@threads for s in 0:nsheet-1
@@ -575,7 +577,7 @@ function movie_bundle(src::AbstractString, dst::AbstractString; fields = nothing
             end
             path = joinpath(d, Printf.@sprintf("%05d.png", s))
             _write_png_codes(path, sheet, sw, sh)
-            Threads.atomic_add!(nbytes, filesize(path))
+            Threads.atomic_add!(nbytes, filesize(path)); Threads.atomic_max!(biggest, filesize(path))
         end
     end
     sel(a) = [a[k + 1] for k in keep]
@@ -589,5 +591,7 @@ function movie_bundle(src::AbstractString, dst::AbstractString; fields = nothing
     cp(PLAYER_HTML, joinpath(dst, "player.html"); force = true)
     install_player(dst)
     nfiles = nsheet * length(fl)
-    return (; nfiles, bytes = nbytes[], per, cols)
+    biggest[] > 15 * 2^20 && @warn "movie_bundle: largest sheet $(round(biggest[] / 2^20; digits = 1)) MB > 15 MB (Artifact file limit)"
+    nbytes[] > 256 * 2^20 && @warn "movie_bundle: bundle $(round(nbytes[] / 2^20; digits = 1)) MB > 256 MB (Artifact version limit)"
+    return (; nfiles, bytes = nbytes[], maxbytes = biggest[], per, cols)
 end

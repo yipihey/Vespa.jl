@@ -52,8 +52,10 @@ movie_bundle("RUN/movie", "RUN/share"; maxfiles = 250, every = 1, downsample = 1
 ```
 
 This tiles several frames into each PNG sheet, so the whole bundle has at most
-`maxfiles` images. A claude.ai Artifact holds 511 files per version, 255 per
-publish and ≤ 15 MB per file. You can also subsample frames (`every`), average
+`maxfiles` images, each sheet at most 4096 px a side. A claude.ai Artifact
+holds 511 files per version, 255 per publish and ≤ 15 MB per file;
+`movie_bundle` warns when a sheet or the whole bundle exceeds those sizes. You
+can also subsample frames (`every`), average
 pixel blocks (`downsample`, exact in the stored quantity), or keep a subset of
 `fields`. Publish `RUN/share/player.html` as the page, with `manifest.json` and
 the `<field>/*.png` files beside it. Any static web host works too: copy
