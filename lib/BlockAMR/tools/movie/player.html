@@ -1,0 +1,685 @@
+<title>Vespa Movie</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Vespa movie player — reads manifest.json + 16-bit-in-RGB PNG frames written by
+   BlockAMR's MovieWriter (lib/BlockAMR/src/movie.jl).  Dark-first instrument look. */
+:root {
+  --bg: #0d1014; --panel: #141a20; --raise: #1b232b; --line: #2a343e; --fg: #dfe6ec;
+  --dim: #8a98a6; --faint: #5b6876; --accent: #f0b450; --accent-fg: #1a1206; --nodata: #232b33;
+  --focus: #6fb3ff; --warn: #ff8a6b;
+  color-scheme: dark;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #f3f1ec; --panel: #fbfaf7; --raise: #ffffff; --line: #d9d4ca; --fg: #1d2226;
+  --dim: #5d6670; --faint: #8f979f; --accent: #b86e00; --accent-fg: #ffffff; --nodata: #e4e0d8;
+  --focus: #1f6fd1; --warn: #c2410c; color-scheme: light } }
+:root[data-theme="light"] {
+  --bg: #f3f1ec; --panel: #fbfaf7; --raise: #ffffff; --line: #d9d4ca; --fg: #1d2226;
+  --dim: #5d6670; --faint: #8f979f; --accent: #b86e00; --accent-fg: #ffffff; --nodata: #e4e0d8;
+  --focus: #1f6fd1; --warn: #c2410c; color-scheme: light }
+* { box-sizing: border-box }
+[hidden] { display: none !important }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); margin: 0 }
+#app { display: flex; flex-direction: column; gap: 10px; min-height: 100vh;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 12px 0 }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px }
+header h1 { font-size: 17px; font-weight: 600; margin: 0; text-wrap: balance; letter-spacing: .01em }
+header .sub { color: var(--dim); font: 12px/1.4 var(--mono); min-width: 0; overflow-wrap: anywhere }
+header .grow { flex: 1 }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden }
+.seg button { border: 0; border-radius: 0; border-right: 1px solid var(--line) }
+.seg button:last-child { border-right: 0 }
+button, select, input { font: 12px var(--mono); color: var(--fg); background: var(--raise);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-height: 28px }
+button { cursor: pointer }
+button:hover, select:hover { border-color: var(--faint) }
+button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent) }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px }
+input[type=number], input.num { width: 92px }
+label.tiny { font: 11px var(--mono); color: var(--dim); display: inline-flex; gap: 4px; align-items: center }
+#panels { display: grid; gap: 10px; grid-template-columns: 1fr }
+#panels.grid2 { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+@media (max-width: 820px) { #panels.grid2 { grid-template-columns: 1fr } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px; min-width: 0 }
+.ptools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
+.ptools .grow { flex: 1 }
+.ptools select.field { font-weight: 500; max-width: 100% }
+.view { position: relative; width: 100%; border-radius: 6px; overflow: hidden; background: var(--nodata);
+  touch-action: none; cursor: crosshair }
+.view canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block }
+.cbrow { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; min-width: 0 }
+.cbrow canvas.cb { width: min(340px, 100%); height: 36px; display: block }
+.readout { font: 12px var(--mono); color: var(--dim); min-width: 0; overflow-wrap: anywhere }
+.readout b { color: var(--fg); font-weight: 500 }
+.busy { position: absolute; right: 8px; top: 6px; font: 11px var(--mono); color: var(--accent); pointer-events: none }
+footer { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
+  padding-block: 8px calc(8px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 6px; z-index: 5 }
+.transport { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center }
+.transport input[type=range] { flex: 1 1 240px; min-width: 160px; accent-color: var(--accent) }
+.clock { font: 13px var(--mono); min-width: 0 }
+.clock .k { color: var(--accent); font-weight: 500 }
+.hint { font: 11px var(--mono); color: var(--faint) }
+.msg { margin: 40px auto; max-width: 62ch; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px }
+.msg h2 { margin: 0 0 6px; font-size: 16px }
+.msg code { font: 12px var(--mono); background: var(--raise); padding: 1px 5px; border-radius: 4px }
+#help { position: fixed; inset: auto 16px 90px auto; max-width: min(420px, calc(100vw - 32px)); z-index: 20;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font: 12px/1.6 var(--mono) }
+#help kbd { background: var(--raise); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px }
+</style>
+
+<div id="app">
+  <header>
+    <h1 id="title">Vespa movie</h1>
+    <span class="sub" id="sub">loading manifest…</span>
+    <span class="grow"></span>
+    <span class="seg" id="layout" role="group" aria-label="panels">
+      <button data-n="1">1</button><button data-n="2" aria-pressed="true">2</button><button data-n="4">4</button>
+    </span>
+    <button id="follow" title="re-read the manifest every 5 s (a run still writing frames)">follow run</button>
+    <button id="helpbtn" aria-expanded="false">keys</button>
+  </header>
+  <main id="panels" class=""></main>
+  <footer>
+    <div class="transport">
+      <button id="first" title="first frame (Home)">⏮</button>
+      <button id="back" title="previous (←)">◀︎</button>
+      <button id="play" title="play / pause (space)" style="min-width:64px">play</button>
+      <button id="fwd" title="next (→)">▶︎</button>
+      <button id="last" title="last frame (End)">⏭</button>
+      <input type="range" id="slider" min="0" max="0" value="0" aria-label="frame">
+      <span class="clock" id="clock"></span>
+    </div>
+    <div class="transport">
+      <label class="tiny">fps <input type="range" id="fps" min="1" max="60" value="12" style="width:120px;flex:none"> <span id="fpsv">12</span></label>
+      <label class="tiny">every <select id="stride"><option>1</option><option>2</option><option>4</option><option>8</option></select> frame</label>
+      <label class="tiny">at end <select id="mode"><option value="loop">loop</option><option value="bounce">bounce</option><option value="stop">stop</option></select></label>
+      <button id="resetview" title="reset zoom (r / double-click)">fit view</button>
+      <span class="hint" id="hint">wheel / pinch: zoom · drag: pan · hover: values</span>
+    </div>
+  </footer>
+  <div id="help" hidden>
+    <div><kbd>space</kbd> play / pause · <kbd>←</kbd><kbd>→</kbd> step · <kbd>⇧</kbd>+arrows ±10</div>
+    <div><kbd>Home</kbd><kbd>End</kbd> first / last · <kbd>[</kbd><kbd>]</kbd> slower / faster</div>
+    <div><kbd>1</kbd><kbd>2</kbd><kbd>4</kbd> panels · <kbd>r</kbd> fit view · <kbd>l</kbd> cycle lin/log/symlog (panel under cursor)</div>
+    <div>link to a frame: append <kbd>#f40</kbd> to the address; served locally, <kbd>?panels=4&amp;fields=rho,T,B2,absw&amp;autoplay</kbd> sets the panels and starts playing</div>
+    <div style="margin-top:6px;color:var(--dim)">Ranges: <b>frame</b> follows the 0.1–99.9 % range of each frame; <b>global</b> fixes that range over all frames (log axes: at most 5 decades); typing a min/max switches to <b>manual</b>. Values are 16-bit quantized per frame (log₁₀ for positive fields).</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const CMAPS = {
+  viridis: "44015446075a470d6047136548186a481d6f482374482878472d7b46327e453781443b844240864045883e49893d4e8a3a538b38588c365c8d34608d32648e31688e2f6c8e2d708e2c738e2a778e297b8e277f8e26828e24868e238a8d218e8d20928c1f968b1f9a8a1f9e891fa18721a58523a98326ad812ab07f2fb47c35b7793bbb7542be714ac16d52c5695ac86465cb5e6ece5877d15381d34d8bd64695d840a0da39aadc32b5de2bc0df25cae11fd5e21adfe318eae51af4e61efde725",
+  magma: "00000402010903031206051a0a08220e0b2b130d34180f3d1d114722115029115a2f116336106b3d0f71440f764a107952137c59157e5f187f651a806b1d81721f817822817e24828426818b2981912b81982d809e2f7fa5317eab337cb2357bba3878c03a76c73d73cd4071d3436ed9466bdf4a68e44f64e95462ed5a5ff1605df4675cf66e5cf8765cfa7d5efb8560fc8e64fd9668fe9d6cfea571feac76feb47bfebb81fec287feca8dfed194fed89afde0a1fde7a9fceeb0fcf6b8fcfdbf",
+  inferno: "00000402010a04031207051b0b072410092d150b371b0c41210c4a280b532f0a5b3609613d0965440a684a0c6b510e6c59106e5f136e65156e6c186e721a6e781c6d7f1e6c85216b8c23699225689827669f2a63a52c60ab2f5eb1325ab73557bf3952c43c4eca404acf4446d44842d94d3dde5238e25734e65d2fea632aed6925f06f20f3761bf57d15f78410f98b0bfa9407fb9b06fca309fcaa0ffcb216fbba1ffac228f9c932f7d13df5d949f4e156f2e865f1ef75f3f586f6fa96fcffa4",
+  plasma: "0d088719068c2206902a059331059738049a3f049c46039f4c02a15302a35901a56001a66600a76c00a87201a87801a88004a88606a68b0aa5910ea39613a19c179ea11b9ba62098ab2494b02991b42e8db83289bd3786c13b82c5407ec9447acd4a76d14e72d5536fd8576bdb5c68de6164e26561e56a5de76f5aea7457ed7953ef7e50f1834cf48849f68d45f79342f99a3efb9f3afca537fdab33fdb130feb72dfebd2afdc328fdca26fcd025fbd724f9dd25f7e425f5eb27f2f227f0f921",
+  cividis: "00224e00255400285b002b62002e6a0030700533711235701a386f213b6e273e6e2d416d32436d36466c3b496c3f4c6c444f6c48526c4c556c50576c545a6d575d6d5b606e5e636f62656f656870696b716c6e727071737374757777767a7a787e7d788280798683798a86788e8978928c78958f779992779d9576a19975a59c74a99f73ada272b1a570b6a96fbaac6dbfb06bc3b369c7b767ccba64d0be62d4c15fd9c55cddc858e1cc55e6d051ead34cefd748f3db42f8df3cfde334fee838",
+  turbo: "30123b351e58392a733d358b4040a2424bb54456c74661d6466be34776ee4680f6458afc4294ff3d9efe37a8fa2fb2f427bee920c7df1bd0d518d7ca18dec01ae4b620eaac2aefa135f39443f78752fa7a61fc6c71fe5f80ff538fff499cfe40a9fb39b4f836bef434c8ef34d2e935dbe236e3db38ebd339f1cb3af6c33afaba39fcb136fea732fe9b2dfe9029fc8423f9751df56918f15d13ec530fe7490ce14109da3907d23105ca2a04c12302b71d02ac1701a11201950d018808027a0403",
+  RdBu: "05306109386d0e41791249841752901b5a9c1f63a8246aae2a71b22f79b53480b93a87bd3f8ec04695c4529dc85fa5cd6eaed27bb6d687beda93c6de9dcbe1a7d0e4b1d5e7bbdaeac5dfeccfe4efd5e7f1dbeaf2e1edf3e7f0f4edf2f5f3f5f6f8f4f2f9f0ebf9ebe3fae7dcfbe3d4fcdecdfdd9c4fbd0b9fac8aff8bfa4f7b799f6af8ef4a683f09c7beb9172e6866ae17860dc6e57d7634fd25849cc4c44c6413ec13639bb2a34b61f2eae172aa21328960f278a0b257f082373042167001f",
+  coolwarm: "3b4cc03f53c6445acc4961d24e68d8536edd5875e15d7ce66282ea6788ee6c8ff17295f4779af77da0f982a6fb88abfd8fb1fe94b6ff9abbff9fbfffa5c3feaac7fdafcafcb5cdfabad0f8bfd3f6c4d5f3c9d7f0cdd9ecd2dbe8d6dce4dadce0dfdbd9e3d9d3e7d7ceead4c8edd1c2f0cdbbf2cab5f4c6aff5c1a9f6bda2f7b89cf7b396f7ad90f7a889f6a283f59c7df39475f18d6fee8669ec7f63e9785de57058e26952de614dd95847d55042d0473dcb3e38c53334c0282fba162bb40426",
+  PuOr: "2d004b330655390c5e3f12684518714c1f7b522584582e8c5f3a916646976d529c745ea27b6aa88275ad8a7eb39287b99b92c1a39bc7aba3cdb3acd2b9b3d6bfbbdac5c2decbc9e2d1d1e6d7d8eadcddece1e2eee5e7f0eaebf2eff0f4f4f4f6f8f5f1f9f1e6faeedcfbead2fce6c8fde3befedeb3fed8a6fed299fdcc8cfdc57ffdbf72fdb965f9b158f4a84cf0a03fea9530e68d23e18417db7d12d47610cd700ec6690cbe630ab75c07b05606a85206a04d079749078f44078740087f3b08",
+  twilight: "30143734113e3911463f125146145e4c176b521c795723855a2b905c359a5d3ea15e49a95e53ae5f5db26066b6616fb96278bb6580bd6989be6e91c07499c17ca2c285a9c48eb1c599b8c8a4becab0c5cdbccbd1c8d0d6d2d5dbdad8dfe0d9e2e2d8dfe0d6d9ddd0cfdacac3d6c2b6d3b9a8d0b09bcda78ecb9d82c89477c6896cc37f64c0755ebc6b59b86255b35953ae5051a84750a13f509a3750922f508828507f2350751e4f6b1b4d60184a5615464b134242123e3a113a3412382f1436",
+  cubehelix: "0000000702060c050e110815150b1d180f2519132d1a18351b1e3b1a2441192a4618314a17374d163f4e15464e154d4e16554b185b481b61451f6741256b3d2b6f393373353c763246783051792f5d7a2f697b30757b33817a378d7a3d997944a7794fb17959b97964c17a70c87b7ccd7d89d17f96d382a3d486afd48abbd490c6d295d0d09cd9cda2e0caa9e7c8b1ecc5baf0c3c1f2c2c8f3c1cff3c2d6f3c4dcf2c6e1f1cae7f0cfebefd4efefdbf3efe2f6f0e9f8f2f0fbf5f8fdfaffffff",
+  gray: "0000000404040808080c0c0c1010101414141818181c1c1c2020202424242828282c2c2c3030303434343838383c3c3c4141414545454949494d4d4d5151515555555959595d5d5d6161616565656969696d6d6d7171717575757979797d7d7d8282828686868a8a8a8e8e8e9292929696969a9a9a9e9e9ea2a2a2a6a6a6aaaaaaaeaeaeb2b2b2b6b6b6babababebebec3c3c3c7c7c7cbcbcbcfcfcfd3d3d3d7d7d7dbdbdbdfdfdfe3e3e3e7e7e7ebebebefefeff3f3f3f7f7f7fbfbfbffffff",
+  Spectral: "5e4fa25758a65061aa496aaf4273b33b7cb73585bb378ebb3f97b747a0b350a9af58b2ac60bba869c3a574c7a57ecca58cd1a497d5a4a2d9a4acdda4b5e1a2bfe5a0c8e99ed1ed9cdaf09ae4f498e9f69dedf8a3f1f9a9f5fbaff9fcb5fdfebbfffcbafff7b2fff2aafeeda1fee999fee491fede89fed683fece7cfdc776fdbf6ffdb768fdaf62fca55dfa9b58f99153f7844ef67a49f47044f06744eb6046e75948e2514add4a4cd8434ed23a4ec9314cc1274ab81e48af1446a70b449e0142",
+  ocean: "008000007a04007408006e0c006810006214005c1800561c005020004a24004428003e2c003830003134002c3800263c001e41001845001249000c4d000651000055000659000c5d001261001865001e6900246d002a71003075003679003c7d004382004a8600508a00568e005b9200629600679a006e9e0073a2007aa60080aa0c85ae188bb22492b63097ba3c9ebe4ba5c357abc763b1cb6fb7cf7bbdd387c3d793c9db9fcfdfabd5e3b7dbe7c3e1ebcfe7efdbedf3e7f3f7f3f9fbffffff",
+};
+const MAX_DECADES = 5;
+const DEFAULT_PANELS = [["rho"], ["T"], ["p", "B2"], ["absw", "absJ", "divv"]];
+const $ = (s, el = document) => el.querySelector(s);
+const qs = new URLSearchParams(location.search);
+const BASE = (qs.get("m") || "").replace(/([^/])$/, "$1/");
+const store = { get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d } catch { return d } },
+                set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} } };
+
+let M = null;                 // manifest
+let frame = 0, playing = false, nPanels = 2, lastTick = 0, dir = 1;
+const view = { cx: 0, cy: 0, zoom: 1 };     // shared: image-pixel centre, zoom ≥ 1 = fit
+const panels = [];
+let hover = null;             // image-pixel coords under the pointer (shared crosshair)
+
+// ── number formatting ──────────────────────────────────────────────────────
+function fmt(v) {
+  if (!isFinite(v)) return "—";
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e4 || a < 1e-3) return v.toExponential(2).replace("e+", "e");
+  return String(+v.toPrecision(4));
+}
+const sup = s => String(s).replace(/[-0-9]/g, c => "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"["-0123456789".indexOf(c)]);
+function niceTicks(a, b, n = 5) {
+  if (!(b > a)) return [a];
+  const step0 = (b - a) / n, mag = 10 ** Math.floor(Math.log10(step0)), r = step0 / mag;
+  const step = (r < 1.5 ? 1 : r < 3 ? 2 : r < 7 ? 5 : 10) * mag;
+  const out = []; for (let t = Math.ceil(a / step) * step; t <= b + step * 1e-9; t += step) out.push(+t.toPrecision(12));
+  return out;
+}
+
+// ── manifest + blob cache ──────────────────────────────────────────────────
+const blobs = new Map();      // url → Promise<Blob>
+function getBlob(url) {
+  let p = blobs.get(url);
+  if (!p) { p = fetch(url).then(r => { if (!r.ok) throw new Error(r.status + " " + url); return r.blob() });
+            p.catch(() => blobs.delete(url)); blobs.set(url, p) }
+  return p;
+}
+function fieldByKey(k) { return M.fields.find(f => f.key === k) }
+function fileOf(fi, k) {           // (url, tile index) of frame k of field fi
+  const per = M.pack?.per || 1, pat = M.pack?.pattern || "%05d.png";
+  const n = Math.floor(k / per), name = pat.replace("%05d", String(n).padStart(5, "0"));
+  return { url: BASE + fi.dir + "/" + name, tile: k % per, file: n };
+}
+
+// ── one panel: own WebGL2 context, texture LRU, controls, colorbar ─────────
+const VS = `#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0., 1.); }`;
+const FS = `#version 300 es
+precision highp float; precision highp int;
+uniform sampler2D tex; uniform sampler2D lut;
+uniform ivec2 img; uniform ivec2 tileOff; uniform vec2 canvas; uniform vec3 vw; // cx, cy, scale
+uniform vec2 lohi; uniform int enc; uniform int scl; uniform vec2 sr; uniform float lth;
+uniform int rev; uniform vec3 nodata; uniform vec3 bg; uniform vec2 cross; uniform int showCross;
+out vec4 o;
+float sym(float v) { return sign(v) * log(1. + abs(v) / lth) / log(10.); }
+void main() {
+  vec2 ip = (gl_FragCoord.xy - .5 * canvas) / vw.z + vw.xy;
+  if (ip.x < 0. || ip.y < 0. || ip.x >= float(img.x) || ip.y >= float(img.y)) { o = vec4(bg, 1.); return; }
+  ivec2 q = ivec2(floor(ip));
+  vec4 c = texelFetch(tex, tileOff + ivec2(q.x, img.y - 1 - q.y), 0);
+  float code = floor(c.r * 255. + .5) * 256. + floor(c.g * 255. + .5);
+  vec3 col;
+  if (code < .5) col = nodata;
+  else {
+    float x = lohi.x + (code - 1.) / 65534. * (lohi.y - lohi.x);
+    float s; bool ok = true;
+    if (enc == 1) { if (scl == 1) s = x; else { float v = pow(10., x); s = scl == 2 ? sym(v) : v; } }
+    else { if (scl == 1) { ok = x > 0.; s = log(max(x, 1e-38)) / log(10.); } else s = scl == 2 ? sym(x) : x; }
+    if (!ok) col = nodata;
+    else {
+      float t = clamp((s - sr.x) / (sr.y - sr.x), 0., 1.);
+      if (sr.y == sr.x) t = .5;
+      if (rev == 1) t = 1. - t;
+      col = texture(lut, vec2(t * 255. / 256. + .5 / 256., .5)).rgb;
+    }
+  }
+  if (showCross == 1) {
+    vec2 d = abs(gl_FragCoord.xy - cross);
+    if ((d.x < .75 && d.y > 4. && d.y < 14.) || (d.y < .75 && d.x > 4. && d.x < 14.)) col = vec3(1.) - col;
+  }
+  o = vec4(col, 1.);
+}`;
+
+function hexRGB(css) {
+  const c = document.createElement("canvas").getContext("2d"); c.fillStyle = css; c.fillRect(0, 0, 1, 1);
+  const d = c.getImageData(0, 0, 1, 1).data; return [d[0] / 255, d[1] / 255, d[2] / 255];
+}
+function lutBytes(name) {
+  const h = CMAPS[name] || CMAPS.viridis, n = h.length / 6, out = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (n - 1), a = Math.floor(t), b = Math.min(a + 1, n - 1), f = t - a;
+    for (let c = 0; c < 3; c++) {
+      const va = parseInt(h.substr(6 * a + 2 * c, 2), 16), vb = parseInt(h.substr(6 * b + 2 * c, 2), 16);
+      out[4 * i + c] = Math.round(va + f * (vb - va));
+    }
+    out[4 * i + 3] = 255;
+  }
+  return out;
+}
+
+class Panel {
+  constructor(idx) {
+    this.idx = idx;
+    this.el = document.createElement("section"); this.el.className = "panel";
+    this.el.innerHTML = `
+      <div class="ptools">
+        <select class="field" aria-label="field"></select>
+        <select class="cmap" aria-label="colormap"></select>
+        <button class="rev" title="reverse colormap">rev</button>
+        <span class="seg scl" role="group" aria-label="scale"><button data-s="lin">lin</button><button data-s="log">log</button><button data-s="symlog">symlog</button></span>
+        <select class="rmode" aria-label="range"><option value="frame">frame 0.1–99.9%</option><option value="framefull">frame min–max</option><option value="global">global 0.1–99.9%</option><option value="manual">manual</option></select>
+        <label class="tiny">min <input class="num vmin" inputmode="decimal"></label>
+        <label class="tiny">max <input class="num vmax" inputmode="decimal"></label>
+        <button class="symm" title="symmetric range ±max">±</button>
+        <label class="tiny lthw" hidden>lin. thresh <input class="num lth" inputmode="decimal"></label>
+      </div>
+      <div class="view"><canvas class="gl"></canvas><canvas class="ov"></canvas><span class="busy" hidden>loading</span></div>
+      <div class="cbrow"><canvas class="cb"></canvas><span class="readout"></span></div>`;
+    this.cv = $(".gl", this.el); this.ov = $(".ov", this.el); this.cb = $(".cb", this.el);
+    const gl = this.gl = this.cv.getContext("webgl2", { antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+    if (!gl) throw new Error("WebGL2 is not available in this browser");
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+      if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o };
+    const pr = this.prog = gl.createProgram();
+    gl.attachShader(pr, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, FS)); gl.linkProgram(pr);
+    gl.useProgram(pr);
+    const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(pr, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    this.U = {}; for (const n of ["tex", "lut", "img", "tileOff", "canvas", "vw", "lohi", "enc", "scl", "sr", "lth", "rev", "nodata", "bg", "cross", "showCross"])
+      this.U[n] = gl.getUniformLocation(pr, n);
+    this.lut = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.lut);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(this.U.tex, 0); gl.uniform1i(this.U.lut, 1);
+    this.fbo = gl.createFramebuffer();
+    this.texs = new Map();       // `${field}/${file}` → {tex, bytes, used, w, h}
+    this.pending = new Map();
+    this.cache = 0;
+    this.wire();
+  }
+  get budget() { return (768 << 20) / Math.max(1, nPanels) }
+  wire() {
+    const fsel = $(".field", this.el), csel = $(".cmap", this.el);
+    for (const f of M.fields) { const o = document.createElement("option"); o.value = f.key;
+      o.textContent = f.label + (f.unit && f.unit !== "code" ? ` [${f.unit}]` : ""); fsel.append(o) }
+    for (const c of Object.keys(CMAPS)) { const o = document.createElement("option"); o.value = o.textContent = c; csel.append(o) }
+    fsel.onchange = () => { this.setField(fsel.value); save(); };
+    csel.onchange = () => { this.s.cmap = csel.value; this.uploadLut(); save(); draw() };
+    $(".rev", this.el).onclick = () => { this.s.rev = !this.s.rev; this.sync(); save(); draw() };
+    for (const b of this.el.querySelectorAll(".scl button")) b.onclick = () => { this.setScale(b.dataset.s); save(); draw() };
+    $(".rmode", this.el).onchange = e => { this.s.rmode = e.target.value; this.sync(); save(); draw() };
+    $(".symm", this.el).onclick = () => { this.s.symm = !this.s.symm; this.sync(); save(); draw() };
+    const num = (cls, key) => { const el = $(cls, this.el); el.onchange = () => { const v = parseFloat(el.value);
+      if (isFinite(v)) { if (key === "lth") this.s.lth = Math.abs(v) || this.s.lth;
+                         else { const r = this.range(); this.s.man = key === "vmin" ? [v, r[1]] : [r[0], v]; this.s.rmode = "manual" } }
+      this.sync(); save(); draw() } };
+    num(".vmin", "vmin"); num(".vmax", "vmax"); num(".lth", "lth");
+    const v = $(".view", this.el);
+    v.addEventListener("wheel", e => { e.preventDefault(); const p = this.toImg(e); zoomAt(p, Math.exp(-e.deltaY * 0.0015)) }, { passive: false });
+    const ptrs = new Map(); let last = null, pinch0 = 0;
+    v.addEventListener("pointerdown", e => { v.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, e); last = e;
+      if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch0 = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) } });
+    v.addEventListener("pointermove", e => {
+      hover = this.toImg(e); hoverPanel = this;
+      if (ptrs.has(e.pointerId)) {
+        ptrs.set(e.pointerId, e);
+        if (ptrs.size === 2) { const [a, b] = [...ptrs.values()], d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+          if (pinch0 > 0) zoomAt(hover, d / pinch0); pinch0 = d }
+        else if (last) { const s = this.scale(); view.cx -= (e.clientX - last.clientX) * devicePixelRatio / s;
+          view.cy += (e.clientY - last.clientY) * devicePixelRatio / s; clampView() }
+        last = e;
+      }
+      draw();
+    });
+    const up = e => { ptrs.delete(e.pointerId); pinch0 = 0; last = ptrs.size ? [...ptrs.values()][0] : null };
+    v.addEventListener("pointerup", up); v.addEventListener("pointercancel", up);
+    v.addEventListener("pointerleave", () => { hover = null; draw() });
+    v.addEventListener("dblclick", () => { resetView(); draw() });
+  }
+  init(key, saved) {
+    const fi = fieldByKey(key);
+    this.s = Object.assign(this.defaults(fi), saved && saved.key === key ? saved : {});
+    $(".field", this.el).value = key; this.uploadLut(); this.sync();
+  }
+  defaults(fi) {
+    const signed = fi.enc === "lin" && fi.key !== "level";
+    return { key: fi.key, cmap: CMAPS[fi.cmap] ? fi.cmap : "viridis", rev: false, scale: fi.scale,
+             rmode: signed ? "global" : "frame", symm: signed, man: null, lth: null };
+  }
+  setField(k) { this.init(k, store.get(`vm:${M.title}:f:${k}`, null)); draw() }
+  setScale(s) { this.s.scale = s; if (this.s.rmode === "manual") this.s.rmode = "frame"; this.sync() }
+  get fi() { return fieldByKey(this.s.key) }
+  // value-space (display units) range for frame k from the manifest, or manual
+  valRange(pair) {
+    const fi = this.fi, f = fi.factor || 1;
+    return fi.enc === "log" ? [10 ** pair[0] * f, 10 ** pair[1] * f] : [pair[0] * f, pair[1] * f].sort((a, b) => a - b);
+  }
+  range() {
+    const fi = this.fi, k = Math.min(frame, M.nframes - 1);
+    let r;
+    if (this.s.rmode === "manual" && this.s.man) r = this.s.man.slice();
+    else if (this.s.rmode === "global") {
+      let lo = Infinity, hi = -Infinity;
+      for (const p of fi.prange) { if (p[0] != null) { const v = this.valRange(p); lo = Math.min(lo, v[0]); hi = Math.max(hi, v[1]) } }
+      r = [lo, hi];
+    } else r = this.valRange((this.s.rmode === "framefull" ? fi.lohi : fi.prange)[k] || [0, 1]);
+    if (this.s.symm && this.s.rmode !== "manual") { const m = Math.max(Math.abs(r[0]), Math.abs(r[1])); r = [-m, m] }
+    // auto ranges on a log axis span ≤ MAX_DECADES (|∇×v| of a uniform inflow is ~0)
+    if (this.s.rmode !== "manual" && this.s.scale === "log" && r[1] > 0) r[0] = Math.max(r[0], r[1] * 10 ** -MAX_DECADES);
+    return r;
+  }
+  lthresh() {
+    if (this.s.lth) return this.s.lth;
+    const fi = this.fi; let m = 0;
+    for (const p of fi.prange) if (p[0] != null) { const v = this.valRange(p); m = Math.max(m, Math.abs(v[0]), Math.abs(v[1])) }
+    return (m || 1) * 1e-3;
+  }
+  tr(v) {            // value → display coordinate
+    const s = this.s.scale;
+    if (s === "log") return Math.log10(v);
+    if (s === "symlog") { const l = this.lthresh(); return Math.sign(v) * Math.log10(1 + Math.abs(v) / l) }
+    return v;
+  }
+  itr(s) {
+    const sc = this.s.scale;
+    if (sc === "log") return 10 ** s;
+    if (sc === "symlog") { const l = this.lthresh(); return Math.sign(s) * l * (10 ** Math.abs(s) - 1) }
+    return s;
+  }
+  srange() {
+    let [a, b] = this.range();
+    if (this.s.scale === "log") { if (!(b > 0)) b = 1; if (!(a > 0)) a = b * 1e-6 }
+    return [this.tr(a), this.tr(b)];
+  }
+  sync() {
+    const s = this.s;
+    $(".cmap", this.el).value = s.cmap;
+    $(".rev", this.el).setAttribute("aria-pressed", s.rev);
+    $(".symm", this.el).setAttribute("aria-pressed", s.symm);
+    for (const b of this.el.querySelectorAll(".scl button")) b.setAttribute("aria-pressed", b.dataset.s === s.scale);
+    $(".rmode", this.el).value = s.rmode;
+    const r = this.range();
+    const a = document.activeElement;
+    if (a !== $(".vmin", this.el)) $(".vmin", this.el).value = fmt(r[0]);
+    if (a !== $(".vmax", this.el)) $(".vmax", this.el).value = fmt(r[1]);
+    $(".lthw", this.el).hidden = s.scale !== "symlog";
+    if (a !== $(".lth", this.el)) $(".lth", this.el).value = fmt(this.lthresh());
+  }
+  uploadLut() {
+    const gl = this.gl; gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.lut);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutBytes(this.s.cmap));
+  }
+  // texture for frame k (Promise when not resident)
+  texFor(k) {
+    const fi = this.fi, f = fileOf(fi, k), key = fi.key + "/" + f.file;
+    const t = this.texs.get(key);
+    if (t) { t.used = performance.now(); return { t, tile: f.tile } }
+    if (!this.pending.has(key)) {
+      const pr = getBlob(f.url)
+        .then(b => createImageBitmap(b, { premultiplyAlpha: "none", colorSpaceConversion: "none" }))
+        .then(bm => {
+          const gl = this.gl, tex = gl.createTexture();
+          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bm);
+          const bytes = bm.width * bm.height * 4; bm.close?.();
+          this.texs.set(key, { tex, bytes, used: performance.now() }); this.cache += bytes;
+          this.pending.delete(key); this.evict(); draw();
+        })
+        .catch(err => { this.pending.delete(key); console.error(err); showErr(String(err)) });
+      this.pending.set(key, pr);
+    }
+    return null;
+  }
+  evict() {
+    if (this.cache <= this.budget) return;
+    const keep = new Set(); for (let d = -1; d <= 6; d++) { const k = frame + d * stride(); if (k >= 0 && k < M.nframes) keep.add(this.fi.key + "/" + fileOf(this.fi, k).file) }
+    const es = [...this.texs.entries()].filter(([k]) => !keep.has(k)).sort((a, b) => a[1].used - b[1].used);
+    for (const [k, t] of es) { if (this.cache <= this.budget * 0.8) break; this.gl.deleteTexture(t.tex); this.cache -= t.bytes; this.texs.delete(k) }
+  }
+  ready(k) { return !!this.texs.get(this.fi.key + "/" + fileOf(this.fi, k).file) }
+  scale() { const w = this.cv.width, h = this.cv.height; return Math.min(w / M.nx, h / M.ny) * view.zoom }
+  toImg(e) { const r = this.cv.getBoundingClientRect(), s = this.scale();
+    return { x: ((e.clientX - r.left) * devicePixelRatio - this.cv.width / 2) / s + view.cx,
+             y: ((r.bottom - e.clientY) * devicePixelRatio - this.cv.height / 2) / s + view.cy } }
+  layout(maxH) {
+    const v = $(".view", this.el), w = v.clientWidth;
+    const h = Math.max(80, Math.min(maxH, Math.round(w * M.ny / M.nx)));
+    v.style.height = h + "px";
+    const dpr = devicePixelRatio || 1;
+    for (const c of [this.cv, this.ov]) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr) }
+    const cr = this.cb.getBoundingClientRect(); this.cb.width = Math.round(cr.width * dpr); this.cb.height = Math.round(cr.height * dpr);
+  }
+  render() {
+    const gl = this.gl, fi = this.fi, k = Math.min(frame, M.nframes - 1);
+    const got = this.texFor(k);
+    $(".busy", this.el).hidden = !!got;
+    // prefetch ahead
+    for (let d = 1; d <= 4; d++) { const kk = k + d * stride() * dir; if (kk >= 0 && kk < M.nframes) this.texFor(kk) }
+    this.sync();
+    gl.viewport(0, 0, this.cv.width, this.cv.height);
+    const css = getComputedStyle(document.documentElement);
+    const bg = hexRGB(css.getPropertyValue("--panel")), nd = hexRGB(css.getPropertyValue("--nodata"));
+    if (!got) { gl.clearColor(...nd, 1); gl.clear(gl.COLOR_BUFFER_BIT); this.overlay(); this.colorbar(); return }
+    const U = this.U, per = M.pack?.per || 1, cols = M.pack?.cols || 1;
+    gl.useProgram(this.prog);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, got.t.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.lut);
+    gl.uniform2i(U.img, M.nx, M.ny);
+    gl.uniform2i(U.tileOff, (got.tile % cols) * M.nx, Math.floor(got.tile / cols) * M.ny);
+    gl.uniform2f(U.canvas, this.cv.width, this.cv.height);
+    gl.uniform3f(U.vw, view.cx, view.cy, this.scale());
+    const lh = fi.lohi[k] || [0, 1], f = fi.factor || 1;
+    if (fi.enc === "log") gl.uniform2f(U.lohi, lh[0] + Math.log10(f), lh[1] + Math.log10(f));
+    else gl.uniform2f(U.lohi, lh[0] * f, lh[1] * f);
+    gl.uniform1i(U.enc, fi.enc === "log" ? 1 : 0);
+    gl.uniform1i(U.scl, { lin: 0, log: 1, symlog: 2 }[this.s.scale]);
+    gl.uniform2f(U.sr, ...this.srange());
+    gl.uniform1f(U.lth, this.lthresh());
+    gl.uniform1i(U.rev, this.s.rev ? 1 : 0);
+    gl.uniform3f(U.nodata, ...nd); gl.uniform3f(U.bg, ...bg);
+    if (hover) { const s = this.scale(); gl.uniform2f(U.cross, (hover.x - view.cx) * s + this.cv.width / 2, (hover.y - view.cy) * s + this.cv.height / 2) }
+    gl.uniform1i(U.showCross, hover ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.overlay(); this.colorbar(); this.readout(got);
+  }
+  readout(got) {
+    const ro = $(".readout", this.el), fi = this.fi;
+    const unit = fi.unit && fi.unit !== "code" ? " " + fi.unit : "";
+    if (!hover || !got) { ro.innerHTML = `<b>${fi.label}</b>${unit ? " [" + fi.unit + "]" : ""}`; return }
+    const ix = Math.floor(hover.x), iy = Math.floor(hover.y);
+    const X = M.extent[0] + (hover.x / M.nx) * (M.extent[1] - M.extent[0]), Y = M.extent[2] + (hover.y / M.ny) * (M.extent[3] - M.extent[2]);
+    const lu = M.length_unit && M.length_unit !== "code" ? " " + M.length_unit : "";
+    let val = "outside";
+    if (ix >= 0 && iy >= 0 && ix < M.nx && iy < M.ny) {
+      const gl = this.gl, cols = M.pack?.cols || 1;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, got.t.tex, 0);
+      const px = new Uint8Array(4);
+      gl.readPixels((got.tile % cols) * M.nx + ix, Math.floor(got.tile / cols) * M.ny + (M.ny - 1 - iy), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      const code = px[0] * 256 + px[1], k = Math.min(frame, M.nframes - 1), lh = fi.lohi[k], f = fi.factor || 1;
+      if (code === 0) val = "no data";
+      else { const x = lh[0] + (code - 1) / 65534 * (lh[1] - lh[0]); val = fmt((fi.enc === "log" ? 10 ** x : x) * f) + unit }
+    }
+    ro.innerHTML = `<b>${fi.key}</b> = <b>${val}</b> &nbsp;at (${fmt(X)}, ${fmt(Y)})${lu}`;
+  }
+  overlay() {
+    const c = this.ov.getContext("2d"), W = this.ov.width, H = this.ov.height, dpr = devicePixelRatio || 1, s = this.scale();
+    c.clearRect(0, 0, W, H);
+    const css = getComputedStyle(document.documentElement);
+    c.font = `${11 * dpr}px ${css.getPropertyValue("--mono")}`;
+    const ex = M.extent, sx = (ex[1] - ex[0]) / M.nx, sy = (ex[3] - ex[2]) / M.ny;
+    const x0 = ex[0] + (view.cx - W / 2 / s) * sx, x1 = ex[0] + (view.cx + W / 2 / s) * sx;
+    const y0 = ex[2] + (view.cy - H / 2 / s) * sy, y1 = ex[2] + (view.cy + H / 2 / s) * sy;
+    const halo = (txt, x, y) => { c.lineWidth = 2.5 * dpr; c.lineJoin = "round"; c.strokeStyle = "rgba(0,0,0,.45)";
+      c.strokeText(txt, x, y); c.fillStyle = "rgba(255,255,255,.92)"; c.fillText(txt, x, y) };
+    // image rectangle on the canvas (ticks hug it when the view is letter-boxed)
+    const L = Math.max(0, (0 - view.cx) * s + W / 2), R = Math.min(W, (M.nx - view.cx) * s + W / 2);
+    const B = Math.min(H, H - ((0 - view.cy) * s + H / 2)), T = Math.max(0, H - ((M.ny - view.cy) * s + H / 2));
+    const lu = M.length_unit && M.length_unit !== "code" ? " " + M.length_unit : "";
+    c.textBaseline = "bottom"; c.textAlign = "center";
+    const xt = niceTicks(x0, x1, Math.max(2, Math.round((R - L) / (110 * dpr))));
+    const xs = xt.map(t => [t, ((t - ex[0]) / sx - view.cx) * s + W / 2]).filter(([, px]) => px >= L + 24 * dpr && px <= R - 30 * dpr);
+    xs.forEach(([t, px], n) => {
+      c.fillStyle = "rgba(255,255,255,.7)"; c.fillRect(px - .5 * dpr, B - 5 * dpr, dpr, 5 * dpr);
+      halo(fmt(t) + (n === xs.length - 1 ? lu : ""), px, B - 6 * dpr);
+    });
+    c.textBaseline = "middle"; c.textAlign = "left";
+    for (const t of niceTicks(y0, y1, Math.max(2, Math.round((B - T) / (70 * dpr))))) {
+      const py = H - (((t - ex[2]) / sy - view.cy) * s + H / 2); if (py < T + 10 * dpr || py > B - 22 * dpr) continue;
+      c.fillStyle = "rgba(255,255,255,.7)"; c.fillRect(L, py - .5 * dpr, 5 * dpr, dpr); halo(fmt(t), L + 7 * dpr, py);
+    }
+  }
+  colorbar() {
+    const c = this.cb.getContext("2d"), W = this.cb.width, H = this.cb.height, dpr = devicePixelRatio || 1;
+    if (!W) return;
+    c.clearRect(0, 0, W, H);
+    const lut = lutBytes(this.s.cmap), bh = 12 * dpr, pad = 6 * dpr, bw = W - 2 * pad;
+    const img = c.createImageData(Math.max(1, Math.round(bw)), 1);
+    for (let i = 0; i < img.width; i++) { let t = i / (img.width - 1); if (this.s.rev) t = 1 - t; const j = Math.round(t * 255) * 4;
+      img.data.set([lut[j], lut[j + 1], lut[j + 2], 255], 4 * i) }
+    const tmp = new OffscreenCanvas(img.width, 1); tmp.getContext("2d").putImageData(img, 0, 0);
+    c.imageSmoothingEnabled = false; c.drawImage(tmp, pad, 0, bw, bh);
+    const css = getComputedStyle(document.documentElement);
+    c.fillStyle = css.getPropertyValue("--dim"); c.font = `${10.5 * dpr}px ${css.getPropertyValue("--mono")}`;
+    c.textAlign = "center"; c.textBaseline = "top";
+    const [a, b] = this.srange(); if (!(b > a)) return;
+    let ticks;
+    if (this.s.scale === "log" && b - a >= 1.5) {
+      const st = Math.max(1, Math.ceil((b - a) / 6)); ticks = [];
+      for (let e = Math.ceil(a); e <= b; e += st) ticks.push([e, "10" + sup(e)]);
+    } else if (this.s.scale === "symlog") {
+      ticks = [[a, fmt(this.itr(a))], [0, "0"], [b, fmt(this.itr(b))]].filter(t => t[0] >= a && t[0] <= b);
+    } else {
+      const lin = this.s.scale === "log" ? niceTicks(10 ** a, 10 ** b, 4).filter(v => v > 0).map(v => [Math.log10(v), fmt(v)])
+                                         : niceTicks(a, b, 4).map(v => [v, fmt(v)]);
+      ticks = lin;
+    }
+    let lastx = -1e9;
+    for (const [s, lab] of ticks) {
+      const x = pad + (s - a) / (b - a) * bw; if (x < pad - 1 || x > W - pad + 1) continue;
+      c.fillRect(x - .5 * dpr, bh, dpr, 3 * dpr);
+      const w = c.measureText(lab).width; if (x - w / 2 < lastx + 6 * dpr) continue;
+      c.fillText(lab, Math.min(Math.max(x, w / 2), W - w / 2), bh + 4 * dpr); lastx = x + w / 2;
+    }
+  }
+}
+let hoverPanel = null;
+
+// ── view (shared zoom / pan) ───────────────────────────────────────────────
+function resetView() { view.cx = M.nx / 2; view.cy = M.ny / 2; view.zoom = 1 }
+function clampView() {
+  view.zoom = Math.min(Math.max(view.zoom, 1), 256);
+  view.cx = Math.min(Math.max(view.cx, 0), M.nx); view.cy = Math.min(Math.max(view.cy, 0), M.ny);
+}
+function zoomAt(p, f) {
+  const z0 = view.zoom; view.zoom = Math.min(Math.max(z0 * f, 1), 256); const r = z0 / view.zoom;
+  view.cx = p.x - (p.x - view.cx) * r; view.cy = p.y - (p.y - view.cy) * r; clampView(); draw();
+}
+
+// ── layout, transport, drawing ─────────────────────────────────────────────
+const stride = () => +$("#stride").value;
+function setPanels(n) {
+  nPanels = n; save();
+  for (const b of document.querySelectorAll("#layout button")) b.setAttribute("aria-pressed", +b.dataset.n === n);
+  while (panels.length < n) {
+    const p = new Panel(panels.length), want = DEFAULT_PANELS[panels.length].find(k => fieldByKey(k)) || M.fields[0].key;
+    const qf = (qs.get("fields") || "").split(",")[panels.length];
+    const st = qf && fieldByKey(qf) ? null : store.get(`vm:${M.title}:p${p.idx}`, null);
+    const key = qf && fieldByKey(qf) ? qf : st && fieldByKey(st.key) ? st.key : want;
+    p.init(key, st || store.get(`vm:${M.title}:f:${key}`, null)); panels.push(p);
+  }
+  const host = $("#panels"); host.replaceChildren(...panels.slice(0, n).map(p => p.el));
+  // 4 panels: 2×2 when that shows the images larger than a 4-high stack
+  const Wd = host.clientWidth || window.innerWidth, Hd = Math.max(240, window.innerHeight - 190), a = M.nx / M.ny;
+  const shown = (cols, rows) => { const w = Wd / cols - 20, h = Hd / rows - 70; return Math.min(w, h * a) };
+  host.className = n === 4 && shown(2, 2) > shown(1, 4) * 1.05 && Wd > 820 ? "grid2" : "";
+  resize();
+}
+function resize() {
+  if (!M) return;
+  const avail = window.innerHeight - 190, n = nPanels, rows = $("#panels").className === "grid2" ? n / 2 : n;
+  const maxH = Math.max(120, avail / rows - 70);
+  for (const p of panels.slice(0, n)) p.layout(maxH);
+  draw();
+}
+let dirty = false;
+function draw() { if (!dirty) { dirty = true; requestAnimationFrame(paint) } }
+function paint() {
+  dirty = false;
+  for (const p of panels.slice(0, nPanels)) p.render();
+  $("#slider").max = M.nframes - 1; $("#slider").value = frame;
+  const ts = M.times[frame] || [];
+  $("#clock").innerHTML = `<span class="k">${frame + 1}</span>/${M.nframes} &nbsp;` +
+    M.time_labels.map((tl, i) => `${tl[0]} = <b>${fmt(ts[i])}</b>${tl[1] && tl[1] !== "code" ? " " + tl[1] : ""}`).join(" &nbsp;·&nbsp; ");
+  $("#play").textContent = playing ? "pause" : "play"; $("#play").setAttribute("aria-pressed", playing);
+}
+function go(k) { frame = Math.min(Math.max(k, 0), M.nframes - 1); draw() }
+function tick(now) {
+  if (!playing) return;
+  requestAnimationFrame(tick);
+  if (now - lastTick < 1000 / +$("#fps").value) return;
+  const all = panels.slice(0, nPanels).every(p => p.ready(frame));
+  if (!all) return;                      // buffering: hold the frame
+  lastTick = now;
+  let k = frame + stride() * dir;
+  const mode = $("#mode").value;
+  if (k >= M.nframes || k < 0) {
+    if (mode === "loop") k = dir > 0 ? 0 : M.nframes - 1;
+    else if (mode === "bounce") { dir = -dir; k = frame + stride() * dir; k = Math.min(Math.max(k, 0), M.nframes - 1) }
+    else { playing = false; k = frame }
+  }
+  go(k);
+}
+function toggle() { playing = !playing; if (playing) { if ($("#mode").value === "stop" && frame >= M.nframes - 1) frame = 0; lastTick = 0; requestAnimationFrame(tick) } draw() }
+function save() {
+  if (!M) return;
+  store.set(`vm:${M.title}:n`, nPanels);
+  for (const p of panels) if (p.s) { store.set(`vm:${M.title}:p${p.idx}`, p.s); store.set(`vm:${M.title}:f:${p.s.key}`, p.s) }
+}
+function showErr(msg) { $("#sub").textContent = msg; $("#sub").style.color = "var(--warn)" }
+
+async function loadManifest() {
+  const r = await fetch(BASE + "manifest.json", { cache: "no-store" });
+  if (!r.ok) throw new Error(`manifest.json: HTTP ${r.status}`);
+  return r.json();
+}
+let followTimer = null;
+async function follow() {
+  try {
+    const m = await loadManifest(), atEnd = frame >= M.nframes - 1;
+    if (m.nframes !== M.nframes) { M = m; for (const p of panels) p.sync(); if (atEnd && !playing) frame = M.nframes - 1; draw() }
+  } catch (e) { console.warn(e) }
+}
+
+async function main() {
+  try { M = await loadManifest() }
+  catch (e) {
+    $("#panels").innerHTML = `<div class="msg"><h2>No movie found here</h2>
+      <p>The player reads <code>manifest.json</code> and the frame PNGs from the directory it is served from (${e.message}).</p>
+      <p>Serve a movie directory written by <code>BlockAMR.MovieWriter</code> over HTTP — browsers do not let pages read local files — e.g.</p>
+      <p><code>python3 -m http.server 8000 -d RUN/movie</code> → open <code>http://localhost:8000/</code></p>
+      <p>or keep one player and pick the movie with <code>?m=path/to/movie/</code>.</p></div>`;
+    $("#sub").textContent = ""; return;
+  }
+  document.title = M.title || "Vespa movie";
+  $("#title").textContent = M.title || "Vespa movie";
+  const meta = Object.entries(M.meta || {}).map(([k, v]) => `${k} ${v}`);
+  $("#sub").textContent = [`${M.nx}×${M.ny} px (level ${M.level})`, `${M.nframes} frames`, `${M.fields.length} fields`, ...meta].join(" · ");
+  resetView();
+  const fromHash = () => { const m = /^#f(\d+)$/.exec(location.hash); if (m) go(+m[1]) };
+  fromHash(); window.addEventListener("hashchange", fromHash);
+  setPanels([1, 2, 4].includes(+qs.get("panels")) ? +qs.get("panels") : store.get(`vm:${M.title}:n`, 2));
+  for (const b of document.querySelectorAll("#layout button")) b.onclick = () => setPanels(+b.dataset.n);
+  $("#play").onclick = toggle;
+  $("#first").onclick = () => go(0); $("#last").onclick = () => go(M.nframes - 1);
+  $("#back").onclick = () => go(frame - stride()); $("#fwd").onclick = () => go(frame + stride());
+  $("#slider").oninput = e => go(+e.target.value);
+  $("#fps").oninput = e => { $("#fpsv").textContent = e.target.value };
+  $("#resetview").onclick = () => { resetView(); draw() };
+  $("#follow").onclick = e => { const on = e.target.getAttribute("aria-pressed") !== "true"; e.target.setAttribute("aria-pressed", on);
+    clearInterval(followTimer); if (on) { followTimer = setInterval(follow, 5000); follow() } };
+  $("#helpbtn").onclick = e => { const h = $("#help"); h.hidden = !h.hidden; e.target.setAttribute("aria-expanded", !h.hidden) };
+  window.addEventListener("resize", resize);
+  window.addEventListener("keydown", e => {
+    if (e.target.matches("input, select")) return;
+    const big = e.shiftKey ? 10 : 1;
+    switch (e.key) {
+      case " ": e.preventDefault(); toggle(); break;
+      case "ArrowRight": e.preventDefault(); go(frame + big * stride()); break;
+      case "ArrowLeft": e.preventDefault(); go(frame - big * stride()); break;
+      case "Home": go(0); break; case "End": go(M.nframes - 1); break;
+      case "[": $("#fps").value = Math.max(1, +$("#fps").value - (+$("#fps").value > 10 ? 5 : 1)); $("#fps").oninput({ target: $("#fps") }); break;
+      case "]": $("#fps").value = Math.min(60, +$("#fps").value + (+$("#fps").value >= 10 ? 5 : 1)); $("#fps").oninput({ target: $("#fps") }); break;
+      case "1": case "2": case "4": setPanels(+e.key); break;
+      case "r": resetView(); draw(); break;
+      case "l": { const p = hoverPanel || panels[0], o = ["lin", "log", "symlog"]; p.setScale(o[(o.indexOf(p.s.scale) + 1) % 3]); save(); draw(); break }
+      case "?": $("#helpbtn").click(); break;
+    }
+  });
+  if (qs.has("autoplay")) toggle();
+  matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  draw();
+}
+main();
+</script>

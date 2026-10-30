@@ -17,7 +17,11 @@
 #   HVC_TEND (in cloud-crushing times, 6), HVC_SNAP (snapshots per t_cc, 4),
 #   HVC_Z (Z/Z☉, 0.3), HVC_BACKEND (cuda), HVC_T (Float64), HVC_DTHRESH (refine
 #   above this × halo density, 3), HVC_LX, HVC_LY (box in cloud radii, 32 × 8),
-#   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save).
+#   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save),
+#   HVC_MOVIE (movie frames per t_cc, 0 = off), HVC_MOVIE_LEVEL (image resolution
+#   level, default HVC_LMAX), HVC_MOVIE_FIELDS (comma list of MOVIE_CATALOG keys,
+#   default: all that apply).  Movie → HVC_OUT/movie (open with the player:
+#   `python3 -m http.server -d HVC_OUT/movie`, or `movie_bundle` it for sharing).
 using BlockAMR, Printf, Serialization, Dates
 try; @eval using CUDA; catch; end
 const BA = BlockAMR
@@ -42,6 +46,9 @@ const WALL    = parse(Float64, env("HVC_WALL", 1e9)) * 3600
 # vacuum — a positivity-floored cell keeps its (draped, amplified) field, and at
 # ρ → 1e-6 ρ_h its Alfvén speed collapses the global time step (β = 100 runs, v1)
 const SMALLR  = parse(Float64, env("HVC_SMALLR", 1e-6))
+const NMOVIE  = parse(Float64, env("HVC_MOVIE", 0.0))
+const LMOVIE  = parse(Int, env("HVC_MOVIE_LEVEL", LMAX))
+const FMOVIE  = env("HVC_MOVIE_FIELDS", "default")
 mkpath(OUT); mkpath(joinpath(OUT, "snap"))
 
 # ── units: length 100 pc (the cloud radius), velocity 100 km/s, density m_H cm⁻³ ──
@@ -226,14 +233,33 @@ ts = open(joinpath(OUT, "timeseries.csv"), "w")
 println(ts, "step,t_code,t_cc,t_myr,dt_code,mass,mcold,mdense,mint,xc,vxc,divb,blocks,wall_s"); flush(ts)
 sc0 = scan(hier); M0c = sc0.mcold
 snapshot(hier, 0, 0.0, sc0)
+# movie: whole tunnel at level LMOVIE; axes in pc, clocks t/t_cc and Myr, fields in
+# physical units (Heaviside–Lorentz B: B_G = √(4π ρ_u) v_u B_code)
+const BG = sqrt(4π * MH) * 1e7
+mw = NMOVIE > 0 ? MovieWriter(joinpath(OUT, "movie"), hier; cooling = cool, level = LMOVIE,
+        fields = FMOVIE == "default" ? :default : Symbol.(strip.(split(FMOVIE, ","))),
+        length_unit = ("pc", 100.0), time_labels = [("t", "t_cc", 1 / TCC), ("t", "Myr", TU / MYR)],
+        units = Dict(:rho => ("m_H cm⁻³", 1.0), :p => ("K cm⁻³", MH * 1e14 / KB),
+                     :B2 => ("μG²", (BG * 1e6)^2), :absJ => ("μG/pc", BG * 1e6 / 100), :Jz => ("μG/pc", BG * 1e6 / 100),
+                     :vmag => ("km/s", 100.0), :vx => ("km/s", 100.0),
+                     :divv => ("Myr⁻¹", MYR / TU), :absw => ("Myr⁻¹", MYR / TU), :wz => ("Myr⁻¹", MYR / TU)),
+        title = "HVC in a Mach-2 halo wind — " * basename(OUT),
+        meta = Dict("χ" => round(χ; sigdigits = 4), "β" => isinf(BETA) ? "∞" : BETA, "table" => basename(TABLE),
+                    "Z/Z☉" => ZREL, "base" => "$(NX)×$(NY)", "L_max" => LMAX)) : nothing
+mw === nothing || write_frame!(mw, hier, 0.0)
+tmnext = NMOVIE > 0 ? TCC / NMOVIE : Inf
 t = 0.0; step = 0; nsnap = 1; tw0 = time(); tnext = TCC / NSNAP
-const TW = Dict(:advance => 0.0, :regrid => 0.0, :diag => 0.0)   # wall-clock per phase
+const TW = Dict(:advance => 0.0, :regrid => 0.0, :diag => 0.0, :movie => 0.0)   # wall-clock per phase
 get(ENV, "HVC_TIMERS", "0") == "1" && BA.enable_timers!()       # synchronized GPU phase timers
 while t < TEND * TCC && step < MAXST
-    global t, step, nsnap, tnext
+    global t, step, nsnap, tnext, tmnext
     TW[:advance] += @elapsed (dt = advance_hierarchy!(hier; cooling = cool))
     t += dt; step += 1
     TW[:regrid] += @elapsed regrid!(hier, pol)
+    if t >= tmnext
+        TW[:movie] += @elapsed write_frame!(mw, hier, t)
+        tmnext = (floor(t * NMOVIE / TCC) + 1) * TCC / NMOVIE
+    end
     if step % 25 == 0 || t >= tnext
         td0 = time()
         sc = scan(hier)
@@ -247,8 +273,8 @@ while t < TEND * TCC && step < MAXST
                     nsnap, t / TCC, t * TU / MYR, step, sc.mcold / M0c, sc.xc, sc.vxc / VW,
                     [length(lv.live) for lv in hier.levels], max_divb(hier), time() - tw0)
             flush(stdout)
-            @printf("          wall by phase: advance %.0f s, regrid %.0f s, diagnostics %.0f s\n",
-                    TW[:advance], TW[:regrid], TW[:diag])
+            @printf("          wall by phase: advance %.0f s, regrid %.0f s, diagnostics %.0f s, movie %.0f s (%d frames)\n",
+                    TW[:advance], TW[:regrid], TW[:diag], TW[:movie], mw === nothing ? 0 : length(mw.frames))
             nsnap += 1; tnext = nsnap * TCC / NSNAP
         end
         TW[:diag] += time() - td0
