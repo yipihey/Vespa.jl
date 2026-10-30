@@ -38,6 +38,10 @@ const LX      = parse(Float64, env("HVC_LX", 32.0)); const LY = parse(Float64, e
 const X0      = parse(Float64, env("HVC_X0", 4.0))
 const MAXST   = parse(Int, env("HVC_MAXSTEPS", 10^9))
 const WALL    = parse(Float64, env("HVC_WALL", 1e9)) * 3600
+# density floor in units of the halo density: magnetized runs need it well above
+# vacuum — a positivity-floored cell keeps its (draped, amplified) field, and at
+# ρ → 1e-6 ρ_h its Alfvén speed collapses the global time step (β = 100 runs, v1)
+const SMALLR  = parse(Float64, env("HVC_SMALLR", 1e-6))
 mkpath(OUT); mkpath(joinpath(OUT, "snap"))
 
 # ── units: length 100 pc (the cloud radius), velocity 100 km/s, density m_H cm⁻³ ──
@@ -82,7 +86,7 @@ inflow = Dict((1, :lo) => (RH, VW, 0.0, 0.0, PH, 0.0, B0, 0.0))
 hier = AMRHierarchy(; nbase = (NX, NY), B = 16, box = LX, backend = BE, T = TT, cap0 = 64,
                     physics = :mhd, divb = :ct, riemann = :hlld, cfl = 0.4,
                     bc = ((:inflow, :outflow), :periodic), inflow, Lcap = LMAX,
-                    smallr = 1e-6 * RH, smallc = 1e-4)
+                    smallr = SMALLR * RH, smallc = 1e-4)
 init_base_level!(hier); build_level_tables!(hier, 0)
 pol = BlockRefinementPolicy(; dthresh = DTHR * RH, nbuf = 2, every = 1, lmax = LMAX)
 
@@ -212,11 +216,11 @@ end
 
 # ── run ───────────────────────────────────────────────────────────────────────
 open(joinpath(OUT, "params.toml"), "w") do io
-    println(io, "# hvc_cloud_2d.jl — $(now())\ntable = \"$(cool.source)\"\nmetallicity_Zsun = $ZREL")
+    println(io, "# hvc_cloud_2d.jl — $(now())\ntable = \"$(TABLE)\"\ntable_source = \"$(replace(cool.source, '\n' => "; "))\"\nmetallicity_Zsun = $ZREL")
     println(io, "beta = $(isinf(BETA) ? "\"inf\"" : BETA)\nB0_code = $B0\nNX = $NX\nNY = $NY\nLMAX = $LMAX")
     println(io, "box_radii = [$LX, $LY]\ncloud_x0_radii = $X0\nT_halo = $Th\nT_cloud = $Tc\nmu_halo = $μh\nmu_cloud = $μc")
     println(io, "chi = $χ\nP_over_k = $Pk\nv_wind_kms = $(vw/1e5)\nt_cc_Myr = $(TCC*TU/MYR)\nt_end_tcc = $TEND")
-    println(io, "dthresh_halo = $DTHR\nfloat = \"$TT\"\nbackend = \"$BE\"\nunits = { length_pc = 100, velocity_kms = 100, density = \"m_H cm^-3\", time_Myr = $(TU/MYR) }")
+    println(io, "smallr_halo = $SMALLR\ndthresh_halo = $DTHR\nfloat = \"$TT\"\nbackend = \"$BE\"\nunits = { length_pc = 100, velocity_kms = 100, density = \"m_H cm^-3\", time_Myr = $(TU/MYR) }")
 end
 ts = open(joinpath(OUT, "timeseries.csv"), "w")
 println(ts, "step,t_code,t_cc,t_myr,dt_code,mass,mcold,mdense,mint,xc,vxc,divb,blocks,wall_s"); flush(ts)
