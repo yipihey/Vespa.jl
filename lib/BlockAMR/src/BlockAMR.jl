@@ -78,6 +78,8 @@ export global_from_level0!, compton_drag!
 export save_checkpoint, load_checkpoint
 export mhd_level!, encode_mhd_from_host!, max_divb, total_bflux, mhd_max_signal
 export ct_level!, set_ct_faces_from_Az!, max_divb_ct
+export CoolingUnits, CloudyCooling, load_cloudy_cooling, cool_level!, cloudy_temperature,
+       cloudy_mu, cloudy_edot, cloudy_isobar
 export memory_mode, set_memory_mode!, memory_report
 export prefetch_level!, advise_level_host!, advise_all_host!, evict_level!, evict_gas_pools!,
        prefetch_grav!, evict_grav!, set_stream_grav!
@@ -182,5 +184,6 @@ include("particles.jl")    # DM particles: per-level deposit + finest-level acce
 include("checkpoint.jl")   # root-boundary save/restore (topology+fields+scales+phi)
 include("mhd.jl")          # GLM-MHD (NestedMHD scheme) on the same blocks / W-cycle
 include("ct.jl")           # constrained-transport MHD (face B, GS05 EMFs), 2-D
+include("cooling.jl")      # tabulated Grackle (Cloudy-mode) cooling + UVB heating
 
 end # module BlockAMR

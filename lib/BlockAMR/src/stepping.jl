@@ -269,7 +269,7 @@ end
 const GROWREGRID = Ref{Any}(nothing)
 
 function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
-                          φ = nothing, chem = nothing, selfgrav = nothing)
+                          φ = nothing, chem = nothing, selfgrav = nothing, cooling = nothing)
     lev = hier.levels[l + 1]
     isempty(lev.live) && return nothing
     # per-substep GROW-ONLY refinement: refinement latency = one substep of the
@@ -310,8 +310,8 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         # out-of-core: keep THIS (parent) level resident while its children run —
         # they read its φ/gas for C/F ghost prolongation + Dirichlet gravity BCs.
         prefetch_level!(lev)
-        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
-        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav)
+        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav, cooling)
+        advance_level_w!(hier, l + 1, λ; φ, chem, selfgrav, cooling)
     end
     # out-of-core: pull THIS level's pools onto the GPU right before its kernels
     # (children ran first and may have evicted it).  Cold levels stay host-
@@ -452,6 +452,9 @@ function advance_level_w!(hier::AMRHierarchy, l::Int, λ::Float32;
         _t = _tic(lev.be); grav_kick_level!(hier, l, φ, 0.5 * dt_l); _toc(lev.be, :grav_kick, l, _t)
     end
     _nanstage!(hier, l, :grav_K2)
+    if cooling !== nothing                                        # tabulated cooling (cooling.jl)
+        _t = _tic(lev.be); cool_level!(hier, l, dt_l, cooling); _toc(lev.be, :cooling, l, _t)
+    end
     if chem !== nothing                                           # analytic H+H₂
         # chem CADENCE (chemk ≥ 2): run every chemk-th substep with the
         # ACCUMULATED dt.  Chem is a per-cell ODE with internal subcycling —
@@ -491,12 +494,12 @@ One root step of the strict-2:1 W-cycle: λ from the global CFL, then the
 recursive fine-first advance.  Level l takes exactly 2^l substeps of λ·dx_l.
 """
 function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing,
-                            selfgrav = nothing)
+                            selfgrav = nothing, cooling = nothing)
     hier.dim == 3 || (φ === nothing && chem === nothing && selfgrav === nothing) ||
         error("BlockAMR 2-D supports hydro only (gravity / chemistry are 3-D)")
     λ = compute_lambda!(hier)
     selfgrav !== nothing && φ !== nothing && phi_from_global!(hier, φ)
-    advance_level_w!(hier, 0, λ; φ, chem, selfgrav)
+    advance_level_w!(hier, 0, λ; φ, chem, selfgrav, cooling)
     return λ * level_dx(hier, 0)
 end
 

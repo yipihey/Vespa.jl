@@ -216,7 +216,7 @@ end
 """Tile origin (level cells, multiples of Bh) of tile index `ti` per axis — wrapped
 on periodic axes, `nothing` if outside the domain on a non-periodic one; the flat
 z of 2-D is 0."""
-function _tile_in_domain(ti::NTuple{3,<:Integer}, Bh::Int, P::Origin,
+function _tile_in_domain(ti::Tuple{Integer,Integer,Integer}, Bh::Int, P::Origin,
                          per::NTuple{3,Bool}, dim::Int)
     out = (Int128(0), Int128(0), Int128(0))
     for d in 1:dim
