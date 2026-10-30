@@ -258,10 +258,12 @@ end
                                (_rl(rec, _CL_GY, g, nt) - _rl(rec, _CL_GY, g + n, nt))),
                               r1, kmin, kmax, gamma)
         end
-        if r1 < smallr        # positivity floor (NestedMHD): static floored cell, B kept
+        if r1 < smallr        # positivity floor (NestedMHD): static floored cell, B kept;
+            # dual energy: keep the cell's entropy at the floor density (mhd.jl)
+            gadv = DE ? max(_de_rhoK(ge0, u0[1], gamma) / max(u0[1], floatmin(T)) * smallr^gamma /
+                            (gamma - one(T)), pfl / (gamma - one(T))) : pfl / (gamma - one(T))
             r1 = smallr; r2 = zero(T); r3 = zero(T); r4 = zero(T)
-            r5 = pfl / (gamma - one(T)) + T(0.5) * (bxc*bxc + byc*byc + r8*r8)
-            gadv = pfl / (gamma - one(T))
+            r5 = gadv + T(0.5) * (bxc*bxc + byc*byc + r8*r8)
         end
         ok = isfinite(r1) & isfinite(r2) & isfinite(r3) & isfinite(r4) & isfinite(r5) &
              isfinite(r8) & isfinite(gadv)

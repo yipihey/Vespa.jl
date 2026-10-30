@@ -547,11 +547,14 @@ end
             gadv = _de_ge_lim(_de_rhoK(ge0, u0[1], gamma) + dtdx * dg, r[1], kmin, kmax, gamma)
         end
         floored = r[1] < smallr
-        if floored             # positivity floor (NestedMHD): static floored cell, B kept
+        if floored             # positivity floor (NestedMHD): static floored cell, B kept;
+            # dual energy: the cell keeps its entropy at the floor density (not p_floor,
+            # which pins it at the cooling floor: 10 K cells in the HVC cavity, measured)
+            gadv = DE ? max(_de_rhoK(ge0, u0[1], gamma) / max(u0[1], floatmin(T)) * smallr^gamma /
+                            (gamma - one(T)), pfl / (gamma - one(T))) : pfl / (gamma - one(T))
             r = (smallr, zero(T), zero(T), zero(T),
-                 pfl / (gamma - one(T)) + T(0.5) * (r[6]*r[6] + r[7]*r[7] + r[8]*r[8]),
+                 gadv + T(0.5) * (r[6]*r[6] + r[7]*r[7] + r[8]*r[8]),
                  r[6], r[7], r[8], r[9])
-            gadv = pfl / (gamma - one(T))
         end
         # keep-old-state safety (the hydro epilogue twin): a nonfinite update never
         # poisons the level
