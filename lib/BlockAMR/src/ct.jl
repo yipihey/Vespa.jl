@@ -43,10 +43,10 @@
 
 using .MHDPhys: riemann_x, rot_to, rot_flux_from, moncen
 
-# cell-centred primitive for CT (ψ ≡ 0)
-@inline function _ct_prim(::Type{T}, D, S1, S2, S3, E, Bx, By, Bz, idx, dsc, ssc, esc,
-                          gamma::T, smallr::T, pfl::T) where {T}
-    u = _mload(T, D, S1, S2, S3, E, Bx, By, Bz, Bz, idx, dsc, ssc, esc)
+# cell-centred primitive for CT (ψ ≡ 0); dual-energy thermal part (mhd.jl)
+@inline function _ct_prim(::Type{T}, D, S1, S2, S3, E, Ge, Bx, By, Bz, idx, dsc, ssc, esc, gsc,
+                          gamma::T, smallr::T, pfl::T, eta1::T, dev::Val) where {T}
+    u = _mload_de(T, D, S1, S2, S3, E, Ge, Bx, By, Bz, Bz, idx, dsc, ssc, esc, gsc, eta1, dev)
     cons2prim((u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], zero(T)), gamma, smallr, pfl)
 end
 
@@ -73,10 +73,13 @@ end
 
 # scratch lanes (lane-major, nt = cap·stride per lane)
 # offsets (lane = off + v): mh 1:9, sx 10:18, sy 19:27, Fx 29:37, Fy 38:46;
-# single lanes: the GS05 reference E_z (28) and the corner E_z (47)
+# single lanes: the GS05 reference E_z (28) and the corner E_z (47); dual energy:
+# the entropy flux of the x faces (48) and y faces (49), the advected K (50) and
+# its minmod slopes (51 x, 52 y — see mhd.jl `_de_flux`)
 const _CL_MH, _CL_SX, _CL_SY, _CL_FX, _CL_FY = 0, 9, 18, 28, 37
 const _CL_ER, _CL_EZ = 28, 47
-const _CLANES = 47
+const _CL_GX, _CL_GY, _CL_K = 48, 49, 50
+const _CLANES = 52
 
 function _ctrec(lev::Level)
     T = eltype(lev.D)
@@ -93,10 +96,10 @@ end
 
 # ── pass 1: half-step prims + half slopes + GS05 reference EMF ────────────────
 @kernel function _ct_rec_k!(rec, @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
-                            @Const(Bx), @Const(By), @Const(Bz),
-                            @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc),
-                            gamma::T, smallr::T, pfl::T, dtdx::T,
-                            B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int) where {T}
+                            @Const(Ge), @Const(Bx), @Const(By), @Const(Bz),
+                            @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                            gamma::T, smallr::T, pfl::T, dtdx::T, eta1::T, dev::Val{DE},
+                            B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int) where {T,DE}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     R = B + Int32(2); nr = R * R
@@ -104,10 +107,11 @@ end
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
         i = c % R + ng - Int32(1); j = c ÷ R + ng - Int32(1)
-        @inline P(ii, jj) = _ct_prim(T, D, S1, S2, S3, E, Bx, By, Bz,
-                                     base + _li2(ii, jj, nd), dsc, ssc, esc, gamma, smallr, pfl)
+        @inline P(ii, jj) = _ct_prim(T, D, S1, S2, S3, E, Ge, Bx, By, Bz,
+                                     base + _li2(ii, jj, nd), dsc, ssc, esc, gsc, gamma, smallr,
+                                     pfl, eta1, dev)
         m0 = P(i, j)
         sx = prim_slope(P(i - Int32(1), j), m0, P(i + Int32(1), j))
         sy = prim_slope(P(i, j - Int32(1)), m0, P(i, j + Int32(1)))
@@ -123,6 +127,15 @@ end
         end
         # E_z reference: predictor velocity × start-of-step field (sweep-fixes 7256715)
         rec[(_CL_ER - 1) * nt + g] = mh[3] * m0[6] - mh[2] * m0[7]
+        if DE                                   # advected entropy: K_half + half slopes (mhd.jl)
+            @inline Kc(ii, jj) = _de_Kc(T, D, Ge, base + _li2(ii, jj, nd), dsc, gsc, gamma)
+            k0 = Kc(i, j)
+            skx = _de_hs(Kc(i - Int32(1), j), k0, Kc(i + Int32(1), j))
+            sky = _de_hs(Kc(i, j - Int32(1)), k0, Kc(i, j + Int32(1)))
+            rec[(_CL_K - 1) * nt + g] = k0 - dtdx * (m0[2] * skx + m0[3] * sky)
+            rec[_CL_K * nt + g] = skx
+            rec[(_CL_K + 1) * nt + g] = sky
+        end
     end
 end
 
@@ -148,6 +161,7 @@ end
             Rq = iflo(padd(mr, _rget(rec, _CL_SX, g, nt), -one(T)), mr, smallr, pfl)
             f = _ct_riemann(rv, L, Rq, 1, gamma, smallr, pfl, T(FBx[gi]))
             Base.Cartesian.@nexprs 9 v -> (rec[(_CL_FX + v - 1) * nt + g] = f[v])
+            rec[(_CL_GX - 1) * nt + g] = _de_flux(rec, _CL_K, 1, gl, g, nt, f[1])
         end
         if j >= ng
             gl = g - Int(nd)
@@ -156,6 +170,7 @@ end
             Rq = iflo(padd(mr, _rget(rec, _CL_SY, g, nt), -one(T)), mr, smallr, pfl)
             f = _ct_riemann(rv, L, Rq, 2, gamma, smallr, pfl, T(FBy[gi]))
             Base.Cartesian.@nexprs 9 v -> (rec[(_CL_FY + v - 1) * nt + g] = f[v])
+            rec[(_CL_GY - 1) * nt + g] = _de_flux(rec, _CL_K, 2, gl, g, nt, f[1])
         end
     end
 end
@@ -191,11 +206,12 @@ end
 # ── pass 4: update cells (flux divergence) + faces (curl E) + B_cc ─────────────
 @kernel function _ct_update_k!(Do_, S1o_, S2o_, S3o_, Eo_, Geo_, Bxo_, Byo_, Bzo_, FBxo_, FByo_,
                                @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
-                               @Const(Bx), @Const(By), @Const(Bz), @Const(FBx), @Const(FBy),
+                               @Const(Ge), @Const(Bx), @Const(By), @Const(Bz), @Const(FBx), @Const(FBy),
                                @Const(rec), @Const(live_d),
                                @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
-                               gamma::T, smallr::T, pfl::T, dtdx::T,
-                               B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int) where {T}
+                               gamma::T, smallr::T, pfl::T, dtdx::T, eta1::T, eta2::T,
+                               dev::Val{DE},
+                               B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int) where {T,DE}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B2 = B * B
@@ -219,13 +235,36 @@ end
         byl = T(FBy[idx])     + dtdx * (ez(g + 1) - ez(g))
         byh = T(FBy[idx + nd]) + dtdx * (ez(g + n + 1) - ez(g + n))
         bxc = T(0.5) * (bxl + bxh); byc = T(0.5) * (byl + byh)
+        # dual energy: advected entropy density (mhd.jl) → Ge at the new density
+        ge0 = DE ? T(Ge[idx]) * T(gsc) : zero(T)
+        gadv = zero(T)
+        if DE                 # K clamped to the cell's 3×3 neighbourhood range (mhd.jl)
+            kmin = _rl(rec, _CL_K, g, nt); kmax = kmin
+            for dj in -1:1, di in -1:1
+                kv = _rl(rec, _CL_K, g + di + dj * n, nt)
+                kmin = min(kmin, kv); kmax = max(kmax, kv)
+            end
+            gadv = _de_ge_lim(_de_rhoK(ge0, u0[1], gamma) + dtdx *
+                              ((_rl(rec, _CL_GX, g, nt) - _rl(rec, _CL_GX, g + 1, nt)) +
+                               (_rl(rec, _CL_GY, g, nt) - _rl(rec, _CL_GY, g + n, nt))),
+                              r1, kmin, kmax, gamma)
+        end
         if r1 < smallr        # positivity floor (NestedMHD): static floored cell, B kept
             r1 = smallr; r2 = zero(T); r3 = zero(T); r4 = zero(T)
             r5 = pfl / (gamma - one(T)) + T(0.5) * (bxc*bxc + byc*byc + r8*r8)
+            gadv = pfl / (gamma - one(T))
         end
-        ok = isfinite(r1) & isfinite(r2) & isfinite(r3) & isfinite(r4) & isfinite(r5) & isfinite(r8)
+        ok = isfinite(r1) & isfinite(r2) & isfinite(r3) & isfinite(r4) & isfinite(r5) &
+             isfinite(r8) & isfinite(gadv)
         if !ok
             r1 = u0[1]; r2 = u0[2]; r3 = u0[3]; r4 = u0[4]; r5 = u0[5]; r8 = u0[8]
+            gadv = ge0
+        end
+        gnew = zero(T)
+        if DE
+            demax = _de_demax(T, E, base, i, j, Int32(0), nd, esc, Int32(0))
+            r5, gnew = _de_close(r1, r2, r3, r4, r5, bxc, byc, r8, gadv, demax, eta1, eta2,
+                                 pfl / (gamma - one(T)))
         end
         q = cons2prim((r1, r2, r3, r4, r5, bxc, byc, r8, zero(T)), gamma, smallr, pfl)
         Do_[idx]  = _narrow(eltype(Do_), r1 / T(dsc))
@@ -233,7 +272,7 @@ end
         S2o_[idx] = _narrow(eltype(S2o_), r3 / T(ssc))
         S3o_[idx] = _narrow(eltype(S3o_), r4 / T(ssc))
         Eo_[idx]  = _narrow(eltype(Eo_), r5 / T(esc))
-        Geo_[idx] = _narrow(eltype(Geo_), q[5] / (gamma - one(T)) / T(gsc))
+        Geo_[idx] = _narrow(eltype(Geo_), (DE ? gnew : q[5] / (gamma - one(T))) / T(gsc))
         Bxo_[idx] = bxc; Byo_[idx] = byc; Bzo_[idx] = r8
         FBxo_[idx] = bxl; FByo_[idx] = byl
         i == ng + B - Int32(1) && (FBxo_[idx + 1] = bxh)     # the block's hi faces
@@ -255,15 +294,15 @@ function ct_level!(hier::AMRHierarchy, l::Int, λ::Real)
     rec = _ctrec(lev); nt = lev.cap * lev.stride
     nb = length(lev.live); B = lev.B
     a = (Int32(B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt)
-    g5 = gasfields(lev)[1:5]
-    _ct_rec_k!(lev.be)(rec, g5..., mfields(lev)[1:3]..., lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
-                       γ, sr, pfl, T(λ), a...; ndrange = nb * (B + 2)^2)
+    g6 = gasfields(lev); dev, η1, η2 = _mde(hier)
+    _ct_rec_k!(lev.be)(rec, g6..., mfields(lev)[1:3]..., lev.live_d, lev.Dsc, lev.Ssc, lev.Esc,
+                       lev.Gsc, γ, sr, pfl, T(λ), η1, dev, a...; ndrange = nb * (B + 2)^2)
     _ct_flux_k!(lev.be)(rec, cfields(lev)..., lev.live_d, γ, sr, pfl, a..., Val(hier.mhd.riemann);
                         ndrange = nb * (B + 2)^2)
     _ct_emf_k!(lev.be)(rec, lev.live_d, a...; ndrange = nb * (B + 1)^2)
     _ct_update_k!(lev.be)(gasfields_o(lev)..., mfields_o(lev)[1:3]..., cfields_o(lev)...,
-                          g5..., mfields(lev)[1:3]..., cfields(lev)..., rec, lev.live_d,
-                          lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, T(λ), a...;
+                          g6..., mfields(lev)[1:3]..., cfields(lev)..., rec, lev.live_d,
+                          lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, T(λ), η1, η2, dev, a...;
                           ndrange = nb * B^2)
     return nothing
 end
@@ -561,7 +600,7 @@ end
 end
 
 # C/F cell flux captures from the face-flux scratch (lanes ρ, ρv, E, Bz; 6,7,9 = 0)
-@kernel function _ct_capture_coarse_k!(reg, @Const(ent), @Const(rec), wc::T,
+@kernel function _ct_capture_coarse_k!(reg, @Const(ent), @Const(rec), wc::T, de::Bool,
                                        nd::Int32, stride::Int32, nt::Int) where {T}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
@@ -572,15 +611,17 @@ end
         i = ci + (ax == Int32(1) ? hi : Int32(0)); j = cj + (ax == Int32(2) ? hi : Int32(0))
         g = Int((ent[b+1] - Int32(1)) * stride + _li2(i, j, nd))
         lane0 = ax == Int32(1) ? _CL_FX : _CL_FY
+        lg = ax == Int32(1) ? _CL_GX : _CL_GY           # dual energy: entropy flux in lane 9
         r = (Int(e) - 1) * 9
         Base.Cartesian.@nexprs 9 v -> begin
-            f = (v == 6 || v == 7 || v == 9) ? zero(T) : _rl(rec, lane0 + v, g, nt)
+            f = (v == 6 || v == 7) ? zero(T) :
+                v == 9 ? (de ? _rl(rec, lg, g, nt) : zero(T)) : _rl(rec, lane0 + v, g, nt)
             reg[r + v] -= wc * ifelse(isfinite(f), f, zero(T))
         end
     end
 end
 
-@kernel function _ct_capture_fine_k!(reg, @Const(ent), @Const(rec), wf::T,
+@kernel function _ct_capture_fine_k!(reg, @Const(ent), @Const(rec), wf::T, de::Bool,
                                      nd::Int32, stride::Int32, nt::Int) where {T}
     e = @index(Global)
     b = (Int32(e) - Int32(1)) * Int32(16)
@@ -593,10 +634,16 @@ end
         g1 = Int(base + _li2(i0, j0, nd))
         g2 = Int(base + _li2(i0 + (ax == Int32(1) ? Int32(0) : Int32(1)),
                              j0 + (ax == Int32(1) ? Int32(1) : Int32(0)), nd))
+        lg = ax == Int32(1) ? _CL_GX : _CL_GY           # dual energy: entropy flux in lane 9
         q = T(0.5) * wf
         r = (Int(e) - 1) * 9
         Base.Cartesian.@nexprs 9 v -> begin
-            if !(v == 6 || v == 7 || v == 9)
+            if v == 9
+                if de
+                    f = _rl(rec, lg, g1, nt) + _rl(rec, lg, g2, nt)
+                    reg[r + v] += q * ifelse(isfinite(f), f, zero(T))
+                end
+            elseif !(v == 6 || v == 7)
                 f = _rl(rec, lane0 + v, g1, nt) + _rl(rec, lane0 + v, g2, nt)
                 reg[r + v] += q * ifelse(isfinite(f), f, zero(T))
             end
@@ -608,7 +655,7 @@ function ct_capture_fine!(hier::AMRHierarchy, l::Int, w::Real)
     lev = hier.levels[l + 1]
     T = eltype(lev.D); rec = _ctrec(lev); nt = lev.cap * lev.stride
     n = get(lev.tabs, :cfn, 0)::Int
-    n > 0 && _ct_capture_fine_k!(lev.be)(lev.tabs[:cfreg], _tabi(lev, :cf), rec, T(w),
+    n > 0 && _ct_capture_fine_k!(lev.be)(lev.tabs[:cfreg], _tabi(lev, :cf), rec, T(w), hier.mhd.de,
                                          Int32(lev.nd), Int32(lev.stride), nt; ndrange = n)
     nc, cent = lev.tabs[:ctcorn]
     nc > 0 && _ct_cap_emf_k!(lev.be)(lev.tabs[:ctreg], cent, rec, T(w), Int32(3),
@@ -620,7 +667,7 @@ function ct_capture_coarse!(hier::AMRHierarchy, l::Int, w::Real)
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     T = eltype(lev.D); rec = _ctrec(plev); nt = plev.cap * plev.stride
     n = get(lev.tabs, :cfn, 0)::Int
-    n > 0 && _ct_capture_coarse_k!(lev.be)(lev.tabs[:cfreg], _tabi(lev, :cf), rec, T(w),
+    n > 0 && _ct_capture_coarse_k!(lev.be)(lev.tabs[:cfreg], _tabi(lev, :cf), rec, T(w), hier.mhd.de,
                                            Int32(plev.nd), Int32(plev.stride), nt; ndrange = n)
     nc, cent = lev.tabs[:ctcorn]
     nc > 0 && _ct_cap_emf_k!(lev.be)(lev.tabs[:ctreg], cent, rec, -T(w), Int32(0),

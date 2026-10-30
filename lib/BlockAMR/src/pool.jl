@@ -369,6 +369,11 @@ MHD — (physical units) for every `:inflow` face.
 via `riemann`, MUSCL-Hancock + MonCen PLM — the NestedMHD scheme) on the same
 blocks, BCs and W-cycle; `glm_ch_scale`/`glm_cp_coef` set the cleaning speed
 and damping, `smallr`/`smallc` the density / sound-speed floors.
+`dual_energy` (MHD; default on) advects the entropy ρp/ρ^γ alongside the total
+energy, stored as the internal energy Ge (dual-energy formalism, entropy form,
+Enzo's η1/η2 selection; mhd.jl): thermal energy from E − ½ρv² − ½B²
+only where it exceeds `de_eta1`·E, Ge reset from it where it exceeds `de_eta2`·
+(neighbour-max E), E rebuilt from Ge where the thermal fraction is below `de_eta1`.
 """
 function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1.0,
                         B::Int = 16, ng::Int = 2, backend::Symbol = :cpu, T::Type = Float32,
@@ -379,7 +384,8 @@ function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1
                         physics::Symbol = :hydro, riemann::Symbol = :hlld,
                         glm_ch_scale::Real = 0.25, glm_cp_coef::Real = 0.18,
                         smallr::Real = 1e-6, smallc::Real = 1e-4, sigdims::Int = 0,
-                        divb::Symbol = :glm)
+                        divb::Symbol = :glm, dual_energy::Bool = true,
+                        de_eta1::Real = 1e-3, de_eta2::Real = 0.1)
     @assert scheme in (:rk2, :ctu) "scheme must be :rk2 or :ctu"
     @assert physics in (:hydro, :mhd) "physics must be :hydro or :mhd"
     if physics === :mhd
@@ -403,7 +409,8 @@ function AMRHierarchy(; nbase::Union{NTuple{3,Int},NTuple{2,Int}}, box::Real = 1
     mpar = (riemann = riemann, glm_ch_scale = Float64(glm_ch_scale),
             glm_cp_coef = Float64(glm_cp_coef), smallr = Float64(smallr),
             smallc = Float64(smallc), sigdims = sigdims == 0 ? dim : sigdims,
-            ct = physics === :mhd && divb === :ct)
+            ct = physics === :mhd && divb === :ct,
+            de = dual_energy, eta1 = Float64(de_eta1), eta2 = Float64(de_eta2))
     AMRHierarchy{typeof(lev0)}([lev0], B, ng, nb3, Float64(box), Lcap, be, backend,
                                Float64(gamma), Float64(cfl), 1.0f0, Int64[0], scheme,
                                dim, bct, inf, physics, mpar)

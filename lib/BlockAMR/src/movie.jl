@@ -104,14 +104,16 @@ function MovieWriter(dir::AbstractString, hier::AMRHierarchy; fields = :default,
 end
 
 # ── the rasterizer: one thread per active cell of one level ───────────────────
-@inline function _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, idx, dsc, ssc, esc, gsc, γ::Float32, mhd::Bool)
+@inline function _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, idx, dsc, ssc, esc, gsc, γ::Float32, mhd::Bool,
+                        de::Bool = false, eta1::Float32 = 0.0f0)
     @inbounds begin
         ρ = max(Float32(D[idx]) * dsc, 1.0f-30)
         vx = Float32(S1[idx]) * ssc / ρ; vy = Float32(S2[idx]) * ssc / ρ; vz = Float32(S3[idx]) * ssc / ρ
         bx = mhd ? Float32(Bx[idx]) : 0.0f0; by = mhd ? Float32(By[idx]) : 0.0f0; bz = mhd ? Float32(Bz[idx]) : 0.0f0
-        p = if mhd
-            (γ - 1.0f0) * (Float32(E[idx]) * esc - 0.5f0 * ρ * (vx*vx + vy*vy + vz*vz) -
-                           0.5f0 * (bx*bx + by*by + bz*bz))
+        p = if mhd                 # dual energy (mhd.jl): Ge where the total's thermal part is noise
+            KE = 0.5f0 * ρ * (vx*vx + vy*vy + vz*vz); EB = 0.5f0 * (bx*bx + by*by + bz*bz)
+            e5 = Float32(E[idx]) * esc
+            (γ - 1.0f0) * ((de ? _de_total(e5, KE, EB, Float32(Ge[idx]) * gsc, eta1) : e5) - KE - EB)
         else
             (γ - 1.0f0) * Float32(Ge[idx]) * gsc
         end
@@ -126,7 +128,7 @@ end
                                   i0::Int32, j0::Int32, @Const(tab), nn::Int, nt::Int, n0::TC, dn::TC,
                                   t0::TC, dT::TC, XH::TC, zfrac::TC, Zrel::TC,
                                   gm1utem::TC, Tfloor::TC, uρ::TC, uv2::TC,
-                                  ut::TC, tmode::Int32, tfac::Float32,
+                                  ut::TC, tmode::Int32, tfac::Float32, de::Bool, eta1::Float32,
                                   B::Int32, ng::Int32, nd::Int32, stride::Int32) where {TC}
     t = @index(Global)
     t0_ = Int32(t) - Int32(1)
@@ -143,11 +145,11 @@ end
         if !(px0 + r <= Int32(0) || px0 >= W || py0 + r <= Int32(0) || py0 >= H)
             z0 = Int32(0); o1 = Int32(1)
             ρ, vx, vy, vz, p, bx, by, bz = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i, j, z0, nd),
-                                                  dsc, ssc, esc, gsc, γ, mhd)
-            xm = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i - o1, j, z0, nd), dsc, ssc, esc, gsc, γ, mhd)
-            xp = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i + o1, j, z0, nd), dsc, ssc, esc, gsc, γ, mhd)
-            ym = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i, j - o1, z0, nd), dsc, ssc, esc, gsc, γ, mhd)
-            yp = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i, j + o1, z0, nd), dsc, ssc, esc, gsc, γ, mhd)
+                                                  dsc, ssc, esc, gsc, γ, mhd, de, eta1)
+            xm = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i - o1, j, z0, nd), dsc, ssc, esc, gsc, γ, mhd, de, eta1)
+            xp = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i + o1, j, z0, nd), dsc, ssc, esc, gsc, γ, mhd, de, eta1)
+            ym = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i, j - o1, z0, nd), dsc, ssc, esc, gsc, γ, mhd, de, eta1)
+            yp = _mprim(D, S1, S2, S3, E, Ge, Bx, By, Bz, base + _lidx(i, j + o1, z0, nd), dsc, ssc, esc, gsc, γ, mhd, de, eta1)
             h = 0.5f0 * invdx
             dvx_dx = h * (xp[2] - xm[2]); dvy_dy = h * (yp[3] - ym[3])
             dvy_dx = h * (xp[3] - xm[3]); dvx_dy = h * (yp[2] - ym[2])
@@ -252,6 +254,7 @@ function write_frame!(mw::MovieWriter, hier::AMRHierarchy, t::Real)
                              TC(c === nothing ? 0.76 : c.XH), TC(c === nothing ? 0 : c.Zrel * c.Zsun),
                              TC(c === nothing ? 0 : c.Zrel), gm1utem, TC(c === nothing ? 1 : c.Tfloor),
                              TC(u.density), TC(u.velocity^2), TC(time_unit(u)), tmode, T(mw.tfactor),
+                             mhd && hier.mhd.de, T(mhd ? hier.mhd.eta1 : 0.0),
                              Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride);
                              ndrange = length(lev.live) * lev.B^2)
     end

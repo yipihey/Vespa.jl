@@ -186,7 +186,7 @@ end
                           @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc), @Const(tab),
                           dt::T, uρ::T, uv2::T, nn::Int, nt::Int, n0::T, dn::T, t0::T, dT::T,
                           XH::T, zfrac::T, Zrel::T, gm1utem::T, Tfloor::T, epsc::T, maxsub::Int,
-                          mhd::Bool, B::Int32, ng::Int32, nd::Int32, stride::Int32,
+                          mhd::Bool, de::Bool, eta1::T, B::Int32, ng::Int32, nd::Int32, stride::Int32,
                           dimv::Val{DIM}) where {T,DIM}
     t = @index(Global)
     t0_ = Int32(t) - Int32(1)
@@ -201,8 +201,10 @@ end
             ec = if mhd
                 s1 = T(S1[idx]) * ssc; s2 = T(S2[idx]) * ssc; s3 = T(S3[idx]) * ssc
                 bx = T(Bx[idx]); by = T(By[idx]); bz = T(Bz[idx])
-                (T(E[idx]) * esc - T(0.5) * (s1*s1 + s2*s2 + s3*s3) / ρ -
-                 T(0.5) * (bx*bx + by*by + bz*bz)) / ρ
+                KE = T(0.5) * (s1*s1 + s2*s2 + s3*s3) / ρ; EB = T(0.5) * (bx*bx + by*by + bz*bz)
+                e5 = T(E[idx]) * esc
+                # dual energy (mhd.jl): cooling acts on the advected internal energy
+                (de ? T(Ge[idx]) * gsc : e5 - KE - EB) / ρ
             else
                 T(Ge[idx]) * gsc / ρ
             end
@@ -235,7 +237,7 @@ function cool_level!(hier::AMRHierarchy, l::Int, dt::Real, cool::CloudyCooling)
                      cool.tab, T(dt * time_unit(u)), T(u.density), T(u.velocity^2),
                      cool.nn, cool.nt, T(cool.n0), T(cool.dn), T(cool.t0), T(cool.dT),
                      T(cool.XH), zfrac, T(cool.Zrel), gm1utem, T(cool.Tfloor), T(cool.eps),
-                     cool.maxsub, mhd, Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
+                     cool.maxsub, mhd, mhd && hier.mhd.de, T(mhd ? hier.mhd.eta1 : 0.0), Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                      Int32(lev.stride), Val(lev.dim); ndrange = nb * _nact(lev))
     return nothing
 end

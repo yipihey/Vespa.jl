@@ -121,7 +121,9 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
                          (physics = :mhd, riemann = ck.mhd.riemann,
                           divb = get(ck.mhd, :ct, false) ? :ct : :glm,
                           glm_ch_scale = ck.mhd.glm_ch_scale, glm_cp_coef = ck.mhd.glm_cp_coef,
-                          smallr = ck.mhd.smallr, smallc = ck.mhd.smallc) : (;))...)
+                          smallr = ck.mhd.smallr, smallc = ck.mhd.smallc,
+                          dual_energy = get(ck.mhd, :de, false),
+                          de_eta1 = get(ck.mhd, :eta1, 1e-3), de_eta2 = get(ck.mhd, :eta2, 0.1)) : (;))...)
     init_base_level!(hier)
     slotmaps = Vector{Vector{Int32}}()
     push!(slotmaps, Int32[hier.levels[1].byorigin[org] for org in ck.levels[1].origins])

@@ -9,8 +9,9 @@
 # data layout and the AMR coupling are BlockAMR's:
 #
 #   * state = the gas pools with Tau ≡ TOTAL energy (incl. ½B²) + the cell-centred
-#     pools Bx, By, Bz, Psi.  Ge is kept = p/(γ−1) (diagnostic: CFL, regrid Jeans,
-#     scales) — MHD carries no independent dual-energy channel;
+#     pools Bx, By, Bz, Psi.  Ge is the internal energy density ρe: with
+#     `dual_energy` (default) an independently evolved channel (below), else
+#     kept = p/(γ−1) as a diagnostic;
 #   * one level step = two launches: `_mhd_rec_k!` stores the half-step primitive +
 #     the per-direction half slopes of every cell of the active box grown by one
 #     (scratch `tabs[:mrec]`), `_mhd_update_k!` solves the 2·DIM faces of each active
@@ -239,7 +240,7 @@ end
     (f[1] < smallr || f[5] < pfl) ? m : f
 end # module MHDPhys
 
-using .MHDPhys: cons2prim, prim2cons, prim_slope, hancock, hancock2, riemann_dir, signal_speed,
+using .MHDPhys: cons2prim, prim2cons, prim_slope, hancock, hancock2, riemann_dir, signal_speed, moncen,
                 padd, iflo
 
 # ── pool access ───────────────────────────────────────────────────────────────
@@ -251,12 +252,117 @@ using .MHDPhys: cons2prim, prim2cons, prim_slope, hancock, hancock2, riemann_dir
                T(Bx[idx]), T(By[idx]), T(Bz[idx]), T(Ps[idx]))
 end
 
+# ── dual energy (entropy form; Ryu et al. 1993, Enzo's η1/η2 selection) ────────
+# Alongside the conservative update the entropy density ρK, K = p/ρ^γ, is
+# advected with the upwind flux F_ρ·K_upwind (no source: exact for isentropic
+# flow — the explicit −p∇·v of an internal-energy channel overshoots to zero in
+# strong rarefactions, measured).  Stored as Ge = ρe = ρ^γ K/(γ−1), so cooling,
+# regrid and diagnostics read an internal energy as before.
+#   * loads: thermal energy from E − ½ρv² − ½B² where it exceeds η1·E AND
+#     _DE_BMIN·½B² (β ≳ 0.07), else Ge.  The second test is BlockAMR's MHD
+#     addition to Enzo's η1: in a magnetically dominated cell a 1 % error of ½B²
+#     is a ~10 % error of the thermal part, of either sign (the rarefied,
+#     β ≈ 0.04 lee of a cloud: 10 K cells without dual energy, 1e7 K with the
+#     η1 test alone — measured);
+#   * cooling acts on Ge (Enzo/Grackle with DualEnergyFormalism), E by the same Δ;
+#   * update epilogue: Ge ← E − KE − EB where that exceeds η2 × the MAX total
+#     energy over the cell and its face neighbours (a resolved shock: the
+#     conservative total is authoritative); E ← KE + EB + Ge where the thermal
+#     fraction falls below η1 (Enzo eta1: non-conservative only there).
+const _DE_BMIN = 0.1
+
+"Total energy with the dual-energy thermal part (Enzo eta1 + the low-β test)."
+@inline function _de_total(u5::T, KE::T, EB::T, ge::T, eta1::T) where {T}
+    eth = u5 - KE - EB
+    return (eth > eta1 * u5) & (eth > T(_DE_BMIN) * EB) ? u5 : KE + EB + ge
+end
+
+# conserved 9-tuple with E replaced by the dual-energy total (loads for prims)
+@inline function _mload_de(::Type{T}, D, S1, S2, S3, E, Ge, Bx, By, Bz, Ps, idx,
+                           dsc, ssc, esc, gsc, eta1::T, ::Val{DE}) where {T,DE}
+    u = _mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps, idx, dsc, ssc, esc)
+    DE || return u
+    ρ = max(u[1], floatmin(T))
+    KE = T(0.5) * (u[2]*u[2] + u[3]*u[3] + u[4]*u[4]) / ρ
+    EB = T(0.5) * (u[6]*u[6] + u[7]*u[7] + u[8]*u[8])
+    @inbounds ge = T(Ge[idx]) * T(gsc)
+    return (u[1], u[2], u[3], u[4], _de_total(u[5], KE, EB, ge, eta1), u[6], u[7], u[8], u[9])
+end
+
+# Enzo `demax`: max |total energy| over the cell and its 2·DIM face neighbours
+@inline function _de_demax(::Type{T}, E, base::Int32, i::Int32, j::Int32, k::Int32,
+                           nd::Int32, esc, kz::Int32) where {T}
+    @inbounds begin
+        m = abs(T(E[base + _lidx(i, j, k, nd)]))
+        m = max(m, abs(T(E[base + _lidx(i - Int32(1), j, k, nd)])))
+        m = max(m, abs(T(E[base + _lidx(i + Int32(1), j, k, nd)])))
+        m = max(m, abs(T(E[base + _lidx(i, j - Int32(1), k, nd)])))
+        m = max(m, abs(T(E[base + _lidx(i, j + Int32(1), k, nd)])))
+        m = max(m, abs(T(E[base + _lidx(i, j, k - kz, nd)])))
+        m = max(m, abs(T(E[base + _lidx(i, j, k + kz, nd)])))
+    end
+    return m * T(esc)
+end
+
+# The entropy flux F_ρ·K_face uses the ADVECTED entropy's own K = (γ−1)Ge/ρ^γ,
+# reconstructed as a passive scalar exactly like the primitives (MonCen half
+# slopes + the MUSCL-Hancock half step K − Δt/2·v·∇K; scratch lanes: K_half +
+# one half slope per direction — a plain start-of-step minmod face value is
+# inconsistent with the time-centred mass flux: 1e-3 pressure error per step at
+# Mach 100, measured) — not the
+# hydro face state, whose pressure comes from the total energy: where that was
+# heated (a ±10 c_s rarefaction start-up: p(E) 0.4 → 2.0 while the isentropic
+# value is 0.2) its K is ~10× the cell's advected K and drains ρK to zero.
+@inline _de_Kc(::Type{T}, D, Ge, idx, dsc, gsc, gamma::T) where {T} =
+    @inbounds (gamma - one(T)) * T(Ge[idx]) * T(gsc) / max(T(D[idx]) * T(dsc), floatmin(T))^gamma
+# lanes (1-based): kl = K_half, kl + d = its half slope along d
+@inline function _de_flux(rec, kl::Int, d::Int, gL::Int, gR::Int, nt::Int, fρ::T) where {T}
+    Kf = fρ >= zero(T) ? _rr(rec, kl, gL, nt) + _rr(rec, kl + d, gL, nt) :
+                         _rr(rec, kl, gR, nt) - _rr(rec, kl + d, gR, nt)
+    return fρ * Kf
+end
+@inline _de_hs(km::T, k0::T, kp::T) where {T} = T(0.5) * moncen(k0 - km, kp - k0)
+
+# Ge (= ρe) ↔ entropy density ρK = (γ−1)·Ge·ρ^(1−γ)
+@inline _de_rhoK(ge::T, ρ::T, gamma::T) where {T} =
+    (gamma - one(T)) * ge * max(ρ, floatmin(T))^(one(T) - gamma)
+@inline _de_ge(rK::T, ρ::T, gamma::T) where {T} =
+    rK * max(ρ, floatmin(T))^(gamma - one(T)) / (gamma - one(T))
+# the advected K of an update, clamped to [min, max] of K over the cell's full
+# 3×3(×3) neighbourhood (no new extrema; face neighbours alone clip diagonal
+# advection — 45 % pressure error at Mach 100, measured): a cell emptying fast divides by ρ_new ≪ ρ,
+# where a 2nd-order outflow face value below K_c leaves entropy behind — measured
+# 3e7 K cells in a near-evacuated cloud wake without the clamp
+@inline _de_ge_lim(rK::T, ρ::T, kmin::T, kmax::T, gamma::T) where {T} =
+    max(ρ, floatmin(T))^gamma * clamp(rK / max(ρ, floatmin(T)), kmin, kmax) / (gamma - one(T))
+
+"""
+Dual-energy epilogue: new (E, Ge) of a cell from the conservative update r,
+the advected Ge (`gadv`), the neighbour-max total `demax`; floor `gfl`.
+"""
+@inline function _de_close(r1::T, r2::T, r3::T, r4::T, r5::T, b1::T, b2::T, b3::T,
+                           gadv::T, demax::T, eta1::T, eta2::T, gfl::T) where {T}
+    ρ = max(r1, floatmin(T))
+    KE = T(0.5) * (r2*r2 + r3*r3 + r4*r4) / ρ
+    EB = T(0.5) * (b1*b1 + b2*b2 + b3*b3)
+    eth = r5 - KE - EB
+    g = eth > eta2 * demax ? eth : gadv          # Enzo eta2: resolved shock → total wins
+    g = max(g, gfl)
+    e = eth > eta1 * r5 ? r5 : KE + EB + g       # Enzo eta1: rebuild E where unresolved
+    return e, g
+end
+
+_mde(hier::AMRHierarchy) = (T = eltype(hier.levels[1].D);
+    (Val(hier.mhd.de), T(hier.mhd.eta1), T(hier.mhd.eta2)))
+
 # rec scratch: lane-major, `nt` = cap·stride elements per lane (Int indexing)
 @inline _rr(rec, lane::Int, g::Int, nt::Int) = @inbounds rec[(lane - 1) * nt + g]
 @inline _rget(rec, off::Int, g::Int, nt::Int) = ntuple(v -> _rr(rec, off + v, g, nt), 9)
 
-"Scratch lanes: half-step primitive (9) + half slopes per active direction (9·DIM)."
-_mlanes(dim::Int) = 9 + 9dim
+"""Scratch lanes: half-step primitive (9) + half slopes per active direction (9·DIM)
++ dual energy: the advected K and its slope per direction (1 + DIM)."""
+_mlanes(dim::Int) = 10 + 10dim
+_mklane(dim::Int) = 10 + 9dim                     # 1-based lane of K
 
 function _mrec(lev::Level)
     T = eltype(lev.D)
@@ -273,11 +379,11 @@ end
 # Every cell of the active box grown by one (the faces of every active cell need
 # the scratch on both sides); stencil ±1 more ⇒ reads stay within ng = 2 ghosts.
 @kernel function _mhd_rec_k!(rec, @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
-                             @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
-                             @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc),
-                             gamma::T, smallr::T, pfl::T, dtdx::T,
+                             @Const(Ge), @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
+                             @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                             gamma::T, smallr::T, pfl::T, dtdx::T, eta1::T, dev::Val{DE},
                              B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int,
-                             dimv::Val{DIM}) where {T,DIM}
+                             dimv::Val{DIM}) where {T,DIM,DE}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     R = B + Int32(2)
@@ -287,12 +393,12 @@ end
     @inbounds begin
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
-        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]
+        dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
         i = c % R + ng - Int32(1); j = (c ÷ R) % R + ng - Int32(1)
         k = DIM == 3 ? c ÷ (R * R) + ng - Int32(1) : Int32(0)
-        @inline P(ii, jj, kk) = cons2prim(_mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps,
-                                         base + _lidx(ii, jj, kk, nd), dsc, ssc, esc),
-                                  gamma, smallr, pfl)
+        @inline P(ii, jj, kk) = cons2prim(_mload_de(T, D, S1, S2, S3, E, Ge, Bx, By, Bz, Ps,
+                                         base + _lidx(ii, jj, kk, nd), dsc, ssc, esc, gsc,
+                                         eta1, dev), gamma, smallr, pfl)
         m0 = P(i, j, k)
         sx = prim_slope(P(i - Int32(1), j, k), m0, P(i + Int32(1), j, k))
         sy = prim_slope(P(i, j - Int32(1), k), m0, P(i, j + Int32(1), k))
@@ -314,6 +420,18 @@ end
             rec[(17 + v) * nt + g] = sy[v]
             DIM == 3 && (rec[(26 + v) * nt + g] = sz[v])
         end
+        if DE                                   # advected entropy: K_half + half slopes
+            kl = 9 + 9DIM                       # 0-based lane offset of K
+            @inline Kc(ii, jj, kk) = _de_Kc(T, D, Ge, base + _lidx(ii, jj, kk, nd), dsc, gsc, gamma)
+            k0 = Kc(i, j, k)
+            skx = _de_hs(Kc(i - Int32(1), j, k), k0, Kc(i + Int32(1), j, k))
+            sky = _de_hs(Kc(i, j - Int32(1), k), k0, Kc(i, j + Int32(1), k))
+            skz = DIM == 3 ? _de_hs(Kc(i, j, k - kz), k0, Kc(i, j, k + kz)) : zero(T)
+            rec[kl * nt + g] = k0 - dtdx * (m0[2] * skx + m0[3] * sky + (DIM == 3 ? m0[4] * skz : zero(T)))
+            rec[(kl + 1) * nt + g] = skx
+            rec[(kl + 2) * nt + g] = sky
+            DIM == 3 && (rec[(kl + 3) * nt + g] = skz)
+        end
     end
 end
 
@@ -327,15 +445,27 @@ end
     return riemann_dir(rv, L, Rq, d, gamma, ch, smallr, pfl)
 end
 
+# the same face + the dual-energy entropy flux
+@inline function _mhd_face_de(rec, gL::Int, gR::Int, d::Int, nt::Int, rv::Val,
+                              gamma::T, ch::T, smallr::T, pfl::T, kl::Int) where {T}
+    off = 9 * d
+    ml = _rget(rec, 0, gL, nt); mr = _rget(rec, 0, gR, nt)
+    L = iflo(padd(ml, _rget(rec, off, gL, nt), one(T)), ml, smallr, pfl)
+    Rq = iflo(padd(mr, _rget(rec, off, gR, nt), -one(T)), mr, smallr, pfl)
+    f = riemann_dir(rv, L, Rq, d, gamma, ch, smallr, pfl)
+    return f, _de_flux(rec, kl, d, gL, gR, nt, f[1])
+end
+
 # ── pass 2: conservative update of every active cell, R → O ───────────────────
 @kernel function _mhd_update_k!(Do_, S1o_, S2o_, S3o_, Eo_, Geo_, Bxo_, Byo_, Bzo_, Pso_,
                                 @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
-                                @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
+                                @Const(Ge), @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
                                 @Const(rec), @Const(live_d),
                                 @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                 gamma::T, ch::T, smallr::T, pfl::T, dtdx::T, glm_fac::T,
+                                eta1::T, eta2::T, dev::Val{DE},
                                 B::Int32, ng::Int32, nd::Int32, stride::Int32, nt::Int,
-                                rv::Val, dimv::Val{DIM}) where {T,DIM}
+                                rv::Val, dimv::Val{DIM}) where {T,DIM,DE}
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     B3 = _nblk(B, dimv)
@@ -350,37 +480,64 @@ end
         u0 = _mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps, idx, dsc, ssc, esc)
         # flux differences (F_lo − F_hi) per direction, NestedMHD's update order
         sx = Int(base + _lidx(i + Int32(1), j, k, nd)) - g
-        fxl = _mhd_face(rec, g - sx, g, 1, nt, rv, gamma, ch, smallr, pfl)
-        fxh = _mhd_face(rec, g, g + sx, 1, nt, rv, gamma, ch, smallr, pfl)
+        fxl, gxl = _mhd_face_de(rec, g - sx, g, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+        fxh, gxh = _mhd_face_de(rec, g, g + sx, 1, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
         sy = Int(base + _lidx(i, j + Int32(1), k, nd)) - g
-        fyl = _mhd_face(rec, g - sy, g, 2, nt, rv, gamma, ch, smallr, pfl)
-        fyh = _mhd_face(rec, g, g + sy, 2, nt, rv, gamma, ch, smallr, pfl)
+        fyl, gyl = _mhd_face_de(rec, g - sy, g, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+        fyh, gyh = _mhd_face_de(rec, g, g + sy, 2, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+        dg = (gxl - gxh) + (gyl - gyh)
         r = if DIM == 3
             sz = Int(base + _lidx(i, j, k + Int32(1), nd)) - g
-            fzl = _mhd_face(rec, g - sz, g, 3, nt, rv, gamma, ch, smallr, pfl)
-            fzh = _mhd_face(rec, g, g + sz, 3, nt, rv, gamma, ch, smallr, pfl)
+            fzl, gzl = _mhd_face_de(rec, g - sz, g, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+            fzh, gzh = _mhd_face_de(rec, g, g + sz, 3, nt, rv, gamma, ch, smallr, pfl, _mklane(DIM))
+            dg += gzl - gzh
             ntuple(v -> u0[v] + dtdx * ((fxl[v] - fxh[v]) + (fyl[v] - fyh[v]) +
                                         (fzl[v] - fzh[v])), 9)
         else
             ntuple(v -> u0[v] + dtdx * ((fxl[v] - fxh[v]) + (fyl[v] - fyh[v])), 9)
         end
-        if r[1] < smallr       # positivity floor (NestedMHD): static floored cell, B kept
+        # dual energy: advected entropy density → Ge at the new density (K clamped
+        # to the cell + face-neighbour range)
+        ge0 = DE ? T(Ge[idx]) * T(gsc) : zero(T)
+        gadv = zero(T)
+        if DE
+            kl = _mklane(DIM)
+            kmin = _rr(rec, kl, g, nt); kmax = kmin
+            szz = DIM == 3 ? Int(base + _lidx(i, j, k + Int32(1), nd)) - g : 0
+            for dk in (DIM == 3 ? (-1:1) : (0:0)), dj in -1:1, di in -1:1
+                kv = _rr(rec, kl, g + di * sx + dj * sy + dk * szz, nt)
+                kmin = min(kmin, kv); kmax = max(kmax, kv)
+            end
+            gadv = _de_ge_lim(_de_rhoK(ge0, u0[1], gamma) + dtdx * dg, r[1], kmin, kmax, gamma)
+        end
+        floored = r[1] < smallr
+        if floored             # positivity floor (NestedMHD): static floored cell, B kept
             r = (smallr, zero(T), zero(T), zero(T),
                  pfl / (gamma - one(T)) + T(0.5) * (r[6]*r[6] + r[7]*r[7] + r[8]*r[8]),
                  r[6], r[7], r[8], r[9])
+            gadv = pfl / (gamma - one(T))
         end
         # keep-old-state safety (the hydro epilogue twin): a nonfinite update never
         # poisons the level
-        ok = true
+        ok = isfinite(gadv)
         Base.Cartesian.@nexprs 9 v -> (ok &= isfinite(r[v]))
         r = ok ? r : u0
+        gadv = ok ? gadv : ge0
+        gnew = zero(T)
+        if DE
+            kz = _kzv(dimv)
+            demax = _de_demax(T, E, base, i, j, k, nd, esc, kz)
+            e5, gnew = _de_close(r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], gadv, demax,
+                                 eta1, eta2, pfl / (gamma - one(T)))
+            r = (r[1], r[2], r[3], r[4], e5, r[6], r[7], r[8], r[9])
+        end
         q = cons2prim(r, gamma, smallr, pfl)
         Do_[idx]  = _narrow(eltype(Do_), r[1] / T(dsc))
         S1o_[idx] = _narrow(eltype(S1o_), r[2] / T(ssc))
         S2o_[idx] = _narrow(eltype(S2o_), r[3] / T(ssc))
         S3o_[idx] = _narrow(eltype(S3o_), r[4] / T(ssc))
         Eo_[idx]  = _narrow(eltype(Eo_), r[5] / T(esc))
-        Geo_[idx] = _narrow(eltype(Geo_), q[5] / (gamma - one(T)) / T(gsc))
+        Geo_[idx] = _narrow(eltype(Geo_), (DE ? gnew : q[5] / (gamma - one(T))) / T(gsc))
         Bxo_[idx] = r[6]; Byo_[idx] = r[7]; Bzo_[idx] = r[8]
         Pso_[idx] = r[9] * glm_fac
     end
@@ -389,9 +546,9 @@ end
 
 # ── CFL signal: Σ_d(|v_d| + c_f,d) per active cell ───────────────────────────
 @kernel function _mhd_signal_k!(out, @Const(D), @Const(S1), @Const(S2), @Const(S3), @Const(E),
-                                @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
-                                @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc),
-                                gamma::T, smallr::T, pfl::T, sigdims::Int32,
+                                @Const(Ge), @Const(Bx), @Const(By), @Const(Bz), @Const(Ps),
+                                @Const(live_d), @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
+                                gamma::T, smallr::T, pfl::T, eta1::T, dev::Val, sigdims::Int32,
                                 B::Int32, ng::Int32, nd::Int32, stride::Int32,
                                 dimv::Val{DIM}) where {T,DIM}
     t = @index(Global)
@@ -402,8 +559,9 @@ end
         slot = live_d[bi + Int32(1)]
         base = (slot - Int32(1)) * stride
         i, j, k = _cell_ijk(c, B, ng, dimv)
-        q = cons2prim(_mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps, base + _lidx(i, j, k, nd),
-                             Dsc[slot], Ssc[slot], Esc[slot]), gamma, smallr, pfl)
+        q = cons2prim(_mload_de(T, D, S1, S2, S3, E, Ge, Bx, By, Bz, Ps, base + _lidx(i, j, k, nd),
+                                Dsc[slot], Ssc[slot], Esc[slot], Gsc[slot], eta1, dev),
+                      gamma, smallr, pfl)
         out[t] = signal_speed(q, gamma, Int(sigdims))
     end
 end
@@ -417,9 +575,10 @@ function mhd_max_signal(hier::AMRHierarchy, lev::Level)
     n == 0 && return 0.0
     T = eltype(lev.D)
     out = device_zeros(lev.be, T, (n,))
-    γ, sr, pfl = _mpar(hier)
-    _mhd_signal_k!(lev.be)(out, gasfields(lev)[1:5]..., mfields(lev)..., lev.live_d,
-                           lev.Dsc, lev.Ssc, lev.Esc, γ, sr, pfl, Int32(hier.mhd.sigdims),
+    γ, sr, pfl = _mpar(hier); dev, η1, _ = _mde(hier)
+    _mhd_signal_k!(lev.be)(out, gasfields(lev)..., mfields(lev)..., lev.live_d,
+                           lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, η1, dev,
+                           Int32(hier.mhd.sigdims),
                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
                            Val(lev.dim); ndrange = n)
     return Float64(maximum(out))
@@ -449,14 +608,15 @@ function mhd_level!(hier::AMRHierarchy, l::Int, λ::Real)
     glm_fac = cp > 0 ? T(exp(-ch * dt / (cp * hier.box))) : one(T)
     rec = _mrec(lev); nt = lev.cap * lev.stride
     nb = length(lev.live); R = lev.B + 2
-    _mhd_rec_k!(lev.be)(rec, gasfields(lev)[1:5]..., mfields(lev)..., lev.live_d,
-                        lev.Dsc, lev.Ssc, lev.Esc, γ, sr, pfl, T(λ),
+    dev, η1, η2 = _mde(hier)
+    _mhd_rec_k!(lev.be)(rec, gasfields(lev)..., mfields(lev)..., lev.live_d,
+                        lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, T(λ), η1, dev,
                         Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt,
                         Val(lev.dim); ndrange = nb * R^lev.dim)
     _mhd_update_k!(lev.be)(gasfields_o(lev)..., mfields_o(lev)...,
-                           gasfields(lev)[1:5]..., mfields(lev)..., rec, lev.live_d,
+                           gasfields(lev)..., mfields(lev)..., rec, lev.live_d,
                            lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc,
-                           γ, T(ch), sr, pfl, T(λ), glm_fac,
+                           γ, T(ch), sr, pfl, T(λ), glm_fac, η1, η2, dev,
                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride), nt,
                            Val(hier.mhd.riemann), Val(lev.dim); ndrange = nb * _nact(lev))
     return nothing
@@ -528,12 +688,16 @@ end
 @inline _add9(a::NTuple{9,T}, b::NTuple{9,T}) where {T} = ntuple(v -> a[v] + b[v], Val(9))
 
 # U_c += λ_c·side·reg grouped by target coarse cell; NestedMHD's positivity guard
-# (skip a correction that would leave ρ ≤ 0 or thermal energy ≤ 0).
+# (skip a correction that would leave ρ ≤ 0 or — without dual energy — thermal
+# energy ≤ 0).  Dual energy: CT carries the entropy flux in lane 9 (ψ ≡ 0);
+# Ge ← E−KE−EB where that exceeds η2·E, else the (refluxed) Ge; E rebuilt where
+# the thermal fraction is below η1.
 @kernel function _mhd_reflux_apply_k!(D, S1, S2, S3, E, Ge, Bx, By, Bz, Ps,
                                       @Const(Dsc), @Const(Ssc), @Const(Esc), @Const(Gsc),
                                       @Const(ent), @Const(reg), @Const(perm), @Const(gs),
                                       λc::T, gamma::T, smallr::T, pfl::T,
-                                      nd::Int32, stride::Int32) where {T}
+                                      eta1::T, eta2::T, ct::Bool, dev::Val{DE},
+                                      nd::Int32, stride::Int32) where {T,DE}
     g = @index(Global)
     @inbounds begin
         a = ntuple(_ -> zero(T), Val(9))
@@ -547,12 +711,25 @@ end
         idx = (slot - Int32(1)) * stride + _lidx(ent[b+2], ent[b+3], ent[b+4], nd)
         dsc = Dsc[slot]; ssc = Ssc[slot]; esc = Esc[slot]; gsc = Gsc[slot]
         u = _mload(T, D, S1, S2, S3, E, Bx, By, Bz, Ps, idx, dsc, ssc, esc)
+        ge = T(Ge[idx]) * T(gsc)
+        rK = _de_rhoK(ge, u[1], gamma)
+        if DE && ct                       # lane 9 = entropy flux, not ψ
+            rK += a[9]
+            a = (a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], zero(T))
+        end
         q = _add9(u, a)
+        DE && (ge = _de_ge(rK, q[1], gamma))
         ρn = q[1]
         eth = q[5] - (q[2]*q[2] + q[3]*q[3] + q[4]*q[4]) / (2ρn) -
               T(0.5) * (q[6]*q[6] + q[7]*q[7] + q[8]*q[8])
-        ok = (ρn > zero(T)) & (eth > zero(T))
+        ok = (ρn > zero(T)) & (DE | (eth > zero(T))) & isfinite(ge)
         Base.Cartesian.@nexprs 9 v -> (ok &= isfinite(q[v]))
+        gnew = zero(T)
+        if DE && ok
+            e5, gnew = _de_close(q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], ge, abs(q[5]),
+                                 eta1, eta2, pfl / (gamma - one(T)))
+            q = (q[1], q[2], q[3], q[4], e5, q[6], q[7], q[8], q[9])
+        end
         if ok
             D[idx]  = _narrow(eltype(D), q[1] / T(dsc))
             S1[idx] = _narrow(eltype(S1), q[2] / T(ssc))
@@ -560,8 +737,8 @@ end
             S3[idx] = _narrow(eltype(S3), q[4] / T(ssc))
             E[idx]  = _narrow(eltype(E), q[5] / T(esc))
             Bx[idx] = q[6]; By[idx] = q[7]; Bz[idx] = q[8]; Ps[idx] = q[9]
-            Ge[idx] = _narrow(eltype(Ge),
-                              cons2prim(q, gamma, smallr, pfl)[5] / (gamma - one(T)) / T(gsc))
+            Ge[idx] = _narrow(eltype(Ge), (DE ? gnew :
+                              cons2prim(q, gamma, smallr, pfl)[5] / (gamma - one(T))) / T(gsc))
         end
     end
 end
@@ -606,12 +783,13 @@ function _mhd_reflux_cells!(hier::AMRHierarchy, l::Int, λc::Real)
     n == 0 && return nothing
     ng_ = lev.tabs[:cfng]::Int
     ng_ == 0 && return nothing
-    T = eltype(lev.D); γ, sr, pfl = _mpar(hier)
+    T = eltype(lev.D); γ, sr, pfl = _mpar(hier); dev, η1, η2 = _mde(hier)
     reg = _tabt_any(lev, :cfreg)
     _mhd_reflux_apply_k!(lev.be)(gasfields(plev)..., mfields(plev)...,
                                  plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                                  _tabi(lev, :cf), reg, _tabi(lev, :cfperm), _tabi(lev, :cfgs),
-                                 T(λc), γ, sr, pfl, Int32(plev.nd), Int32(plev.stride);
+                                 T(λc), γ, sr, pfl, η1, η2, hier.mhd.ct, dev,
+                                 Int32(plev.nd), Int32(plev.stride);
                                  ndrange = ng_)
     fill!(reg, zero(T))
     return nothing
