@@ -322,6 +322,11 @@ end
     return fρ * Kf
 end
 @inline _de_hs(km::T, k0::T, kp::T) where {T} = T(0.5) * moncen(k0 - km, kp - k0)
+# min half-step pressure (scratch lane 5) over a cell's face neighbours (sz = 0: 2-D)
+@inline function _de_pnb(rec, g::Int, sx::Int, sy::Int, sz::Int, nt::Int)
+    p = min(_rr(rec, 5, g - sx, nt), _rr(rec, 5, g + sx, nt), _rr(rec, 5, g - sy, nt), _rr(rec, 5, g + sy, nt))
+    return sz == 0 ? p : min(p, _rr(rec, 5, g - sz, nt), _rr(rec, 5, g + sz, nt))
+end
 
 # Ge (= ρe) ↔ entropy density ρK = (γ−1)·Ge·ρ^(1−γ)
 @inline _de_rhoK(ge::T, ρ::T, gamma::T) where {T} =
@@ -549,8 +554,12 @@ end
         floored = r[1] < smallr
         if floored             # positivity floor (NestedMHD): static floored cell, B kept;
             # dual energy: the cell keeps its entropy at the floor density (not p_floor,
-            # which pins it at the cooling floor: 10 K cells in the HVC cavity, measured)
-            gadv = DE ? max(_de_rhoK(ge0, u0[1], gamma) / max(u0[1], floatmin(T)) * smallr^gamma /
+            # which pins it at the cooling floor: 10 K cells in the HVC cavity), but its
+            # pressure is capped at its face neighbours' minimum — an over-pressured
+            # floored cell evacuates its neighbours, which floor in turn (β = 100 HVC:
+            # floor region ×300, 1e10 K, measured)
+            gadv = DE ? max(min(_de_rhoK(ge0, u0[1], gamma) / max(u0[1], floatmin(T)) * smallr^gamma,
+                                _de_pnb(rec, g, sx, sy, DIM == 3 ? Int(base + _lidx(i, j, k + Int32(1), nd)) - g : 0, nt)) /
                             (gamma - one(T)), pfl / (gamma - one(T))) : pfl / (gamma - one(T))
             r = (smallr, zero(T), zero(T), zero(T),
                  gadv + T(0.5) * (r[6]*r[6] + r[7]*r[7] + r[8]*r[8]),
