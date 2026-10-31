@@ -22,6 +22,49 @@ level `plev`: fine-block outer faces not covered by same-level siblings, grouped
 2×2 into coarse face cells, each targeted at the adjacent UNCOVERED coarse cell.
 """
 function build_cf_faces(lev::Level, plev::Level)
+    B = lev.B; ng = lev.ng
+    B2 = lev.dim == 3 ? B : 1                          # t2 extent (flat z in 2-D)
+    g2 = lev.dim == 3 ? 2 : 1                          # fine group along t2
+    ent = Int32[]
+    for s in lev.live
+        m = lev.meta[s]
+        o = m.origin
+        for ax in 1:lev.dim, side in (Int32(-1), Int32(1))
+            t1, t2 = ax == 1 ? (2, 3) : ax == 2 ? (1, 3) : (1, 2)
+            lo_ax = side == 1 ? Int128(o[ax]) + B : Int128(o[ax]) - 1
+            # a face ON a non-periodic domain edge has no coarse neighbour
+            (!lev.per[ax] && !(0 <= lo_ax < Int128(lev.P[ax]))) && continue
+            # block origins are B-lattice aligned (children sit at 2·(parent
+            # origin + k·B/2)), so a face is covered by the one same-level block
+            # across it — or not at all: one O(1) lookup, no per-cell coverage
+            nb = ntuple(d -> d == ax ? wrapc(Int128(o[d]) + side * B, lev.P[d]) : o[d], 3)
+            haskey(lev.byorigin, nb) && continue
+            qax = side == 1 ? (Int128(o[ax]) + B) >> 1 : (Int128(o[ax]) >> 1) - 1
+            fax = side == 1 ? Int32(ng + B - 1) : Int32(ng)
+            for f2 in 0:g2:B2-g2, f1 in 0:2:B-2         # 2×2 (2-D: 2×1) fine groups
+                # outside coarse cell (global coarse coords)
+                q = ntuple(d -> d == ax ? qax :
+                                d == t1 ? (Int128(o[t1]) + f1) >> 1 :
+                                (t2 <= lev.dim ? (Int128(o[t2]) + f2) >> 1 : Int128(0)), 3)
+                qw = ntuple(d -> wrapc(q[d], plev.P[d]), 3)
+                own = lattice_owner(plev, qw, B)
+                own != 0 ||
+                    error("C/F face target not owned (nesting violation?)")
+                po = plev.meta[own]
+                cc = ntuple(d -> Int32(Int(mod(Int128(qw[d]) - Int128(po.origin[d]),
+                                               Int128(plev.P[d]))) + _ngax(plev, d)), 3)
+                fc = ntuple(d -> d == ax ? fax : d == t1 ? Int32(ng + f1) :
+                                 Int32(_ngax(lev, t2) + f2), 3)
+                push!(ent, own, cc[1], cc[2], cc[3], Int32(ax), side, s, fc[1], fc[2], fc[3],
+                      Int32(0), Int32(0), Int32(0), Int32(0), Int32(0), Int32(0))
+            end
+        end
+    end
+    return length(ent) ÷ 16, ent
+end
+
+# reference (per-cell coverage from every lattice neighbour), kept for the tests
+function _build_cf_faces_ref(lev::Level, plev::Level)
     ent = Int32[]
     B = lev.B; ng = lev.ng
     B2 = lev.dim == 3 ? B : 1                          # t2 extent (flat z in 2-D)

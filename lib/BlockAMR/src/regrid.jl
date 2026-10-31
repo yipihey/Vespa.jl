@@ -624,10 +624,11 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     # dominates the regrid (~90% of the tables phase at deep DM refinement: ~4 s of
     # a ~4.4 s tables phase at 100k blocks; regrid ~5-6× faster with it skipped).
     grav_only = isempty(hier.levels[1].Do)
+    tCF = 0.0
     tTB = @elapsed for l in 0:length(hier.levels)-1
         if changed[l + 1] || (l >= 1 && changed[l])
             build_level_tables!(hier, l)
-            (l >= 1 && !grav_only) && build_cf_register!(hier, l)
+            (l >= 1 && !grav_only) && (tCF += @elapsed build_cf_register!(hier, l))
         end
     end
     # φ ring maintenance, coarse→fine (children prolong from refreshed parent
@@ -635,7 +636,7 @@ function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool =
     tPH = @elapsed for l in 0:length(hier.levels)-1
         (changed[l + 1] || (l >= 1 && changed[l])) && refresh_phi_ghosts!(hier, l)
     end
-    _prof && (println("  regrid phases: flag=$(round(tFLAG,digits=2)) rebuild=$(round(tRB,digits=2)) compact=$(round(tCP,digits=2)) tables=$(round(tTB,digits=2)) phi=$(round(tPH,digits=2)) s"); flush(stdout))
+    _prof && (println("  regrid phases: flag=$(round(tFLAG,digits=5)) rebuild=$(round(tRB,digits=5)) compact=$(round(tCP,digits=5)) tables=$(round(tTB,digits=5)) cfreg=$(round(tCF,digits=5)) phi=$(round(tPH,digits=5)) changed=$(join(Int.(changed[2:end]))) s"); flush(stdout))
     return nothing
 end
 

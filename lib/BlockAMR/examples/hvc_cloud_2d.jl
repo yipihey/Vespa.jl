@@ -260,7 +260,10 @@ const TW = Dict(:advance => 0.0, :regrid => 0.0, :diag => 0.0, :movie => 0.0)   
 get(ENV, "HVC_TIMERS", "0") == "1" && BA.enable_timers!()       # synchronized GPU phase timers
 while t < TEND * TCC && step < MAXST
     global t, step, nsnap, tnext, tmnext
-    TW[:advance] += @elapsed (dt = advance_hierarchy!(hier; cooling = cool))
+    # synchronize so the phase clocks charge GPU work to the phase that queued it
+    # (kernel launches are asynchronous: without this, the advance's kernels drain
+    # inside the regrid's first device→host copy and are billed to "regrid")
+    TW[:advance] += @elapsed (dt = advance_hierarchy!(hier; cooling = cool); BA.KA.synchronize(hier.levels[1].be))
     t += dt; step += 1
     TW[:regrid] += @elapsed regrid!(hier, pol)
     if t >= tmnext

@@ -515,6 +515,90 @@ function build_ct_tables!(hier::AMRHierarchy, l::Int)
         lattice_owner(lev, q, B) != 0
     end
     res = Int32[]; corners = Dict{NTuple{2,Int128},Int}(); cent = Int32[]
+    sizehint!(res, 8 * length(lev.live) * 2Bh * (Bh + 1))
+    # corner / face keys wrap ONLY on periodic axes (a hi-wall corner x = P must not
+    # fold onto the lo-wall corner x = 0)
+    wk(v, d) = plev.per[d] ? Int128(mod(v, Int128(plev.P[d]))) : Int128(v)
+    for s in lev.live
+        m = lev.meta[s]
+        X0 = Int128(m.origin[1]) >> 1; Y0 = Int128(m.origin[2]) >> 1
+        # the block's coarse footprint [X0, X0+Bh) × [Y0, Y0+Bh) lies inside ONE
+        # parent block (meta.parent): its interior faces index that parent directly
+        ps = m.parent; po = plev.meta[ps].origin
+        pi0 = Int(X0 - Int128(po[1])) + ng; pj0 = Int(Y0 - Int128(po[2])) + ng
+        # restriction: coarse x-faces X0..X0+Bh × Y0..Y0+Bh−1 (y transposed)
+        for (ax, na, nb) in ((1, Bh, Bh - 1), (2, Bh - 1, Bh)), b in 0:nb, a in 0:na
+            if a < Bh && b < Bh              # the cell (X0+a, Y0+b) is the parent's
+                push!(res, ps, Int32(pi0 + a), Int32(pj0 + b), Int32(ax), s,
+                      Int32(ng + 2a), Int32(ng + 2b), Int32(0))
+                continue
+            end
+            o = _face_owner(plev, X0 + a, Y0 + b, ax)    # the hi column/row
+            o === nothing && continue
+            push!(res, Int32(o[1]), Int32(o[2]), Int32(o[3]), Int32(ax), s,
+                  Int32(ng + 2a), Int32(ng + 2b), Int32(0))
+        end
+        # C/F corners on the footprint boundary (cells inside the footprint are
+        # covered by this block: only the outside ones are looked up)
+        for b in 0:Bh, a in 0:Bh
+            (a in (0, Bh) || b in (0, Bh)) || continue
+            X = X0 + a; Y = Y0 + b
+            key = (wk(X, 1), wk(Y, 2))
+            haskey(corners, key) && continue
+            allcov = true
+            for dx in (-1, 0), dy in (-1, 0)
+                inside = 0 <= a + dx < Bh && 0 <= b + dy < Bh
+                (inside || covered(X + dx, Y + dy)) || (allcov = false; break)
+            end
+            allcov && continue
+            co = _corner_owner(plev, X, Y); fo = _corner_owner(lev, 2X, 2Y)
+            (co === nothing || fo === nothing) && continue
+            corners[key] = length(corners) + 1
+            push!(cent, Int32(co[1]), Int32(co[2]), Int32(co[3]), Int32(fo[1]), Int32(fo[2]),
+                  Int32(fo[3]), Int32(0), Int32(0))
+        end
+    end
+    # corrected faces: uncovered on both sides, touching a C/F corner
+    reg(X, Y) = get(corners, (wk(X, 1), wk(Y, 2)), 0)
+    fent = Int32[]; seen = Set{NTuple{3,Int128}}()
+    for (X, Y) in keys(corners)
+        for (ax, FX, FY) in ((1, X, Y - 1), (1, X, Y), (2, X - 1, Y), (2, X, Y))
+            k = (wk(FX, 1), wk(FY, 2), Int128(ax))
+            k in seen && continue
+            push!(seen, k)
+            # the two cells sharing the face
+            c1 = ax == 1 ? (FX - 1, FY) : (FX, FY - 1)
+            inb(c) = all(plev.per[d] || (0 <= c[d] < Int128(plev.P[d])) for d in 1:2)
+            (inb(c1) && covered(c1...)) && continue
+            (inb((FX, FY)) && covered(FX, FY)) && continue
+            o = _face_owner(plev, FX, FY, ax)
+            o === nothing && continue
+            lo = reg(FX, FY); hi = ax == 1 ? reg(FX, FY + 1) : reg(FX + 1, FY)
+            (lo == 0 && hi == 0) && continue
+            push!(fent, Int32(o[1]), Int32(o[2]), Int32(o[3]), Int32(ax), Int32(lo), Int32(hi),
+                  Int32(0), Int32(0))
+        end
+    end
+    T = eltype(lev.D); be = lev.be
+    lev.tabs[:ctres]  = (length(res) ÷ 8, to_device(be, res, Int32))
+    lev.tabs[:ctcorn] = (length(cent) ÷ 8, to_device(be, cent, Int32))
+    lev.tabs[:ctface] = (length(fent) ÷ 8, to_device(be, fent, Int32))
+    lev.tabs[:ctreg]  = device_zeros(be, T, (max(length(corners), 1),))
+    return nothing
+end
+
+# reference (all owners by lookup), kept for the tests
+function _build_ct_tables_ref!(hier::AMRHierarchy, l::Int)
+    lev = hier.levels[l + 1]; plev = hier.levels[l]
+    B = lev.B; Bh = B ÷ 2; ng = lev.ng
+    covered(X, Y) = begin                       # parent cell under a level-l block?
+        for (d, v) in ((1, X), (2, Y))
+            plev.per[d] || (0 <= v < Int128(plev.P[d])) || return true   # beyond the domain
+        end
+        q = (wrapc(2X, lev.P[1]), wrapc(2Y, lev.P[2]), UInt128(0))
+        lattice_owner(lev, q, B) != 0
+    end
+    res = Int32[]; corners = Dict{NTuple{2,Int128},Int}(); cent = Int32[]
     # corner / face keys wrap ONLY on periodic axes (a hi-wall corner x = P must not
     # fold onto the lo-wall corner x = 0)
     wk(v, d) = plev.per[d] ? Int128(mod(v, Int128(plev.P[d]))) : Int128(v)
