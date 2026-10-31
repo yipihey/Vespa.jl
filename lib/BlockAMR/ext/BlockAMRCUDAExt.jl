@@ -90,8 +90,7 @@ mutable struct _GraphEntry
 end
 const _GRAPHS = WeakKeyDict{Any,Dict{Tuple{Int,UInt},_GraphEntry}}()
 const _SEEN = WeakKeyDict{Any,Set{Tuple{Int,UInt}}}()
-BlockAMR.graph_stats() = (replays = _GSTAT[1], records = _GSTAT[2], plain = _GSTAT[3])
-const _GSTAT = zeros(Int, 3)
+const _GSTAT = BlockAMR._GSTAT       # counters live in the core (graph_stats)
 
 function BlockAMR._graph_step!(::CUDABackend, hier::BlockAMR.AMRHierarchy, λq, k, cooling)
     refs = BlockAMR._graph_refs(hier)

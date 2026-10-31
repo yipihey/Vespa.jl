@@ -9,10 +9,19 @@ for bc in (:periodic, :outflow), physics in (:hydro, :mhd)
     @test BA.build_cf_faces(lev, plev) == BA._build_cf_faces_ref(lev, plev)
     if physics === :mhd
         BA._build_ct_tables_ref!(h, 1)
-        ref = Dict(k => (lev.tabs[k][1], Array(lev.tabs[k][2])) for k in (:ctres, :ctcorn, :ctface))
+        ref = Dict(k => (lev.tabs[k][1], Array(lev.tabs[k][2])) for k in (:ctcorn, :ctface))
+        # face restriction: the reference face list vs the device-built per-block path
+        fx = rand(Float32, length(lev.FBx)); fy = rand(Float32, length(lev.FBy))
+        copyto!(lev.FBx, fx); copyto!(lev.FBy, fy)
+        cx0 = Array(plev.FBx); cy0 = Array(plev.FBy)
+        BA._ct_restrict_faces!(lev, plev); rx = Array(plev.FBx); ry = Array(plev.FBy)
+        copyto!(plev.FBx, cx0); copyto!(plev.FBy, cy0)
         BA.build_ct_tables!(h, 1)
-        new = Dict(k => (lev.tabs[k][1], Array(lev.tabs[k][2])) for k in (:ctres, :ctcorn, :ctface))
+        new = Dict(k => (lev.tabs[k][1], Array(lev.tabs[k][2])) for k in (:ctcorn, :ctface))
         @test new == ref
+        BA._ct_restrict_faces!(lev, plev)
+        @test Array(plev.FBx) == rx && Array(plev.FBy) == ry
+        @test rx != cx0                                       # the restriction did write
     end
 end
 

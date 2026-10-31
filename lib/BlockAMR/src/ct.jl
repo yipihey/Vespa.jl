@@ -541,7 +541,7 @@ function build_ct_tables!(hier::AMRHierarchy, l::Int)
         lattice_owner(lev, q, B) != 0
     end
     res = Int32[]; corners = Dict{NTuple{2,Int128},Int}(); cent = Int32[]
-    sizehint!(res, 8 * length(lev.live) * 2Bh * (Bh + 1))
+    resb = Int32[]; sizehint!(resb, 10 * length(lev.live))
     # corner / face keys wrap ONLY on periodic axes (a hi-wall corner x = P must not
     # fold onto the lo-wall corner x = 0)
     wk(v, d) = plev.per[d] ? Int128(mod(v, Int128(plev.P[d]))) : Int128(v)
@@ -552,18 +552,15 @@ function build_ct_tables!(hier::AMRHierarchy, l::Int)
         # parent block (meta.parent): its interior faces index that parent directly
         ps = m.parent; po = plev.meta[ps].origin
         pi0 = Int(X0 - Int128(po[1])) + ng; pj0 = Int(Y0 - Int128(po[2])) + ng
-        # restriction: coarse x-faces X0..X0+Bh × Y0..Y0+Bh−1 (y transposed)
-        for (ax, na, nb) in ((1, Bh, Bh - 1), (2, Bh - 1, Bh)), b in 0:nb, a in 0:na
-            if a < Bh && b < Bh              # the cell (X0+a, Y0+b) is the parent's
-                push!(res, ps, Int32(pi0 + a), Int32(pj0 + b), Int32(ax), s,
-                      Int32(ng + 2a), Int32(ng + 2b), Int32(0))
-                continue
-            end
-            o = _face_owner(plev, X0 + a, Y0 + b, ax)    # the hi column/row
-            o === nothing && continue
-            push!(res, Int32(o[1]), Int32(o[2]), Int32(o[3]), Int32(ax), s,
-                  Int32(ng + 2a), Int32(ng + 2b), Int32(0))
-        end
+        # restriction (built on the device, _ct_restrict_blocks_k!): per fine block
+        # the parent + the owners of its hi x-column / hi y-row (one coarse lattice
+        # block each — lattice alignment), 0 where no owner
+        hx = _face_owner(plev, X0 + Bh, Y0, 1); hy = _face_owner(plev, X0, Y0 + Bh, 2)
+        push!(resb, s, ps, Int32(pi0), Int32(pj0),
+              hx === nothing ? Int32(0) : Int32(hx[1]), hx === nothing ? Int32(0) : Int32(hx[2]),
+              hx === nothing ? Int32(0) : Int32(hx[3]),
+              hy === nothing ? Int32(0) : Int32(hy[1]), hy === nothing ? Int32(0) : Int32(hy[2]),
+              hy === nothing ? Int32(0) : Int32(hy[3]))
         # C/F corners on the footprint boundary (cells inside the footprint are
         # covered by this block: only the outside ones are looked up)
         for b in 0:Bh, a in 0:Bh
@@ -606,7 +603,8 @@ function build_ct_tables!(hier::AMRHierarchy, l::Int)
         end
     end
     T = eltype(lev.D); be = lev.be
-    lev.tabs[:ctres]  = (length(res) ÷ 8, to_device(be, res, Int32))
+    delete!(lev.tabs, :ctres)
+    lev.tabs[:ctresb] = (length(resb) ÷ 10, to_device(be, resb, Int32))
     lev.tabs[:ctcorn] = (length(cent) ÷ 8, to_device(be, cent, Int32))
     lev.tabs[:ctface] = (length(fent) ÷ 8, to_device(be, fent, Int32))
     lev.tabs[:ctreg]  = device_zeros(be, T, (max(length(corners), 1),))
@@ -672,6 +670,7 @@ function _build_ct_tables_ref!(hier::AMRHierarchy, l::Int)
         end
     end
     T = eltype(lev.D); be = lev.be
+    delete!(lev.tabs, :ctresb)
     lev.tabs[:ctres]  = (length(res) ÷ 8, to_device(be, res, Int32))
     lev.tabs[:ctcorn] = (length(cent) ÷ 8, to_device(be, cent, Int32))
     lev.tabs[:ctface] = (length(fent) ÷ 8, to_device(be, fent, Int32))
@@ -692,6 +691,40 @@ end
             FXc[dc] = h * (FXf[fb + _li2(fi, fj, ndf)] + FXf[fb + _li2(fi, fj + Int32(1), ndf)])
         else
             FYc[dc] = h * (FYf[fb + _li2(fi, fj, ndf)] + FYf[fb + _li2(fi + Int32(1), fj, ndf)])
+        end
+    end
+end
+
+# face restriction generated on the device from per-fine-block records
+# (s, parent, pi0, pj0, hx owner slot/i/j, hy owner slot/i/j): thread = one of the
+# block's 2·Bh·(Bh+1) coarse faces (x-faces a ∈ 0:Bh, b < Bh; y-faces a < Bh,
+# b ∈ 0:Bh) — the entries of the host face list, without building/uploading it
+@kernel function _ct_restrict_blocks_k!(FXc, FYc, @Const(FXf), @Const(FYf), @Const(rb),
+                                        Bh::Int32, ng::Int32, ndc::Int32, ndf::Int32,
+                                        stc::Int32, stf::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    per = (Bh + Int32(1)) * Bh
+    bi = t0 ÷ (Int32(2) * per); r = t0 % (Int32(2) * per)
+    ax1 = r < per; q = r % per
+    a = ax1 ? q % (Bh + Int32(1)) : q % Bh
+    b = ax1 ? q ÷ (Bh + Int32(1)) : q ÷ Bh
+    o = bi * Int32(10)
+    @inbounds begin
+        s = rb[o + 1]
+        inside = a < Bh && b < Bh
+        slot = inside ? rb[o + 2] : (ax1 ? rb[o + 5] : rb[o + 8])
+        if slot != Int32(0)
+            ci = inside ? rb[o + 3] + a : (ax1 ? rb[o + 6] : rb[o + 9] + a)
+            cj = inside ? rb[o + 4] + b : (ax1 ? rb[o + 7] + b : rb[o + 10])
+            dc = (slot - Int32(1)) * stc + _li2(ci, cj, ndc)
+            fb = (s - Int32(1)) * stf; fi = ng + Int32(2) * a; fj = ng + Int32(2) * b
+            h = eltype(FXc)(0.5)
+            if ax1
+                FXc[dc] = h * (FXf[fb + _li2(fi, fj, ndf)] + FXf[fb + _li2(fi, fj + Int32(1), ndf)])
+            else
+                FYc[dc] = h * (FYf[fb + _li2(fi, fj, ndf)] + FYf[fb + _li2(fi + Int32(1), fj, ndf)])
+            end
         end
     end
 end
@@ -800,6 +833,24 @@ function ct_capture_coarse!(hier::AMRHierarchy, l::Int, w::Real)
     return nothing
 end
 
+
+"Restrict level-`l`'s faces into the parent's footprint faces (device-built or table)."
+function _ct_restrict_faces!(lev::Level, plev::Level)
+    if haskey(lev.tabs, :ctresb)
+        nb, rb = lev.tabs[:ctresb]; Bh = lev.B ÷ 2
+        nb > 0 && _ct_restrict_blocks_k!(lev.be)(plev.FBx, plev.FBy, lev.FBx, lev.FBy, rb,
+                                                 Int32(Bh), Int32(lev.ng), Int32(plev.nd),
+                                                 Int32(lev.nd), Int32(plev.stride), Int32(lev.stride);
+                                                 ndrange = nb * 2Bh * (Bh + 1))
+    else
+        nr, rent = lev.tabs[:ctres]
+        nr > 0 && _ct_restrict_face_k!(lev.be)(plev.FBx, plev.FBy, lev.FBx, lev.FBy, rent,
+                                               Int32(plev.nd), Int32(lev.nd), Int32(plev.stride),
+                                               Int32(lev.stride); ndrange = nr)
+    end
+    return nothing
+end
+
 """
     ct_sync!(hier, l, λc)
 
@@ -814,10 +865,7 @@ function ct_sync!(hier::AMRHierarchy, l::Int, λc::Real)
     nf > 0 && _ct_emf_apply_k!(lev.be)(plev.FBx, plev.FBy, fent, lev.tabs[:ctreg], T(λc),
                                        Int32(plev.nd), Int32(plev.stride); ndrange = nf)
     fill!(lev.tabs[:ctreg], zero(T))
-    nr, rent = lev.tabs[:ctres]
-    nr > 0 && _ct_restrict_face_k!(lev.be)(plev.FBx, plev.FBy, lev.FBx, lev.FBy, rent,
-                                           Int32(plev.nd), Int32(lev.nd), Int32(plev.stride),
-                                           Int32(lev.stride); ndrange = nr)
+    _ct_restrict_faces!(lev, plev)
     ct_face_exchange!(plev)
     ct_bcc!(plev)
     return nothing

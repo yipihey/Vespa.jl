@@ -521,7 +521,8 @@ function advance_hierarchy_graph!(hier::AMRHierarchy; cooling = nothing, rung::I
 end
 
 "Graph-step counters (CUDA): (; replays, records, plain)."
-graph_stats() = (replays = 0, records = 0, plain = 0)
+const _GSTAT = zeros(Int, 3)
+graph_stats() = (replays = _GSTAT[1], records = _GSTAT[2], plain = _GSTAT[3])
 
 _graph_step!(be, hier::AMRHierarchy, λq, k, cooling) =
     advance_level_w!(hier, 0, λq; φ = nothing, chem = nothing, selfgrav = nothing, cooling)
