@@ -80,6 +80,7 @@ export mhd_level!, encode_mhd_from_host!, max_divb, total_bflux, mhd_max_signal
 export ct_level!, set_ct_faces_from_Az!, max_divb_ct
 export CoolingUnits, CloudyCooling, load_cloudy_cooling, cool_level!, cloudy_temperature,
        cloudy_mu, cloudy_edot, cloudy_isobar
+export leaf_moments
 export MovieWriter, write_frame!, MOVIE_CATALOG, movie_bundle, read_movie_manifest, install_player
 export memory_mode, set_memory_mode!, memory_report
 export prefetch_level!, advise_level_host!, advise_all_host!, evict_level!, evict_gas_pools!,
@@ -187,5 +188,6 @@ include("mhd.jl")          # GLM-MHD (NestedMHD scheme) on the same blocks / W-c
 include("ct.jl")           # constrained-transport MHD (face B, GS05 EMFs), 2-D
 include("cooling.jl")      # tabulated Grackle (Cloudy-mode) cooling + UVB heating
 include("movie.jl")        # first-class movies: GPU derived fields → 16-bit PNG + manifest
+include("diagnostics.jl")  # on-device leaf reductions (mass in temperature bands, centroids)
 
 end # module BlockAMR

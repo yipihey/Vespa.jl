@@ -157,37 +157,9 @@ cellstate(L, s, idx) = begin
     (ρ, s1 / ρ, s2 / ρ, temp_cgs(ρ, max(eint, 1e-30)))
 end
 
-# composite scan: uncovered cells of every level (fine data where it exists)
-function scan(h)
-    out = (mass = 0.0, mcold = 0.0, xm = 0.0, ym = 0.0, vxm = 0.0, mdense = 0.0, mint = 0.0)
-    m, mc, xm, ym, vxm, md, mi = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    for l in 0:length(h.levels)-1
-        lev = h.levels[l + 1]; isempty(lev.live) && continue
-        L = levdata(h, l); dx = BA.level_dx(h, l); dA = dx^2
-        flev = l + 1 < length(h.levels) ? h.levels[l + 2] : nothing
-        for s in lev.live
-            o = lev.meta[s].origin; base = (Int(s) - 1) * lev.stride
-            for j in 0:lev.B-1, i in 0:lev.B-1
-                if flev !== nothing && !isempty(flev.live)
-                    q = (UInt128(2 * (Int(o[1]) + i)), UInt128(2 * (Int(o[2]) + j)), UInt128(0))
-                    BA.lattice_owner(flev, q, flev.B) != 0 && continue
-                end
-                idx = base + (j + lev.ng) * lev.nd + (i + lev.ng) + 1
-                ρ, vx, vy, Tg = cellstate(L, s, idx)
-                dm = ρ * dA; m += dm
-                if Tg < 2e4                     # cold: below the mixing-layer peak
-                    mc += dm; xm += dm * (Int(o[1]) + i + 0.5) * dx; ym += dm * (Int(o[2]) + j + 0.5) * dx
-                    vxm += dm * vx
-                elseif Tg < 5e5
-                    mi += dm                   # intermediate (mixing) gas
-                end
-                ρ > RC / 3 && (md += dm)
-            end
-        end
-    end
-    return (mass = m, mcold = mc, xc = mc > 0 ? xm / mc : NaN, yc = mc > 0 ? ym / mc : NaN,
-            vxc = mc > 0 ? vxm / mc : NaN, mdense = md, mint = mi)
-end
+# composite scan over leaf cells, on the device (BlockAMR.leaf_moments: the
+# dual-energy temperature from the cooling table; 7 numbers per level to the host)
+scan(h) = leaf_moments(h, cool; Tcold = 2e4, Tmix = 5e5, rho_dense = RC / 3)
 
 # uniform map at output level Lo over a window [x0, x0+w) × [y0, y0+hgt) (code units)
 function rastermap(h, Lo, x0, y0, w, hgt)

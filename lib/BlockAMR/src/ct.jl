@@ -964,20 +964,34 @@ function set_ct_faces_from_Az!(hier::AMRHierarchy, l::Int, Az)
 end
 
 "max over active cells of |∇·B|·dx / max|B| from the FACE field (CT)."
+# per active cell: |∇·B|·dx (face differences) and the larger |face B| (device)
+@kernel function _ct_divb_k!(dv, bm, @Const(FBx), @Const(FBy), @Const(live_d),
+                             B::Int32, ng::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    B2 = B * B
+    bi = t0 ÷ B2; c = t0 % B2
+    @inbounds begin
+        slot = live_d[bi + Int32(1)]
+        q = (slot - Int32(1)) * stride + _li2(c % B + ng, c ÷ B + ng, nd)
+        T = eltype(dv)
+        dv[t] = abs((T(FBx[q + 1]) - T(FBx[q])) + (T(FBy[q + nd]) - T(FBy[q])))
+        bm[t] = max(abs(T(FBx[q])), abs(T(FBy[q])))
+    end
+end
+
+"max |∇·B|·dx / max |B_face| over all levels (constrained transport), on the device."
 function max_divb_ct(hier::AMRHierarchy)
     worst = 0.0; bmax = 0.0
     for l in 0:length(hier.levels)-1
         lev = hier.levels[l + 1]
         isempty(lev.live) && continue
-        fx = Array(lev.FBx); fy = Array(lev.FBy); nd = lev.nd; ng = lev.ng
-        for s in lev.live
-            base = (Int(s) - 1) * lev.stride
-            for j in ng:ng+lev.B-1, i in ng:ng+lev.B-1
-                q = base + j*nd + i + 1
-                worst = max(worst, abs((fx[q + 1] - fx[q]) + (fy[q + nd] - fy[q])))
-                bmax = max(bmax, abs(fx[q]), abs(fy[q]))
-            end
-        end
+        n = length(lev.live) * lev.B^2
+        T = eltype(lev.FBx)
+        dv = device_zeros(lev.be, T, (n,)); bm = device_zeros(lev.be, T, (n,))
+        _ct_divb_k!(lev.be)(dv, bm, lev.FBx, lev.FBy, lev.live_d, Int32(lev.B), Int32(lev.ng),
+                            Int32(lev.nd), Int32(lev.stride); ndrange = n)
+        worst = max(worst, Float64(maximum(dv))); bmax = max(bmax, Float64(maximum(bm)))
     end
     return worst / max(bmax, floatmin(Float64))
 end

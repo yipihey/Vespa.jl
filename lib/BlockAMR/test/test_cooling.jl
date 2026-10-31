@@ -125,4 +125,62 @@ for BE in BACKENDS
     @info "Float32 cooling vs Float64 integrator" BE worst moved
 end
 end # for BE
+
+# leaf_moments (on-device leaf reductions) ≡ a host loop with the same physics, on
+# a 2-level CT hierarchy (cells under the fine patch skipped)
+for BE in BACKENDS
+@testset "leaf_moments vs host reference [$BE]" begin
+    h = static2d(; nbase = (64, 32), kids = KIDS_CENTER, box = 2.0, backend = BE, physics = :mhd,
+                 divb = :ct, T = Float64)
+    UC = CoolingUnits(density = BA._MH_CGS, length = 100 * 3.0857e18, velocity = 1e7)
+    c = load_cloudy_cooling(joinpath(TABDIR, "FG2011_z0"); be = BA.backend(BE), units = UC,
+                            metallicity = 0.3, T = Float32)
+    γ = h.gamma; kpc = BA._KB_CGS / (BA._MH_CGS * 1e14)
+    for l in 0:1
+        lev = h.levels[l + 1]; n = lev.cap * lev.stride; a = [zeros(n) for _ in 1:10]; dx = BA.level_dx(h, l)
+        for s in lev.live, j in 0:15, i in 0:15
+            o = lev.meta[s].origin; idx = (Int(s) - 1) * lev.stride + (j + 2) * lev.nd + (i + 2) + 1
+            x = (Int(o[1]) + i + 0.5) * dx; y = (Int(o[2]) + j + 0.5) * dx
+            ρ = 10.0^(-3 + 2x); Tg = 10.0^(3 + 3y); u = 0.3sin(π * y)
+            p = ρ * kpc * Tg / 0.62
+            vals = (ρ, ρ * u, 0.0, 0.0, p / (γ - 1) + 0.5ρ * u^2 + 0.5 * 1e-4, p / (γ - 1),
+                    0.01, 0.0, 0.0, 0.0)
+            for f in 1:10; a[f][idx] = vals[f]; end
+        end
+        BA.encode_mhd_from_host!(lev, a...)
+    end
+    r = leaf_moments(h, c; Tcold = 2e4, Tmix = 5e5, rho_dense = 0.03)
+    # host reference
+    acc = zeros(7)
+    for l in 0:1
+        lev = h.levels[l + 1]; dx = BA.level_dx(h, l)
+        D, S1, E, G, Bx, By, Bz = map(Array, (lev.D, lev.S1, lev.Tau, lev.Ge, lev.Bx, lev.By, lev.Bz))
+        ds, ss, es, gs = map(Array, (lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc))
+        for s in lev.live, j in 0:15, i in 0:15
+            o = lev.meta[s].origin
+            l == 0 && BA.lattice_owner(h.levels[2], (UInt128(2(Int(o[1]) + i)), UInt128(2(Int(o[2]) + j)),
+                                                     UInt128(0)), 16) != 0 && continue
+            idx = (Int(s) - 1) * lev.stride + (j + 2) * lev.nd + (i + 2) + 1
+            ρ = D[idx] * ds[s]; s1 = S1[idx] * ss[s]; KE = 0.5s1^2 / ρ
+            EB = 0.5(Bx[idx]^2 + By[idx]^2 + Bz[idx]^2)
+            eint = BA._de_total(E[idx] * es[s], KE, EB, G[idx] * gs[s], h.mhd.eta1) - KE - EB
+            Tg = cloudy_temperature(c, ρ * BA._MH_CGS, eint / ρ * 1e14)[1]
+            m = ρ * dx^2; acc[1] += m
+            if Tg < 2e4
+                acc[2] += m; acc[3] += m * (Int(o[1]) + i + 0.5) * dx; acc[5] += s1 * dx^2
+            elseif Tg < 5e5
+                acc[6] += m
+            end
+            ρ > 0.03 && (acc[7] += m)
+        end
+    end
+    @test acc[2] > 0 && acc[6] > 0 && acc[7] > 0             # every band populated
+    @test isapprox(r.mass, acc[1]; rtol = 1e-6)          # per-cell terms in Float32
+    @test isapprox(r.mcold, acc[2]; rtol = 1e-6)
+    @test isapprox(r.xc, acc[3] / acc[2]; rtol = 1e-6)
+    @test isapprox(r.vxc, acc[5] / acc[2]; rtol = 1e-5)
+    @test isapprox(r.mint, acc[6]; rtol = 1e-6)
+    @test isapprox(r.mdense, acc[7]; rtol = 1e-6)
+end
+end # for BE
 end # tables present
