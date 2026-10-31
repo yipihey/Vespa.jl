@@ -81,4 +81,52 @@ function BlockAMR.prefetch_host!(a::CuArray)
     return a
 end
 
+
+# ── CUDA Graph replay of root steps (BlockAMR.advance_hierarchy_graph!) ───────
+mutable struct _GraphEntry
+    exec::Any                       # CuGraphExec
+    swapped::Vector{Bool}           # levels whose R/O roles flip per root step
+    refs::Vector{Any}               # strong refs: no captured buffer is freed/reused
+end
+const _GRAPHS = WeakKeyDict{Any,Dict{Tuple{Int,UInt},_GraphEntry}}()
+const _SEEN = WeakKeyDict{Any,Set{Tuple{Int,UInt}}}()
+BlockAMR.graph_stats() = (replays = _GSTAT[1], records = _GSTAT[2], plain = _GSTAT[3])
+const _GSTAT = zeros(Int, 3)
+
+function BlockAMR._graph_step!(::CUDABackend, hier::BlockAMR.AMRHierarchy, λq, k, cooling)
+    refs = BlockAMR._graph_refs(hier)
+    key = (k, BlockAMR._graph_fp(refs))
+    cache = get!(() -> Dict{Tuple{Int,UInt},_GraphEntry}(), _GRAPHS, hier)
+    seen = get!(() -> Set{Tuple{Int,UInt}}(), _SEEN, hier)
+    e = get(cache, key, nothing)
+    if e === nothing && !(key in seen)
+        # first occurrence of this (rung, topology, parity): an ordinary step — it
+        # also allocates any lazily-built scratch, which a capture may not; record
+        # only keys that recur (a graph used once is pure cost)
+        length(seen) >= 16 && empty!(seen)
+        push!(seen, key); _GSTAT[3] += 1
+        return BlockAMR.advance_level_w!(hier, 0, λq; φ = nothing, chem = nothing,
+                                         selfgrav = nothing, cooling)
+    end
+    if e === nothing
+        before = [lev.D for lev in hier.levels]
+        nst = hier.nstep[1]
+        g = CUDA.capture() do       # records the launches; nothing executes yet
+            BlockAMR.advance_level_w!(hier, 0, λq; φ = nothing, chem = nothing,
+                                      selfgrav = nothing, cooling)
+        end
+        swapped = [hier.levels[i].D !== before[i] for i in eachindex(before)]
+        # the host-side bookkeeping ran during capture: undo it, replay below
+        for (i, sw) in enumerate(swapped); sw && BlockAMR.swap_buffers!(hier.levels[i]); end
+        hier.nstep[1] = nst
+        length(cache) >= 4 && empty!(cache)          # topology moved on: drop stale graphs
+        e = _GraphEntry(CUDA.instantiate(g), swapped, refs); _GSTAT[2] += 1
+        cache[key] = e
+    end
+    CUDA.launch(e.exec); _GSTAT[1] += 1
+    for (i, sw) in enumerate(e.swapped); sw && BlockAMR.swap_buffers!(hier.levels[i]); end
+    hier.nstep[1] += 1
+    return nothing
+end
+
 end # module

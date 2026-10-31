@@ -499,6 +499,50 @@ end
 One root step of the strict-2:1 W-cycle: λ from the global CFL, then the
 recursive fine-first advance.  Level l takes exactly 2^l substeps of λ·dx_l.
 """
+# ── graph-replayed root steps (CUDA Graphs; ext/BlockAMRCUDAExt.jl) ───────────
+"""
+    advance_hierarchy_graph!(hier; cooling = nothing, rung = 16) -> dt
+
+One root step like `advance_hierarchy!` (hydro/MHD + cooling; no gravity/chem),
+with λ = Δt/Δx rounded DOWN to the ladder 2^(k/`rung`) (≤ 2^(1/rung)−1 smaller
+step; CFL-safe) so consecutive steps share it.  On CUDA the W-cycle's ~500
+kernel launches are recorded once into a CUDA graph per (λ rung, hierarchy
+fingerprint) and replayed with one launch; any regrid / table rebuild / pool
+reallocation / R-O parity changes the fingerprint and triggers a re-record.
+Other backends: a plain step at the rounded λ.
+"""
+function advance_hierarchy_graph!(hier::AMRHierarchy; cooling = nothing, rung::Int = 16)
+    λ = compute_lambda!(hier)
+    k = floor(Int, log2(Float64(λ)) * rung)
+    λq = Float32(exp2(k / rung))
+    hier.λ = λq
+    _graph_step!(hier.levels[1].be, hier, λq, k, cooling)
+    return λq * level_dx(hier, 0)
+end
+
+"Graph-step counters (CUDA): (; replays, records, plain)."
+graph_stats() = (replays = 0, records = 0, plain = 0)
+
+_graph_step!(be, hier::AMRHierarchy, λq, k, cooling) =
+    advance_level_w!(hier, 0, λq; φ = nothing, chem = nothing, selfgrav = nothing, cooling)
+
+# identity of everything a recorded step bakes in: field arrays (objects change on
+# R/O swaps and reallocation), every table object and every table count
+function _graph_refs(hier::AMRHierarchy)
+    refs = Any[]
+    for lev in hier.levels
+        isempty(lev.live) && (push!(refs, 0); continue)
+        push!(refs, length(lev.live), lev.live_d, lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, lev.Bsc)
+        append!(refs, (gasfields(lev)..., gasfields_o(lev)..., mfields(lev)..., mfields_o(lev)...,
+                       cfields(lev)..., cfields_o(lev)...))
+        for k in sort!(collect(keys(lev.tabs)))
+            push!(refs, k, lev.tabs[k])
+        end
+    end
+    return refs
+end
+_graph_fp(refs) = hash(Tuple(x isa Union{Number,Symbol} ? x : objectid(x) for x in refs))
+
 function advance_hierarchy!(hier::AMRHierarchy; φ = nothing, chem = nothing,
                             selfgrav = nothing, cooling = nothing)
     hier.dim == 3 || (φ === nothing && chem === nothing && selfgrav === nothing) ||

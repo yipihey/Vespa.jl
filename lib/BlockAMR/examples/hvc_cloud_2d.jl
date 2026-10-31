@@ -19,6 +19,8 @@
 #   above this × halo density, 3), HVC_LX, HVC_LY (box in cloud radii, 32 × 8),
 #   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save),
 #   HVC_COOL_T (cooling arithmetic, Float32 | Float64; default Float32),
+#   HVC_GRAPH (1: CUDA-graph replay of root steps, λ on a 2^(1/16) ladder; default 1),
+#   HVC_REGRID_EVERY (regrid cadence in root steps; default 1),
 #   HVC_MOVIE (movie frames per t_cc, 0 = off), HVC_MOVIE_LEVEL (image resolution
 #   level, default HVC_LMAX), HVC_MOVIE_FIELDS (comma list of MOVIE_CATALOG keys,
 #   default: all that apply), HVC_SHOCKSW (1: PLUTO-style shock switch,
@@ -52,6 +54,8 @@ const NMOVIE  = parse(Float64, env("HVC_MOVIE", 0.0))
 const LMOVIE  = parse(Int, env("HVC_MOVIE_LEVEL", LMAX))
 const FMOVIE  = env("HVC_MOVIE_FIELDS", "default")
 const SHOCKSW = env("HVC_SHOCKSW", "0") == "1"
+const GRAPH   = env("HVC_GRAPH", "1") == "1"            # CUDA-graph replay of root steps
+const REGRID_EVERY = parse(Int, env("HVC_REGRID_EVERY", 1))   # regrid cadence (root steps)
 mkpath(OUT); mkpath(joinpath(OUT, "snap"))
 
 # ── units: length 100 pc (the cloud radius), velocity 100 km/s, density m_H cm⁻³ ──
@@ -235,9 +239,11 @@ while t < TEND * TCC && step < MAXST
     # synchronize so the phase clocks charge GPU work to the phase that queued it
     # (kernel launches are asynchronous: without this, the advance's kernels drain
     # inside the regrid's first device→host copy and are billed to "regrid")
-    TW[:advance] += @elapsed (dt = advance_hierarchy!(hier; cooling = cool); BA.KA.synchronize(hier.levels[1].be))
+    TW[:advance] += @elapsed (dt = GRAPH ? advance_hierarchy_graph!(hier; cooling = cool) :
+                                       advance_hierarchy!(hier; cooling = cool);
+                              BA.KA.synchronize(hier.levels[1].be))
     t += dt; step += 1
-    TW[:regrid] += @elapsed regrid!(hier, pol)
+    (step % REGRID_EVERY == 0) && (TW[:regrid] += @elapsed regrid!(hier, pol))
     if t >= tmnext
         TW[:movie] += @elapsed write_frame!(mw, hier, t)
         tmnext = (floor(t * NMOVIE / TCC) + 1) * TCC / NMOVIE
@@ -268,3 +274,4 @@ close(ts)
 save_checkpoint(joinpath(OUT, "final.ckpt"), hier; extra = (t = t, step = step))
 get(ENV, "HVC_TIMERS", "0") == "1" && BA.timer_report()
 @printf("done: t=%.3f t_cc (%.2f Myr), %d root steps, %.0f s wall\n", t / TCC, t * TU / MYR, step, time() - tw0)
+GRAPH && println("graph steps: ", BA.graph_stats())

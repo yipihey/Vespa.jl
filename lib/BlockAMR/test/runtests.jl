@@ -36,5 +36,6 @@ const BACKENDS = (:cpu,
     include("test_mhd_shock.jl")   # MHD shock switch vs the carbuncle (Quirk)
     include("test_cooling.jl")     # tabulated Grackle cooling vs libgrackle (needs tables)
     include("test_tables_fast.jl") # fast C/F table builders ≡ the reference builders
+    include("test_graph.jl")       # CUDA-graph root steps ≡ plain launches
     include("test_movie.jl")       # movie output: GPU derived fields → 16-bit PNG, bundles
 end

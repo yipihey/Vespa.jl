@@ -137,6 +137,46 @@ end
     end
 end
 
+# fused: every field of a BC cell in one thread (same source/destination index);
+# field tuples peeled by @inline recursion (static access, see transfer.jl)
+@inline _bcf_each(::Tuple{}, ::Tuple{}, ::Tuple{}, ::Tuple{}, args...) = nothing
+@inline function _bcf_each(F::Tuple, SC::Tuple, V::Tuple, FL::Tuple, didx, sidx, slot, fid,
+                           kind, a, useval)
+    f = first(F); sc = first(SC); val = first(V); flipax = first(FL)
+    @inbounds if kind == BC_INFLOW && useval == Int32(1)
+        f[didx] = _narrow(eltype(f), val[fid] / eltype(val)(sc[slot]))
+    else
+        v = f[sidx]
+        f[didx] = (kind == BC_REFLECTING && flipax == a) ? -v : v
+    end
+    _bcf_each(Base.tail(F), Base.tail(SC), Base.tail(V), Base.tail(FL), didx, sidx, slot, fid,
+              kind, a, useval)
+end
+@kernel function _bc_fillN_k!(F, SC, V, FL, @Const(jobs), @Const(cellstart),
+                              njobs::Int32, nd::Int32, stride::Int32, ng::Int32, B::Int32,
+                              useval::Int32)
+    t = @index(Global)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, Int32(t) - Int32(1))
+    @inbounds begin
+        slot = jobs[b+1]
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        a = jobs[b+12]; side = jobs[b+13]; kind = jobs[b+14]; fid = jobs[b+15]
+        g = a == Int32(1) ? di : (a == Int32(2) ? dj : dk)
+        sg = if kind == BC_REFLECTING
+            side == Int32(0) ? Int32(2) * ng - Int32(1) - g :
+                               Int32(2) * (ng + B) - Int32(1) - g
+        else
+            side == Int32(0) ? ng : ng + B - Int32(1)
+        end
+        si = a == Int32(1) ? sg : di
+        sj = a == Int32(2) ? sg : dj
+        sk = a == Int32(3) ? sg : dk
+        base = (slot - Int32(1)) * stride
+        _bcf_each(F, SC, V, FL, base + (dk * nd + dj) * nd + di + Int32(1),
+                  base + (sk * nd + sj) * nd + si + Int32(1), slot, fid, kind, a, useval)
+    end
+end
+
 """
     fill_boundary!(hier, l; buf = :R)
 
@@ -154,15 +194,24 @@ function fill_boundary!(hier::AMRHierarchy, l::Int; buf::Symbol = :R)
     # normal momentum AND normal B flip at a reflecting face; ψ is even
     flips = (Int32(0), Int32(1), Int32(2), Int32(3), Int32(0), Int32(0),
              Int32(1), Int32(2), Int32(3), Int32(0))
+    keep = Tuple(fi for fi in 1:length(dst) if !isempty(dst[fi]))
     for a in 1:lev.dim
         tab = get(lev.tabs, Symbol(:bc, a), nothing)
         (tab === nothing || tab.total == 0) && continue
-        for (fi, (F, sc)) in enumerate(zip(dst, scs))
-            isempty(F) && continue
-            _bc_fill_k!(lev.be)(F, sc, vals[fi], tab.jobs, tab.cellstart,
-                                Int32(tab.njobs), Int32(lev.nd), Int32(lev.stride),
-                                Int32(lev.ng), Int32(lev.B), flips[fi], Int32(1);
-                                ndrange = tab.total)
+        if _FUSED[]
+            _bc_fillN_k!(lev.be)(map(i -> dst[i], keep), map(i -> scs[i], keep),
+                                 map(i -> vals[i], keep), map(i -> flips[i], keep),
+                                 tab.jobs, tab.cellstart, Int32(tab.njobs), Int32(lev.nd),
+                                 Int32(lev.stride), Int32(lev.ng), Int32(lev.B), Int32(1);
+                                 ndrange = tab.total)
+        else
+            for (fi, (F, sc)) in enumerate(zip(dst, scs))
+                isempty(F) && continue
+                _bc_fill_k!(lev.be)(F, sc, vals[fi], tab.jobs, tab.cellstart,
+                                    Int32(tab.njobs), Int32(lev.nd), Int32(lev.stride),
+                                    Int32(lev.ng), Int32(lev.B), flips[fi], Int32(1);
+                                    ndrange = tab.total)
+            end
         end
         for S in sps
             _bc_fill_k!(lev.be)(S, lev.Dsc, vals[1], tab.jobs, tab.cellstart,

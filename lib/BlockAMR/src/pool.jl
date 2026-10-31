@@ -299,6 +299,31 @@ overlapping_blocks(lev::Level, lo::NTuple{3,Int128}, len::NTuple{3,Int}) =
 # overlap result sets are tiny, so a reusable Vector beats a per-call `Set`).
 # Lets the table builders reuse one buffer across their (hundreds of thousands
 # of) queries instead of allocating a Vector+Set each time.
+const _NO_SLOTS = Int32[]                    # shared empty result (never mutated)
+
+"""
+    lattice_overlaps!(out, lev, lo, len) -> out
+
+Live slots overlapping the (wrapped) box [lo, lo+len) — like `overlapping_blocks!`,
+but by B-lattice enumeration: block origins are lattice-aligned and a block fills
+its lattice cell, so the box meets exactly the blocks of the lattice cells it
+spans (≤ 2 per axis for boxes ≤ B): O(1) `byorigin` lookups, no tile walk.
+"""
+function lattice_overlaps!(out::Vector{Int32}, lev::Level,
+                           lo::NTuple{3,Int128}, len::NTuple{3,Int})
+    empty!(out)
+    B = Int128(lev.B)
+    r = ntuple(d -> d <= lev.dim ? (fld(lo[d], B):fld(lo[d] + len[d] - 1, B)) : (0:0), 3)
+    for ck in r[3], cj in r[2], ci in r[1]
+        o = (wrapc(ci * B, lev.P[1]), wrapc(cj * B, lev.P[2]),
+             lev.dim == 3 ? wrapc(ck * B, lev.P[3]) : UInt128(0))
+        s = get(lev.byorigin, o, Int32(0))
+        (s == 0 || s in out) && continue
+        push!(out, s)
+    end
+    return out
+end
+
 function overlapping_blocks!(out::Vector{Int32}, lev::Level,
                              lo::NTuple{3,Int128}, len::NTuple{3,Int})
     empty!(out)
@@ -308,7 +333,7 @@ function overlapping_blocks!(out::Vector{Int32}, lev::Level,
     for tk in rng[3], tj in rng[2], ti in rng[1]
         key = (wrapc(Int128(ti), UInt128(nt[1])), wrapc(Int128(tj), UInt128(nt[2])),
                wrapc(Int128(tk), UInt128(nt[3])))
-        for s in get(lev.tilemap, key, Int32[])
+        for s in get(lev.tilemap, key, _NO_SLOTS)
             s in out && continue
             m = lev.meta[s]
             ok = true

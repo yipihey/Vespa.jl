@@ -101,7 +101,7 @@ block's own interior and is skipped.  Same-level blocks are disjoint, so every
 emitted destination cell is a ghost cell.
 """
 function build_sibling_jobs(lev::Level)
-    acc = _JobAcc(26 * length(lev.live)); B = lev.B
+    acc = _JobAcc((3^lev.dim - 1) * length(lev.live)); B = lev.B   # 8 (2-D) / 26 (3-D) neighbours; grows if needed
     ngv = ntuple(d -> _ngax(lev, d), 3); ndv = ntuple(d -> _ndax(lev, d), 3)
     Bv  = ntuple(d -> _Bax(lev, d), 3)
     cands = Int32[]                                        # reused across blocks
@@ -143,7 +143,7 @@ to.  A cell-keyed exchange would miss those owned hi faces, and the two sides of
 a C/F corner would then reconstruct from different face values.
 """
 function build_ct_face_sibling_jobs(lev::Level, ax::Int)
-    acc = _JobAcc(26 * length(lev.live)); B = lev.B
+    acc = _JobAcc((3^lev.dim - 1) * length(lev.live)); B = lev.B   # 8 (2-D) / 26 (3-D) neighbours; grows if needed
     ngv = ntuple(d -> _ngax(lev, d), 3); ndv = ntuple(d -> _ndax(lev, d), 3)
     cands = Int32[]
     hasbeyond(o) = begin
@@ -235,7 +235,7 @@ blocks) prolongation jobs for every live block of `lev` (level l) sourced from
 function build_prolong_jobs(lev::Level, plev::Level; interior::Bool = false,
                             only_slots = nothing)
     slots = only_slots === nothing ? lev.live : only_slots
-    acc = _JobAcc(26 * length(slots)); B = lev.B; ng = lev.ng
+    acc = _JobAcc((3^lev.dim - 1) * length(slots)); B = lev.B; ng = lev.ng
     ovb = Int32[]                                         # reused overlap buffer
     for s in slots
         m = lev.meta[s]
@@ -282,7 +282,7 @@ function _emit_prolong!(acc::_JobAcc, s::Int32, rlo::NTuple{3,Int128},
     phi  = ntuple(d -> cld(rlo[d] + rext[d], 2), 3)
     plen = ntuple(d -> Int(phi[d] - plo[d]), 3)
     covered = 0
-    for ps in overlapping_blocks!(ovb, plev, plo, plen)
+    for ps in lattice_overlaps!(ovb, plev, plo, plen)
         pm = plev.meta[ps]
         r1 = axis_images3(plo[1], plen[1], Int128(pm.origin[1]), _Bax(plev, 1), Int128(plev.P[1]))
         r2 = axis_images3(plo[2], plen[2], Int128(pm.origin[2]), _Bax(plev, 2), Int128(plev.P[2]))

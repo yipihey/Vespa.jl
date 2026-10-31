@@ -66,7 +66,7 @@ export stage_level!, max_signal, max_accel, hierarchy_rk2_step!, compute_dt, tot
 export ctu_level!
 export build_level_tables!, build_cf_register!, capture_cf!, reflux_apply!
 export BlockRefinementPolicy, regrid!, compact_level!
-export advance_hierarchy!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
+export advance_hierarchy!, advance_hierarchy_graph!, advance_level_w!, compute_lambda!, capture_fine!, capture_coarse!
 export update_scales!, encode_from_host!
 export grav_kick_level!, sync_block_geometry!
 export enable_timers!, reset_timers!, timer_report

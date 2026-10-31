@@ -356,6 +356,19 @@ end
     t = @index(Global)
     t0 = Int32(t) - Int32(1)
     b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    _ct_pface!(Ff, FR, FO, θ, ax, jobs, b, ri, rj, B, ng, nd, stride)
+end
+# both face pools (x, y) of a ghost cell in one thread (one launch per fill)
+@kernel function _ct_prolong_face2_k!(FX, FY, @Const(FRX), @Const(FOX), @Const(FRY), @Const(FOY),
+                                      θ::T, @Const(jobs), @Const(cellstart), njobs::Int32,
+                                      B::Int32, ng::Int32, nd::Int32, stride::Int32) where {T}
+    t = @index(Global)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, Int32(t) - Int32(1))
+    _ct_pface!(FX, FRX, FOX, θ, Int32(1), jobs, b, ri, rj, B, ng, nd, stride)
+    _ct_pface!(FY, FRY, FOY, θ, Int32(2), jobs, b, ri, rj, B, ng, nd, stride)
+end
+@inline function _ct_pface!(Ff, FR, FO, θ::T, ax::Int32, jobs, b, ri, rj,
+                            B::Int32, ng::Int32, nd::Int32, stride::Int32) where {T}
     @inbounds begin
         di = jobs[b+3] + ri; dj = jobs[b+4] + rj
         # owned faces (the block's own lo..hi faces) are evolved, never prolonged
@@ -377,6 +390,7 @@ end
             Ff[(jobs[b+1] - Int32(1)) * stride + _li2(di, dj, nd)] = v
         end
     end
+    return nothing
 end
 
 function ct_fill_face_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R)
@@ -385,7 +399,12 @@ function ct_fill_face_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Sym
     T = eltype(lev.D)
     if l >= 1
         plev = hier.levels[l]; pro = _tabt(lev, :pro)
-        if pro.total > 0
+        if pro.total > 0 && _FUSED[]
+            _ct_prolong_face2_k!(lev.be)(dst..., cfields(plev)[1], cfields_o(plev)[1],
+                                         cfields(plev)[2], cfields_o(plev)[2], T(θ), pro.jobs,
+                                         pro.cellstart, Int32(pro.njobs), Int32(lev.B), Int32(lev.ng),
+                                         Int32(lev.nd), Int32(lev.stride); ndrange = pro.total)
+        elseif pro.total > 0
             for (ax, fd, fR, fO) in zip((1, 2), dst, cfields(plev), cfields_o(plev))
                 _ct_prolong_face_k!(lev.be)(fd, fR, fO, T(θ), Int32(ax), pro.jobs, pro.cellstart,
                                             Int32(pro.njobs), Int32(lev.B), Int32(lev.ng),
@@ -399,8 +418,15 @@ end
 
 "Authoritative-face sibling exchange of a level's face pools (tables.jl)."
 function ct_face_exchange!(lev::Level, dst = cfields(lev))
-    _run_copy!(lev.be, _tabt(lev, :sibfx), dst[1], dst[1], lev.nd, lev.stride)
-    _run_copy!(lev.be, _tabt(lev, :sibfy), dst[2], dst[2], lev.nd, lev.stride)
+    tx = _tabt(lev, :sibfx); ty = _tabt(lev, :sibfy)
+    if _FUSED[] && tx.total + ty.total > 0
+        _rect_copy2tab_k!(lev.be)(dst[1], tx.jobs, tx.cellstart, Int32(tx.njobs), Int32(tx.total),
+                                  dst[2], ty.jobs, ty.cellstart, Int32(ty.njobs),
+                                  Int32(lev.nd), Int32(lev.stride); ndrange = tx.total + ty.total)
+    else
+        _run_copy!(lev.be, tx, dst[1], dst[1], lev.nd, lev.stride)
+        _run_copy!(lev.be, ty, dst[2], dst[2], lev.nd, lev.stride)
+    end
     return nothing
 end
 

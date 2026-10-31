@@ -828,3 +828,26 @@ end
 end
 
 _nonempty(t::Tuple) = Tuple(x for x in t if !isempty(x))
+
+# identity copy through TWO job tables in one launch (CT face pools x / y)
+@kernel function _rect_copy2tab_k!(A, @Const(jobsA), @Const(csA), njA::Int32, totA::Int32,
+                                   Bf, @Const(jobsB), @Const(csB), njB::Int32,
+                                   nd::Int32, stride::Int32)
+    t = @index(Global)
+    t0 = Int32(t) - Int32(1)
+    if t0 < totA
+        _copy1(A, jobsA, csA, njA, t0, nd, stride)
+    else
+        _copy1(Bf, jobsB, csB, njB, t0 - totA, nd, stride)
+    end
+end
+@inline function _copy1(F, jobs, cellstart, njobs::Int32, t0::Int32, nd::Int32, stride::Int32)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, t0)
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ri; sj = jobs[b+7] + rj; sk = jobs[b+8] + rk
+        F[(jobs[b+1] - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)] =
+            F[(jobs[b+2] - Int32(1)) * stride + (sk * nd + sj) * nd + si + Int32(1)]
+    end
+    return nothing
+end
