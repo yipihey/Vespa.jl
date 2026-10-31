@@ -53,7 +53,7 @@ for BE in BACKENDS
             o = lev.meta[s].origin; idx = (Int(s) - 1) * lev.stride + (j + 2) * lev.nd + (i + 2) + 1
             X = (Int(o[1]) + i) / 32; Y = (Int(o[2]) + j) / 32
             ρ = 10.0^(-3 + 3X); Tg = 10.0^(2 + 4.5Y); v = 30.0
-            p = ρ * BA._KB_CGS * Tg / (0.62 * BA._MH_CGS) / (BA._MH_CGS * 1e10)   # code pressure
+            p = ρ * BA._KB_CGS * Tg / 0.62 / (BA._MH_CGS * 1e10)    # code pressure (ρ in m_H cm⁻³)
             ge = p / (γ - 1); bx = physics === :mhd ? 0.0 : 0.0
             vals = (ρ, ρ * v, 0.0, 0.0, ge + 0.5ρ * v^2, ge, bx, 0.0, 0.0, 0.0)
             for f in 1:10; a[f][idx] = vals[f]; end
@@ -79,6 +79,50 @@ for BE in BACKENDS
         @test worst < 1e-9
         @test wE < 1e-12
     end
+end
+end # for BE
+
+# Float32 table + arithmetic on a Float64 hierarchy (the HVC default): against the
+# Float64 scalar integrator, incl. rarefied cells (n ~ 1e-7, where n_H²·Λ alone
+# would underflow Float32)
+for BE in BACKENDS
+@testset "cooling: Float32 table on Float64 hydro ≡ Float64 integrator [$BE]" begin
+    h = AMRHierarchy(; nbase = (32, 32), B = 16, backend = BE, physics = :mhd, T = Float64, divb = :ct)
+    init_base_level!(h); build_level_tables!(h, 0)
+    c32 = load_cloudy_cooling(joinpath(TABDIR, "FG2011_z0"); be = BA.backend(BE), units = UCOOL,
+                              metallicity = 0.3, T = Float32)
+    c64 = load_cloudy_cooling(joinpath(TABDIR, "FG2011_z0"); be = BA.backend(:cpu), units = UCOOL,
+                              metallicity = 0.3)
+    @test eltype(c32.tab) == Float32
+    lev = h.levels[1]; n = lev.cap * lev.stride
+    a = [zeros(n) for _ in 1:10]; γ = h.gamma
+    for s in lev.live, j in 0:15, i in 0:15
+        o = lev.meta[s].origin; idx = (Int(s) - 1) * lev.stride + (j + 2) * lev.nd + (i + 2) + 1
+        X = (Int(o[1]) + i) / 32; Y = (Int(o[2]) + j) / 32
+        ρ = 10.0^(-7 + 8X); Tg = 10.0^(2 + 5Y)
+        p = ρ * BA._KB_CGS * Tg / 0.62 / (BA._MH_CGS * 1e10)
+        vals = (ρ, 0.0, 0.0, 0.0, p / (γ - 1), p / (γ - 1), 0.0, 0.0, 0.0, 0.0)
+        for f in 1:10; a[f][idx] = vals[f]; end
+    end
+    BA.encode_mhd_from_host!(lev, a...)
+    D0 = Array(lev.D); G0 = Array(lev.Ge)
+    dt = 0.02
+    cool_level!(h, 0, dt, c32)
+    G1 = Array(lev.Ge)
+    hc = Float64.(Array(c64.tab)); g = (γ - 1) * BA._MH_CGS / BA._KB_CGS
+    worst = 0.0; moved = 0
+    for s in lev.live, j in 0:15, i in 0:15
+        idx = (Int(s) - 1) * lev.stride + (j + 2) * lev.nd + (i + 2) + 1
+        ρc = D0[idx] * BA._MH_CGS; e0 = G0[idx] / D0[idx] * 1e10
+        e1 = BA._cloudy_integrate(e0, ρc, dt * BA.time_unit(UCOOL), hc, c64.nn, c64.nt, c64.n0,
+                                  c64.dn, c64.t0, c64.dT, c64.XH, c64.Zrel * c64.Zsun, c64.Zrel, g,
+                                  c64.Tfloor, c64.eps, c64.maxsub)
+        worst = max(worst, abs(G1[idx] / D0[idx] * 1e10 / e1 - 1))
+        moved += abs(e1 / e0 - 1) > 1e-3
+    end
+    @test moved > 200                      # the step does real work
+    @test worst < 1e-4
+    @info "Float32 cooling vs Float64 integrator" BE worst moved
 end
 end # for BE
 end # tables present

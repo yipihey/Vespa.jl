@@ -144,14 +144,22 @@ end
     return Tg, munew
 end
 
-# net volumetric rate [erg cm⁻³ s⁻¹]
-@inline function _cloudy_edot(nH::T, Tg::T, ln::T, Zrel::T, tab, nn::Int, nt::Int,
+# net rate per n_H² [erg cm³ s⁻¹]: (H − Λ)_prim + (Z/Z☉)(H − Λ)_met
+@inline function _cloudy_rate(Tg::T, ln::T, Zrel::T, tab, nn::Int, nt::Int,
                               n0::T, dn::T, t0::T, dT::T) where {T}
     lt = log10(Tg)
     pc = _tab2(tab, 1, ln, lt, nn, nt, n0, dn, t0, dT); ph = _tab2(tab, 2, ln, lt, nn, nt, n0, dn, t0, dT)
     mc = _tab2(tab, 3, ln, lt, nn, nt, n0, dn, t0, dT); mh = _tab2(tab, 4, ln, lt, nn, nt, n0, dn, t0, dT)
-    return nH * nH * ((exp10(ph) - exp10(pc)) + Zrel * (exp10(mh) - exp10(mc)))
+    return (exp10(ph) - exp10(pc)) + Zrel * (exp10(mh) - exp10(mc))
 end
+# net volumetric rate [erg cm⁻³ s⁻¹]
+@inline _cloudy_edot(nH::T, Tg::T, ln::T, Zrel::T, tab, nn::Int, nt::Int, n0::T, dn::T, t0::T, dT::T) where {T} =
+    nH * nH * _cloudy_rate(Tg, ln, Zrel, tab, nn, nt, n0, dn, t0, dT)
+# specific rate ė/ρ [erg g⁻¹ s⁻¹] = n_H·(X_H/m_H)·rate, ordered so no intermediate
+# leaves Float32's range (n_H²·rate is ~1e-40 in rarefied gas: flushed to zero)
+@inline _cloudy_edot_spec(nH::T, Tg::T, ln::T, Zrel::T, XH::T, tab, nn::Int, nt::Int,
+                          n0::T, dn::T, t0::T, dT::T) where {T} =
+    (_cloudy_rate(Tg, ln, Zrel, tab, nn, nt, n0, dn, t0, dT) * (XH / T(_MH_CGS))) * nH
 
 # integrate the specific internal energy e (cgs) over dt (s); returns e_new
 @inline function _cloudy_integrate(e0::T, ρ::T, dt::T, tab, nn::Int, nt::Int, n0::T, dn::T,
@@ -168,7 +176,7 @@ end
     for _ in 1:maxsub
         t >= dt && break
         Tg, μ = _cloudy_T(e, ln, zfrac, tab, nn, nt, n0, dn, t0, dT, gm1utem, Tfloor)
-        edot = _cloudy_edot(nH, Tg, ln, Zrel, tab, nn, nt, n0, dn, t0, dT) / ρ
+        edot = _cloudy_edot_spec(nH, Tg, ln, Zrel, XH, tab, nn, nt, n0, dn, t0, dT)
         # Grackle (solve_rate_cool_g, energy-only path): at the floor cooling stops;
         # Δt_sub = min(0.1·e/|ė|, remaining) — no damping, so a cell near its
         # equilibrium oscillates within ±10 % exactly as in Grackle

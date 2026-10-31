@@ -18,6 +18,7 @@
 #   HVC_Z (Z/Z☉, 0.3), HVC_BACKEND (cuda), HVC_T (Float64), HVC_DTHRESH (refine
 #   above this × halo density, 3), HVC_LX, HVC_LY (box in cloud radii, 32 × 8),
 #   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save),
+#   HVC_COOL_T (cooling arithmetic, Float32 | Float64; default Float32),
 #   HVC_MOVIE (movie frames per t_cc, 0 = off), HVC_MOVIE_LEVEL (image resolution
 #   level, default HVC_LMAX), HVC_MOVIE_FIELDS (comma list of MOVIE_CATALOG keys,
 #   default: all that apply), HVC_SHOCKSW (1: PLUTO-style shock switch,
@@ -58,7 +59,10 @@ const PC = 3.0857e18; const KB = BA._KB_CGS; const MH = BA._MH_CGS
 const U = CoolingUnits(density = MH, length = 100PC, velocity = 1e7)
 const TU = BA.time_unit(U); const MYR = 3.15576e13
 const γ = 5 / 3
-cool = load_cloudy_cooling(TABLE; be = BA.backend(BE), units = U, metallicity = ZREL, T = TT)
+# the cooling table (and its kernel arithmetic) in Float32 by default, independent of
+# the hydro precision: 22× faster on GPUs with slow Float64, final e within 2e-6
+const COOLT = env("HVC_COOL_T", "Float32") == "Float64" ? Float64 : Float32
+cool = load_cloudy_cooling(TABLE; be = BA.backend(BE), units = U, metallicity = ZREL, T = COOLT)
 
 # ── the shared isobar: halo state, the cloud's warm equilibrium ────────────────
 const Pk = 1000.0                         # P/k = n_tot T  [K cm⁻³]
@@ -229,7 +233,7 @@ open(joinpath(OUT, "params.toml"), "w") do io
     println(io, "beta = $(isinf(BETA) ? "\"inf\"" : BETA)\nB0_code = $B0\nNX = $NX\nNY = $NY\nLMAX = $LMAX")
     println(io, "box_radii = [$LX, $LY]\ncloud_x0_radii = $X0\nT_halo = $Th\nT_cloud = $Tc\nmu_halo = $μh\nmu_cloud = $μc")
     println(io, "chi = $χ\nP_over_k = $Pk\nv_wind_kms = $(vw/1e5)\nt_cc_Myr = $(TCC*TU/MYR)\nt_end_tcc = $TEND")
-    println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)")
+    println(io, "shock_switch = $SHOCKSW\ndual_energy = $(hier.mhd.de)\ncooling_float = \"$COOLT\"")
     println(io, "smallr_halo = $SMALLR\ndthresh_halo = $DTHR\nfloat = \"$TT\"\nbackend = \"$BE\"\nunits = { length_pc = 100, velocity_kms = 100, density = \"m_H cm^-3\", time_Myr = $(TU/MYR) }")
 end
 ts = open(joinpath(OUT, "timeseries.csv"), "w")

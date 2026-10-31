@@ -162,7 +162,7 @@ end
             Tg, tcool = if tmode == Int32(2)                  # cooling table (K, code time)
                 ec = TC(e) * uv2; ρc = TC(ρ) * uρ; nH = XH * ρc / TC(_MH_CGS); ln = log10(nH)
                 Tk, _ = _cloudy_T(ec, ln, zfrac, tab, nn, nt, n0, dn, t0, dT, gm1utem, Tfloor)
-                ed = _cloudy_edot(nH, Tk, ln, Zrel, tab, nn, nt, n0, dn, t0, dT) / ρc
+                ed = _cloudy_edot_spec(nH, Tk, ln, Zrel, XH, tab, nn, nt, n0, dn, t0, dT)
                 (Float32(Tk), Float32(abs(ec / ed) / ut))
             elseif tmode == Int32(1)
                 (tfac * p / ρ, 0.0f0)
