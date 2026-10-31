@@ -619,8 +619,13 @@ _mpar(hier::AMRHierarchy) = (T = eltype(hier.levels[1].D);
 
 "Max unsplit MHD signal Σ_d(|v_d|+c_f,d) over the active cells of a level."
 function mhd_max_signal(hier::AMRHierarchy, lev::Level)
+    out = _mhd_signal_cells(hier, lev)
+    return out === nothing ? 0.0 : Float64(maximum(out))
+end
+# per-active-cell MHD signal on the device (no reduction, no host sync)
+function _mhd_signal_cells(hier::AMRHierarchy, lev::Level)
     n = length(lev.live) * _nact(lev)
-    n == 0 && return 0.0
+    n == 0 && return nothing
     T = eltype(lev.D)
     out = device_zeros(lev.be, T, (n,))
     γ, sr, pfl = _mpar(hier); dev, η1, _ = _mde(hier)
@@ -629,7 +634,7 @@ function mhd_max_signal(hier::AMRHierarchy, lev::Level)
                            Int32(hier.mhd.sigdims),
                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
                            Val(lev.dim); ndrange = n)
-    return Float64(maximum(out))
+    return out
 end
 
 """The global GLM cleaning speed (one c_h for every level), from the CFL λ of the

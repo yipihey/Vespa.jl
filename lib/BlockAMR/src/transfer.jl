@@ -512,18 +512,33 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
         evar_int = get(ENV, "BAM_EVAR", "total") == "internal"
         # BAM_PROLONG_E: experimental specific-e Ge interpolation (2nd-order small)
         prolE = get(ENV, "BAM_PROLONG_E", "0") == "1"
-        for fi in 1:6
-            (evar_int && fi == 5) && continue               # Tau rebuilt below
-            (prolE && fi == 6) && continue                  # Ge via specific-e kernel
-            _run_prolong!(lev.be, pro, dst[fi], srcR[fi], srcO[fi], Float32(θ),
-                          lev.nd, lev.stride, cf[fi], cc[fi]; kz = _kz(lev))
-        end
-        # MHD: B and ψ limited-linear like the gas (identity scale class)
-        for (fd, fR, fO) in zip(buf === :R ? mfields(lev) : mfields_o(lev),
-                                mfields(plev), mfields_o(plev))
-            isempty(fd) && continue
-            _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
-                          lev.Bsc, plev.Bsc; kz = _kz(lev))
+        if _FUSED[] && !evar_int && !prolE
+            # one launch: gas (own scale classes) + B, ψ (identity class Bsc)
+            if pro.total > 0
+                md = _nonempty(buf === :R ? mfields(lev) : mfields_o(lev))
+                mR = _nonempty(mfields(plev)); mO = _nonempty(mfields_o(plev))
+                nm = length(md)
+                _rect_prolongN_k!(lev.be)((dst..., md...), (srcR..., mR...), (srcO..., mO...),
+                                          (cf..., ntuple(_ -> lev.Bsc, nm)...),
+                                          (cc..., ntuple(_ -> plev.Bsc, nm)...), Float32(θ),
+                                          pro.jobs, pro.cellstart, Int32(pro.njobs),
+                                          Int32(lev.nd), Int32(lev.stride), _kz(lev);
+                                          ndrange = pro.total)
+            end
+        else
+            for fi in 1:6
+                (evar_int && fi == 5) && continue               # Tau rebuilt below
+                (prolE && fi == 6) && continue                  # Ge via specific-e kernel
+                _run_prolong!(lev.be, pro, dst[fi], srcR[fi], srcO[fi], Float32(θ),
+                              lev.nd, lev.stride, cf[fi], cc[fi]; kz = _kz(lev))
+            end
+            # MHD: B and ψ limited-linear like the gas (identity scale class)
+            for (fd, fR, fO) in zip(buf === :R ? mfields(lev) : mfields_o(lev),
+                                    mfields(plev), mfields_o(plev))
+                isempty(fd) && continue
+                _run_prolong!(lev.be, pro, fd, fR, fO, Float32(θ), lev.nd, lev.stride,
+                              lev.Bsc, plev.Bsc; kz = _kz(lev))
+            end
         end
         if prolE && pro.total > 0                           # Ge: needs fine D (field 1) prolonged first
             _rect_prolong_e_k!(lev.be)(dst[6], dst[1], srcR[6], srcO[6], srcR[1], srcO[1],
@@ -557,14 +572,25 @@ function fill_ghosts!(hier::AMRHierarchy, l::Int; θ::Real = 0, buf::Symbol = :R
         end
     end
     sib = _tabt(lev, :sib)
-    for (fd, sc) in zip(dst, classes(lev))
-        _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
+    if _FUSED[]
+        if sib.total > 0
+            _rect_copyN_k!(lev.be)(dst, classes(lev), sib.jobs, sib.cellstart, Int32(sib.njobs),
+                                   Int32(lev.nd), Int32(lev.stride); ndrange = sib.total)
+            md = _nonempty(buf === :R ? mfields(lev) : mfields_o(lev))
+            isempty(md) || _rect_copyN_k!(lev.be)(md, nothing, sib.jobs, sib.cellstart,
+                                                  Int32(sib.njobs), Int32(lev.nd), Int32(lev.stride);
+                                                  ndrange = sib.total)
+        end
+    else
+        for (fd, sc) in zip(dst, classes(lev))
+            _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride, sc, sc)
+        end
+        for fd in (buf === :R ? mfields(lev) : mfields_o(lev))
+            isempty(fd) || _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride)
+        end
     end
     for sd in (buf === :R ? lev.sp : lev.spo)
         _run_copy!(lev.be, sib, sd, sd, lev.nd, lev.stride)
-    end
-    for fd in (buf === :R ? mfields(lev) : mfields_o(lev))
-        isempty(fd) || _run_copy!(lev.be, sib, fd, fd, lev.nd, lev.stride)
     end
     isct(lev) && ct_fill_face_ghosts!(hier, l; θ, buf)   # CT face pools (ct.jl)
     # non-periodic domain faces: synthesize the ghosts beyond the edge LAST
@@ -583,12 +609,22 @@ function restrict_level!(hier::AMRHierarchy, l::Int)
     @assert l >= 1
     lev = hier.levels[l + 1]; plev = hier.levels[l]
     res = _tabt(lev, :res)
-    for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
-                                  classes(plev), classes(lev))
-        _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs; kz = _kz(lev))
-    end
-    for (fc, ff) in zip(mfields(plev), mfields(lev))    # MHD: B, ψ volume means
-        isempty(fc) || _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride; kz = _kz(lev))
+    if _FUSED[]
+        if res.total > 0
+            a = (res.jobs, res.cellstart, Int32(res.njobs), Int32(lev.nd), Int32(lev.stride), _kz(lev))
+            _rect_restrictN_k!(lev.be)(gasfields(plev), gasfields(lev), classes(plev), classes(lev),
+                                       a...; ndrange = res.total)
+            mc = _nonempty(mfields(plev)); mf = _nonempty(mfields(lev))
+            isempty(mc) || _rect_restrictN_k!(lev.be)(mc, mf, nothing, nothing, a...; ndrange = res.total)
+        end
+    else
+        for (fc, ff, scd, scs) in zip(gasfields(plev), gasfields(lev),
+                                      classes(plev), classes(lev))
+            _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride, scd, scs; kz = _kz(lev))
+        end
+        for (fc, ff) in zip(mfields(plev), mfields(lev))    # MHD: B, ψ volume means
+            isempty(fc) || _run_restrict!(lev.be, res, fc, ff, lev.nd, lev.stride; kz = _kz(lev))
+        end
     end
     for (sc, sf) in zip(plev.sp, lev.sp)                # mass-weighted X mean
         res.total == 0 && continue
@@ -682,3 +718,113 @@ end
             _narrow(eltype(A), phys / scd[jobs[b+1]])
     end
 end
+
+# ── fused multi-field launches (one launch per job table, not one per field) ──
+"BAM_FUSED=0 restores the per-field launch train (A/B checks); read at load (__init__),
+not at precompile time."
+const _FUSED = Ref(true)
+# Each thread handles ONE destination cell for EVERY field; the field tuples are
+# peeled by @inline recursion (first/tail), so every field access is static and
+# consecutive threads still touch consecutive addresses of each field.  (The
+# _rect_*6_k! variants above put one field per thread and indexed the tuple at
+# run time — a select chain on the GPU, ~10× slower.)  At ~5 µs of GPU work per
+# per-field launch against tens of µs of host launch cost, the per-field train
+# was ~70 % of all launches in a 2-D MHD AMR step (HVC, nsys).
+
+# sibling copy, per-field scale ratio (gas classes) / identity (B, ψ: SC = nothing)
+@inline _cpy_each(::Tuple{}, ::Nothing, qd, qs, bd, bs) = nothing
+@inline _cpy_each(::Tuple{}, ::Tuple{}, qd, qs, bd, bs) = nothing
+@inline function _cpy_each(F::Tuple, ::Nothing, qd, qs, bd, bs)
+    f = first(F)
+    @inbounds f[qd] = f[qs]
+    _cpy_each(Base.tail(F), nothing, qd, qs, bd, bs)
+end
+@inline function _cpy_each(F::Tuple, SC::Tuple, qd, qs, bd, bs)
+    f = first(F); sc = first(SC); W = _wt(eltype(f))
+    @inbounds f[qd] = _narrow(eltype(f), W(f[qs]) * (W(sc[bs]) / W(sc[bd])))
+    _cpy_each(Base.tail(F), Base.tail(SC), qd, qs, bd, bs)
+end
+@kernel function _rect_copyN_k!(F, SC, @Const(jobs), @Const(cellstart),
+                                njobs::Int32, nd::Int32, stride::Int32)
+    t = @index(Global)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, Int32(t) - Int32(1))
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ri; sj = jobs[b+7] + rj; sk = jobs[b+8] + rk
+        bd = jobs[b+1]; bs = jobs[b+2]
+        qd = (bd - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)
+        qs = (bs - Int32(1)) * stride + (sk * nd + sj) * nd + si + Int32(1)
+        _cpy_each(F, SC, qd, qs, bd, bs)
+    end
+end
+
+# limited-linear prolongation (the _rect_prolong_llsc_k! formula), every field
+@inline _pro_each(::Tuple{}, ::Tuple{}, ::Tuple{}, ::Tuple{}, ::Tuple{}, args...) = nothing
+@inline function _pro_each(F::Tuple, FR::Tuple, FO::Tuple, SCD::Tuple, SCS::Tuple,
+                           θ, qd, sbase, si, sj, sk, nd, kz, f1, f2, f3, bd, bs)
+    dst = first(F); srcR = first(FR); srcO = first(FO); scd = first(SCD); scs = first(SCS)
+    W = _wt(eltype(dst)); θw = W(θ)
+    @inline S(ii, jj, kk) = @inbounds (one(W) - θw) * W(srcR[sbase + (kk * nd + jj) * nd + ii + Int32(1)]) +
+                                      θw * W(srcO[sbase + (kk * nd + jj) * nd + ii + Int32(1)])
+    c  = S(si, sj, sk)
+    sx = _mm(S(si + Int32(1), sj, sk) - c, c - S(si - Int32(1), sj, sk))
+    sy = _mm(S(si, sj + Int32(1), sk) - c, c - S(si, sj - Int32(1), sk))
+    sz = kz == Int32(1) ? _mm(S(si, sj, sk + Int32(1)) - c, c - S(si, sj, sk - Int32(1))) : zero(W)
+    @inbounds begin
+        phys = (c + W(f1) * sx + W(f2) * sy + W(f3) * sz) * W(scs[bs])
+        dst[qd] = _narrow(eltype(dst), phys / W(scd[bd]))
+    end
+    _pro_each(Base.tail(F), Base.tail(FR), Base.tail(FO), Base.tail(SCD), Base.tail(SCS),
+              θ, qd, sbase, si, sj, sk, nd, kz, f1, f2, f3, bd, bs)
+end
+@kernel function _rect_prolongN_k!(F, FR, FO, SCD, SCS, θ::Float32,
+                                   @Const(jobs), @Const(cellstart),
+                                   njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
+    t = @index(Global)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, Int32(t) - Int32(1))
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + ((ri + jobs[b+12]) >> 0x01)
+        sj = jobs[b+7] + ((rj + jobs[b+13]) >> 0x01)
+        sk = jobs[b+8] + ((rk + jobs[b+14]) >> 0x01)
+        f1 = ((ri + jobs[b+12]) & Int32(1)) == Int32(0) ? -0.25 : 0.25
+        f2 = ((rj + jobs[b+13]) & Int32(1)) == Int32(0) ? -0.25 : 0.25
+        f3 = ((rk + jobs[b+14]) & Int32(1)) == Int32(0) ? -0.25 : 0.25
+        bd = jobs[b+1]; bs = jobs[b+2]
+        qd = (bd - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)
+        sbase = (bs - Int32(1)) * stride
+        _pro_each(F, FR, FO, SCD, SCS, θ, qd, sbase, si, sj, sk, nd, kz, f1, f2, f3, bd, bs)
+    end
+end
+
+# conservative 2^DIM-mean restriction, per-field scales (gas) / identity (B, ψ)
+@inline _res_each(::Tuple{}, ::Tuple{}, SCD, SCS, args...) = nothing
+@inline function _res_each(F::Tuple, FF::Tuple, SCD, SCS, qd, sbase, si, sj, sk, nd, kz, bd, bs)
+    dst = first(F); src = first(FF); W = _wt(eltype(dst))
+    acc = zero(W)
+    @inbounds for ck in Int32(0):kz, cj in Int32(0):Int32(1), ci in Int32(0):Int32(1)
+        acc += W(src[sbase + ((sk + ck) * nd + (sj + cj)) * nd + (si + ci) + Int32(1)])
+    end
+    acc *= kz == Int32(1) ? W(0.125) : W(0.25)
+    @inbounds if SCD === nothing
+        dst[qd] = _narrow(eltype(dst), acc)
+    else
+        dst[qd] = _narrow(eltype(dst), acc * W(first(SCS)[bs]) / W(first(SCD)[bd]))
+    end
+    _res_each(Base.tail(F), Base.tail(FF), SCD === nothing ? nothing : Base.tail(SCD),
+              SCS === nothing ? nothing : Base.tail(SCS), qd, sbase, si, sj, sk, nd, kz, bd, bs)
+end
+@kernel function _rect_restrictN_k!(F, FF, SCD, SCS, @Const(jobs), @Const(cellstart),
+                                    njobs::Int32, nd::Int32, stride::Int32, kz::Int32)
+    t = @index(Global)
+    b, ri, rj, rk = _job_decode(jobs, cellstart, njobs, Int32(t) - Int32(1))
+    @inbounds begin
+        di = jobs[b+3] + ri; dj = jobs[b+4] + rj; dk = jobs[b+5] + rk
+        si = jobs[b+6] + Int32(2) * ri; sj = jobs[b+7] + Int32(2) * rj; sk = jobs[b+8] + Int32(2) * rk
+        bd = jobs[b+1]; bs = jobs[b+2]
+        qd = (bd - Int32(1)) * stride + (dk * nd + dj) * nd + di + Int32(1)
+        _res_each(F, FF, SCD, SCS, qd, (bs - Int32(1)) * stride, si, sj, sk, nd, kz, bd, bs)
+    end
+end
+
+_nonempty(t::Tuple) = Tuple(x for x in t if !isempty(x))

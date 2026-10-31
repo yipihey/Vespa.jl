@@ -360,14 +360,19 @@ end
 
 "Max |v|+c_s over all active cells of a level (0 for an empty level)."
 function max_signal(lev::Level, γ::Real)
+    out = _signal_cells(lev, γ)
+    return out === nothing ? 0.0f0 : maximum(out)        # device reduction
+end
+# per-active-cell |v|+c_s on the device (no reduction, no host sync); nothing if empty
+function _signal_cells(lev::Level, γ::Real)
     n = length(lev.live) * _nact(lev)
-    n == 0 && return 0.0f0
+    n == 0 && return nothing
     out = device_zeros(lev.be, Float32, (n,))
     _max_signal_k!(lev.be)(out, lev.D, lev.S1, lev.S2, lev.S3, lev.Ge, lev.live_d,
                            lev.Dsc, lev.Ssc, lev.Gsc,
                            Float32(γ), Int32(lev.B), Int32(lev.ng), Int32(lev.nd),
                            Int32(lev.stride), Val(lev.dim); ndrange = n)
-    return maximum(out)                       # device reduction
+    return out
 end
 
 """

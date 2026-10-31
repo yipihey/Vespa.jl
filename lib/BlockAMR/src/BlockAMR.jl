@@ -190,4 +190,8 @@ include("cooling.jl")      # tabulated Grackle (Cloudy-mode) cooling + UVB heati
 include("movie.jl")        # first-class movies: GPU derived fields → 16-bit PNG + manifest
 include("diagnostics.jl")  # on-device leaf reductions (mass in temperature bands, centroids)
 
+function __init__()
+    _FUSED[] = get(ENV, "BAM_FUSED", "1") != "0"    # runtime switches: never baked into the cache
+end
+
 end # module BlockAMR

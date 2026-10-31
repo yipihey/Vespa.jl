@@ -15,3 +15,20 @@ for bc in (:periodic, :outflow), physics in (:hydro, :mhd)
         @test new == ref
     end
 end
+
+# fused multi-field ghost fill / restriction ≡ the per-field launch train, bitwise
+for BE in BACKENDS, bc in (:periodic, :outflow), physics in (:hydro, :mhd)
+    res = Dict{Bool,Any}()
+    for fused in (false, true)
+        BA._FUSED[] = fused
+        h = static2d(; nbase = (64, 32), kids = KIDS_ALL, bc, physics, backend = BE,
+                     divb = physics === :mhd ? :ct : :glm)
+        setall!(h, x -> (1 + 0.3sin(2π * x[1]) * cos(2π * x[2]), 0.2, -0.1, 0.0, 1 + 0.2x[2]))
+        for l in 0:1; fill_ghosts!(h, l; θ = 0.25f0, buf = :R); end
+        restrict_level!(h, 1)
+        res[fused] = [Array(getfield(h.levels[l + 1], f)) for l in 0:1
+                      for f in (:D, :S1, :S2, :S3, :Tau, :Ge, :Bx, :By, :Bz, :Psi) if !isempty(getfield(h.levels[l + 1], f))]
+    end
+    BA._FUSED[] = true
+    @test res[true] == res[false]
+end

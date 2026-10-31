@@ -94,11 +94,17 @@ binary subcycling every level satisfies its CFL iff λ ≤ cfl/smax_l for all l,
 λ = cfl / max_l(smax_l).  Stored in `hier.λ`.
 """
 function compute_lambda!(hier::AMRHierarchy)
-    smax = 0.0f0
+    # every level's max reduced ON THE DEVICE into a 1-element array; one host
+    # copy for all levels (a reduction per level was one host sync each)
+    parts = Any[]
     for l in 0:length(hier.levels)-1
-        isempty(hier.levels[l+1].live) && continue
-        smax = max(smax, _signal(hier, hier.levels[l+1]))
+        lev = hier.levels[l+1]
+        isempty(lev.live) && continue
+        out = hier.physics === :mhd ? _mhd_signal_cells(hier, lev) : _signal_cells(lev, hier.gamma)
+        out === nothing && continue
+        r = similar(out, 1); maximum!(r, out); push!(parts, r)
     end
+    smax = isempty(parts) ? 0.0f0 : Float32(maximum(Array(reduce(vcat, parts))))
     # BAM_SMAXCAP (absolute signal cap, code units; 0 = off): cells beyond the
     # cap are numerical garbage the epilogue/reflux guards keep frozen — they
     # must not strangle the global dτ (the observed 470× collapse), or the

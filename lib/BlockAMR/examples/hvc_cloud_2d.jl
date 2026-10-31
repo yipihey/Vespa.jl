@@ -15,7 +15,7 @@
 # Knobs (env): HVC_OUT (dir), HVC_TABLE (dir of an exported Cloudy table),
 #   HVC_BETA (Inf | number), HVC_NX (base cells along x, default 256), HVC_LMAX (4),
 #   HVC_TEND (in cloud-crushing times, 6), HVC_SNAP (snapshots per t_cc, 4),
-#   HVC_Z (Z/Z☉, 0.3), HVC_BACKEND (cuda), HVC_T (Float64), HVC_DTHRESH (refine
+#   HVC_Z (Z/Z☉, 0.3), HVC_BACKEND (cuda), HVC_T (Float32; Float64 only by exception), HVC_DTHRESH (refine
 #   above this × halo density, 3), HVC_LX, HVC_LY (box in cloud radii, 32 × 8),
 #   HVC_X0 (cloud centre x in radii, 4), HVC_MAXSTEPS, HVC_WALL (hours, stop+save),
 #   HVC_COOL_T (cooling arithmetic, Float32 | Float64; default Float32),
@@ -38,7 +38,7 @@ const TEND    = parse(Float64, env("HVC_TEND", 6.0))
 const NSNAP   = parse(Float64, env("HVC_SNAP", 4.0))
 const ZREL    = parse(Float64, env("HVC_Z", 0.3))
 const BE      = Symbol(env("HVC_BACKEND", "cuda"))
-const TT      = env("HVC_T", "Float64") == "Float32" ? Float32 : Float64
+const TT      = env("HVC_T", "Float32") == "Float64" ? Float64 : Float32   # Float64 only by exception
 const DTHR    = parse(Float64, env("HVC_DTHRESH", 3.0))
 const LX      = parse(Float64, env("HVC_LX", 32.0)); const LY = parse(Float64, env("HVC_LY", 8.0))
 const X0      = parse(Float64, env("HVC_X0", 4.0))
