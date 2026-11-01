@@ -398,6 +398,15 @@ tables and C/F registers are rebuilt.
 function regrid!(hier::AMRHierarchy, pol::BlockRefinementPolicy; compact::Bool = true,
                  parts = nothing, mass_code = 0.0, jeans_coef = 0.0, jeans_efix = 0.0,
                  static_parts = nothing, static_mass_code = 0.0)
+    # CT: the R ghost rings hold scratch after a level step (ct.jl: the pre-update lanes
+    # live in the O pools, which the swap makes R) and the new blocks' prolongation
+    # stencil reads one cell into them: fill them, coarse → fine, while the tables are
+    # still current.  (Hydro / GLM rings hold values of an earlier step here.)
+    if any(isct, hier.levels)
+        for l in 0:length(hier.levels)-1
+            isempty(hier.levels[l + 1].live) || fill_ghosts!(hier, l; θ = 0.0f0, buf = :R)
+        end
+    end
     Ltarget = min(pol.lmax, hier.Lcap)
     nbuf = pol.nbuf
     @assert nbuf <= hier.ng "nbuf=$nbuf > ng=$(hier.ng): device dilation reads the ghost frame"

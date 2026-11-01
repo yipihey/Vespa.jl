@@ -32,7 +32,9 @@ function checkpoint_state(hier::AMRHierarchy; extra = NamedTuple())
         gf = ntuple(_ -> Array{T}(undef, na, nl), nf)
         fsp = [Array{UInt16}(undef, na, nl) for _ in 1:lev.nsp]
         fphi = Array{Float32}(undef, na, nl)
-        hostf = map(Array, (gasfields(lev)..., (ismhd(lev) ? mfields(lev) : ())...))
+        # CT has no ψ pool: its column is written as zeros (file format unchanged)
+        hostf = map(a -> isempty(a) ? zeros(T, lev.cap * lev.stride) : Array(a),
+                    (gasfields(lev)..., (ismhd(lev) ? mfields(lev) : ())...))
         hsp = map(Array, lev.sp)
         hphi = Array(lev.phi)
         live = lev.live
@@ -185,7 +187,7 @@ function load_checkpoint(path::AbstractString; backend::Symbol = :cpu,
         dbg && (@printf("load: scattered L%d (%d blocks) in %.1fs\n", l, length(smap), _t()-ts); flush(stdout))
         tc = _t()
         for (dev, hh) in zip((gasfields(lev)..., (nf == 10 ? mfields(lev) : ())...), hosts)
-            copyto!(dev, hh)
+            isempty(dev) || copyto!(dev, hh)
         end
         for (t, sp) in enumerate(lev.sp)
             copyto!(sp, hsp[t])

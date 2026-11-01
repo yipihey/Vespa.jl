@@ -95,6 +95,8 @@ gasfields_o(lev::Level) = (lev.Do, lev.S1o, lev.S2o, lev.S3o, lev.Tauo, lev.Geo)
 "MHD pools (Bx, By, Bz, ψ) — zero-size in hydro runs; data motion skips empty pools."
 mfields(lev::Level)     = (lev.Bx, lev.By, lev.Bz, lev.Psi)
 mfields_o(lev::Level)   = (lev.Bxo, lev.Byo, lev.Bzo, lev.Psio)
+"The MHD pools for kernels that READ ψ: CT has no ψ pool (ψ ≡ 0), Bz stands in, unused."
+_mfields_rd(lev::Level) = isempty(lev.Psi) ? (lev.Bx, lev.By, lev.Bz, lev.Bz) : mfields(lev)
 ismhd(lev::Level)       = !isempty(lev.Bx)
 "CT face pools (FBx, FBy) — zero-size unless divb = :ct."
 cfields(lev::Level)     = (lev.FBx, lev.FBy)
@@ -136,6 +138,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
     zu()  = (gravity_only ? device_zeros(be, UInt16, (0,)) : device_zeros(be, UInt16, (cap0 * stride,)))
     zf()  = (gravity_only ? device_zeros(be, Float32, (0,)) : device_zeros(be, Float32, (cap0 * stride,)))
     mz()  = mhd ? zed() : device_zeros(be, T, (0,))
+    pz()  = (mhd && !ct) ? zed() : device_zeros(be, T, (0,))    # ψ: GLM only
     cz()  = ct ? zed() : device_zeros(be, T, (0,))
     ones32(n) = to_device(be, ones(Float32, n), Float32)
     lev = Level{typeof(zed()),typeof(zu()),typeof(ones32(1)),typeof(to_device(be, Int32[], Int32))}(
@@ -151,7 +154,7 @@ function Level(; l::Int, B::Int, ng::Int = 2, nbase::NTuple{3,Int}, be,
         device_zeros(be, Float32, (cap0 * stride,)),
         device_zeros(be, Float32, (0,)),     # dm: lazy — only levels that deposit pay for it
         to_device(be, Int32[], Int32), Dict{Symbol,Any}(), dim, per,
-        (mz() for _ in 1:8)..., ones32(cap0), (cz() for _ in 1:4)...)
+        mz(), mz(), mz(), pz(), mz(), mz(), mz(), pz(), ones32(cap0), (cz() for _ in 1:4)...)
     # out-of-core: pools are born host-preferred so allocation + checkpoint
     # restore land in host RAM (not device) — prefetch_level! pulls the working
     # set to the GPU per advance.  No-op unless memory_mode() === :managed.
@@ -499,6 +502,7 @@ end
 function init_base_level!(hier::AMRHierarchy)
     lev = hier.levels[1]
     nb  = ntuple(d -> hier.nbase[d] ÷ _Bax(lev, d), 3)
+    reserve!(lev, prod(nb))      # the base level's size is known: one exact allocation
     for k in 0:nb[3]-1, j in 0:nb[2]-1, i in 0:nb[1]-1
         org = (UInt128(i * hier.B), UInt128(j * hier.B), UInt128(k * _Bax(lev, 3)))
         s = alloc_slot!(lev)

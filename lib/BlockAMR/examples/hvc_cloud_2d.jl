@@ -14,6 +14,7 @@
 # Run (GPU):  julia --project=lib/BlockAMR/test lib/BlockAMR/examples/hvc_cloud_2d.jl
 # Knobs (env): HVC_OUT (dir), HVC_TABLE (dir of an exported Cloudy table),
 #   HVC_BETA (Inf | number), HVC_NX (base cells along x, default 256), HVC_LMAX (4),
+#   HVC_B (block size, 16),
 #   HVC_TEND (in cloud-crushing times, 6), HVC_SNAP (snapshots per t_cc, 4),
 #   HVC_Z (Z/Z☉, 0.3), HVC_BACKEND (cuda), HVC_T (Float32; Float64 only by exception), HVC_DTHRESH (refine
 #   above this × halo density, 3), HVC_LX, HVC_LY (box in cloud radii, 32 × 8),
@@ -36,6 +37,7 @@ const TABLE   = env("HVC_TABLE", expanduser("~/data/grackle_tables/FG2011_z0"))
 const BETA    = parse(Float64, env("HVC_BETA", "Inf"))
 const NX      = parse(Int, env("HVC_NX", 256))
 const LMAX    = parse(Int, env("HVC_LMAX", 4))
+const NB      = parse(Int, env("HVC_B", 16))                # block size (divides NX and NY)
 const TEND    = parse(Float64, env("HVC_TEND", 6.0))
 const NSNAP   = parse(Float64, env("HVC_SNAP", 4.0))
 const ZREL    = parse(Float64, env("HVC_Z", 0.3))
@@ -100,7 +102,7 @@ const TCC = sqrt(χ) * 1.0 / VW                          # crushing time, code (
 # ── hierarchy: elongated wind tunnel ──────────────────────────────────────────
 const NY = round(Int, NX * LY / LX)
 inflow = Dict((1, :lo) => (RH, VW, 0.0, 0.0, PH, 0.0, B0, 0.0))
-hier = AMRHierarchy(; nbase = (NX, NY), B = 16, box = LX, backend = BE, T = TT, cap0 = 64,
+hier = AMRHierarchy(; nbase = (NX, NY), B = NB, box = LX, backend = BE, T = TT, cap0 = 64,
                     physics = :mhd, divb = :ct, riemann = :hlld, cfl = 0.4,
                     bc = ((:inflow, :outflow), :periodic), inflow, Lcap = LMAX,
                     smallr = SMALLR * RH, smallc = 1e-4, shock_switch = SHOCKSW)

@@ -629,7 +629,7 @@ function _mhd_signal_cells(hier::AMRHierarchy, lev::Level)
     T = eltype(lev.D)
     out = device_zeros(lev.be, T, (n,))
     γ, sr, pfl = _mpar(hier); dev, η1, _ = _mde(hier)
-    _mhd_signal_k!(lev.be)(out, gasfields(lev)..., mfields(lev)..., lev.live_d,
+    _mhd_signal_k!(lev.be)(out, gasfields(lev)..., _mfields_rd(lev)..., lev.live_d,
                            lev.Dsc, lev.Ssc, lev.Esc, lev.Gsc, γ, sr, pfl, η1, dev,
                            Int32(hier.mhd.sigdims),
                            Int32(lev.B), Int32(lev.ng), Int32(lev.nd), Int32(lev.stride),
@@ -790,7 +790,8 @@ end
             S2[idx] = _narrow(eltype(S2), q[3] / T(ssc))
             S3[idx] = _narrow(eltype(S3), q[4] / T(ssc))
             E[idx]  = _narrow(eltype(E), q[5] / T(esc))
-            Bx[idx] = q[6]; By[idx] = q[7]; Bz[idx] = q[8]; Ps[idx] = q[9]
+            Bx[idx] = q[6]; By[idx] = q[7]; Bz[idx] = q[8]
+            ct || (Ps[idx] = q[9])                 # CT has no ψ pool (_mfields_rd)
             Ge[idx] = _narrow(eltype(Ge), (DE ? gnew :
                               cons2prim(q, gamma, smallr, pfl)[5] / (gamma - one(T))) / T(gsc))
         end
@@ -839,7 +840,7 @@ function _mhd_reflux_cells!(hier::AMRHierarchy, l::Int, λc::Real)
     ng_ == 0 && return nothing
     T = eltype(lev.D); γ, sr, pfl = _mpar(hier); dev, η1, η2 = _mde(hier)
     reg = _tabt_any(lev, :cfreg)
-    _mhd_reflux_apply_k!(lev.be)(gasfields(plev)..., mfields(plev)...,
+    _mhd_reflux_apply_k!(lev.be)(gasfields(plev)..., _mfields_rd(plev)...,
                                  plev.Dsc, plev.Ssc, plev.Esc, plev.Gsc,
                                  _tabi(lev, :cf), reg, _tabi(lev, :cfperm), _tabi(lev, :cfgs),
                                  T(λc), γ, sr, pfl, η1, η2, hier.mhd.ct, dev,
@@ -862,7 +863,7 @@ function encode_mhd_from_host!(lev::Level, hD, hS1, hS2, hS3, hE, hGe, hBx, hBy,
     encode_from_host!(lev, hD, hS1, hS2, hS3, hE, hGe)
     T = eltype(lev.D)
     for (dev, h) in zip(mfields(lev), (hBx, hBy, hBz, hPsi))
-        copyto!(dev, convert(Array{T}, h))
+        isempty(dev) || copyto!(dev, convert(Array{T}, h))
     end
     return nothing
 end
