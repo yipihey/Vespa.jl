@@ -102,7 +102,7 @@ const TCC = sqrt(χ) * 1.0 / VW                          # crushing time, code (
 # ── hierarchy: elongated wind tunnel ──────────────────────────────────────────
 const NY = round(Int, NX * LY / LX)
 inflow = Dict((1, :lo) => (RH, VW, 0.0, 0.0, PH, 0.0, B0, 0.0))
-hier = AMRHierarchy(; nbase = (NX, NY), B = NB, box = LX, backend = BE, T = TT, cap0 = 64,
+hier = AMRHierarchy(; nbase = (NX, NY), B = NB, box = LX, backend = BE, T = TT, cap0 = max(1, 64 * 16^2 ÷ NB^2),
                     physics = :mhd, divb = :ct, riemann = :hlld, cfl = 0.4,
                     bc = ((:inflow, :outflow), :periodic), inflow, Lcap = LMAX,
                     smallr = SMALLR * RH, smallc = 1e-4, shock_switch = SHOCKSW)
