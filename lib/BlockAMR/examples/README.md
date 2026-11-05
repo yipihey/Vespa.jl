@@ -52,8 +52,9 @@ HVC_OUT=runs/test-gpu HVC_NX=256 HVC_LMAX=4 HVC_BETA=100 HVC_SMALLR=1e-2 HVC_TEN
   julia --project=lib/BlockAMR/examples lib/BlockAMR/examples/hvc_cloud_2d.jl
 ```
 
-A run ends with a `done:` line and leaves `timeseries.csv`, `params.toml`, `snap/`, `run.log`
-if you redirect to it, and `final.ckpt`.
+A run ends with a `done:` line and leaves `timeseries.csv`, `params.toml`, `snap/` and
+`final.ckpt`. On our machine these tests take about 1 to 1.5 minutes, mostly compilation.
+Installing the packages takes about 2.5 minutes the first time.
 
 ### The runs we have done
 
@@ -120,6 +121,40 @@ movie_video("runs/uni-b100/movie", "runs/uni-b100/share")
 ```
 
 Details are in `../tools/movie/README.md`.
+
+## Cooling and chemistry
+
+**What this problem uses.** The driver uses tabulated Grackle (Cloudy) cooling and UV heating,
+in ionization equilibrium. You can change the metallicity (`HVC_Z`, in solar units) and the
+table. For the self-shielded table, run the export on `CloudyData_UVB=FG2011_shielded.h5` from
+the same URL and point `HVC_TABLE` at the result.
+
+**Non-equilibrium chemistry does not work with this driver yet. Do not pass `chem =` to a
+2-D or MHD run.** The H + H₂ network from `ChemistryKernels` is connected to BlockAMR, but only
+for 3-D hydro runs:
+
+- `chem_level!` assumes 3-D blocks, so on a 2-D level it would address the wrong cells, and it
+  would not raise an error.
+- The MHD and constrained-transport kernels do not advect species.
+- The network has no tabulated metal cooling above 10⁴ K, which this problem depends on in the
+  1e6 K halo and the mixing layers.
+- It is far slower: about 1 Mcell/s in Float32 on our GPU, against hundreds of Mcell/s for the
+  table.
+
+**What you can run today:**
+
+- One-zone chemistry on its own, which is a good way to compare the network with the table on
+  HVC conditions: see the quick start in the
+  [ChemistryKernels README](https://github.com/yipihey/ChemistryKernels.jl) and its
+  `docs/integration.md`.
+- Chemistry in a 3-D hydro hierarchy: create it with `nsp = 2` (HII, H₂) and pass
+  `chem = (; a_value, density_units, length_units, time_units)` to `advance_hierarchy!`.
+  `test/test_chem.jl` is a working example of `chem_level!`. The `advance_hierarchy_graph!` path
+  does not run chemistry.
+
+**What this problem would need:** species advection in `ct.jl` and `mhd.jl`, including the
+coarse/fine flux corrections; a 2-D `chem_level!`; and a way to combine the network with
+tabulated metal cooling without counting primordial cooling twice.
 
 ## Known issues
 
