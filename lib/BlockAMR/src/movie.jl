@@ -518,6 +518,111 @@ end
 read_movie_manifest(dir::AbstractString) = _jparse(read(joinpath(dir, "manifest.json"), String))
 
 """
+    movie_video(src, dst; fields = all, every = 1, frames = all, downsample = 1, crf = 24,
+                crfs = Dict(:divv => 32, :wz => 32, :Jz => 32, :absw => 32, :absJ => 32), gop = 16,
+                floors = Dict(:absw => 3.0, :absJ => 3.0), tailratio = 30.0, asinh_scale = 10.0,
+                cpu_used = 4, threads = 8, title = nothing, ffmpeg = "ffmpeg")
+
+Encode a PNG movie directory as a compressed copy for sharing: 10-bit VP9 luma, one
+IVF file per `gop` frames (`dst/<field>/NNNNN.ivf`, each starting on a keyframe), read
+by the same player through WebCodecs.  Lossy: values are for looking, keep the PNG
+movie as the master (readouts show ≈).  Needs `ffmpeg` with libvpx-vp9.
+
+Each field gets one fixed range over the kept frames, since a per-frame range makes
+the picture flicker and defeats motion prediction.  `floors` (dex below the peak)
+clips log fields whose low-level structure is what costs the bits.  Signed fields
+with heavy tails (max|v| / median|v| > `tailratio`) are coded in asinh(v/a) with `a` =
+`asinh_scale` × that median (larger: cheaper, less weak structure), or 1024 levels spread over the shocks would erase weak structure.
+`crfs` overrides `crf` per field: the wave-dominated fields cost 10-30× the smooth ones,
+so the defaults spend less on them.  No-data pixels are not preserved.  Returns `(; nfiles, bytes, maxbytes, fields)`.
+"""
+function movie_video(src::AbstractString, dst::AbstractString; fields = nothing, every::Int = 1,
+                     frames = nothing, downsample::Int = 1, crf::Int = 24,
+                     crfs = Dict(:divv => 32, :wz => 32, :Jz => 32, :absw => 32, :absJ => 32), gop::Int = 16,
+                     floors = Dict(:absw => 3.0, :absJ => 3.0), tailratio::Real = 30.0, asinh_scale::Real = 10.0,
+                     cpu_used::Int = 4, threads::Int = 8, title = nothing, ffmpeg::AbstractString = "ffmpeg")
+    m = read_movie_manifest(src)
+    get(get(m, "pack", Dict()), "per", 1) == 1 || error("movie_video: source is packed")
+    keep = frames === nothing ? collect(0:every:m["nframes"]-1) : collect(Int, frames)
+    fl = fields === nothing ? m["fields"] : [f for f in m["fields"] if Symbol(f["key"]) in Symbol.(fields)]
+    isempty(fl) && error("movie_video: no fields selected")
+    ds = downsample; W0 = m["nx"]; W = (m["nx"] ÷ ds) & ~1; H = (m["ny"] ÷ ds) & ~1      # VP9 4:2:0: even
+    N = 1023; chroma = fill(UInt16(512), W * H ÷ 2)
+    out_fields = Any[]; nbytes = Threads.Atomic{Int}(0); biggest = Threads.Atomic{Int}(0)
+    groups = [keep[i:min(i + gop - 1, length(keep))] for i in 1:gop:length(keep)]
+    # one value per pixel, in the field's stored quantity
+    decode(f, k, c) = (lh = f["lohi"][k + 1]; lh[1] + (Int(c) - 1) / 65534 * (lh[2] - lh[1]))
+    for f in fl
+        key = f["key"]; d = joinpath(dst, f["dir"]); mkpath(d)
+        q = get(crfs, Symbol(key), crf)
+        lohi = [f["lohi"][k + 1] for k in keep]
+        lo = minimum(p -> p[1], lohi); hi = maximum(p -> p[2], lohi)
+        enc = f["enc"]; a = 0.0
+        if enc == "log"
+            fl_ = get(floors, Symbol(key), nothing)
+            fl_ === nothing || (lo = max(lo, hi - fl_))
+        elseif key != "level"
+            mid = keep[(length(keep) + 1) ÷ 2]
+            cs, _, _ = _read_png_codes(joinpath(src, f["dir"], Printf.@sprintf("%05d.png", mid)))
+            vs = sort!(abs.(decode.(Ref(f), mid, view(cs, 1:64:length(cs)))))
+            med = vs[(length(vs) + 1) ÷ 2]; top = max(abs(lo), abs(hi))
+            if med > 0 && top / med > tailratio
+                enc = "asinh"; a = Float64(asinh_scale * med); lo = asinh(lo / a); hi = asinh(hi / a)
+            end
+        end
+        hi > lo || (hi = lo + 1)
+        forward = enc == "asinh" ? (v -> asinh(v / a)) : identity
+        Threads.@threads for g in eachindex(groups)
+            path = joinpath(d, Printf.@sprintf("%05d.ivf", g - 1))
+            cmd = `$ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p10le -s $(W)x$(H) -r 20
+                   -i - -c:v libvpx-vp9 -profile:v 2 -crf $q -b:v 0 -g $(length(groups[g])) -deadline good
+                   -cpu-used $cpu_used -row-mt 1 -threads $threads -tile-columns 3 -f ivf $path`
+            open(cmd, "w") do io
+                Y = Vector{UInt16}(undef, W * H)
+                for k in groups[g]
+                    pix, w0, _ = _read_png_codes(joinpath(src, f["dir"], Printf.@sprintf("%05d.png", k)))
+                    lh = f["lohi"][k + 1]; l0 = Float64(lh[1]); sc = (Float64(lh[2]) - l0) / 65534
+                    @inbounds for r in 0:H-1                     # row 0 = top (the PNG order)
+                        y = H - 1 - r
+                        for x in 0:W-1
+                            c = if ds == 1
+                                Float64(pix[y * w0 + x + 1])
+                            else
+                                acc = 0; n = 0
+                                for b in 0:ds-1, e in 0:ds-1
+                                    cq = pix[(y * ds + b) * w0 + x * ds + e + 1]
+                                    cq != 0 && (acc += Int(cq); n += 1)
+                                end
+                                n == 0 ? 1.0 : acc / n
+                            end
+                            v = forward(l0 + (c - 1) * sc)
+                            Y[r * W + x + 1] = round(UInt16, clamp((v - lo) / (hi - lo), 0.0, 1.0) * N)
+                        end
+                    end
+                    write(io, Y); write(io, chroma)
+                end
+            end
+            Threads.atomic_add!(nbytes, filesize(path)); Threads.atomic_max!(biggest, filesize(path))
+        end
+        cv(p) = enc == "asinh" ? [asinh(p[1] / a), asinh(p[2] / a)] : [p[1], p[2]]
+        nf = merge(f, Dict{String,Any}("enc" => enc, "lohi" => [[lo, hi] for _ in keep],
+                                       "prange" => [(p = f["prange"][k + 1]; p[1] === nothing ? p : cv(p)) for k in keep]))
+        enc == "asinh" && (nf["asinh"] = a)
+        push!(out_fields, nf)
+    end
+    out = Dict{String,Any}(m)
+    out["nx"] = W; out["ny"] = H; out["nframes"] = length(keep)
+    out["times"] = [m["times"][k + 1] for k in keep]; out["fields"] = out_fields
+    delete!(out, "pack")
+    out["video"] = Dict("codec" => "vp09.02.51.10", "bits" => 10, "gop" => gop, "pattern" => "%05d.ivf")
+    title === nothing || (out["title"] = String(title))
+    write(joinpath(dst, "manifest.json"), _js(out))
+    cp(PLAYER_HTML, joinpath(dst, "player.html"); force = true)
+    install_player(dst)
+    return (; nfiles = length(groups) * length(fl), bytes = nbytes[], maxbytes = biggest[], fields = length(fl))
+end
+
+"""
     movie_bundle(src, dst; fields = all, every = 1, frames = all, downsample = 1,
                  maxfiles = 480, maxsheet = 4096, title = nothing)
 

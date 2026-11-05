@@ -81,7 +81,7 @@ export ct_level!, set_ct_faces_from_Az!, max_divb_ct
 export CoolingUnits, CloudyCooling, load_cloudy_cooling, cool_level!, cloudy_temperature,
        cloudy_mu, cloudy_edot, cloudy_isobar
 export leaf_moments
-export MovieWriter, write_frame!, MOVIE_CATALOG, movie_bundle, read_movie_manifest, install_player
+export MovieWriter, write_frame!, MOVIE_CATALOG, movie_bundle, movie_video, read_movie_manifest, install_player
 export memory_mode, set_memory_mode!, memory_report
 export prefetch_level!, advise_level_host!, advise_all_host!, evict_level!, evict_gas_pools!,
        prefetch_grav!, evict_grav!, set_stream_grav!

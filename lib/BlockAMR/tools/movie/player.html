@@ -176,6 +176,79 @@ function fileOf(fi, k) {           // (url, tile index) of frame k of field fi
   return { url: BASE + fi.dir + "/" + name, tile: k % per, file: n };
 }
 
+// ── video movies (movie_video): one IVF file per keyframe group, WebCodecs ─────
+// A group is decoded as a unit (a flush demands a keyframe next).  Frames become
+// the same two-byte code textures as the PNG path (R = code >> 8, G = code & 255),
+// so shader, ranges and readout are shared.
+function ivfChunks(buf) {
+  const d = new DataView(buf), out = []; let p = d.getUint16(6, true);
+  while (p + 12 <= buf.byteLength) { const n = d.getUint32(p, true); out.push(new Uint8Array(buf, p + 12, n)); p += 12 + n }
+  return out;
+}
+class VideoSource {
+  constructor(panel, fi) {
+    this.p = panel; this.fi = fi; this.want = new Set(); this.running = false; this.dead = false;
+    const N = (1 << M.video.bits) - 1; this.lut = new Uint16Array(N + 1);
+    for (let y = 0; y <= N; y++) { const c = 1 + Math.round(y * 65534 / N); this.lut[y] = (c >> 8) | ((c & 255) << 8) }
+    this.rg = new Uint8Array(2 * M.nx * M.ny); this.rg16 = new Uint16Array(this.rg.buffer);
+  }
+  key(k) { return this.fi.key + "/" + k }
+  request(k) { this.want.add(k); if (!this.running) this.pump() }
+  clear() { this.want.clear() }
+  close() { this.dead = true; this.want.clear() }
+  // frames one panel's texture budget holds at once
+  get window() { return Math.max(2, Math.floor(this.p.budget * 0.8 / (2 * M.nx * M.ny)) - 1) }
+  async pump() {
+    this.running = true;
+    try {
+      for (;;) {
+        const need = [...this.want].filter(k => !this.p.texs.has(this.key(k)));
+        if (this.dead || !need.length) break;
+        await this.decodeGroup(Math.min(...need));
+      }
+    } catch (e) { console.error(e); showErr(String(e)) }
+    this.running = false;
+  }
+  async decodeGroup(lo) {
+    const G = M.video.gop, g = Math.floor(lo / G), name = M.video.pattern.replace("%05d", String(g).padStart(5, "0"));
+    const chunks = ivfChunks(await (await getBlob(BASE + this.fi.dir + "/" + name)).arrayBuffer());
+    const hi = lo + this.window - 1; let k = g * G, chain = Promise.resolve(), failure = null;
+    const dec = new VideoDecoder({
+      output: f => {
+        const i = k++;
+        if (i < lo || i > hi || this.dead || this.p.fi !== this.fi) { f.close(); return }
+        chain = chain.then(() => this.upload(f, i));
+      },
+      error: e => { failure = e },
+    });
+    dec.configure({ codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny });
+    chunks.forEach((c, i) => dec.decode(new EncodedVideoChunk({ type: i === 0 ? "key" : "delta", timestamp: (g * G + i) * 1000, data: c })));
+    await dec.flush(); await chain; dec.close();
+    if (failure) throw failure;
+    // a frame the group could not supply must not be asked for forever
+    if (lo >= k) this.want.delete(lo);
+    draw();
+  }
+  async upload(f, i) {
+    try {
+      const size = f.allocationSize();
+      if (!this.buf || this.buf.byteLength < size) this.buf = new ArrayBuffer(size);
+      const lay = await f.copyTo(this.buf), W = M.nx, H = M.ny, lut = this.lut, out = this.rg16;
+      const hdr = M.video.bits > 8, stride = hdr ? lay[0].stride >> 1 : lay[0].stride, off = hdr ? lay[0].offset >> 1 : lay[0].offset;
+      const Y = hdr ? new Uint16Array(this.buf) : new Uint8Array(this.buf);
+      for (let r = 0, q = 0; r < H; r++) { const s = off + r * stride; for (let x = 0; x < W; x++) out[q++] = lut[Y[s + x]] }
+      const p = this.p, gl = p.gl, tex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, W, H, 0, gl.RG, gl.UNSIGNED_BYTE, this.rg);
+      const bytes = 2 * W * H, key = this.key(i), old = p.texs.get(key);
+      if (old) { gl.deleteTexture(old.tex); p.cache -= old.bytes }
+      p.texs.set(key, { tex, bytes, used: performance.now() }); p.cache += bytes; p.evict(); draw();
+    } finally { f.close() }
+  }
+}
+
 // ── one panel: own WebGL2 context, texture LRU, controls, colorbar ─────────
 const VS = `#version 300 es
 in vec2 p; void main() { gl_Position = vec4(p, 0., 1.); }`;
@@ -183,7 +256,7 @@ const FS = `#version 300 es
 precision highp float; precision highp int;
 uniform sampler2D tex; uniform sampler2D lut;
 uniform ivec2 img; uniform ivec2 tileOff; uniform vec2 canvas; uniform vec3 vw; // cx, cy, scale
-uniform vec2 lohi; uniform int enc; uniform int scl; uniform vec2 sr; uniform float lth;
+uniform vec2 lohi; uniform int enc; uniform float asa; uniform int scl; uniform vec2 sr; uniform float lth;
 uniform int rev; uniform vec3 nodata; uniform vec3 bg; uniform vec2 cross; uniform int showCross;
 out vec4 o;
 float sym(float v) { return sign(v) * log(1. + abs(v) / lth) / log(10.); }
@@ -198,6 +271,7 @@ void main() {
   else {
     float x = lohi.x + (code - 1.) / 65534. * (lohi.y - lohi.x);
     float s; bool ok = true;
+    if (enc == 2) x = asa * .5 * (exp(x) - exp(-x));     // asinh-coded: back to the value
     if (enc == 1) { if (scl == 1) s = x; else { float v = pow(10., x); s = scl == 2 ? sym(v) : v; } }
     else { if (scl == 1) { ok = x > 0.; s = log(max(x, 1e-38)) / log(10.); } else s = scl == 2 ? sym(x) : x; }
     if (!ok) col = nodata;
@@ -263,7 +337,7 @@ class Panel {
     const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
     const loc = gl.getAttribLocation(pr, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    this.U = {}; for (const n of ["tex", "lut", "img", "tileOff", "canvas", "vw", "lohi", "enc", "scl", "sr", "lth", "rev", "nodata", "bg", "cross", "showCross"])
+    this.U = {}; for (const n of ["tex", "lut", "img", "tileOff", "canvas", "vw", "lohi", "enc", "asa", "scl", "sr", "lth", "rev", "nodata", "bg", "cross", "showCross"])
       this.U[n] = gl.getUniformLocation(pr, n);
     this.lut = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.lut);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -320,7 +394,7 @@ class Panel {
     $(".field", this.el).value = key; this.uploadLut(); this.sync();
   }
   defaults(fi) {
-    const signed = fi.enc === "lin" && fi.key !== "level";
+    const signed = fi.enc !== "log" && fi.key !== "level";
     return { key: fi.key, cmap: CMAPS[fi.cmap] ? fi.cmap : "viridis", rev: false, scale: fi.scale,
              rmode: signed ? "global" : "frame", symm: signed, man: null, lth: null };
   }
@@ -330,6 +404,7 @@ class Panel {
   // value-space (display units) range for frame k from the manifest, or manual
   valRange(pair) {
     const fi = this.fi, f = fi.factor || 1;
+    if (fi.enc === "asinh") return [fi.asinh * Math.sinh(pair[0]) * f, fi.asinh * Math.sinh(pair[1]) * f].sort((a, b) => a - b);
     return fi.enc === "log" ? [10 ** pair[0] * f, 10 ** pair[1] * f] : [pair[0] * f, pair[1] * f].sort((a, b) => a - b);
   }
   range() {
@@ -392,6 +467,10 @@ class Panel {
     const fi = this.fi, f = fileOf(fi, k), key = fi.key + "/" + f.file;
     const t = this.texs.get(key);
     if (t) { t.used = performance.now(); return { t, tile: f.tile } }
+    if (M.video) {
+      if (!this.vs || this.vs.fi !== fi) { this.vs?.close(); this.vs = new VideoSource(this, fi) }
+      this.vs.request(k); return null;
+    }
     if (!this.pending.has(key)) {
       const pr = getBlob(f.url)
         .then(b => createImageBitmap(b, { premultiplyAlpha: "none", colorSpaceConversion: "none" }))
@@ -430,6 +509,7 @@ class Panel {
   }
   render() {
     const gl = this.gl, fi = this.fi, k = Math.min(frame, M.nframes - 1);
+    this.vs?.clear();                     // only what this paint still wants
     const got = this.texFor(k);
     $(".busy", this.el).hidden = !!got;
     // prefetch ahead
@@ -449,8 +529,9 @@ class Panel {
     gl.uniform3f(U.vw, view.cx, view.cy, this.scale());
     const lh = fi.lohi[k] || [0, 1], f = fi.factor || 1;
     if (fi.enc === "log") gl.uniform2f(U.lohi, lh[0] + Math.log10(f), lh[1] + Math.log10(f));
+    else if (fi.enc === "asinh") { gl.uniform2f(U.lohi, lh[0], lh[1]); gl.uniform1f(U.asa, fi.asinh * f) }
     else gl.uniform2f(U.lohi, lh[0] * f, lh[1] * f);
-    gl.uniform1i(U.enc, fi.enc === "log" ? 1 : 0);
+    gl.uniform1i(U.enc, fi.enc === "log" ? 1 : fi.enc === "asinh" ? 2 : 0);
     gl.uniform1i(U.scl, { lin: 0, log: 1, symlog: 2 }[this.s.scale]);
     gl.uniform2f(U.sr, ...this.srange());
     gl.uniform1f(U.lth, this.lthresh());
@@ -478,7 +559,8 @@ class Panel {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       const code = px[0] * 256 + px[1], k = Math.min(frame, M.nframes - 1), lh = fi.lohi[k], f = fi.factor || 1;
       if (code === 0) val = "no data";
-      else { const x = lh[0] + (code - 1) / 65534 * (lh[1] - lh[0]); val = fmt((fi.enc === "log" ? 10 ** x : x) * f) + unit }
+      else { const x = lh[0] + (code - 1) / 65534 * (lh[1] - lh[0]);
+        val = fmt((fi.enc === "log" ? 10 ** x : fi.enc === "asinh" ? fi.asinh * Math.sinh(x) : x) * f) + unit + (M.video ? " (≈)" : "") }
     }
     ro.innerHTML = `<b>${fi.key}</b> = <b>${val}</b> &nbsp;at (${fmt(X)}, ${fmt(Y)})${lu}`;
   }
@@ -640,6 +722,12 @@ async function main() {
       <p><code>python3 -m http.server 8000 -d RUN/movie</code> → open <code>http://localhost:8000/</code></p>
       <p>or keep one player and pick the movie with <code>?m=path/to/movie/</code>.</p></div>`;
     $("#sub").textContent = ""; return;
+  }
+  if (M.video) {
+    const ok = "VideoDecoder" in window && (await VideoDecoder.isConfigSupported({ codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny })
+                                            .catch(() => ({ supported: false }))).supported;
+    if (!ok) { $("#panels").innerHTML = `<div class="msg"><h2>This browser cannot play this movie</h2>
+      <p>It needs WebCodecs with ${M.video.codec} (10-bit VP9) at ${M.nx}×${M.ny}. Current Chrome or Edge should work.</p></div>`; $("#sub").textContent = ""; return }
   }
   document.title = M.title || "Vespa movie";
   $("#title").textContent = M.title || "Vespa movie";

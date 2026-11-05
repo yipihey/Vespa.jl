@@ -7,6 +7,9 @@
 #     bounded seams where stencils read prolonged C/F ghosts); CPU ≡ GPU codes;
 #   * movie_bundle sheets (several frames per PNG, downsampling) decode back to
 #     the per-frame codes; the manifest parses back.
+#   * movie_video (when ffmpeg has libvpx-vp9): every group file decodes to its own
+#     frames in order and the right way up, in the fixed per-field range; heavy-tailed
+#     signed fields are asinh-coded; floors clip.
 using Printf: @sprintf
 using BlockAMR: _write_png_codes, _read_png_codes
 
@@ -87,3 +90,61 @@ for BE in BACKENDS
     end
 end
 end # for BE
+
+@testset "movie_video: VP9 groups decode to their own frames" begin
+    hasvp9 = try
+        occursin("libvpx-vp9", read(pipeline(`ffmpeg -hide_banner -encoders`; stderr = devnull), String))
+    catch
+        false
+    end
+    if !hasvp9
+        @info "ffmpeg with libvpx-vp9 not found: movie_video test skipped"
+    else
+        W, H, nfr = 96, 48, 7
+        src = mktempdir(); dst = mktempdir()
+        # smooth, distinct per frame and asymmetric top/bottom: mix-ups and flips show
+        rho(x, y, k) = -2.0 + 2.0 * (x / W) + 1.5 * (y / H) + 0.25 * k
+        div(x, y, k) = (abs(x - 8k - 20) < 1.5 ? 500.0 : 0.3 * sin(2π * y / H) + 0.02k)
+        mk(key, enc, fun) = begin
+            mkpath(joinpath(src, key)); lohi = Any[]
+            for k in 0:nfr-1
+                v = [fun(x, y, k) for y in 0:H-1 for x in 0:W-1]; lo, hi = extrema(v)
+                codes = [UInt16(1 + round(Int, (q - lo) / (hi - lo) * 65534)) for q in v]
+                _write_png_codes(joinpath(src, key, @sprintf("%05d.png", k)), codes, W, H)
+                push!(lohi, [lo, hi])
+            end
+            Dict{String,Any}("key" => key, "dir" => key, "enc" => enc, "cmap" => "viridis", "scale" => "lin",
+                             "label" => key, "unit" => "code", "factor" => 1.0, "lohi" => lohi, "prange" => lohi)
+        end
+        m = Dict{String,Any}("format" => "vespa-movie-1", "nx" => W, "ny" => H, "nframes" => nfr, "level" => 0,
+                             "times" => [[Float64(k)] for k in 0:nfr-1], "time_labels" => [["t", "code"]],
+                             "extent" => [0.0, 1.0, 0.0, 0.5], "length_unit" => "code", "title" => "t",
+                             "meta" => Dict{String,Any}(), "pack" => Dict("per" => 1, "cols" => 1),
+                             "fields" => Any[mk("rho", "log", rho), mk("divv", "lin", div)])
+        write(joinpath(src, "manifest.json"), BlockAMR._js(m))
+        r = movie_video(src, dst; gop = 3, crf = 10, threads = 2, cpu_used = 8, floors = Dict{Symbol,Float64}())
+        @test r.nfiles == 3 * 2 && r.bytes > 0
+        v = read_movie_manifest(dst)
+        @test v["video"]["bits"] == 10 && v["video"]["gop"] == 3 && !haskey(v, "pack") && v["nframes"] == nfr
+        fr = v["fields"][1]; fd = v["fields"][2]
+        @test fr["enc"] == "log" && fd["enc"] == "asinh" && fd["asinh"] > 0
+        @test all(p -> p == fr["lohi"][1], fr["lohi"])            # one fixed range
+        for g in 0:2
+            path = joinpath(dst, "rho", @sprintf("%05d.ivf", g))
+            raw = read(pipeline(`ffmpeg -hide_banner -loglevel error -i $path -f rawvideo -pix_fmt yuv420p10le -`))
+            ks = (3g):min(3g + 2, nfr - 1); fs = (W * H + W * H ÷ 2) * 2
+            @test length(raw) == length(ks) * fs
+            ys = reinterpret(UInt16, raw); lo, hi = fr["lohi"][1]
+            for (i, k) in enumerate(ks), r_ in 0:H-1, x in 0:W-1
+                q = lo + ys[(i - 1) * (fs ÷ 2) + r_ * W + x + 1] / 1023 * (hi - lo)
+                @test abs(q - rho(x, H - 1 - r_, k)) < 0.05       # row 0 = top
+            end
+        end
+        # a floor clips the range of a log field
+        d2 = mktempdir()
+        movie_video(src, d2; fields = [:rho], gop = 7, crf = 40, threads = 2, cpu_used = 8, floors = Dict(:rho => 1.0))
+        p2 = read_movie_manifest(d2)["fields"][1]["lohi"][1]
+        @test p2[2] - p2[1] ≈ 1.0
+        @test isfile(joinpath(dst, "player.html")) && isfile(joinpath(dst, "index.html"))
+    end
+end

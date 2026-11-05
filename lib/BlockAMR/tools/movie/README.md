@@ -32,6 +32,22 @@ stencil reads prolonged coarse→fine ghosts, the coarse truncation error divide
 by the fine Δx shows as a faint seam on the fine side of the C/F face. The
 solver sees the same ghosts.
 
+## Compressed copies for sharing
+
+```julia
+movie_video("RUN/movie", "RUN/share"; crf = 24, gop = 16, every = 1, downsample = 1)
+```
+
+This writes 10-bit VP9 video, one IVF file per `gop` frames, and needs `ffmpeg` with
+libvpx-vp9. The same player opens it through WebCodecs, so current Chrome or Edge is
+the tested path; other browsers get a message if they lack it. It is lossy: readouts
+show ≈, and the PNG movie stays the master. Each field gets one fixed range over all
+frames, so per-frame range modes show that range. `floors` (default 3 dex below the peak for
+`absw` and `absJ`) clips log fields, and heavy-tailed signed fields such as `divv` are
+coded in asinh(v/a); lower `asinh_scale` (default 10) to keep more weak structure, at more bits. `crfs` sets
+the quality per field; the defaults spend less on `divv wz Jz absw absJ`, which cost 10-30×
+the smooth fields.
+
 ## Watching
 
 ```sh
