@@ -130,7 +130,7 @@ end # for BE
         @test fr["enc"] == "log" && fd["enc"] == "asinh" && fd["asinh"] > 0
         @test all(p -> p == fr["lohi"][1], fr["lohi"])            # one fixed range
         for g in 0:2
-            path = joinpath(dst, "rho", @sprintf("%05d.ivf", g))
+            path = joinpath(dst, "rho", @sprintf("%05d.webm", g))
             raw = read(pipeline(`ffmpeg -hide_banner -loglevel error -i $path -f rawvideo -pix_fmt yuv420p10le -`))
             ks = (3g):min(3g + 2, nfr - 1); fs = (W * H + W * H ÷ 2) * 2
             @test length(raw) == length(ks) * fs

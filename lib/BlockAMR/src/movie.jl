@@ -524,7 +524,7 @@ read_movie_manifest(dir::AbstractString) = _jparse(read(joinpath(dir, "manifest.
                 cpu_used = 4, threads = 8, title = nothing, ffmpeg = "ffmpeg")
 
 Encode a PNG movie directory as a compressed copy for sharing: 10-bit VP9 luma, one
-IVF file per `gop` frames (`dst/<field>/NNNNN.ivf`, each starting on a keyframe), read
+WebM file per `gop` frames (`dst/<field>/NNNNN.webm`, each starting on a keyframe), read
 by the same player through WebCodecs.  Lossy: values are for looking, keep the PNG
 movie as the master (readouts show ≈).  Needs `ffmpeg` with libvpx-vp9.
 
@@ -573,10 +573,10 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
         hi > lo || (hi = lo + 1)
         forward = enc == "asinh" ? (v -> asinh(v / a)) : identity
         Threads.@threads for g in eachindex(groups)
-            path = joinpath(d, Printf.@sprintf("%05d.ivf", g - 1))
+            path = joinpath(d, Printf.@sprintf("%05d.webm", g - 1))
             cmd = `$ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p10le -s $(W)x$(H) -r 20
                    -i - -c:v libvpx-vp9 -profile:v 2 -crf $q -b:v 0 -g $(length(groups[g])) -deadline good
-                   -cpu-used $cpu_used -row-mt 1 -threads $threads -tile-columns 3 -f ivf $path`
+                   -cpu-used $cpu_used -row-mt 1 -threads $threads -tile-columns 3 -f webm $path`
             open(cmd, "w") do io
                 Y = Vector{UInt16}(undef, W * H)
                 for k in groups[g]
@@ -614,7 +614,7 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
     out["nx"] = W; out["ny"] = H; out["nframes"] = length(keep)
     out["times"] = [m["times"][k + 1] for k in keep]; out["fields"] = out_fields
     delete!(out, "pack")
-    out["video"] = Dict("codec" => "vp09.02.51.10", "bits" => 10, "gop" => gop, "pattern" => "%05d.ivf")
+    out["video"] = Dict("codec" => "vp09.02.51.10", "bits" => 10, "gop" => gop, "pattern" => "%05d.webm")
     title === nothing || (out["title"] = String(title))
     write(joinpath(dst, "manifest.json"), _js(out))
     cp(PLAYER_HTML, joinpath(dst, "player.html"); force = true)

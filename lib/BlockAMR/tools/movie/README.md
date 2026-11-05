@@ -38,7 +38,7 @@ solver sees the same ghosts.
 movie_video("RUN/movie", "RUN/share"; crf = 24, gop = 16, every = 1, downsample = 1)
 ```
 
-This writes 10-bit VP9 video, one IVF file per `gop` frames, and needs `ffmpeg` with
+This writes 10-bit VP9 video, one WebM file per `gop` frames, and needs `ffmpeg` with
 libvpx-vp9. The same player opens it through WebCodecs, so current Chrome or Edge is
 the tested path; other browsers get a message if they lack it. It is lossy: readouts
 show ≈, and the PNG movie stays the master. Each field gets one fixed range over all

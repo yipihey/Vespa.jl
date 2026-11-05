@@ -176,13 +176,26 @@ function fileOf(fi, k) {           // (url, tile index) of frame k of field fi
   return { url: BASE + fi.dir + "/" + name, tile: k % per, file: n };
 }
 
-// ── video movies (movie_video): one IVF file per keyframe group, WebCodecs ─────
+// ── video movies (movie_video): one WebM file per keyframe group, WebCodecs ────
 // A group is decoded as a unit (a flush demands a keyframe next).  Frames become
 // the same two-byte code textures as the PNG path (R = code >> 8, G = code & 255),
 // so shader, ranges and readout are shared.
-function ivfChunks(buf) {
-  const d = new DataView(buf), out = []; let p = d.getUint16(6, true);
-  while (p + 12 <= buf.byteLength) { const n = d.getUint32(p, true); out.push(new Uint8Array(buf, p + 12, n)); p += 12 + n }
+// the frames of a WebM file (EBML): Segment → Cluster → SimpleBlock | BlockGroup → Block
+function webmChunks(buf) {
+  const b = new Uint8Array(buf), out = [];
+  const vint = (p, keep) => { let n = 1, m = 0x80; while (n <= 8 && !(b[p] & m)) { n++; m >>= 1 }
+    let v = keep ? b[p] : b[p] & (m - 1), known = (b[p] & (m - 1)) === m - 1 ? 0 : 1;
+    for (let i = 1; i < n; i++) { v = v * 256 + b[p + i]; if (b[p + i] !== 255) known = 1 }
+    return { v, n, known } };
+  const walk = (p, end) => {
+    while (p < end) {
+      const id = vint(p, true), sz = vint(p + id.n, false), q = p + id.n + sz.n, e = sz.known ? q + sz.v : end;
+      if (id.v === 0x18538067 || id.v === 0x1F43B675 || id.v === 0xA0) walk(q, e);        // containers
+      else if (id.v === 0xA3 || id.v === 0xA1) { const h = vint(q, false).n + 3; out.push(new Uint8Array(buf, q + h, e - q - h)) }
+      p = e;
+    }
+  };
+  walk(0, b.length);
   return out;
 }
 class VideoSource {
@@ -211,7 +224,7 @@ class VideoSource {
   }
   async decodeGroup(lo) {
     const G = M.video.gop, g = Math.floor(lo / G), name = M.video.pattern.replace("%05d", String(g).padStart(5, "0"));
-    const chunks = ivfChunks(await (await getBlob(BASE + this.fi.dir + "/" + name)).arrayBuffer());
+    const chunks = webmChunks(await (await getBlob(BASE + this.fi.dir + "/" + name)).arrayBuffer());
     const hi = lo + this.window - 1; let k = g * G, chain = Promise.resolve(), failure = null;
     const dec = new VideoDecoder({
       output: f => {
