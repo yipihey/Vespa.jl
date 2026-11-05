@@ -113,14 +113,16 @@ larger blocks refining more volume.
 python3 -m http.server 8000 -d runs/uni-b100/movie     # then open http://localhost:8000/
 ```
 
-To make a small copy for sharing (about 300× smaller, but lossy):
+To make a small copy for sharing (about 150× smaller at β = 100 and about 50× at B = 0 with both
+the default 10-bit and 8-bit copies, because turbulence compresses poorly; lossy):
 
 ```julia
 using BlockAMR
 movie_video("runs/uni-b100/movie", "runs/uni-b100/share")
 ```
 
-Details are in `../tools/movie/README.md`.
+Pass `renditions = (8,)` to halve the size. 8-bit is what iOS Safari plays. Details are in
+`../tools/movie/README.md`.
 
 ## Cooling and chemistry
 
