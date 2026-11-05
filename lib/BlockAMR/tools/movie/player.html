@@ -198,12 +198,28 @@ function webmChunks(buf) {
   walk(0, b.length);
   return out;
 }
+// phones and tablets: tighter memory limits (iPadOS reports itself as a Mac with touch)
+const SMALLDEV = /iPhone|iPad|Android/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// the first rendition this browser reads; a failure moves every panel to the next
+let rendition = null;
+const REND = () => M.video.renditions[rendition];
+async function pickRendition() {
+  const rs = M.video.renditions;
+  for (let i = 0; i < rs.length; i++) {
+    const r = await VideoDecoder.isConfigSupported({ codec: rs[i].codec, codedWidth: M.nx, codedHeight: M.ny }).catch(() => ({ supported: false }));
+    if (r.supported) { rendition = i; return true }
+  }
+  return false;
+}
 class VideoSource {
   constructor(panel, fi) {
     this.p = panel; this.fi = fi; this.want = new Set(); this.running = false; this.dead = false;
-    const N = (1 << M.video.bits) - 1; this.lut = new Uint16Array(N + 1);
-    for (let y = 0; y <= N; y++) { const c = 1 + Math.round(y * 65534 / N); this.lut[y] = (c >> 8) | ((c & 255) << 8) }
+    this.makeLut();
     this.rg = new Uint8Array(2 * M.nx * M.ny); this.rg16 = new Uint16Array(this.rg.buffer);
+  }
+  makeLut() {
+    this.lutBits = REND().bits; const N = (1 << this.lutBits) - 1; this.lut = new Uint16Array(N + 1);
+    for (let y = 0; y <= N; y++) { const c = 1 + Math.round(y * 65534 / N); this.lut[y] = (c >> 8) | ((c & 255) << 8) }
   }
   key(k) { return this.fi.key + "/" + k }
   request(k) { this.want.add(k); if (!this.running) this.pump() }
@@ -218,7 +234,13 @@ class VideoSource {
       for (;;) {
         const need = [...this.want].filter(k => !this.p.texs.has(this.key(k)));
         if (this.dead || !need.length) break;
-        await this.decodeGroup(Math.min(...need));
+        const used = rendition;
+        try { await this.decodeGroup(Math.min(...need)) }
+        catch (e) {             // the next rendition, once; another panel may have moved already
+          if (used + 1 >= M.video.renditions.length) throw e;
+          console.warn(`${REND().bits}-bit video failed, using the next rendition:`, e);
+          if (rendition === used) rendition = used + 1;
+        }
       }
     } catch (e) {               // stays visible on the panel; no retry loop
       this.failed = true; console.error(e);
@@ -227,7 +249,8 @@ class VideoSource {
     this.running = false;
   }
   async decodeGroup(lo) {
-    const G = M.video.gop, g = Math.floor(lo / G), name = M.video.pattern.replace("%05d", String(g).padStart(5, "0"));
+    const R = REND(); if (this.lutBits !== R.bits) this.makeLut();
+    const G = M.video.gop, g = Math.floor(lo / G), name = R.pattern.replace("%05d", String(g).padStart(5, "0"));
     this.p.setBusy(`loading: fetching ${this.fi.key}/${name}`);
     const chunks = webmChunks(await (await getBlob(BASE + this.fi.dir + "/" + name)).arrayBuffer());
     if (!chunks.length) throw new Error(`${name}: no frames in the file`);
@@ -243,7 +266,7 @@ class VideoSource {
       },
       error: fail,
     });
-    const cfg = { codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny, hardwareAcceleration: "prefer-software" };
+    const cfg = { codec: R.codec, codedWidth: M.nx, codedHeight: M.ny, hardwareAcceleration: "prefer-software" };
     if (!(await VideoDecoder.isConfigSupported(cfg)).supported) delete cfg.hardwareAcceleration;
     dec.configure(cfg);
     this.p.setBusy(`loading: decoding ${chunks.length} frames`);
@@ -262,11 +285,12 @@ class VideoSource {
   }
   async upload(f, i) {
     try {
-      if (f.format !== "I420P10" && f.format !== "I420") throw new Error(`the decoder gave frames in format ${f.format}, which this player cannot read`);
+      const hdr = f.format === "I420P10";
+      if (!hdr && f.format !== "I420" && f.format !== "NV12") throw new Error(`the decoder gave frames in format ${f.format}, which this player cannot read`);
       const size = f.allocationSize();
       if (!this.buf || this.buf.byteLength < size) this.buf = new ArrayBuffer(size);
       const lay = await f.copyTo(this.buf), W = M.nx, H = M.ny, lut = this.lut, out = this.rg16;
-      const hdr = f.format === "I420P10", stride = hdr ? lay[0].stride >> 1 : lay[0].stride, off = hdr ? lay[0].offset >> 1 : lay[0].offset;
+      const stride = hdr ? lay[0].stride >> 1 : lay[0].stride, off = hdr ? lay[0].offset >> 1 : lay[0].offset;
       const Y = hdr ? new Uint16Array(this.buf) : new Uint8Array(this.buf);
       for (let r = 0, q = 0; r < H; r++) { const s = off + r * stride; for (let x = 0; x < W; x++) out[q++] = lut[Y[s + x]] }
       const p = this.p, gl = p.gl, tex = gl.createTexture();
@@ -381,7 +405,7 @@ class Panel {
     this.cache = 0;
     this.wire();
   }
-  get budget() { return (768 << 20) / Math.max(1, nPanels) }
+  get budget() { return (SMALLDEV ? 256 << 20 : 768 << 20) / Math.max(1, nPanels) }
   wire() {
     const fsel = $(".field", this.el), csel = $(".cmap", this.el);
     for (const f of M.fields) { const o = document.createElement("option"); o.value = f.key;
@@ -757,10 +781,10 @@ async function main() {
     $("#sub").textContent = ""; return;
   }
   if (M.video) {
-    const ok = "VideoDecoder" in window && (await VideoDecoder.isConfigSupported({ codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny })
-                                            .catch(() => ({ supported: false }))).supported;
+    if (!M.video.renditions) M.video.renditions = [{ bits: M.video.bits, codec: M.video.codec, pattern: M.video.pattern }];
+    const ok = "VideoDecoder" in window && await pickRendition();
     if (!ok) { $("#panels").innerHTML = `<div class="msg"><h2>This browser cannot play this movie</h2>
-      <p>It needs WebCodecs with ${M.video.codec} (10-bit VP9) at ${M.nx}×${M.ny}. Current Chrome or Edge should work.</p></div>`; $("#sub").textContent = ""; return }
+      <p>It needs WebCodecs with VP9 video at ${M.nx}×${M.ny}. Current Chrome or Edge should work.</p></div>`; $("#sub").textContent = ""; return }
   }
   document.title = M.title || "Vespa movie";
   $("#title").textContent = M.title || "Vespa movie";
@@ -769,7 +793,7 @@ async function main() {
   resetView();
   const fromHash = () => { const m = /^#f(\d+)$/.exec(location.hash); if (m) go(+m[1]) };
   fromHash(); window.addEventListener("hashchange", fromHash);
-  setPanels([1, 2, 4].includes(+qs.get("panels")) ? +qs.get("panels") : store.get(`vm:${M.title}:n`, 2));
+  setPanels([1, 2, 4].includes(+qs.get("panels")) ? +qs.get("panels") : store.get(`vm:${M.title}:n`, SMALLDEV ? 1 : 2));
   for (const b of document.querySelectorAll("#layout button")) b.onclick = () => setPanels(+b.dataset.n);
   $("#play").onclick = toggle;
   $("#first").onclick = () => go(0); $("#last").onclick = () => go(M.nframes - 1);

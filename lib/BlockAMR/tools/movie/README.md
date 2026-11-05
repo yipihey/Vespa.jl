@@ -40,7 +40,8 @@ movie_video("RUN/movie", "RUN/share"; crf = 24, gop = 16, every = 1, downsample 
 
 This writes 10-bit VP9 video, one WebM file per `gop` frames, and needs `ffmpeg` with
 libvpx-vp9. The same player opens it through WebCodecs, so current Chrome or Edge is
-the tested path; other browsers get a message if they lack it. It is lossy: readouts
+the tested path; other browsers get a message if they lack it. It writes a 10-bit and an 8-bit copy of every file, because some hardware decoders give
+the page 10-bit frames it cannot read; the player then switches to 8-bit (256 levels) by itself. It is lossy: readouts
 show ≈, and the PNG movie stays the master. Each field gets one fixed range over all
 frames, so per-frame range modes show that range. `floors` (default 3 dex below the peak for
 `absw` and `absJ`) clips log fields, and heavy-tailed signed fields such as `divv` are

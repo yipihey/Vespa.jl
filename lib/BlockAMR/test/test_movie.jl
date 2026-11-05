@@ -126,9 +126,15 @@ end # for BE
         m["fields"][3]["lohi"][1] = [nothing, nothing]; m["fields"][3]["prange"][1] = [nothing, nothing]
         write(joinpath(src, "manifest.json"), BlockAMR._js(m))
         r = movie_video(src, dst; gop = 3, crf = 10, threads = 2, cpu_used = 8, floors = Dict{Symbol,Float64}())
-        @test r.nfiles == 3 * 3 && r.bytes > 0
+        @test r.nfiles == 3 * 3 * 2 && r.bytes > 0
         v = read_movie_manifest(dst)
-        @test v["video"]["bits"] == 10 && v["video"]["gop"] == 3 && !haskey(v, "pack") && v["nframes"] == nfr
+        @test v["video"]["gop"] == 3 && !haskey(v, "pack") && v["nframes"] == nfr
+        @test [q["bits"] for q in v["video"]["renditions"]] == [10, 8]
+        # the 8-bit fallback holds the same frames
+        raw8 = read(pipeline(`ffmpeg -hide_banner -loglevel error -i $(joinpath(dst, "rho", "00001.b8.webm")) -f rawvideo -pix_fmt yuv420p -`))
+        lo8, hi8 = v["fields"][1]["lohi"][1]
+        @test length(raw8) == 3 * (W * H + W * H ÷ 2)
+        @test all(abs(lo8 + raw8[(y * W + x) + 1] / 255 * (hi8 - lo8) - rho(x, H - 1 - y, 3)) < 0.1 for y in 0:H-1, x in 0:W-1)
         fr = v["fields"][1]; fd = v["fields"][2]
         @test fr["enc"] == "log" && fd["enc"] == "asinh" && fd["asinh"] > 0
         @test all(p -> p == fr["lohi"][1], fr["lohi"])            # one fixed range
@@ -146,7 +152,7 @@ end # for BE
         end
         # a floor clips the range of a log field
         d2 = mktempdir()
-        movie_video(src, d2; fields = [:rho], gop = 7, crf = 40, threads = 2, cpu_used = 8, floors = Dict(:rho => 1.0))
+        movie_video(src, d2; fields = [:rho], gop = 7, crf = 40, threads = 2, cpu_used = 8, floors = Dict(:rho => 1.0), renditions = (10,))
         p2 = read_movie_manifest(d2)["fields"][1]["lohi"][1]
         @test p2[2] - p2[1] ≈ 1.0
         @test isfile(joinpath(dst, "player.html")) && isfile(joinpath(dst, "index.html"))

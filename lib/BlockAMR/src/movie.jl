@@ -517,15 +517,23 @@ function _jparse(s::AbstractString)
 end
 read_movie_manifest(dir::AbstractString) = _jparse(read(joinpath(dir, "manifest.json"), String))
 
+_vid_suffix(bits::Int) = bits == 10 ? ".webm" : ".b$bits.webm"
+_vid_manifest(gop::Int, renditions) = Dict{String,Any}("gop" => gop, "renditions" => [
+    Dict{String,Any}("bits" => b, "codec" => b == 10 ? "vp09.02.51.10" : "vp09.00.51.08", "pattern" => "%05d" * _vid_suffix(b))
+    for b in renditions])
+
 """
     movie_video(src, dst; fields = all, every = 1, frames = all, downsample = 1, crf = 24,
                 crfs = Dict(:divv => 32, :wz => 32, :Jz => 32, :absw => 32, :absJ => 32), gop = 16,
                 floors = Dict(:absw => 3.0, :absJ => 3.0), tailratio = 30.0, asinh_scale = 10.0,
-                cpu_used = 4, threads = 8, title = nothing, ffmpeg = "ffmpeg")
+                cpu_used = 4, threads = 8, renditions = (10, 8), title = nothing, ffmpeg = "ffmpeg")
 
-Encode a PNG movie directory as a compressed copy for sharing: 10-bit VP9 luma, one
-WebM file per `gop` frames (`dst/<field>/NNNNN.webm`, each starting on a keyframe), read
-by the same player through WebCodecs.  Lossy: values are for looking, keep the PNG
+Encode a PNG movie directory as a compressed copy for sharing: VP9 luma, one WebM file
+per `gop` frames (`dst/<field>/NNNNN.webm`, each starting on a keyframe), read by the
+same player through WebCodecs.  `renditions` lists the bit depths: the player takes the
+first its browser can read.  Some hardware decoders hand 10-bit frames to the page in a
+format it cannot copy (`VideoFrame.format === null`), so the 8-bit one (`NNNNN.b8.webm`,
+256 levels) is the fallback; it needs about as many bytes again.  Lossy: values are for looking, keep the PNG
 movie as the master (readouts show ≈).  Needs `ffmpeg` with libvpx-vp9.
 
 Each field gets one fixed range over the kept frames, since a per-frame range makes
@@ -540,14 +548,14 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
                      frames = nothing, downsample::Int = 1, crf::Int = 24,
                      crfs = Dict(:divv => 32, :wz => 32, :Jz => 32, :absw => 32, :absJ => 32), gop::Int = 16,
                      floors = Dict(:absw => 3.0, :absJ => 3.0), tailratio::Real = 30.0, asinh_scale::Real = 10.0,
-                     cpu_used::Int = 4, threads::Int = 8, title = nothing, ffmpeg::AbstractString = "ffmpeg")
+                     cpu_used::Int = 4, threads::Int = 8, renditions = (10, 8), title = nothing,
+                     ffmpeg::AbstractString = "ffmpeg")
     m = read_movie_manifest(src)
     get(get(m, "pack", Dict()), "per", 1) == 1 || error("movie_video: source is packed")
     keep = frames === nothing ? collect(0:every:m["nframes"]-1) : collect(Int, frames)
     fl = fields === nothing ? m["fields"] : [f for f in m["fields"] if Symbol(f["key"]) in Symbol.(fields)]
     isempty(fl) && error("movie_video: no fields selected")
     ds = downsample; W0 = m["nx"]; W = (m["nx"] ÷ ds) & ~1; H = (m["ny"] ÷ ds) & ~1      # VP9 4:2:0: even
-    N = 1023; chroma = fill(UInt16(512), W * H ÷ 2)
     out_fields = Any[]; nbytes = Threads.Atomic{Int}(0); biggest = Threads.Atomic{Int}(0)
     groups = [keep[i:min(i + gop - 1, length(keep))] for i in 1:gop:length(keep)]
     # one value per pixel, in the field's stored quantity
@@ -575,18 +583,22 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
         end
         hi > lo || (hi = lo + 1)
         forward = enc == "asinh" ? (v -> asinh(v / a)) : identity
-        Threads.@threads for g in eachindex(groups)
-            path = joinpath(d, Printf.@sprintf("%05d.webm", g - 1))
-            cmd = `$ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt yuv420p10le -s $(W)x$(H) -r 20
-                   -i - -c:v libvpx-vp9 -profile:v 2 -crf $q -b:v 0 -g $(length(groups[g])) -deadline good
+        Threads.@threads for job in [(g, b) for g in eachindex(groups) for b in renditions]
+            g, bits = job
+            path = joinpath(d, Printf.@sprintf("%05d", g - 1) * _vid_suffix(bits))
+            N = (1 << bits) - 1
+            pf, prof, E = bits == 10 ? ("yuv420p10le", 2, UInt16) : ("yuv420p", 0, UInt8)
+            chroma = fill(E((N + 1) ÷ 2), W * H ÷ 2)
+            cmd = `$ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt $pf -s $(W)x$(H) -r 20
+                   -i - -c:v libvpx-vp9 -profile:v $prof -crf $q -b:v 0 -g $(length(groups[g])) -deadline good
                    -cpu-used $cpu_used -row-mt 1 -threads $threads -tile-columns 3 -f webm $path`
             open(cmd, "w") do io
-                Y = Vector{UInt16}(undef, W * H)
+                Y = Vector{E}(undef, W * H)
                 for k in groups[g]
                     pix, w0, _ = _read_png_codes(joinpath(src, f["dir"], Printf.@sprintf("%05d.png", k)))
                     lh = f["lohi"][k + 1]
                     if lh[1] === nothing                         # all no-data: the bottom of the range
-                        fill!(Y, 0x0000); write(io, Y); write(io, chroma); continue
+                        fill!(Y, zero(E)); write(io, Y); write(io, chroma); continue
                     end
                     l0 = Float64(lh[1]); sc = (Float64(lh[2]) - l0) / 65534
                     @inbounds for r in 0:H-1                     # row 0 = top (the PNG order)
@@ -603,7 +615,7 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
                                 n == 0 ? 1.0 : acc / n
                             end
                             v = forward(l0 + (c - 1) * sc)
-                            Y[r * W + x + 1] = round(UInt16, clamp((v - lo) / (hi - lo), 0.0, 1.0) * N)
+                            Y[r * W + x + 1] = round(E, clamp((v - lo) / (hi - lo), 0.0, 1.0) * N)
                         end
                     end
                     write(io, Y); write(io, chroma)
@@ -621,12 +633,12 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
     out["nx"] = W; out["ny"] = H; out["nframes"] = length(keep)
     out["times"] = [m["times"][k + 1] for k in keep]; out["fields"] = out_fields
     delete!(out, "pack")
-    out["video"] = Dict("codec" => "vp09.02.51.10", "bits" => 10, "gop" => gop, "pattern" => "%05d.webm")
+    out["video"] = _vid_manifest(gop, renditions)
     title === nothing || (out["title"] = String(title))
     write(joinpath(dst, "manifest.json"), _js(out))
     cp(PLAYER_HTML, joinpath(dst, "player.html"); force = true)
     install_player(dst)
-    return (; nfiles = length(groups) * length(fl), bytes = nbytes[], maxbytes = biggest[], fields = length(fl))
+    return (; nfiles = length(groups) * length(fl) * length(renditions), bytes = nbytes[], maxbytes = biggest[], fields = length(fl))
 end
 
 """
