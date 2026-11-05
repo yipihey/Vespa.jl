@@ -556,7 +556,10 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
         key = f["key"]; d = joinpath(dst, f["dir"]); mkpath(d)
         q = get(crfs, Symbol(key), crf)
         lohi = [f["lohi"][k + 1] for k in keep]
-        lo = minimum(p -> p[1], lohi); hi = maximum(p -> p[2], lohi)
+        # a frame with nothing to show has a null range (log |J| of J = 0 at t = 0)
+        ok = [p for p in lohi if p[1] !== nothing]
+        isempty(ok) && (ok = [[0.0, 1.0]])
+        lo = minimum(p -> p[1], ok); hi = maximum(p -> p[2], ok)
         enc = f["enc"]; a = 0.0
         if enc == "log"
             fl_ = get(floors, Symbol(key), nothing)
@@ -581,7 +584,11 @@ function movie_video(src::AbstractString, dst::AbstractString; fields = nothing,
                 Y = Vector{UInt16}(undef, W * H)
                 for k in groups[g]
                     pix, w0, _ = _read_png_codes(joinpath(src, f["dir"], Printf.@sprintf("%05d.png", k)))
-                    lh = f["lohi"][k + 1]; l0 = Float64(lh[1]); sc = (Float64(lh[2]) - l0) / 65534
+                    lh = f["lohi"][k + 1]
+                    if lh[1] === nothing                         # all no-data: the bottom of the range
+                        fill!(Y, 0x0000); write(io, Y); write(io, chroma); continue
+                    end
+                    l0 = Float64(lh[1]); sc = (Float64(lh[2]) - l0) / 65534
                     @inbounds for r in 0:H-1                     # row 0 = top (the PNG order)
                         y = H - 1 - r
                         for x in 0:W-1

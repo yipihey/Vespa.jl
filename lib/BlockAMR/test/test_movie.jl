@@ -120,15 +120,19 @@ end # for BE
                              "times" => [[Float64(k)] for k in 0:nfr-1], "time_labels" => [["t", "code"]],
                              "extent" => [0.0, 1.0, 0.0, 0.5], "length_unit" => "code", "title" => "t",
                              "meta" => Dict{String,Any}(), "pack" => Dict("per" => 1, "cols" => 1),
-                             "fields" => Any[mk("rho", "log", rho), mk("divv", "lin", div)])
+                             "fields" => Any[mk("rho", "log", rho), mk("divv", "lin", div), mk("absJ", "log", rho)])
+        # frame 0 of a log field with nothing to show: all no-data, null range (J = 0 at t = 0)
+        _write_png_codes(joinpath(src, "absJ", "00000.png"), zeros(UInt16, W * H), W, H)
+        m["fields"][3]["lohi"][1] = [nothing, nothing]; m["fields"][3]["prange"][1] = [nothing, nothing]
         write(joinpath(src, "manifest.json"), BlockAMR._js(m))
         r = movie_video(src, dst; gop = 3, crf = 10, threads = 2, cpu_used = 8, floors = Dict{Symbol,Float64}())
-        @test r.nfiles == 3 * 2 && r.bytes > 0
+        @test r.nfiles == 3 * 3 && r.bytes > 0
         v = read_movie_manifest(dst)
         @test v["video"]["bits"] == 10 && v["video"]["gop"] == 3 && !haskey(v, "pack") && v["nframes"] == nfr
         fr = v["fields"][1]; fd = v["fields"][2]
         @test fr["enc"] == "log" && fd["enc"] == "asinh" && fd["asinh"] > 0
         @test all(p -> p == fr["lohi"][1], fr["lohi"])            # one fixed range
+        @test all(p -> p[1] !== nothing, v["fields"][3]["lohi"])  # a null frame does not poison it
         for g in 0:2
             path = joinpath(dst, "rho", @sprintf("%05d.webm", g))
             raw = read(pipeline(`ffmpeg -hide_banner -loglevel error -i $path -f rawvideo -pix_fmt yuv420p10le -`))
