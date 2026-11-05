@@ -212,6 +212,7 @@ class VideoSource {
   // frames one panel's texture budget holds at once
   get window() { return Math.max(2, Math.floor(this.p.budget * 0.8 / (2 * M.nx * M.ny)) - 1) }
   async pump() {
+    if (this.failed) return;
     this.running = true;
     try {
       for (;;) {
@@ -219,24 +220,41 @@ class VideoSource {
         if (this.dead || !need.length) break;
         await this.decodeGroup(Math.min(...need));
       }
-    } catch (e) { console.error(e); showErr(String(e)) }
+    } catch (e) {               // stays visible on the panel; no retry loop
+      this.failed = true; console.error(e);
+      this.p.setBusy(`failed: ${e.message || e}`, true); showErr(`${this.fi.key}: ${e.message || e}`);
+    }
     this.running = false;
   }
   async decodeGroup(lo) {
     const G = M.video.gop, g = Math.floor(lo / G), name = M.video.pattern.replace("%05d", String(g).padStart(5, "0"));
+    this.p.setBusy(`loading: fetching ${this.fi.key}/${name}`);
     const chunks = webmChunks(await (await getBlob(BASE + this.fi.dir + "/" + name)).arrayBuffer());
-    const hi = lo + this.window - 1; let k = g * G, chain = Promise.resolve(), failure = null;
+    if (!chunks.length) throw new Error(`${name}: no frames in the file`);
+    const hi = lo + this.window - 1; let k = g * G, done = 0, chain = Promise.resolve(), failure = null, last = performance.now();
+    const fail = e => { failure = failure || e };
     const dec = new VideoDecoder({
       output: f => {
-        const i = k++;
-        if (i < lo || i > hi || this.dead || this.p.fi !== this.fi) { f.close(); return }
-        chain = chain.then(() => this.upload(f, i));
+        const i = k++; last = performance.now();
+        if (failure || i < lo || i > hi || this.dead || this.p.fi !== this.fi) { f.close(); done++; return }
+        // every frame is released whatever happens: a held frame can starve the decoder
+        chain = chain.then(() => failure ? f.close() : this.upload(f, i)).catch(e => { f.close(); fail(e) })
+                     .then(() => { done++; this.p.setBusy(`loading: decoded ${done}/${chunks.length}`) });
       },
-      error: e => { failure = e },
+      error: fail,
     });
-    dec.configure({ codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny });
+    const cfg = { codec: M.video.codec, codedWidth: M.nx, codedHeight: M.ny, hardwareAcceleration: "prefer-software" };
+    if (!(await VideoDecoder.isConfigSupported(cfg)).supported) delete cfg.hardwareAcceleration;
+    dec.configure(cfg);
+    this.p.setBusy(`loading: decoding ${chunks.length} frames`);
     chunks.forEach((c, i) => dec.decode(new EncodedVideoChunk({ type: i === 0 ? "key" : "delta", timestamp: (g * G + i) * 1000, data: c })));
-    await dec.flush(); await chain; dec.close();
+    // a stalled decoder (no frame for 30 s) must not look like loading forever
+    const dog = new Promise((_, no) => { const t = setInterval(() => {
+      if (failure || k >= g * G + chunks.length) clearInterval(t);
+      else if (performance.now() - last > 30000) { clearInterval(t); no(new Error(`decoder stalled after ${k - g * G}/${chunks.length} frames`)) }
+    }, 1000) });
+    try { await Promise.race([dec.flush(), dog]); await chain }
+    finally { if (dec.state !== "closed") dec.close() }
     if (failure) throw failure;
     // a frame the group could not supply must not be asked for forever
     if (lo >= k) this.want.delete(lo);
@@ -244,10 +262,11 @@ class VideoSource {
   }
   async upload(f, i) {
     try {
+      if (f.format !== "I420P10" && f.format !== "I420") throw new Error(`the decoder gave frames in format ${f.format}, which this player cannot read`);
       const size = f.allocationSize();
       if (!this.buf || this.buf.byteLength < size) this.buf = new ArrayBuffer(size);
       const lay = await f.copyTo(this.buf), W = M.nx, H = M.ny, lut = this.lut, out = this.rg16;
-      const hdr = M.video.bits > 8, stride = hdr ? lay[0].stride >> 1 : lay[0].stride, off = hdr ? lay[0].offset >> 1 : lay[0].offset;
+      const hdr = f.format === "I420P10", stride = hdr ? lay[0].stride >> 1 : lay[0].stride, off = hdr ? lay[0].offset >> 1 : lay[0].offset;
       const Y = hdr ? new Uint16Array(this.buf) : new Uint8Array(this.buf);
       for (let r = 0, q = 0; r < H; r++) { const s = off + r * stride; for (let x = 0; x < W; x++) out[q++] = lut[Y[s + x]] }
       const p = this.p, gl = p.gl, tex = gl.createTexture();
@@ -507,6 +526,7 @@ class Panel {
     const es = [...this.texs.entries()].filter(([k]) => !keep.has(k)).sort((a, b) => a[1].used - b[1].used);
     for (const [k, t] of es) { if (this.cache <= this.budget * 0.8) break; this.gl.deleteTexture(t.tex); this.cache -= t.bytes; this.texs.delete(k) }
   }
+  setBusy(msg, bad) { const b = $(".busy", this.el); b.textContent = msg; b.hidden = false; b.style.color = bad ? "var(--warn)" : "" }
   ready(k) { return !!this.texs.get(this.fi.key + "/" + fileOf(this.fi, k).file) }
   scale() { const w = this.cv.width, h = this.cv.height; return Math.min(w / M.nx, h / M.ny) * view.zoom }
   toImg(e) { const r = this.cv.getBoundingClientRect(), s = this.scale();
@@ -524,7 +544,7 @@ class Panel {
     const gl = this.gl, fi = this.fi, k = Math.min(frame, M.nframes - 1);
     this.vs?.clear();                     // only what this paint still wants
     const got = this.texFor(k);
-    $(".busy", this.el).hidden = !!got;
+    if (!this.vs?.failed) { $(".busy", this.el).hidden = !!got; if (got) { const b = $(".busy", this.el); b.textContent = "loading"; b.style.color = "" } }
     // prefetch ahead
     for (let d = 1; d <= 4; d++) { const kk = k + d * stride() * dir; if (kk >= 0 && kk < M.nframes) this.texFor(kk) }
     this.sync();
