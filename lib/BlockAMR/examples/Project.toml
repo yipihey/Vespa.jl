@@ -1,10 +1,8 @@
-# Environment for the BlockAMR examples.  ChemistryKernels.jl is a sibling checkout of
-# this repository (see README.md).  CUDA is only used when HVC_BACKEND=cuda.
+# Environment for the BlockAMR examples.  ChemistryKernels and EmissionKernels come from
+# VespaRegistry (see README.md).  CUDA is only used when HVC_BACKEND=cuda.
 [deps]
 BlockAMR = "1a2b3c4d-0014-4000-8000-000000000014"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-ChemistryKernels = "1a2b3c4d-0009-4000-8000-000000000009"
 
 [sources]
 BlockAMR = {path = ".."}
-ChemistryKernels = {path = "../../../../ChemistryKernels.jl"}

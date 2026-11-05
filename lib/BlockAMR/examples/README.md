@@ -13,13 +13,14 @@ its companion initial-condition documents were not available. The header of
 You need Julia 1.10 or later (tested on 1.12), and Python 3 with `numpy` and `h5py` for the
 cooling table. `ffmpeg` with libvpx-vp9 is only needed to make shareable movies.
 
-Clone the code, with `ChemistryKernels.jl` next to `Vespa.jl`:
+Clone the code and install the packages. `ChemistryKernels` and `EmissionKernels` come from our
+own Julia registry, so add that first:
 
 ```sh
 git clone -b blockamr-mhd-dualenergy git@github.com:yipihey/Vespa.jl.git
-git clone git@github.com:yipihey/ChemistryKernels.jl.git
 cd Vespa.jl
-julia --project=lib/BlockAMR/examples -e 'using Pkg; Pkg.instantiate()'
+julia -e 'using Pkg; Pkg.Registry.add("General"); Pkg.Registry.add(RegistrySpec(url = "https://github.com/yipihey/VespaRegistry"))'
+julia --project=lib/BlockAMR/examples -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 ```
 
 Make the cooling table (FG2011 UV background, z = 0), which the driver looks for in
