@@ -16,8 +16,13 @@ using MultiCode: EnzoLib, RamsesLib, CodeBridge
 using MusicLib
 
 function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real = 50.0,
-                                        level::Integer = 5, worker::Bool = false)
+                                        level::Integer = 5, worker::Bool = false,
+                                        rng::Symbol = :music,
+                                        panphasia_descriptor::AbstractString = "")
     MusicLib.available() || error("libmusic_capi not found")
+    rng === :panphasia && !MusicLib.has_feature("PANPHASIA") &&
+        error("rng = :panphasia but $(MusicLib.libpath()) has no PANPHASIA " *
+              "(features: $(MusicLib.features())); rebuild with music/deps/build_music_linux.sh")
     # worker=true: MUSIC generates in its OWN process (CodeBridge's Julia
     # reference worker) — immune to the OpenMP/FFTW runtime pollution that
     # makes in-process generation segfault once many live codes share the
@@ -32,7 +37,8 @@ function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real =
     n = 2^level
     mk(format, fname) = MusicSpec(boxlength = boxlength, zstart = zstart,
                                   levelmin = level, levelmax = level,
-                                  format = format, filename = fname)
+                                  format = format, filename = fname,
+                                  rng = rng, panphasia_descriptor = String(panphasia_descriptor))
     re, rr = try
         a = MusicLib.generate(mk(:enzo, "ic_enzo"); workdir = mktempdir())
         b = MusicLib.generate(mk(:ramses, "ics_ramses"); workdir = mktempdir())
@@ -81,7 +87,9 @@ function MultiCode.run_music_crosscheck(; boxlength::Real = 20.0, zstart::Real =
     corr = sum(de .* dr) / (n^3 * se * sr)
     rms = sqrt(sum(abs2, de .- dr) / n^3) / se
     return (corr = corr, rms = rms, sigma_enzo = se, sigma_ramses = sr,
-            n = n, free = () -> nothing)
+            n = n, rng = rng, panphasia_descriptor = String(panphasia_descriptor),
+            music_build = MusicLib.build_info(), music_features = MusicLib.features(),
+            free = () -> nothing)
 end
 
 end # module

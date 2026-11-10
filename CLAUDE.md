@@ -217,6 +217,15 @@ Hard-won gotchas:
   hydro (`RAMSES_LIB` must point here for Sod), `bin64hrt` = hydro+RT
   (`RAMSES_LIB_RT`; build `make NDIM=3 HYDRO=1 GRAV=1 RT=1 NRTGRP=1 NION=1
   libramses`, and `make clean` first when flags change — stale `.mod` files).
+- **MUSIC = MUSIC2.** `MusicLib` (sibling `Music.jl`) loads `libmusic_capi.so` from
+  `~/Projects/music`, branch `music2` (= cosmo-sims/MUSIC2 HEAD + our C-ABI shim;
+  remote `upstream`). Build: `bash music/deps/build_music_linux.sh` (CLASS + PANPHASIA
+  on). `MusicSpec(rng=:panphasia, panphasia_descriptor=…)` for published phases;
+  `music_cosmology(...)` for Planck-2018 sets (never MUSIC2's bare `ParameterSet` —
+  main.cc still reads `Omega_m`/`H0` from the config). `MusicLib.features()` /
+  `build_info()` report what the loaded library has. MUSIC writes `wnoise_*.bin` to
+  its CWD: `generate` uses `music_generate_in` so worker runs don't litter the repo.
+  `run_music_crosscheck(rng=:panphasia, …)` gates Enzo+RAMSES on PANPHASIA phases.
 - **RAMSES-RT driving:** call `rt_neq_updates!` once after `init` (fills the σ·c
   chemistry tables; without it photons stream but nothing ionizes). Ion
   fractions are density-weighted: `xHII = uold₆/uold₁`. Keep RT point sources at

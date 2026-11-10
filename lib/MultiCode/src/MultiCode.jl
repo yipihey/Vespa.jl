@@ -128,11 +128,14 @@ the Athena-specific file/runtime/readback details.  Implemented in
 function athena_stage_cellset end
 
 """
-    run_music_crosscheck(; boxlength=20.0, zstart=50.0, level=5) -> (; corr, rms, …)
+    run_music_crosscheck(; boxlength=20.0, zstart=50.0, level=5, worker=false,
+                           rng=:music, panphasia_descriptor="") -> (; corr, rms, …)
 
 The MUSIC injector validation: ONE MusicSpec realization, Enzo booted on the
 generated `parameter_file.txt` + particle ICs and RAMSES (UNITS=COSMO) on the
 grafic2 level directory, the two codes' INITIAL CIC density fields correlated.
+`rng = :panphasia` draws the realization from a PANPHASIA descriptor (MUSIC2 built
+with PANPHASIA); the result carries `music_build`/`music_features` for provenance.
 Implemented in `MultiCodeMusicExt` — `using MusicLib` activates it.
 """
 function run_music_crosscheck end
